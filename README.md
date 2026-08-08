@@ -16,6 +16,3 @@ Release code and binaries for MaxPrice, a Claude Code cost/token tracker.
 ### Hub:
 - Windows (Installer)
 - (Linux coming soon)
-
-## Code:
-WIP, coming soon.
