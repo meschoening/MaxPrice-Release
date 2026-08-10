@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Notarization requires the hardened runtime, which denies executable memory
+    by default. The sidecar is a compiled Bun binary, so JavaScriptCore JITs -
+    without these two entitlements the kernel SIGKILLs it before it can
+    announce its port (ADR-0002), and the app launches to a permanently empty
+    window: every number in the UI comes from the sidecar.
+
+    BOTH keys are required, and the second one is easy to miss. Granting only
+    allow-jit is enough to run the sidecar by hand from a shell, but NOT enough
+    when the app spawns it - that path still died with
+    "EXC_BAD_ACCESS / SIGKILL (Code Signature Invalid), CODESIGNING Invalid
+    Page" on a JIT page. So a green standalone probe does not prove the app
+    works; only launching the built app does. Verified 2026-07-29:
+    allow-jit alone => app-spawned sidecar killed;
+    allow-jit + allow-unsigned-executable-memory => sidecar live and listening.
+    disable-library-validation was tested and is NOT needed (the bun:ffi
+    watchdog only dlopens Apple-signed libc).
+
+    None of this reproduces in an unnotarized local build - `tauri dev` and
+    `install_desktop.sh` produce ad-hoc-signed binaries with no hardened
+    runtime, where the JIT is unrestricted. It appears only in a signed release
+    build, and notarization still passes either way, so neither the release
+    gate nor Apple will tell you it is broken.
+  -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+</dict>
+</plist>

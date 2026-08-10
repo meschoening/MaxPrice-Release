@@ -1,0 +1,2858 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@maxprice/glass";
+
+/* `dark:` variants fire on the RESOLVED data-theme that public/theme-boot.js
+   stamps on <html> before first paint (ADR-0043) — never on the media query:
+   the boot script owns system-preference resolution and re-stamps on OS
+   flips while the preference is "system". */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Legacy token names → glass tokens (ADR-0043). Un-migrated pages keep
+   rendering through these aliases until their reskin milestone lands — old
+   layouts wearing glass colors, dev-only on the redesign branch. Plain
+   @theme (not inline) so the --color-* variables are emitted on :root:
+   several components reference them literally in arbitrary values. All
+   theme flips restyle :root itself, so the var() chain recomputes there.
+     --color-soft  is our text-muted color (shadcn's --muted is a soft bg).
+     --color-brand is the accent (shadcn's --accent is a hover bg). */
+@theme {
+  --color-panel: var(--panel);
+  --color-text: var(--text);
+  --color-soft: var(--soft);
+  --color-brand: var(--accent);
+  /* LOAD-BEARING NAMES: packages/shared/src/usage-status.ts emits bg-good /
+     bg-warn / bg-bad literally, which resolve against these tokens. Keep the
+     names identical here and in apps/hub-desktop; do not rename independently. */
+  --color-good: var(--good);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-line: var(--hairline);
+}
+
+/* Bridge shadcn's semantic tokens to the glass palette. Everything flips on
+   :root via data-theme, so these aliases pick up dark values automatically. */
+:root {
+  --radius: 0.625rem;
+  --background: var(--wash-base);
+  --foreground: var(--text);
+  --popover: var(--panel);
+  --popover-foreground: var(--text);
+  --primary: var(--accent);
+  --primary-foreground: var(--wash-base);
+  --secondary: color-mix(in oklch, var(--text) 4%, transparent);
+  --secondary-foreground: var(--text);
+  --muted: color-mix(in oklch, var(--text) 4%, transparent);
+  --muted-foreground: var(--soft);
+  /* shadcn's --accent (a hover bg) is deliberately NOT set here: the name
+     belongs to the glass accent token. --color-accent below maps the
+     utility straight onto the hover tint instead. */
+  --accent-foreground: var(--text);
+  --destructive: var(--bad);
+  --border: var(--hairline);
+  --input: var(--hairline);
+  --ring: var(--accent);
+}
+
+/* Shadcn token → Tailwind utility name mappings. `@theme inline` substitutes
+   the value at compile time, so `bg-primary` etc. resolve via our :root
+   aliases above. Entries that would shadow our own `--color-*` tokens
+   (`--color-brand`, `--color-soft`) are deliberately absent. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: color-mix(in oklch, var(--text) 6%, transparent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+}
+
+/* Un-migrated shadcn overlays wear the glass menu material so they stay
+   legible over the wash until their pages reskin (M2+): --popover is now a
+   translucent glass tint, which needs the frost behind it. */
+[data-slot="popover-content"],
+[data-slot="dialog-content"] {
+  -webkit-backdrop-filter: var(--frost-chip);
+  backdrop-filter: var(--frost-chip);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+/* ============================================================
+   M2 — chrome + Live page recipes (glass.html, NOTES §Option C).
+   Page-level styling only; the material itself (.panel/.chip/.seg/
+   .menu/.opt/.toggle/.eyebrow/.pulse/.logo) lives in @maxprice/glass.
+   ============================================================ */
+
+/* Thin scrollbars on the frame's two scroll regions (mock .sidebar). */
+.thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--text) 20%, transparent) transparent;
+}
+
+/* --- detached frosted sidebar --- */
+.identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 4px;
+}
+.wordmark {
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+/* Only the boot-splash lockup wears this now — the sidebar identity row's
+   version chip moved to Settings › App info (map #100). The auto margin that
+   used to push it to the sidebar's right edge went with it, so the lockup no
+   longer has to cancel it. */
+.ver {
+  font-size: 10.5px;
+  color: var(--soft);
+}
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 16px 0 4px;
+}
+.nav a {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7.5px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--soft);
+  transition:
+    color 0.15s,
+    background-color 0.15s;
+}
+.nav a svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+.nav a:hover {
+  color: var(--text);
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+}
+.nav a.active {
+  color: var(--text);
+  font-weight: 600;
+  background: color-mix(in oklch, var(--accent) 25%, transparent);
+  box-shadow: var(--panel-inner);
+}
+.nav .pulse {
+  margin-left: auto;
+}
+.sep {
+  height: 1px;
+  background: var(--hairline);
+  margin: 12px 2px;
+  flex-shrink: 0;
+}
+.field {
+  margin-bottom: 15px;
+}
+.field .eyebrow {
+  display: block;
+  margin-bottom: 7px;
+  padding-left: 4px;
+}
+.presets {
+  display: flex;
+  padding: 3px;
+  gap: 2px;
+}
+.presets button {
+  flex: 1;
+  padding: 4px 0;
+}
+.readout {
+  margin-top: 7px;
+  padding-left: 4px;
+  font-size: 11px;
+  color: var(--soft);
+}
+.select {
+  width: 100%;
+  justify-content: space-between;
+  padding: 7px 13px;
+  font-size: 12.5px;
+  color: var(--text);
+}
+.select.placeholder {
+  color: var(--soft);
+}
+/* Any chip trigger's caret rotates while its menu is open (Radix stamps
+   data-state on the trigger). */
+.chip .caret {
+  transition: transform 0.2s;
+}
+.chip[data-state="open"] .caret {
+  transform: rotate(180deg);
+}
+.select svg {
+  color: var(--soft);
+  transition: transform 0.2s;
+}
+.select[data-state="open"] svg {
+  transform: rotate(180deg);
+}
+
+/* --- floating pill topbar --- */
+.topbar {
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 11px 14px 11px 26px;
+  flex-wrap: wrap;
+}
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.topbar h1 {
+  font-size: 21px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+.subtitle {
+  font-size: 11.5px;
+  color: var(--soft);
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2.5px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--live);
+  background: color-mix(in oklch, var(--live) 13%, transparent);
+  border: 1px solid color-mix(in oklch, var(--live) 30%, transparent);
+}
+.badge.warn {
+  color: var(--warn);
+  background: color-mix(in oklch, var(--warn) 13%, transparent);
+  border-color: color-mix(in oklch, var(--warn) 30%, transparent);
+}
+.badge.bad {
+  color: var(--bad);
+  background: color-mix(in oklch, var(--bad) 13%, transparent);
+  border-color: color-mix(in oklch, var(--bad) 30%, transparent);
+}
+/* The badge/status dot inherits its tone from the text color. */
+.conn-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: glass-pulse 2.4s ease-in-out infinite;
+}
+.badge.bad .conn-dot {
+  animation: none;
+}
+.tb-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* --- floating stat tiles --- */
+.tiles {
+  display: grid;
+  grid-template-columns: 1fr 1.62fr 1fr;
+  gap: 18px;
+}
+.tile {
+  padding: 17px 20px 16px;
+  display: flex;
+  flex-direction: column;
+}
+.value {
+  font-size: 29px;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
+  margin: 3px 0 1px;
+  transform-origin: left center;
+}
+.value.bump {
+  animation: glass-bump 0.35s ease;
+}
+.tile-sub {
+  font-size: 12px;
+  color: var(--soft);
+}
+.delta {
+  align-self: flex-start;
+  margin-top: 10px;
+  padding: 2.5px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--up);
+  background: color-mix(in oklch, var(--up) 14%, transparent);
+}
+.delta.down {
+  color: var(--live);
+  background: color-mix(in oklch, var(--live) 14%, transparent);
+}
+.delta.flat {
+  color: var(--soft);
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+}
+
+/* active block tile */
+.block-tile {
+  flex-direction: row;
+  align-items: center;
+  gap: 20px;
+}
+.ring-wrap {
+  position: relative;
+  width: 100px;
+  height: 100px;
+  flex-shrink: 0;
+}
+.ring-wrap svg {
+  width: 100px;
+  height: 100px;
+}
+.ring-track {
+  fill: none;
+  stroke: var(--ring-track);
+  stroke-width: 7;
+}
+.ring-fill {
+  fill: none;
+  stroke: url(#ringGrad);
+  stroke-width: 7;
+  stroke-linecap: round;
+  /* earned: the live block's trackers glow; 1Hz advance crawls (900ms linear) */
+  filter: drop-shadow(0 0 6px var(--accent-glow));
+  transition: stroke-dasharray 0.9s linear;
+}
+.stop-a {
+  stop-color: var(--accent-a);
+}
+.stop-b {
+  stop-color: var(--accent-b);
+}
+.ring-label {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  text-align: center;
+}
+.ring-label b {
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.ring-label small {
+  font-size: 8.5px;
+  font-weight: 600;
+  color: var(--soft);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.block-body {
+  min-width: 0;
+  flex: 1;
+}
+.block-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+.window-chip {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--soft);
+  padding: 1.5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+  background: color-mix(in oklch, var(--text) 4%, transparent);
+}
+.block-value-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.block-value-row .value {
+  font-size: 25px;
+}
+.block-meta {
+  font-size: 11.5px;
+  color: var(--soft);
+}
+.limit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.limit-row label {
+  font-size: 11px;
+  color: var(--soft);
+  white-space: nowrap;
+}
+.limit-meter {
+  flex: 1;
+  max-width: 170px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--ring-track);
+  overflow: hidden;
+  box-shadow: var(--panel-inner);
+}
+.limit-meter i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+  box-shadow: 0 0 8px var(--accent-glow);
+  transition: width 0.9s linear;
+}
+.limit-row b {
+  font-size: 11px;
+  font-weight: 800;
+}
+.block-foot {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--soft);
+}
+.block-foot b {
+  font-weight: 800;
+  color: var(--text);
+  font-size: 11px;
+}
+
+/* --- chart panel --- */
+.chart-card {
+  padding: 16px 20px 13px;
+}
+.chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.chart-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.legend-row .chip {
+  padding: 3.5px 11px;
+  font-size: 11px;
+  color: var(--text);
+}
+.legend-row .chip.muted {
+  opacity: 0.5;
+}
+.legend-row .chip.muted:hover {
+  opacity: 0.8;
+}
+.legend-row .chip.muted .label {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+.legend-axis {
+  margin: 0 2px 0 6px;
+}
+.swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.ghost-key {
+  border-style: dashed;
+  color: var(--soft);
+}
+.ghost-key .swatch {
+  background: var(--ghost);
+  opacity: 0.4;
+}
+/* The ghost-key pill IS the overlay toggle; off = the mute chips' treatment
+   (chip dim + struck label via .muted) with the swatch hollowed to a ring —
+   the ghost tone survives so the pill stays findable, mirroring the muted
+   legend swatches. Full ring opacity: the chip-level dim already softens it. */
+.ghost-key.muted .swatch {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--ghost);
+  opacity: 1;
+}
+.chart-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 11px;
+  border-top: 1px solid var(--hairline);
+}
+.summary {
+  font-size: 11.5px;
+  color: var(--soft);
+}
+.summary b {
+  font-weight: 800;
+  color: var(--text);
+  font-size: 11.5px;
+}
+.foot-toggles {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+/* --- the glass SVG chart (M3, #61 — ported from prototype/styles.css) --- */
+/* Loading skeleton bars — the .skel shimmer treatment in bar shape. */
+.chart-skel-bar {
+  flex: 1;
+  border-radius: 6px 6px 0 0;
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+  animation: glass-pulse 2.4s ease-in-out infinite;
+}
+.chart-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.chart-svg.compact {
+  height: 100%;
+}
+.grid-line {
+  stroke: var(--grid);
+  stroke-width: 1;
+}
+.tick,
+.day {
+  font-size: 10px;
+  font-weight: 500;
+  fill: var(--soft);
+}
+.day-today {
+  fill: var(--text);
+  font-weight: 800;
+}
+.ghost-bar {
+  fill: var(--ghost);
+  opacity: 0.4;
+}
+/* Dense mode (ADR-0046). The ghost keeps the twin's exact tone and opacity —
+   only its geometry changes, from a narrower bar beside each cluster to one
+   continuous silhouette behind the stack, because at ~2 units per bucket there
+   is no room to stand two marks side by side. */
+.ghost-silhouette {
+  fill: var(--ghost);
+  opacity: 0.4;
+}
+/* A series band: the fill is inline (the series color), and shape-rendering
+   keeps 2-unit-wide steps from being antialiased into mush. No transition —
+   dense bands snap (see DenseBands in glass-chart.tsx). */
+.band {
+  shape-rendering: crispEdges;
+}
+.hit {
+  fill: transparent;
+}
+.cluster {
+  outline-offset: -2px;
+}
+.cluster:hover rect:not(.hit) {
+  filter: brightness(1.07);
+}
+/* Hover crosshair (ADR-0046). Line styles and dense bars use it; sparse bars
+   keep the .cluster:hover brightness lift instead (dense mode has no per-bucket
+   rects). Marks the bucket the tooltip is reporting. Neutral against the
+   accent now-line; no transition — it tracks the pointer and snaps. */
+.hover-line {
+  stroke: var(--soft);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  opacity: 0.45;
+}
+.peak-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  fill: var(--text);
+  paint-order: stroke;
+  stroke: var(--halo);
+  stroke-width: 3.5;
+}
+.now-line {
+  stroke: var(--accent);
+  opacity: 0.7;
+  stroke-dasharray: 4 4;
+}
+.now-label {
+  font-size: 10px;
+  fill: var(--accent);
+}
+.line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.line-ghost {
+  opacity: 0.45;
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+}
+.line-area {
+  opacity: 0.12;
+}
+/* Stream ticks morph bar geometry in place; span/group-by switches rebuild.
+   T9: rect geometry rides CSS transitions; the ghost path's `d` is rAF-tweened
+   in glass-chart.tsx — there must be NO `transition: d` rule anywhere. */
+.chart-svg rect.seg,
+.chart-svg rect.clip-rect {
+  transition:
+    x 0.45s var(--ease-glass),
+    y 0.45s var(--ease-glass),
+    width 0.45s var(--ease-glass),
+    height 0.45s var(--ease-glass);
+}
+/* The glass package styles a `.seg` of its own (segmented controls) with a
+   backdrop-filter; on our SVG rects that declaration is at best a no-op and
+   at worst a per-rect compositing layer. Sever the name collision here. */
+.chart-svg .seg {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.bars-layer {
+  animation: rise 0.4s var(--ease-glass);
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+}
+.chart-tip {
+  position: absolute;
+  z-index: 30;
+  pointer-events: none;
+  min-width: 168px;
+  max-width: 260px;
+  padding: 9px 12px;
+  border-radius: 14px;
+  font-size: 12px;
+  background: var(--panel);
+  -webkit-backdrop-filter: var(--frost-chip);
+  backdrop-filter: var(--frost-chip);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-shadow), var(--panel-inner);
+}
+
+/* --- rails --- */
+.rails {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+}
+.rail-card {
+  padding: 15px 19px 9px;
+}
+.rail-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 3px;
+}
+.rail-head h2 {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.view-all {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  border-radius: 6px;
+}
+.view-all:hover {
+  text-decoration: underline;
+}
+.rail-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 14px;
+  padding: 9.5px 2px;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+}
+.rail-row + .rail-row {
+  border-top: 1px solid var(--hairline);
+}
+.row-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-meta {
+  font-size: 11px;
+  color: var(--soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-cost {
+  font-size: 12.5px;
+  font-weight: 800;
+  justify-self: end;
+}
+.split {
+  display: flex;
+  gap: 2px;
+  width: 92px;
+  height: 4px;
+  justify-self: end;
+  align-self: center;
+}
+.split i {
+  border-radius: 2px;
+}
+
+/* --- quality floor (mock breakpoints) --- */
+@media (max-width: 1150px) {
+  .tiles {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 1020px) {
+  .rails {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* --- motion (INTERACTIONS.md) --- */
+/* Tile value bump: scale 1 → 1.035 → 1, 350ms ease, origin left. */
+@keyframes glass-bump {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.035);
+  }
+}
+/* Refresh pill on stream event: halo pulse off the connection dot —
+   box-shadow 0 → 9px ring fade, 600ms ease-out (replays via a keyed overlay
+   span on each SSE usage event, Part 3's replay mechanism). */
+@keyframes conn-halo {
+  from {
+    box-shadow: 0 0 0 0 color-mix(in oklch, var(--live) 55%, transparent);
+  }
+  to {
+    box-shadow: 0 0 0 9px transparent;
+  }
+}
+.refresh-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.refresh-dot.live {
+  background: var(--live);
+  animation: glass-pulse 2.4s ease-in-out infinite;
+}
+.refresh-dot.idle {
+  background: color-mix(in oklch, var(--soft) 45%, transparent);
+}
+.refresh-dot.warn {
+  background: var(--warn);
+  animation: glass-pulse 2.4s ease-in-out infinite;
+}
+.refresh-dot.busy {
+  background: color-mix(in oklch, var(--soft) 60%, transparent);
+  animation: glass-pulse 1.2s ease-in-out infinite;
+}
+.refresh-halo {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  animation: conn-halo 0.6s ease-out;
+}
+
+/* The refresh pill's label crossfade — the outgoing label fades out while the
+   incoming one fades in over the same window (they overlap), so the text never
+   blanks between states. Replayed by keying the layers on a transition id. */
+@keyframes label-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes label-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* (Part 5's page-top indeterminate progress bar was relocated in M5: the
+   streaming affordance is now the .stream-bar hairline riding the timeline
+   head-bar's bottom edge — see the M5 section below.) */
+
+/* ============================================================
+   M4 — lists family recipes (sessions-glass.html, NOTES §Lists
+   family — the T5 `hairline` variant only). One frosted table
+   panel; rows are flat tint fills (blur budget rule 2: frost
+   never per-row). The sticky column header frosts WITHIN the
+   panel; the ADR-0016 detail strip is its own glass panel.
+   ============================================================ */
+
+/* --- the detail strip (ADR-0016 on glass) --- */
+.strip {
+  padding: 14px 20px;
+  min-height: 104px;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: center;
+  align-items: center;
+  gap: 10px 26px;
+}
+/* Selected wears the same 3px accent inset bar as the selected row — strip
+   and row read as linked. */
+.strip.selected {
+  box-shadow:
+    var(--panel-shadow),
+    var(--panel-inner),
+    inset 3px 0 0 var(--accent);
+}
+/* The Projects loading shell: floor at the rendered two-row strip's height
+   (chart row + pinned split row) so settling doesn't shift the table. */
+.strip.tall {
+  min-height: 173px;
+}
+.strip-id {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex-shrink: 0;
+  max-width: 300px;
+}
+.strip-id .id-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.strip-id h3 {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.strip-id .sub {
+  font-size: 11px;
+  color: var(--soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  font-size: 11px;
+  color: var(--soft);
+  border-radius: 6px;
+  transition: color 0.15s;
+  text-align: left;
+}
+.copy-btn:hover {
+  color: var(--text);
+}
+.copy-btn svg {
+  width: 11px;
+  height: 11px;
+  flex-shrink: 0;
+}
+.copy-btn .ok {
+  color: var(--good);
+}
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex-shrink: 0;
+}
+.stat .eyebrow {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+.stat b {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.strip-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 190px;
+  min-width: 0;
+}
+.strip-section .eyebrow {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+/* Wider basis for the Projects strip's 30-day chart: 30 daily bars need the
+   room before wrapping. */
+.strip-section.wide {
+  flex: 1.6 1 260px;
+}
+.strip-hint {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  color: var(--soft);
+}
+.strip-action {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--accent);
+  border: 1px solid color-mix(in oklch, var(--accent) 35%, var(--panel-border));
+  background: color-mix(in oklch, var(--accent) 8%, transparent);
+  transition:
+    background-color 0.15s,
+    border-color 0.15s;
+}
+.strip-action:hover {
+  background: color-mix(in oklch, var(--accent) 18%, transparent);
+  border-color: color-mix(in oklch, var(--accent) 55%, var(--panel-border));
+}
+
+/* the model split bar — flat data fills on glass, never frosted */
+.splitbar {
+  display: flex;
+  gap: 2px;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+}
+.splitbar i {
+  height: 100%;
+}
+.split-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 11px;
+  color: var(--soft);
+}
+.split-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.split-legend .sw {
+  width: 8px;
+  height: 8px;
+  border-radius: 2.5px;
+}
+
+/* --- the table panel: ONE frosted surface; rows are flat tints --- */
+/* The page's flex column supplies the height (ADR-0016: the table card is
+   the viewport remainder under the strip) — not the mock's fixed 58vh. */
+.table-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.head-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--hairline);
+  flex-shrink: 0;
+}
+.head-bar h2 {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.count-chip {
+  font-size: 11px;
+  color: var(--soft);
+}
+/* glass search — the T1 input recipe, pill-shaped for the list head bar */
+.search-wrap {
+  margin-left: auto;
+  position: relative;
+  width: 230px;
+  max-width: 50%;
+}
+.search-wrap svg {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 12px;
+  height: 12px;
+  color: var(--soft);
+  pointer-events: none;
+}
+.search {
+  width: 100%;
+  padding: 5px 12px 5px 30px;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--text);
+  background: color-mix(in oklch, var(--text) 4%, transparent);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-inner);
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.search::placeholder {
+  color: var(--soft);
+}
+.search:focus {
+  outline: none;
+  border-color: color-mix(in oklch, var(--accent) 45%, var(--panel-border));
+  box-shadow:
+    var(--panel-inner),
+    0 0 0 3px color-mix(in oklch, var(--accent) 18%, transparent);
+}
+
+/* Bottom scroll affordance: rows fade at the panel's rounded edge instead of
+   chopping — presentation-only. */
+.fade {
+  position: sticky;
+  bottom: 0;
+  height: 18px;
+  flex-shrink: 0;
+  margin-top: -18px;
+  pointer-events: none;
+  z-index: 5;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    color-mix(in oklch, var(--wash-base) 55%, transparent)
+  );
+}
+
+/* The sticky header block — frost WITHIN the panel (same nested-frost
+   precedent as the sidebar's .menu leaf; one surface, mounts once). Rows
+   visibly blur as they slide beneath it: the material demo of the page.
+   Carries the column-header row AND the Blocks page's pinned active row so
+   both stay put over the scrolling body without a second frost surface. */
+.sticky-head {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: color-mix(in oklch, var(--panel) 60%, transparent);
+  -webkit-backdrop-filter: var(--frost-chip);
+  backdrop-filter: var(--frost-chip);
+}
+/* Reduced transparency: a 60%-of-opaque mix would still let scrolled rows
+   ghost through the sticky header sharply (no frost to soften them) — go
+   fully opaque instead. */
+:root[data-reduce-transparency] .sticky-head {
+  background: var(--panel);
+}
+.col-head {
+  border-bottom: 1px solid var(--hairline);
+}
+/* Keyed on the role, not the tag: a sortable header is a <button>, an
+   unsortable one a plain <div> (data-table.tsx), and both wear the same
+   38px chrome — 8/12 padding + a 4px gap + the 10px arrow. The hover and
+   sorted states below stay button-only, since neither can apply to a header
+   that does not sort. */
+.col-head [role="columnheader"] {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--soft);
+  transition: color 0.15s;
+}
+.col-head button:hover,
+.col-head button.sorted {
+  color: var(--text);
+}
+.col-head [role="columnheader"].num {
+  justify-content: flex-end;
+}
+.col-head [role="columnheader"] svg {
+  width: 10px;
+  height: 10px;
+  flex-shrink: 0;
+}
+.col-head [role="columnheader"] > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- rows: flat tint fills only (T5 `hairline`: flush + dividers) --- */
+.row {
+  cursor: pointer;
+  outline: none;
+  transition:
+    background-color 0.15s,
+    border-color 0.15s;
+  border-bottom: 1px solid color-mix(in oklch, var(--hairline) 60%, transparent);
+}
+.row:hover {
+  background: color-mix(in oklch, var(--text) 5%, transparent);
+}
+.row[aria-selected="true"] {
+  background: color-mix(in oklch, var(--accent) 14%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: 8px;
+}
+/* Blocks: the pinned active row — accent underline + tint + inset bar. Lives
+   inside .sticky-head, so its translucent tint composites over the shared
+   frost, not over the rows sliding beneath. */
+.row.pinned {
+  background: color-mix(in oklch, var(--accent) 8%, transparent);
+  border-bottom: 2px solid color-mix(in oklch, var(--accent) 55%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.row.pinned[aria-selected="true"] {
+  background: color-mix(in oklch, var(--accent) 14%, transparent);
+}
+/* Projects: a repository's worktrees, disclosed beneath it (ADR-0061). A child
+   is subordinate, not lesser — it keeps full text contrast and only loses the
+   divider, so a disclosed family reads as one block rather than four rows. */
+.row.child {
+  border-bottom-color: transparent;
+  background: color-mix(in oklch, var(--text) 3%, transparent);
+}
+.row.child:hover {
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+}
+/* The last child restores the family's closing divider. */
+.row.child:not(:has(+ .row.child)) {
+  border-bottom-color: color-mix(in oklch, var(--hairline) 60%, transparent);
+}
+.cell {
+  min-width: 0;
+  padding: 9px 12px;
+  font-size: 12.5px;
+}
+/* The first cell of a tree table: disclosure control, then the cell's own
+   content. The control keeps its width when absent (`.placeholder`) so names
+   stay on one axis whether or not a project has worktrees. */
+.tree-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.tree-toggle {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  color: var(--text-dim);
+  transition:
+    transform 0.15s,
+    background-color 0.15s,
+    color 0.15s;
+}
+.tree-toggle svg {
+  width: 13px;
+  height: 13px;
+}
+.tree-toggle:hover {
+  background: color-mix(in oklch, var(--text) 10%, transparent);
+  color: var(--text);
+}
+.tree-toggle.open {
+  transform: rotate(90deg);
+}
+.tree-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* A leaf reserves the control's footprint rather than closing the gap, so every
+   name in the column starts on one axis whether or not its row can expand. */
+.tree-toggle.placeholder {
+  pointer-events: none;
+}
+/* Children step in beyond that shared axis — the indent is what marks them as
+   belonging to the row above. */
+.row.child .cell:first-child {
+  padding-left: 34px;
+}
+.cell.num {
+  text-align: right;
+  font-weight: 500;
+}
+.cell.cost {
+  font-weight: 800;
+}
+.cell .lead {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+  min-width: 0;
+}
+.cell .lead b {
+  font-weight: 600;
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cell .lead small {
+  font-size: 10.5px;
+  color: var(--soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cell .trunc {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cell.softer {
+  color: var(--soft);
+}
+/* A cell's inline cluster: truncating label + trailing dot / row action. */
+.wcell {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+/* The pinned row's window label reads bold (the mock's <b>). */
+.row.pinned .trunc {
+  font-weight: 600;
+}
+.empty-msg {
+  padding: 34px 16px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--soft);
+}
+
+/* colored model-family text tokens (the mock's .fam) */
+.fam {
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+/* machine dot + resolved name (.mdot) / the Projects fold cluster (.mdots) */
+.mdot {
+  font-size: 11.5px;
+}
+.mdots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--soft);
+}
+
+/* --- status pills (active / gap / done / stale) --- */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  border: 1px solid var(--hairline);
+  color: var(--soft);
+  background: color-mix(in oklch, var(--text) 4%, transparent);
+  white-space: nowrap;
+}
+.pill .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  box-shadow: none;
+}
+.pill.live-p {
+  color: var(--good);
+  border-color: color-mix(in oklch, var(--good) 30%, transparent);
+  background: color-mix(in oklch, var(--good) 12%, transparent);
+}
+.pill.live-p .dot {
+  background: var(--good);
+  animation: glass-pulse 2.4s ease-in-out infinite;
+}
+.pill.warn-p {
+  color: var(--warn);
+  border-color: color-mix(in oklch, var(--warn) 30%, transparent);
+  background: color-mix(in oklch, var(--warn) 12%, transparent);
+}
+.pill b {
+  font-weight: 800;
+}
+
+/* Projects: hover-reveal "Open in Live ↗" row action */
+.row-action {
+  margin-left: auto;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  border: 1px solid var(--panel-border);
+  color: var(--soft);
+  background: color-mix(in oklch, var(--text) 4%, transparent);
+  opacity: 0;
+  transition:
+    opacity 0.15s,
+    color 0.15s,
+    border-color 0.15s;
+}
+.row-action svg {
+  width: 11px;
+  height: 11px;
+}
+.row:hover .row-action,
+.row-action:focus-visible {
+  opacity: 1;
+}
+.row-action:hover {
+  color: var(--accent);
+  border-color: color-mix(in oklch, var(--accent) 45%, var(--panel-border));
+}
+
+/* the 5h limit meter: flat accent for settled blocks; the gradient+glow is
+   earned by liveness only (the active block's tracker, per the glass canon) */
+.meter {
+  width: 100%;
+  max-width: 190px;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--ring-track);
+  box-shadow: var(--panel-inner);
+}
+.meter i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+}
+.meter.live-m i {
+  background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+  box-shadow: 0 0 8px var(--accent-glow);
+}
+
+/* ============================================================
+   M5 — session detail recipes (session-detail-glass.html, NOTES
+   §Session detail — the T6 `lens` variant only). The summary
+   strip fuses SessionHeader + KeyValueGrid + the split Card into
+   one glass panel wearing the lists family's two-row layout; the
+   timeline is ONE tall frosted panel carrying the T5 table
+   language onto the frozen virtualized scroll body.
+   ============================================================ */
+
+/* --- topbar back chrome: the circular glass back chip at the pill's left
+   edge. The chip supplies the visual inset, so the pill drops to the mock's
+   14px left padding while it is present. --- */
+.tb-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.back-chip {
+  flex-shrink: 0;
+  border-radius: 50%;
+}
+.topbar.has-back {
+  padding-left: 14px;
+}
+
+/* --- summary strip details --- */
+.strip-id .sub a {
+  color: var(--accent);
+  font-weight: 600;
+}
+.strip-id .sub a:hover {
+  text-decoration: underline;
+}
+/* The em-dash placeholder inside a stat value reads light, not 800. */
+.stat .dash {
+  font-weight: 400;
+}
+
+/* --- desktop-scale insets: glass ships the hub console's 11px recipe; the
+   detail page's states read at the mock's 12px. `.lead` covers inline leads
+   (the warn inset is a single line); glass's p.lead rules still win on their
+   higher specificity for the hub structure. --- */
+.inset p {
+  font-size: 12px;
+}
+.inset .lead {
+  color: var(--text);
+  font-weight: 600;
+}
+.inset.warn .lead {
+  color: var(--warn);
+}
+.inset.danger .lead {
+  color: var(--bad);
+}
+
+/* --- the timeline head-bar: hosts the streaming hairline at its bottom
+   edge, so it needs to clip and position it. --- */
+.tl-wrap .head-bar {
+  position: relative;
+  overflow: hidden;
+}
+
+/* The streaming progress hairline — Part 5's page-top indeterminate bar,
+   relocated to the surface it is filling (T6). Fades out on settle; the
+   slide pauses once faded so a hidden bar costs nothing. */
+.stream-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2.5px;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 0.4s;
+}
+.stream-bar i {
+  display: block;
+  height: 100%;
+  width: 34%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: stream-slide 1.1s linear infinite;
+}
+@keyframes stream-slide {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(420%);
+  }
+}
+.stream-bar.done {
+  opacity: 0;
+}
+.stream-bar.done i {
+  animation-play-state: paused;
+}
+
+/* --- the lens scroll body: inner vertical scroll capped at the mock's
+   60vh; the virtualizer's scroll element. --- */
+.tl-scroll {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+/* --- timeline cells (the mock's .tl-cell): tighter than the list `.cell`
+   because the 38px row grid is fixed-height — padding is vertical-centering,
+   not rhythm. --- */
+.tl-cell {
+  min-width: 0;
+  padding: 0 12px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tl-cell.num {
+  text-align: right;
+  font-weight: 500;
+}
+.tl-cell.num.zero {
+  color: color-mix(in oklch, var(--soft) 50%, transparent);
+}
+.tl-cell.time {
+  color: var(--soft);
+}
+.tl-cell.cost {
+  font-weight: 800;
+}
+.tl-cell.running {
+  color: var(--soft);
+}
+/* Column-header cells — AFTER the value-cell rules so the eyebrow face wins
+   the equal-specificity fight with `.tl-cell.num`. */
+.col-head .tl-cell {
+  padding: 8px 12px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--soft);
+}
+
+/* --- timeline rows: the T5 hairline language at the frozen 38px grid.
+   Non-interactive (no selection), so no cursor/focus treatment. --- */
+.tl-rows .tl-row {
+  min-height: 38px;
+  border-bottom: 1px solid color-mix(in oklch, var(--hairline) 60%, transparent);
+}
+.tl-rows .tl-row:hover {
+  background: color-mix(in oklch, var(--text) 5%, transparent);
+}
+
+/* A freshly-arrived frame (the re-stream's new tail row): rise + tint flash
+   on the motion contract's entrance curve. */
+.tl-row.new {
+  animation: arrive 900ms var(--ease-glass);
+}
+@keyframes arrive {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+    background-color: color-mix(in oklch, var(--accent) 18%, transparent);
+  }
+  55% {
+    opacity: 1;
+    transform: none;
+    background-color: color-mix(in oklch, var(--accent) 12%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+/* "Waiting for events…" — the dashed tint inset inside the panel body. */
+.tl-wait {
+  margin: 26px 16px;
+  padding: 22px 16px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--soft);
+  border: 1px dashed color-mix(in oklch, var(--hairline) 160%, transparent);
+  border-radius: 12px;
+  background: color-mix(in oklch, var(--text) 2.5%, transparent);
+}
+
+/* --- loading skeleton: flat tint blocks pulsing at the system cadence —
+   never a frosted shimmer (T6). --- */
+.skel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.skel i {
+  display: block;
+  height: 10px;
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+  animation: glass-pulse 2.4s ease-in-out infinite;
+}
+
+/* ============================================================
+   M6 — Settings + minor surfaces (settings-glass.html, NOTES
+   §Settings + minor surfaces — the T7 `clusters` variant only).
+   Three grouped panels — Data / Connections / Application —
+   sections hairlined inside, the wash breathing between groups.
+   Primitives (.chip/.seg/.toggle/.input/.select-wrap/.inset/
+   .toast/.dot) live in @maxprice/glass; these are page recipes.
+   ============================================================ */
+
+/* --- the settings form: three cluster panels in one centered column --- */
+.settings-form {
+  width: 100%;
+  max-width: 680px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.cluster {
+  padding: 2px 0 4px;
+}
+.cluster-head {
+  display: block;
+  padding: 15px 22px 0;
+}
+
+/* --- section grammar: title + dim description + control block --- */
+.s-section {
+  padding: 17px 22px 19px;
+  border-top: 1px solid color-mix(in oklch, var(--hairline) 80%, transparent);
+}
+.cluster .s-section:first-of-type {
+  border-top: none;
+}
+.s-section h2 {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.s-section .desc {
+  font-size: 11.5px;
+  color: var(--soft);
+  margin-top: 1px;
+}
+.s-section .control {
+  margin-top: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+/* --- section internals --- */
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.status-line .when {
+  font-size: 11px;
+  color: var(--soft);
+}
+.helper {
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--soft);
+}
+.err {
+  font-size: 11px;
+  color: var(--bad);
+}
+.subline {
+  font-size: 11px;
+  color: var(--soft);
+  padding-left: 38px;
+  margin-top: -4px;
+}
+.hint-line {
+  font-size: 11px;
+  color: var(--soft);
+}
+.row-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.row-line .input {
+  flex: 1;
+  min-width: 0;
+}
+.row-line .chip {
+  flex-shrink: 0;
+}
+/* T7 keeps the hub-scale 11px inset text inside the form (M5's app-wide
+   12px bump serves the detail page's states, not these). */
+.settings-form .inset p {
+  font-size: 11px;
+}
+/* --- App info: the read-only label/value grammar (T3's `pairs`, map #100;
+   NOTES §"Settings › App info"). Labels anchor to the TOP of their value, so
+   the tall Pricing cell keeps its label in place instead of centering it
+   against four lines. Dots appear on LIVE rows only — the Sidecar row is the
+   one such row (2026-08-01); the static facts above it stay pure label/value
+   pairs, which is why `.ai-val` lays out as a flex line with no gap of its own
+   when the dot is absent. --- */
+.ai-pairs {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 20px;
+  row-gap: 10px;
+  width: 100%;
+}
+.ai-pairs dt {
+  font-size: 11.5px;
+  color: var(--soft);
+  padding-top: 1px;
+}
+.ai-pairs dd {
+  min-width: 0;
+}
+/* The fixed three-atom value stack, identical in every row so a row never
+   invents its own shape. Amber tints the VALUE only when the value itself is
+   degraded; a failed refresh over good live prices tints only the note. */
+.ai-val {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.ai-val.soft {
+  color: var(--soft);
+}
+.ai-val.warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+/* A hard failure, not a degraded reading: the word wears the same red as its
+   dot rather than the amber the tone rule gives a merely-degraded value. */
+.ai-val.bad {
+  color: var(--bad);
+  font-weight: 600;
+}
+.ai-meta {
+  font-size: 11px;
+  color: var(--soft);
+  margin-top: 2px;
+}
+.ai-note {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--soft);
+  margin-top: 4px;
+  max-width: 46ch;
+}
+.ai-note.warn {
+  color: var(--warn);
+}
+.ai-note code {
+  font-size: 10.5px;
+  padding: 1px 4px;
+  border-radius: 5px;
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+}
+
+/* The timezone/currency selects are fixed-width fields, not row fills. */
+.tz-wrap {
+  flex: none;
+  width: 260px;
+  max-width: 100%;
+}
+.cur-wrap {
+  flex: none;
+  width: 110px;
+}
+
+/* --- path rows: flat tint leafs — data rows are never frosted --- */
+.paths {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+.path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 12px;
+  border-radius: 11px;
+  background: color-mix(in oklch, var(--text) 3.5%, transparent);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-inner);
+}
+.path-row .p {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.path-btn {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  border: 1px solid var(--panel-border);
+  color: var(--soft);
+  background: color-mix(in oklch, var(--text) 4%, transparent);
+  transition:
+    color 0.15s,
+    border-color 0.15s;
+}
+.path-btn svg {
+  width: 12px;
+  height: 12px;
+}
+.path-btn:hover:not(:disabled) {
+  color: var(--text);
+}
+.path-btn.rm:hover:not(:disabled) {
+  color: var(--bad);
+  border-color: color-mix(in oklch, var(--bad) 40%, var(--panel-border));
+}
+
+/* --- the reset confirm: a floating glass leaf (the T1 kebab-leaf recipe),
+   danger-tinted action inside. Positioning comes from the popover host. --- */
+.leaf {
+  width: 270px;
+  padding: 12px 13px;
+  border-radius: 14px;
+  background: var(--panel);
+  -webkit-backdrop-filter: var(--frost-chip);
+  backdrop-filter: var(--frost-chip);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-shadow), var(--panel-inner);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.leaf h4 {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.leaf p {
+  font-size: 11px;
+  color: var(--soft);
+  line-height: 1.45;
+}
+.leaf .btns {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+/* Project merge assertions (ADR-0064): one roomy glass dialog for the
+   all-time picker and the durable assertion manager. Confirmation is a second
+   click, signalled with a stronger accent rather than danger red — grouping is
+   reversible and does not delete source data. */
+.project-merge-dialog[data-slot="dialog-content"] {
+  width: min(680px, calc(100% - 48px));
+  max-width: 680px;
+  max-height: min(760px, calc(100vh - 48px));
+  overflow-y: auto;
+  padding: 20px 22px;
+  gap: 14px;
+  background: var(--panel);
+  -webkit-backdrop-filter: var(--frost-panel);
+  backdrop-filter: var(--frost-panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 20px;
+  box-shadow: var(--panel-shadow), var(--panel-inner);
+}
+.project-merge-form {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in oklch, var(--text) 3%, transparent);
+}
+.project-merge-form > label {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  color: var(--soft);
+  font-size: 11px;
+}
+.project-merge-picker {
+  width: 100%;
+  min-width: 0;
+}
+.project-merge-menu {
+  max-height: min(340px, var(--radix-popover-content-available-height));
+}
+.project-merge-menu .input {
+  flex-shrink: 0;
+}
+.project-merge-options {
+  min-height: 0;
+  overflow-y: auto;
+}
+.project-merge-options .opt > .truncate {
+  min-width: 0;
+  flex: 1;
+}
+.project-merge-options .opt em {
+  flex-shrink: 0;
+}
+.project-merge-picked {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--text);
+}
+.project-merge-picked small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--soft);
+}
+.project-merge-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.chip.project-merge-confirm {
+  color: var(--accent);
+  border-color: color-mix(in oklch, var(--accent) 30%, var(--panel-border));
+}
+.chip.project-merge-confirm.armed {
+  color: var(--text);
+  background: color-mix(in oklch, var(--accent) 38%, transparent);
+  border-color: color-mix(in oklch, var(--accent) 72%, var(--panel-border));
+}
+.project-merge-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.project-merge-list h3 {
+  color: var(--soft);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.project-merge-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+}
+.project-merge-row.conflict {
+  border-color: color-mix(in oklch, var(--warn) 35%, var(--hairline));
+}
+.project-merge-page-warning {
+  margin: 10px 14px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.table-panel .lead > .pill {
+  align-self: flex-start;
+  padding: 1px 6px;
+  font-size: 9px;
+}
+
+/* --- the update gate: ONE glass panel over a FLAT tint scrim (--scrim);
+   a frosted scrim is the blur budget's one forbidden move. --- */
+.gate-scrim {
+  background: var(--scrim);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.gate-dialog {
+  width: 400px;
+  max-width: calc(100% - 48px);
+  padding: 20px 22px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--panel);
+  -webkit-backdrop-filter: var(--frost-panel);
+  backdrop-filter: var(--frost-panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 20px;
+  box-shadow: var(--panel-shadow), var(--panel-inner);
+}
+/* The dialog container is not interactive — it takes focus as Radix's trap
+   fallback (e.g. when the focused Install button disables mid-install), and
+   the glass global :focus-visible ring must not paint on it. */
+.gate-dialog:focus,
+.gate-dialog:focus-visible {
+  outline: none;
+}
+.gate-dialog h3 {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.5;
+}
+.gate-dialog .gate-desc {
+  font-size: 12px;
+  color: var(--soft);
+  line-height: 1.5;
+}
+.gate-dialog .btns {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+.gate-x {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  color: var(--soft);
+  transition:
+    color 0.15s,
+    background-color 0.15s;
+}
+.gate-x:hover {
+  color: var(--text);
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+}
+.gate-x svg {
+  width: 13px;
+  height: 13px;
+}
+/* Mid-install: an indeterminate accent track beneath the description copy
+   (the T6 streaming hairline motif in a body-track home — M6 gate feedback;
+   the ring-track background keeps it legible when the slide is stilled by
+   reduced motion). */
+.busy-hairline {
+  width: 100%;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--ring-track);
+  overflow: hidden;
+}
+.busy-hairline i {
+  display: block;
+  height: 100%;
+  width: 40%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+  animation: gate-slide 1.2s ease-in-out infinite;
+}
+@keyframes gate-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+/* ============================================================
+   Settings › Storage (map #124, T3 #127 / T9 #133) —
+   storage-glass.html variant C (`framed`) + NOTES.md
+   §"Settings › Storage — Glass". A PAGE recipe, so it lives
+   here rather than in @maxprice/glass: nothing below is a
+   primitive, and the hub console has no bar of its own.
+   ============================================================ */
+
+/* --- the ramp. ONE hue (the accent) stepped by LIGHTNESS, deliberately NOT
+   an identity palette: MODEL_COLORS and MACHINE_PALETTE both mean "this hue
+   is this thing" and are reused across the app so a colour recalls its
+   subject, while a storage segment has no life outside this bar. Six steps of
+   one blue read as ONE quantity divided rather than six unrelated categories.
+   Colour is keyed to segment ID, never to bar position, so a swatch means the
+   same thing on every machine. Light theme runs dark→light and dark theme
+   light→dark so every step keeps its contrast against the panel it sits on.
+   --- */
+:root {
+  --seg-fleetReplica: oklch(56% 0.19 250);
+  --seg-localArchive: oklch(60% 0.17 248);
+  --seg-scanCache: oklch(65% 0.15 246);
+  --seg-usageHistory: oklch(73% 0.11 242);
+  --seg-logs: oklch(80% 0.075 238);
+  --seg-other: oklch(86% 0.05 236);
+  /* the un-reclaimable mass: NEUTRAL, never a ramp step — it is not ours */
+  --seg-inert: oklch(30% 0.02 280 / 0.14);
+  --seg-inert-hatch: oklch(30% 0.02 280 / 0.16);
+}
+:root[data-theme="dark"] {
+  --seg-fleetReplica: oklch(76% 0.15 250);
+  --seg-localArchive: oklch(72% 0.14 248);
+  --seg-scanCache: oklch(68% 0.13 246);
+  --seg-usageHistory: oklch(60% 0.11 242);
+  --seg-logs: oklch(52% 0.085 238);
+  --seg-other: oklch(45% 0.06 236);
+  --seg-inert: oklch(95% 0.02 280 / 0.11);
+  --seg-inert-hatch: oklch(95% 0.02 280 / 0.14);
+}
+/* The inert fill is the ONE thing here defined with alpha, so it is the one
+   thing the opaque fallback could eat: a 14%-alpha tint that reads fine over a
+   frosted panel goes nearly invisible over a flat one, which would silently
+   delete 71% of the bar. Restate it as a solid mix rather than letting it
+   inherit (M8's T4 fallback). */
+:root[data-reduce-transparency] {
+  --seg-inert: color-mix(in oklch, var(--text) 13%, var(--panel-opaque));
+  --seg-inert-hatch: color-mix(in oklch, var(--text) 26%, var(--panel-opaque));
+}
+
+.st {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* --- the corpus context line: ABOVE the bar, and deliberately NOT a segment.
+   It is ~3× the bar and MaxPrice cannot delete a byte of it. --- */
+.st-corpus {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--soft);
+  max-width: 64ch;
+}
+.st-corpus svg {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  margin-top: 2px;
+  opacity: 0.8;
+}
+.st-corpus b {
+  color: var(--text);
+  font-weight: 600;
+}
+.st-corpus .miss {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* --- the total line, directly above the bar --- */
+.st-total {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+.st-total .lab {
+  font-size: 11.5px;
+  color: var(--soft);
+}
+.st-total .val {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.st-total .val .unknown {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--warn);
+  letter-spacing: 0;
+}
+
+/* --- the bar. GEOMETRY: widths are proportional `flex-grow` on a ZERO basis
+   (`flex: <share> 1 0`), never a percentage basis. `flex-basis: 71%` resolves
+   against the FULL container and `gap` is then added on top, so an n-segment
+   bar overshoots its box by (n−1)×gap. Grow weights make flexbox subtract the
+   gaps itself, and `min-width` still floors a tiny segment because the others
+   are free to shrink. --- */
+.st-frame {
+  width: 100%;
+  padding: 3px;
+  border-radius: 8px;
+  background: color-mix(in oklch, var(--text) 2.5%, transparent);
+  box-shadow:
+    inset 0 0 0 1px var(--seg-inert-hatch),
+    var(--panel-inner);
+}
+/* Amber whenever a segment could not be read. The frame itself is present at
+   ALL times, inert segment or not: the frame is the EXTENT, and a border that
+   comes and goes teaches nothing. */
+.st-frame.incomplete {
+  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--warn) 45%, transparent);
+}
+.st-bar {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  gap: 3px;
+  height: 20px;
+}
+.st-seg {
+  border-radius: 3px;
+  min-width: 3px;
+  box-shadow: var(--panel-inner);
+  transition: filter 0.12s;
+}
+.st-seg.hl {
+  filter: brightness(1.14) saturate(1.1);
+}
+.st-seg.inert {
+  background:
+    repeating-linear-gradient(45deg, transparent 0 4px, var(--seg-inert-hatch) 4px 8px),
+    var(--seg-inert);
+  box-shadow: inset 0 0 0 1px var(--seg-inert-hatch);
+}
+/* An unmeasured extent is never expressed as a proportion: a dashed stub at a
+   FIXED width, so it cannot be read as one, and never as a 0-width nothing. */
+.st-seg.unknown {
+  background: none;
+  border: 1px dashed color-mix(in oklch, var(--warn) 55%, transparent);
+  box-shadow: none;
+  display: grid;
+  place-items: center;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--warn);
+}
+/* --- the legend: the arithmetic authority. The bar is the picture and may
+   round; these numbers may not. No per-row percentages anywhere — the bar
+   already encodes proportion, so a percent column would restate one picture in
+   the other's units. --- */
+.st-legend {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 2px;
+}
+.st-row {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) max-content;
+  column-gap: 10px;
+  align-items: baseline;
+  padding: 5px 6px;
+  border-radius: 8px;
+  transition: background-color 0.12s;
+}
+.st-row.hl {
+  background: color-mix(in oklch, var(--text) 5%, transparent);
+}
+.st-row .sw {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  align-self: center;
+  box-shadow: var(--panel-inner);
+}
+.st-row .sw.inert {
+  background:
+    repeating-linear-gradient(45deg, transparent 0 3px, var(--seg-inert-hatch) 3px 6px),
+    var(--seg-inert);
+  box-shadow: inset 0 0 0 1px var(--seg-inert-hatch);
+}
+.st-row .sw.unknown {
+  background: none;
+  border: 1px dashed color-mix(in oklch, var(--warn) 55%, transparent);
+  box-shadow: none;
+}
+.st-row .lab,
+.st-row .size {
+  font-size: 12px;
+  color: var(--text);
+}
+.st-row .size.unknown {
+  color: var(--warn);
+  font-weight: 600;
+}
+/* The Local archive's "· Storing history back to <date>" suffix (issue #139). Muted and
+   a step down, so the row still reads label-then-size at a glance and the date
+   is the aside it is. The label cell is `minmax(0, 1fr)`, so on a narrow panel
+   this wraps under the label rather than squeezing the size column. */
+.st-row .lab .since {
+  color: var(--soft);
+  font-size: 11px;
+}
+/* --- the dwell popover: the legend's descriptions, out of the resting list.
+   Portalled to <body>, so `fixed` resolves against the viewport rather than
+   the backdrop-filtered panel above it (see NotePopover).
+
+   `pointer-events: none` is load-bearing, not decoration: the popover opens
+   UNDER the cursor's path and would otherwise steal the hover that opened it,
+   which is the flicker loop every hover-card gets wrong. It also means the row
+   underneath stays hoverable, so moving down the list keeps working while one
+   is open. --- */
+.note-pop {
+  position: fixed;
+  z-index: 60;
+  max-width: 42ch;
+  pointer-events: none;
+  padding: 8px 11px;
+  border-radius: 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--panel-opaque);
+  border: 1px solid var(--panel-border);
+  box-shadow:
+    0 10px 28px oklch(0% 0 0 / 0.22),
+    var(--panel-inner);
+  opacity: 0;
+  transform: translateY(-3px);
+  transition:
+    opacity 0.12s,
+    transform 0.12s;
+}
+.note-pop.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+.note-pop .pop-lab {
+  display: block;
+  font-weight: 700;
+  margin-bottom: 3px;
+}
+
+/* --- the two actions. The 13px belongs to the DIVIDER between them, never
+   above the first: `.control` already sits 11px under the description, where
+   every other section on the page starts. --- */
+.st-actions {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.st-act {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.st-act + .st-act {
+  border-top: 1px solid color-mix(in oklch, var(--hairline) 80%, transparent);
+  margin-top: 13px;
+  padding-top: 13px;
+}
+.st-act .head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.st-act .why {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--soft);
+  max-width: 60ch;
+}
+.st-act .why b {
+  color: var(--text);
+  font-weight: 600;
+}
+/* The ONE --bad sentence in the section. The destructive button is the only
+   red thing; every guard reason beside it is amber. */
+.st-act .why .never {
+  color: var(--bad);
+  font-weight: 600;
+}
+.st-act .inset,
+.st-act .err {
+  width: 100%;
+  max-width: 60ch;
+}
+
+/* --- the typed confirm: the update-gate dialog recipe (`.gate-dialog`) with
+   the three facts, the session sample and the scope field this one adds. --- */
+.st-confirm {
+  width: 440px;
+}
+.st-confirm p {
+  font-size: 12px;
+  color: var(--soft);
+  line-height: 1.5;
+}
+.st-confirm p b {
+  color: var(--text);
+  font-weight: 600;
+}
+.st-confirm .facts {
+  font-size: 11px;
+}
+.st-sample {
+  width: 100%;
+  border-radius: 12px;
+  overflow: hidden;
+  background: color-mix(in oklch, var(--text) 3.5%, transparent);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-inner);
+}
+.st-sample .srow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 6px 11px;
+  font-size: 11px;
+  border-top: 1px solid color-mix(in oklch, var(--hairline) 70%, transparent);
+}
+.st-sample .srow:first-child {
+  border-top: none;
+}
+.st-sample .srow .s-id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.st-sample .srow .s-id b {
+  color: var(--text);
+  font-weight: 600;
+}
+.st-sample .srow .s-id span,
+.st-sample .srow .s-n {
+  color: var(--soft);
+}
+.st-sample .srow .s-n {
+  flex-shrink: 0;
+}
+.st-sample .more {
+  padding: 6px 11px;
+  font-size: 10.5px;
+  color: var(--soft);
+  border-top: 1px solid color-mix(in oklch, var(--hairline) 70%, transparent);
+}
+.st-confirm .confirm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 2px;
+}
+.st-confirm .confirm-field label {
+  font-size: 11px;
+  color: var(--soft);
+}
+.st-confirm .confirm-field label b {
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+
+/* --- first-launch empty state: a glass panel wearing a DASHED border (T6's
+   empty insets promoted to a page-level surface), tray glyph in a tint
+   circle, accent Settings link. --- */
+.empty-card {
+  margin-inline: auto;
+  max-width: 430px;
+  text-align: center;
+  padding: 30px 28px 26px;
+  border-radius: 20px;
+  background: var(--panel);
+  -webkit-backdrop-filter: var(--frost-panel);
+  backdrop-filter: var(--frost-panel);
+  border: 1px dashed color-mix(in oklch, var(--soft) 45%, var(--panel-border));
+  box-shadow: var(--panel-shadow), var(--panel-inner);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.empty-card .glyph {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+  box-shadow: var(--panel-inner);
+  color: var(--soft);
+}
+.empty-card .glyph svg {
+  width: 20px;
+  height: 20px;
+}
+.empty-card h3 {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.empty-card p {
+  font-size: 12.5px;
+  color: var(--soft);
+  line-height: 1.55;
+}
+.empty-card p .path-lit {
+  color: var(--text);
+}
+.empty-card .also {
+  font-size: 11.5px;
+}
+.empty-card .also a {
+  color: var(--accent);
+  font-weight: 600;
+}
+.empty-card .also a:hover {
+  text-decoration: underline;
+}
+
+/* ============================================================
+   T4 — the boot splash gate (map #75; NOTES §Boot splash; ADR-0047).
+   The resolved `still` composition: no surface at all — the body's own
+   wash — an 84px breathing lens orb, the MaxPrice lockup, one quiet
+   line. Material (.panel/.chip/.logo/.inset/.dot) comes from
+   @maxprice/glass; reduced motion is killed globally by its media rule.
+   ============================================================ */
+.boot-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  /* SPLASH_FADE_MS — keep in step with lib/boot-splash.ts */
+  transition: opacity 0.5s var(--ease-glass);
+}
+.boot-splash[data-phase="reveal"] {
+  opacity: 0;
+  pointer-events: none;
+}
+.boot-gate {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+/* The hero orb — the sidebar's own mark rescaled (--logo-d drives every
+   internal length), breathing at 3.2s: scale 1→1.02 + accent-glow swell.
+   The splash's only ambient motion. */
+.boot-gate .logo {
+  --logo-d: 84px;
+  animation: boot-breathe 3.2s ease-in-out infinite;
+}
+@keyframes boot-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow:
+      inset 0 calc(var(--logo-d) / 32) calc(var(--logo-d) / 16) oklch(100% 0 0 / 0.315),
+      0 6px 20px color-mix(in oklch, var(--accent) 30%, transparent);
+  }
+  50% {
+    transform: scale(1.02);
+    box-shadow:
+      inset 0 calc(var(--logo-d) / 32) calc(var(--logo-d) / 16) oklch(100% 0 0 / 0.315),
+      0 10px 32px color-mix(in oklch, var(--accent) 50%, transparent);
+  }
+}
+.boot-lockup {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.boot-lockup .wordmark {
+  font-size: 20px;
+}
+.boot-quiet {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--soft);
+}
+.boot-dots i {
+  font-style: normal;
+  opacity: 0.25;
+  animation: boot-dot 1.4s infinite;
+}
+.boot-dots i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.boot-dots i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+@keyframes boot-dot {
+  0%,
+  60%,
+  100% {
+    opacity: 0.25;
+  }
+  30% {
+    opacity: 1;
+  }
+}
+/* ---- the progress rail (ADR-0067, amending NOTES §Boot splash) ----
+   One aggregate bar is the hero; the stat line names the step and its live
+   count; the breadcrumb below is a quiet four-word map of the whole boot.
+   The three share one width so nothing labels a bar it is wider than. */
+.boot-prog {
+  --boot-rail: min(380px, 78vw);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 9px;
+}
+.boot-track {
+  position: relative;
+  width: var(--boot-rail);
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--ring-track);
+  box-shadow: var(--panel-inner);
+}
+.boot-track .fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  /* The gradient is pinned to the TRACK's width, not the fill's, so the colour
+     at any point on the bar is fixed — the ramp doesn't slide as it grows. */
+  background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+  background-size: var(--boot-rail) 100%;
+  box-shadow: 0 0 12px color-mix(in oklch, var(--accent) 45%, transparent);
+  /* Progress is monotone and event-driven; the transition smooths the sidecar's
+     ~4/s patch cadence into continuous motion. It never invents progress —
+     a stalled scan holds the fill exactly where it stopped. */
+  transition: width 0.45s var(--ease-glass);
+}
+/* The one moving thing that is NOT progress, and the reason a stall still looks
+   alive rather than crashed. Deliberately inside the track (not on the fill),
+   so it sweeps the whole bar regardless of how far along the boot is. */
+.boot-track .sheen {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent 0%, oklch(100% 0 0 / 0.35) 50%, transparent 100%);
+  background-size: 38% 100%;
+  background-repeat: no-repeat;
+  animation: boot-sheen 1.9s linear infinite;
+}
+@keyframes boot-sheen {
+  from {
+    background-position: -40% 0;
+  }
+  to {
+    background-position: 140% 0;
+  }
+}
+.boot-statline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  width: var(--boot-rail);
+  font-size: 12px;
+}
+.boot-statline .sname {
+  font-weight: 600;
+  color: var(--text);
+  /* The step name is the only elastic thing on the row — the count and percent
+     must never be pushed off the end of the bar they describe. */
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.boot-statline .scount,
+.boot-statline .spct {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  color: var(--soft);
+}
+.boot-statline .spct {
+  font-weight: 700;
+}
+/* The breadcrumb. Short labels only — the long name is already in the stat line
+   directly above, and repeating it makes the row wider than the bar. */
+.boot-steps {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  width: var(--boot-rail);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--soft);
+}
+.boot-steps li {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.boot-steps li[data-state="pending"] {
+  opacity: 0.45;
+}
+.boot-steps li[data-state="active"] .sname {
+  color: var(--text);
+  font-weight: 700;
+}
+.boot-steps .glyph {
+  position: relative;
+  width: 11px;
+  height: 11px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+}
+.boot-steps .glyph::after {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--soft);
+  opacity: 0.32;
+}
+.boot-steps li[data-state="active"] .glyph::after {
+  width: 9px;
+  height: 9px;
+  opacity: 1;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent);
+  animation: boot-pip 1.4s ease-in-out infinite;
+}
+@keyframes boot-pip {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(0.72);
+  }
+}
+/* Done wears the live tone and a drawn check — the same completion vocabulary
+   the rest of the app uses, so the breadcrumb reads without a legend. */
+.boot-steps li[data-state="done"] .glyph::after {
+  width: 11px;
+  height: 11px;
+  opacity: 1;
+  background: color-mix(in oklch, var(--live) 22%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--live) 55%, transparent);
+}
+.boot-steps li[data-state="done"] .glyph::before {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  width: 5px;
+  height: 2.5px;
+  border-left: 1.5px solid var(--live);
+  border-bottom: 1.5px solid var(--live);
+  transform: rotate(-45deg) translate(0.5px, -0.5px);
+}
+/* The pre-ready failure card: one glass panel + the T1 danger inset
+   carrying the technical reason. Enters on the 250ms toast-class lift. */
+.boot-error {
+  width: min(400px, 90vw);
+  padding: 24px 26px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: boot-error-enter 0.25s var(--ease-glass);
+}
+.boot-error .err-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.boot-error h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 800;
+}
+.boot-error > p {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--soft);
+}
+.boot-error .inset {
+  align-self: stretch;
+}
+/* "Stopped while reading session files — 825 / 1,253 files." Sits above the
+   technical reason, in body tone rather than soft: it is the sentence the user
+   can actually act on. Scoped to `.boot-error` to outrank the `> p` soft rule
+   above — the bare class loses to it on specificity. */
+.boot-error .boot-where {
+  color: var(--text);
+  font-weight: 600;
+}
+.boot-error .err-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+@keyframes boot-error-enter {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+/* The frame's entrance at reveal: the panels rise together while the
+   splash fades above them. One-shot.
+
+   The frame is MOUNTED throughout the hold (ADR-0066) so Live's queries run
+   beneath the opaque splash rather than after it, so both rules key off the
+   phase rather than off mount:
+   - `visibility` (never `display: none`) keeps layout live during the hold —
+     belt-and-braces today, since the SVG chart draws into a fixed viewBox and
+     measures nothing, but a measured chart would silently get zero width;
+   - scoping the rise to the revealed state is what re-triggers it AT the
+     reveal. On `.boot-frame` unconditionally it would run and be spent while
+     hidden, and the frame would pop in flat. */
+.boot-frame[data-boot="hold"] {
+  visibility: hidden;
+}
+.boot-frame[data-boot="reveal"] {
+  animation: boot-rise 0.4s var(--ease-glass);
+}
+@keyframes boot-rise {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+}

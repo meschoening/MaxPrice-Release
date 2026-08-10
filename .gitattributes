@@ -1,0 +1,8 @@
+# Check out LF everywhere — Windows checkouts under autocrlf produced CRLF
+# working trees, which made Prettier (endOfLine: lf) flag every file.
+* text=auto eol=lf
+
+# Binary assets — never eol-converted.
+*.png binary
+*.ico binary
+*.icns binary

@@ -1,0 +1,56 @@
+[package]
+name = "maxprice-hub-desktop"
+version = "0.4.0"
+description = "MaxPrice Hub"
+authors = ["Max Schoening"]
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "maxprice_hub_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-os = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "macros", "rt", "io-util"] }
+parking_lot = "0.12"
+time = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Read-only HKCU access for the autostart self-heal (ADR-0051). The autostart
+# plugin can only tell us an entry EXISTS, never where it points, so we read the
+# Run value ourselves; `enable()` stays the only writer.
+#
+# Version 0.55 is already resolved in the lock, but only as a HOST-SIDE
+# build-dependency (tauri-build -> tauri-winres -> embed-resource 3.0.9); this
+# is the first time it is linked into the shipped exe. auto-launch 0.5.0 (the
+# plugin's own backend) links its own older winreg 0.10.1, on the unmaintained
+# winapi shim — the duplicate is deliberate, and the two need not stay aligned.
+#
+# windows-sys carries the job-object calls that give the daemon a kernel-enforced
+# lifetime (ADR-0072). 0.61 is already in the lock as a transitive dependency, so
+# pinning it here adds no new version to the graph.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

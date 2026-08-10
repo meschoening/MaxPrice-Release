@@ -1,0 +1,22 @@
+{
+  "name": "@maxprice/glass",
+  "version": "0.4.0",
+  "private": true,
+  "description": "The Glass design system (ADR-0043): tokens, wash, material recipes, and form primitives shared by the desktop app and the hub console. CSS-only — no TypeScript, no build step.",
+  "main": "./index.css",
+  "style": "./index.css",
+  "exports": {
+    ".": "./index.css",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@fontsource-variable/manrope": "5.2.8"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0"
+  }
+}

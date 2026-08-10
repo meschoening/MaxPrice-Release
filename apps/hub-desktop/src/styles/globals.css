@@ -1,0 +1,493 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@maxprice/glass";
+
+/* `dark:` variants fire on the RESOLVED data-theme that public/theme-boot.js
+   stamps on <html> before first paint (ADR-0043) — never on the media query:
+   the boot script owns system-preference resolution and re-stamps on OS
+   flips while the preference is "system". */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Legacy token names → glass tokens (ADR-0043). The un-migrated console keeps
+   rendering through these aliases until the hub reskin milestone lands. Plain
+   @theme (not inline) so the --color-* variables are emitted on :root for
+   literal var() references. All theme flips restyle :root itself, so the
+   var() chain recomputes there.
+     --color-soft  is our text-muted color (shadcn's --muted is a soft bg).
+     --color-brand is the accent (shadcn's --accent is a hover bg). */
+@theme {
+  --color-panel: var(--panel);
+  --color-text: var(--text);
+  --color-soft: var(--soft);
+  --color-brand: var(--accent);
+  /* LOAD-BEARING NAMES: packages/shared/src/usage-status.ts emits bg-good /
+     bg-warn / bg-bad literally, which resolve against these tokens. Keep the
+     names identical here and in apps/desktop; do not rename independently. */
+  --color-good: var(--good);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-line: var(--hairline);
+}
+
+/* Bridge shadcn's semantic tokens to the glass palette. Everything flips on
+   :root via data-theme, so these aliases pick up dark values automatically. */
+:root {
+  --radius: 0.625rem;
+  --background: var(--wash-base);
+  --foreground: var(--text);
+  --popover: var(--panel);
+  --popover-foreground: var(--text);
+  --primary: var(--accent);
+  --primary-foreground: var(--wash-base);
+  --secondary: color-mix(in oklch, var(--text) 4%, transparent);
+  --secondary-foreground: var(--text);
+  --muted: color-mix(in oklch, var(--text) 4%, transparent);
+  --muted-foreground: var(--soft);
+  /* shadcn's --accent (a hover bg) is deliberately NOT set here: the name
+     belongs to the glass accent token. --color-accent below maps the
+     utility straight onto the hover tint instead. */
+  --accent-foreground: var(--text);
+  --destructive: var(--bad);
+  --border: var(--hairline);
+  --input: var(--hairline);
+  --ring: var(--accent);
+}
+
+/* Shadcn token → Tailwind utility name mappings. `@theme inline` substitutes
+   the value at compile time, so `bg-primary` etc. resolve via our :root
+   aliases above. Entries that would shadow our own `--color-*` tokens
+   (`--color-brand`, `--color-soft`) are deliberately absent. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: color-mix(in oklch, var(--text) 6%, transparent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+/* The tray window's one scroll region is the document itself — the mock's
+   thin tinted scrollbar (its .viewport rule), worn by the root scroller. */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--text) 20%, transparent) transparent;
+}
+
+/* ============================================================
+   Hub console (M7) — page-level layout per NOTES.md §Hub console and
+   hub-glass.html (?shell=pill, the T1 resolution). The system recipes
+   (panel/chip/inset/input/kmenu/dot/toast) come from @maxprice/glass;
+   what lives here is the tray-window scale and the console's own
+   structure. The wash is the glass body rule (fields-only — the dot
+   lattice was cut at M2 approval).
+   ============================================================ */
+
+/* Scale at 420px (T1): radius 18 (20 reads oversized in a tray window),
+   chips a step smaller, the lens orb at header size, the toast tucked to
+   the tray's bottom inset. App-wide overrides — the whole app IS the
+   tray console. */
+.panel {
+  border-radius: 18px;
+}
+.chip {
+  padding: 4.5px 12px;
+  font-size: 11.5px;
+}
+/* The icon-only chip at tray scale — square padding, not the lozenge padding
+   above. @maxprice/glass declares `.icon-chip { padding: 6px }` and neither
+   sheet is layered, so the `.chip` rule above — equal specificity (0,1,0),
+   later in the cascade — was silently overriding it and stretching the icon
+   cap to 41x26. Two classes here so this outranks both single-class rules.
+   LOAD-BEARING: 4.5px keeps the chip exactly 26px tall (15px svg + 9px
+   padding + 2px border) while making it 26px WIDE, i.e. an actual circle.
+   The 26 is what `.hub-header`'s concentric-cap math below is written
+   against — change this padding and that ring breaks. */
+.chip.icon-chip {
+  padding: 4.5px;
+}
+.logo {
+  /* The orb diameter — glyph and inset rim derive from it in @maxprice/glass. */
+  --logo-d: 24px;
+}
+.toast {
+  bottom: 14px;
+}
+
+button {
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The floating pill header — sticky at a 10px inset, cards sliding
+   beneath it (the frost proof). */
+.hub-header {
+  position: sticky;
+  top: 10px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 12px 0;
+  /* Concentric caps: the pill's round ends and the round ends nested inside
+     them (the orb, the theme chip) share a centre, so each reads as the pill's
+     own cap shrunk in place rather than a circle parked near it. That holds
+     when the horizontal gap to a cap equals the vertical gap — the pill is
+     42px tall, the chip 26px and the orb 24px, so 8px clears both. The border
+     eats 1px of each gap, hence 7px right / 8px left. Both are load-bearing:
+     bumping the header's padding, the chip's, or --logo-d breaks the ring. */
+  padding: 7px 7px 7px 8px;
+  border-radius: 999px;
+  background: var(--panel);
+  -webkit-backdrop-filter: var(--frost-panel);
+  backdrop-filter: var(--frost-panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-shadow), var(--panel-inner);
+}
+/* A lone header label since the version moved to the App info card (map #143).
+   The `.identity` wrapper that used to hold the pair is gone with it: it existed
+   to make the 14px wordmark and the 10.5px version share a baseline — centring
+   each label's own line box left the version ~2.4px high, reading as a
+   superscript rather than a caption — and a flex group around a single child is
+   a gap that never applies. */
+.wordmark {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  /* One-line pill at the 380px floor: the wordmark never wraps. Nothing
+     else in the header can grow, so there is no ellipsis case left. */
+  white-space: nowrap;
+}
+/* The theme chip is the header's only right-side control now that the overall
+   status dot/label is gone (it duplicated the Hub status card's own), so it
+   takes over the auto margin that used to push that pair to the edge. */
+.hub-header > .chip {
+  margin-left: auto;
+}
+
+/* 12px viewport padding + 14px card gaps: the wash must stay visible
+   between panels here too. */
+.cards {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 12px 12px 16px;
+}
+
+/* Cards: eyebrow titles + a right-aligned status dot/label. */
+.card {
+  padding: 13px 15px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 2px;
+}
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--soft);
+  text-align: right;
+}
+.krows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.krow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--soft);
+}
+.krow b {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A row value that states a problem (ADR-0051's "Starts at login: No — not
+   registered"). The card's louder register is the `inset warn` block, reserved
+   for states that break the hub's job RIGHT NOW — a blocked firewall, an
+   archive that failed to load. A login entry that won't fire is a next-boot
+   concern, so it gets the token's colour without the block's weight. */
+.krow b.warn {
+  color: var(--warn);
+}
+/* The pairs row whose value cell carries a CONTROL, not just a value (the App
+   info card's Updates row, map #143). Baseline alignment is right for two runs
+   of text; a 26px chip hung off a baseline sits visibly low, so this variant
+   centres instead. The value side WRAPS rather than ellipses — at the 380px
+   floor a second line is cheap and a truncated update state is not a state. The
+   min-height pins the row so the card doesn't resize as the control appears and
+   disappears between states. */
+.krow.control {
+  align-items: center;
+  min-height: 26px;
+}
+.krow.control .val {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  text-align: right;
+}
+.krow.control .val .sub {
+  font-size: 11px;
+  color: var(--soft);
+}
+.hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--soft);
+}
+.hint code {
+  font-size: 10px;
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+  padding: 0.5px 5px;
+  border-radius: 5px;
+}
+.btnrow {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+}
+.flow {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.btns {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+}
+.err {
+  font-size: 11px;
+  color: var(--bad);
+}
+
+/* Centered inset variant (HubStatusCard): the whole inset centers — its
+   text lines, any warning, error, and its auto-width action button. Used by
+   the hygiene inset (stale/unreadable lines + Compact) and the firewall
+   warning (message + Allow through firewall). Opt-in per inset via the
+   `centered` class, so the bind-warning / events-down insets (no action) stay
+   left. Neither sheet is layered, so this 2-class selector outranks .inset. */
+.inset.centered {
+  align-items: center;
+  text-align: center;
+}
+
+/* Machines rows. */
+.mrow {
+  position: relative;
+  padding: 8px 0 7px;
+}
+.mrow + .mrow {
+  border-top: 1px solid var(--hairline);
+}
+.mrow-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.mname {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mid {
+  font-size: 10.5px;
+  color: var(--soft);
+  flex-shrink: 0;
+}
+.mcount {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--soft);
+  flex-shrink: 0;
+}
+.msub {
+  font-size: 11px;
+  color: var(--soft);
+  padding-left: 15px;
+  margin-top: 0.5px;
+}
+.kebab {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  justify-content: center;
+  flex-shrink: 0;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+/* The kmenu recipe is @maxprice/glass; the anchor offset is ours. */
+.kmenu {
+  top: 32px;
+}
+.mflow {
+  margin-top: 8px;
+}
+
+/* ============================================================
+   Tray popout (ADR-0050) — T1 variant A "leaf", per NOTES.md §Tray popout
+   and tray-popout-glass.html. The popout floats over the user's DESKTOP,
+   which backdrop-filter cannot blur through, so it wears the opaque T4
+   reduce-transparency composite with its own miniature internal wash —
+   never the translucent panel recipe. The WINDOW is opaque (T2: transparent
+   + undecorated disables the Windows system shadow and flashes on first
+   paint), so the frame fills the viewport edge-to-edge: Win11's DWM rounds
+   and shadows the undecorated window itself (`shadow: true`), macOS stays
+   square in v1 — the mock's radius 14 returns only if a transparent-window
+   revisit ever lands. Scoped under the body class main.tsx stamps.
+   ============================================================ */
+/* --panel-opaque is glass's always-defined opaque composite and flips with the
+   theme on its own, so the base needs no dark override. The wash's hues track
+   glass's --wash; the radii and alphas are the popout's own (a 224px window,
+   not a 1280px one), which is why it is restated here rather than derived. */
+body.popout-window {
+  --pop-base: var(--panel-opaque);
+  --pop-wash:
+    radial-gradient(320px 220px at 12% -6%, oklch(90% 0.06 280 / 0.5), transparent 70%),
+    radial-gradient(300px 210px at 95% 110%, oklch(92% 0.05 60 / 0.42), transparent 66%),
+    radial-gradient(260px 190px at 105% 38%, oklch(91% 0.05 200 / 0.4), transparent 62%);
+  background-color: var(--pop-base);
+  background-image: var(--pop-wash);
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+:root[data-theme="dark"] body.popout-window {
+  --pop-wash:
+    radial-gradient(320px 220px at 12% -6%, oklch(30% 0.09 300 / 0.5), transparent 70%),
+    radial-gradient(300px 210px at 95% 110%, oklch(26% 0.08 220 / 0.45), transparent 66%),
+    radial-gradient(260px 190px at 105% 38%, oklch(24% 0.07 340 / 0.38), transparent 62%);
+}
+
+/* The frame IS the window: hairline border + inner highlight at the viewport
+   edge (the OS shadow lives outside the opaque window; --pop-shadow from the
+   mock has nowhere to draw). */
+.popout-frame {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px;
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-inner);
+}
+.prows {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.prow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 7px 10px;
+}
+.prow .name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.prow .state {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--soft);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.prow .state b {
+  font-weight: 600;
+  color: var(--text);
+}
+/* The clients row: count leading, flush with the dots' edge — no dot, no
+   name-column indent (T1's resolved left alignment). */
+.prow .state.clients {
+  margin-left: 0;
+  text-align: left;
+}
+/* No fresh reading (starting / not responding) — the dependent rows dim. */
+.prow.dim {
+  opacity: 0.55;
+}
+.pdivider {
+  height: 1px;
+  flex-shrink: 0;
+  background: var(--hairline);
+  margin: 4px 8px;
+}
+/* Full-width menu items — the kmenu button recipe at the popout's row width. */
+.pactions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.pactions button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 500;
+  text-align: left;
+  color: var(--text);
+  background: none;
+  border: none;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.pactions button:hover {
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+}

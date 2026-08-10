@@ -1,0 +1,30 @@
+.DS_Store
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+# Vite's dep-optimizer cache — not under node_modules/ because Bun hoists
+# node_modules to the workspace root, so it lands in apps/<app>/.vite/.
+.vite/
+
+# Tauri / Rust
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+apps/hub/credstore/target/
+apps/hub-desktop/src-tauri/target/
+
+# Compiled sidecar/hub binaries (built per-target during the release build)
+apps/sidecar/binaries/
+apps/desktop/src-tauri/binaries/
+apps/hub/binaries/
+apps/hub-desktop/src-tauri/binaries/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.log

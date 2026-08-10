@@ -1,0 +1,63 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "MaxPrice",
+  "version": "0.4.0",
+  "identifier": "com.maxprice.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeDevCommand": "bun run dev",
+    "beforeBuildCommand": "cd ../.. && bun run build:binaries && bun --filter @maxprice/desktop build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "MaxPrice",
+        "label": "main",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/meschoening/MP-Updates/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJCNTM3RTIyNkY3RTc0MzEKUldReGRINXZJbjVUdTliT3VoZW5kZHRseDMzY0JFSkcvR1gzbVd2eXo5ZWFaTlZLY2p5WnhaV2cK"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": false,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": ["binaries/maxprice-sidecar"],
+    "macOS": {
+      "entitlements": "entitlements.plist"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "installer-hooks.nsh"
+      }
+    },
+    "category": "DeveloperTool",
+    "shortDescription": "Live view for MaxPrice",
+    "longDescription": "A native-feeling desktop view over your Claude Code usage data."
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "name": "maxprice",
+  "version": "0.4.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:binaries": "bun --filter @maxprice/sidecar build:binaries",
+    "dev:renderer": "bun --filter @maxprice/desktop dev",
+    "dev": "bun run dev:binaries && bun --filter @maxprice/desktop tauri dev",
+    "dev:hub": "bun --filter @maxprice/hub build:binaries && bun --filter @maxprice/hub-desktop tauri dev",
+    "build:binaries": "bun --filter @maxprice/sidecar build:binaries",
+    "build": "bun run build:binaries && bun --filter @maxprice/desktop tauri build --no-sign",
+    "build:hub": "bun --filter @maxprice/hub build:credstore && bun --filter @maxprice/hub build:binaries && bun --filter @maxprice/hub-desktop tauri build --no-sign",
+    "typecheck": "bun --filter '*' typecheck && bun run typecheck:scripts",
+    "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json",
+    "test": "bun --filter '*' test && bun run test:scripts",
+    "test:scripts": "bun test scripts/release-tooling.test.ts scripts/public-sync.test.ts scripts/updater-manifest.test.ts",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "@types/bun": "^1.3.0",
+    "@types/node": "^22.10.0",
+    "eslint": "^9.18.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "eslint-plugin-react-refresh": "^0.4.16",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.20.0"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

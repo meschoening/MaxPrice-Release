@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for the MaxPrice Hub operator window. The hub daemon is spawned by Rust via app.shell().sidecar(), so the renderer does not need shell:allow-spawn; the tray and autostart are driven from Rust.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "process:default",
+    "updater:default",
+    "os:allow-platform",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled"
+  ]
+}

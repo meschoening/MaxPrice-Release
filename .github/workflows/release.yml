@@ -1,0 +1,867 @@
+name: release
+
+# Cross-platform release pipeline for MaxPrice.
+#
+# Trigger: push a `v*` tag (e.g. `v0.1.0`).
+#
+# Flow:
+#   1. preflight        — gates the release by asserting the tag matches both
+#                         products' declared versions, and that the updater
+#                         secrets exist. A red gate blocks every job below —
+#                         nothing builds or releases on a mismatched tag.
+#   2. create-release   — opens a DRAFT GitHub Release for the tag.
+#   3. build (matrix)   — macOS universal / Windows x64 / Linux x64; compiles the
+#                         Bun sidecar binary per target, then `tauri build`, and
+#                         uploads bundles to the draft release.
+#   4. build-hub        — the MaxPrice Hub tray app, Windows only; uploads to the
+#                         same draft release.
+#   5. notarize-macos   — separate, slow (10+ min) Apple notarization step that
+#                         cannot fail the build job above.
+#   6. compose-updater  — moves the updater freight OFF this release and onto the
+#                         MP-Updates repo, as a PRERELEASE.
+#   7. publish          — un-drafts the release.
+#   8. verify-updater   — proves every manifest URL resolves, then flips the
+#                         MP-Updates prerelease to switch the channel over.
+#
+# THE UPDATE CHANNEL LIVES IN A SEPARATE REPO (ADR-0071).
+#
+# This release's asset list is five installers, and stays five installers. The
+# updater freight — the macOS .app.tar.gz and both manifests — goes to
+# MP-Updates instead, so what a human sees when they open the releases page is
+# only the things a human downloads. Detached .sig files are published nowhere
+# at all: a signature travels INSIDE the manifest, which is the only place
+# Tauri's updater reads one from.
+#
+# A manifest is just URLs, so nothing is copied that does not have to be:
+# Windows entries point straight back at the .exe on THIS release. Only macOS
+# needs a home in MP-Updates, because a .app.tar.gz is not an installer.
+#
+# `createUpdaterArtifacts` stays FALSE in both committed tauri.conf.json files.
+# The build jobs below merge `src-tauri/tauri.updater.conf.json` over it with
+# `--config`, which makes updater artifacts a property of the CI release path
+# rather than of the product — so the local hand-built fallback pipeline
+# (ADR-0052) is untouched and needs no signing key on any machine. The tradeoff
+# is recorded in ADR-0071: a fallback release serves no update, and the channel
+# resumes at the next CI release.
+#
+# The ORDER of the last three jobs is the safety property, not an accident.
+# compose-updater strips the draft BEFORE it is published, so the extra assets
+# are never publicly visible even briefly; it uploads to MP-Updates as a
+# PRERELEASE, which GitHub excludes from `releases/latest`, so the live channel
+# still points at the previous good release throughout. Only verify-updater —
+# after every URL has been fetched — flips that prerelease off, and that flip is
+# the single moment the channel switches. Every failure path leaves the old
+# channel serving the old release, which is the one outcome that is never worse
+# than doing nothing.
+#
+# Two products ship from one tag and their platform sets DIFFER: the desktop app
+# (`build`, step 3) targets macOS / Windows / Linux, while the MaxPrice Hub tray
+# app (`build-hub`, step 4) is Windows only — no macOS and no Linux leg, by
+# decision (ADR-0050). See that job's header for what restoring either takes.
+#
+# Third-party actions are pinned to full commit SHAs (with a trailing `# vN`
+# comment) so a moved tag can't change what runs in this `contents: write`
+# pipeline. Re-resolve the SHA when intentionally bumping an action.
+#
+# Owner-provisioned GitHub Actions secrets (all optional — the build degrades
+# to an UNSIGNED build when an Apple signing secret is absent):
+#   Signing (build job) — absent ⇒ an unsigned build, not a failed one:
+#   - APPLE_CERTIFICATE              base64 of the .p12 signing certificate
+#   - APPLE_CERTIFICATE_PASSWORD     password for that .p12
+#   - APPLE_SIGNING_IDENTITY         e.g. "Developer ID Application: Name (TEAMID)"
+#   Notarization (notarize-macos job) — all three or none; see that job's header
+#   for why this is an App Store Connect API key and not an Apple ID:
+#   - APPLE_API_KEY                  base64 of the AuthKey_<KEYID>.p8
+#   - APPLE_API_KEY_ID               the key's 10-char Key ID
+#   - APPLE_API_ISSUER               the account's Issuer ID (a UUID)
+#
+# Updater secrets — REQUIRED, unlike every Apple secret above. `preflight`
+# asserts all three before a single job compiles, because each one fails late
+# and expensively otherwise: a missing signing key kills `tauri build` at the
+# END of a release compile, and a missing token kills compose-updater after
+# every artifact has already been built.
+#   - TAURI_SIGNING_PRIVATE_KEY           the minisign private key's file contents
+#   - TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password (must be non-empty)
+#   - UPDATES_REPO_TOKEN                  fine-grained PAT, contents:write on
+#                                         meschoening/MP-Updates. GITHUB_TOKEN
+#                                         cannot reach another repository, which
+#                                         is the whole reason this one exists.
+#
+# The signing key must be the half matching the `pubkey` committed in BOTH
+# tauri.conf.json files. A mismatched pair signs cleanly, uploads cleanly, and
+# is rejected by every installed app — so compose-updater re-checks the key id
+# out of each signature against that committed pubkey rather than trusting it.
+#
+# `GITHUB_TOKEN` is provided automatically by GitHub Actions.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Allow the workflow to create releases and upload assets.
+permissions:
+  contents: write
+
+env:
+  # The repo serving the update channel (ADR-0071). This must stay in lockstep
+  # with the `plugins.updater.endpoints` URL committed in BOTH tauri.conf.json
+  # files — they are what an installed app polls, and nothing here can correct
+  # a shipped binary that points somewhere else.
+  UPDATES_REPO: meschoening/MP-Updates
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 1. Gate — refuse to ship a tag whose product versions disagree.
+  # --------------------------------------------------------------------------
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Assert tag matches product versions
+        # One `v*` tag ships BOTH products of a version-locked monorepo, so a
+        # tag that disagrees with either tauri.conf.json publishes mislabelled
+        # installers: the bundle's filename and its self-reported runtime
+        # version would name a release it did not come from. (No updater is
+        # involved — ADR-0054 builds no updater artifacts at all.) Both
+        # tauri.conf.json files are load-bearing (they set the runtime version);
+        # both package.json files are baked in as __APP_VERSION__ — cosmetic, but
+        # asserted for lockstep hygiene. All four must equal the tag.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          fail=0
+          for file in \
+            apps/desktop/src-tauri/tauri.conf.json \
+            apps/hub-desktop/src-tauri/tauri.conf.json \
+            apps/desktop/package.json \
+            apps/hub-desktop/package.json; do
+            got="$(jq -r '.version' "$file")"
+            if [ "$got" != "$version" ]; then
+              echo "::error file=$file::Version mismatch — $file declares '$got' but the tag is '$TAG' (expected '$version'). Bump $file to $version (or retag)."
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Tag/version disagreement would publish mislabelled installers — refusing to release."; exit 1
+          fi
+
+      - name: Assert the updater secrets exist
+        # Every one of these fails LATE if it is missing, which is the only
+        # reason this step exists so early. Without the signing key `tauri build`
+        # runs the entire release compile and dies at the bundling step; without
+        # the token, compose-updater dies after all four legs have finished. Both
+        # cost 20+ minutes to discover something knowable in a second.
+        #
+        # The password must be NON-EMPTY: minisign accepts an empty passphrase
+        # and Tauri will happily sign with it, so an accidentally-blank secret
+        # produces a working release with an unprotected key rather than an
+        # error anyone would notice.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          UPDATES_REPO_TOKEN: ${{ secrets.UPDATES_REPO_TOKEN }}
+        run: |
+          missing=""
+          [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]          || missing="$missing TAURI_SIGNING_PRIVATE_KEY"
+          [ -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ] || missing="$missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          [ -n "$UPDATES_REPO_TOKEN" ]                 || missing="$missing UPDATES_REPO_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::Updater secrets absent ($missing ) — refusing to release. See this workflow's header for what each one is."
+            exit 1
+          fi
+
+  # --------------------------------------------------------------------------
+  # 2. Open a draft GitHub Release for the pushed tag.
+  # --------------------------------------------------------------------------
+  create-release:
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create-release.outputs.result }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Create draft release
+        id: create-release
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const tag = context.ref.replace("refs/tags/", "");
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `MaxPrice ${tag}`,
+              body: "See the assets below to download and install this version.",
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+
+  # --------------------------------------------------------------------------
+  # 3. Build the app for every platform and upload to the draft release.
+  # --------------------------------------------------------------------------
+  build:
+    needs: [preflight, create-release]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      # `--bundles` is pinned PER LEG, and must stay pinned. tauri.conf.json says
+      # `bundle.targets: "all"`, which on Windows also builds an .msi and on
+      # Linux also builds an .AppImage — neither of which this release ships.
+      # scripts/release-assets.ts is the source of truth for the five-installer
+      # shape and records why: no MSI, because ADR-0038's console-driven
+      # firewall repair is written against the per-user unelevated NSIS install;
+      # no AppImage, because linuxdeploy runs `ldd` over the Bun-compiled sidecar
+      # and the dynamic loader segfaults. The three legs of the local fallback
+      # pipeline pin exactly these same three sets.
+      #
+      # `--config src-tauri/tauri.updater.conf.json` merges over tauri.conf.json
+      # and turns updater artifacts on for the CI build only (ADR-0071). The path
+      # is relative to `projectPath`, which is both the tauri CLI's working
+      # directory and the directory tauri-action resolves its own copy of the
+      # merge against.
+      #
+      # LINUX DELIBERATELY OMITS THAT OVERLAY. Tauri v2 can only update an
+      # AppImage, so a .deb-only build with `createUpdaterArtifacts` on hits the
+      # CLI's one hard error in this area — "configured to create updater
+      # artifacts but no updater-enabled targets were built" — and the leg dies
+      # at bundling. Linux ships an installer and no update path, which is what
+      # the manifests' missing linux key already says.
+      #
+      # Everything after the `--` is passed through by `tauri build` to the
+      # runner (cargo). `-- --locked` therefore enforces the committed
+      # Cargo.lock on the release build itself. There must be at most ONE `--`
+      # per args string — a second one is forwarded to cargo as a literal
+      # argument.
+      matrix:
+        include:
+          # macOS — a single universal binary; the sidecar must be compiled for
+          # BOTH darwin triples so Tauri can lipo them. `app` is bundled as well
+          # as `dmg` because the .app.tar.gz updater bundle is derived from it.
+          - platform: macos-latest
+            args: "--target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.updater.conf.json -- --locked"
+            sidecar-targets: "darwin-arm64 darwin-x64"
+          - platform: ubuntu-latest
+            args: "--bundles deb -- --locked"
+            sidecar-targets: "linux-x64"
+          - platform: windows-latest
+            args: "--bundles nsis --config src-tauri/tauri.updater.conf.json -- --locked"
+            sidecar-targets: "windows-x64"
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install Rust (stable)
+        # SHA pins the action's code, not the compiler — the `stable` channel
+        # below still selects the latest stable toolchain at run time.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-03-27
+        with:
+          toolchain: stable
+          # Universal macOS needs both arch targets; other platforms build host-native.
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "apps/desktop/src-tauri -> target"
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # Pinned for a deterministic sidecar runtime — the compiled binary
+          # embeds this Bun version. It is also a FLOOR, not just a pin: Bun
+          # before 1.3.14 emits an x64 macOS binary whose LC_CODE_SIGNATURE
+          # declares an extent running past end-of-file, so code signing
+          # destroys it while codesign, spctl, and Apple's notary service all
+          # still pass. The macOS leg below signs, so a lower pin publishes an
+          # Intel app that cannot launch. Never move it below 1.3.14. Bump in
+          # lockstep with the repo's local Bun (root package.json `engines.bun`
+          # requires >=1.3.14), and with the other of the TWO pins of the same
+          # value in this file (`build`, `build-hub`) — both must move together.
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Compile sidecar binaries
+        # `build:binaries` takes host-key args from apps/sidecar/scripts/build-binaries.ts::TARGETS
+        # (darwin-arm64 / darwin-x64 / linux-x64 / windows-x64) — NOT Rust triples.
+        # Tauri's externalBin then bundles binaries/maxprice-sidecar-<rust-triple>.
+        env:
+          SIDECAR_TARGETS: ${{ matrix.sidecar-targets }}
+        # Force bash: on windows-latest the default shell is pwsh, where
+        # `$SIDECAR_TARGETS` expands to nothing and build:binaries would silently
+        # fall back to the host target only.
+        shell: bash
+        run: bun run build:binaries $SIDECAR_TARGETS
+
+      - name: Build, sign, and upload (tauri-action)
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS code signing — only the certificate-import vars are set here so
+          # the build SIGNS but does NOT notarize (notarization is a separate job).
+          # Guarded by `if:` so the build still succeeds UNSIGNED when secrets are absent.
+          APPLE_CERTIFICATE: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          # Minisign, NOT Apple: this signs the updater bundles so an installed
+          # app can verify an update against the pubkey baked into it. Asserted
+          # present by preflight, because the failure is otherwise at the very
+          # end of the compile.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          # tauri-action would upload a latest.json to THIS release; the channel
+          # lives in MP-Updates and its manifests are composed later, from the
+          # signatures, by compose-updater. Leave this off.
+          includeUpdaterJson: false
+          args: ${{ matrix.args }}
+
+  # --------------------------------------------------------------------------
+  # 4. Build the MaxPrice Hub tray app (ADR-0036) and upload to the same draft
+  #     release. Distinct artifact (com.maxprice.hub); its bundles share the
+  #     productName prefix "MaxPrice Hub" ("MaxPrice Hub_…") — the space after
+  #     "MaxPrice" is the discriminator; they never collide with the desktop's
+  #     "MaxPrice_…". Co-released from the same v* tag (version-locked monorepo).
+  #
+  #     WINDOWS ONLY — neither a macOS nor a Linux leg, both deliberately
+  #     (ADR-0050). Windows is the supported hub host and the only platform the
+  #     packaged tray app has been smoked on end to end.
+  #
+  #     No macOS leg: the packaged tray app has never been built or run on a
+  #     Mac, and shipping a bundle nobody has opened is worse than shipping
+  #     none. The macOS SOURCE paths stay in the repo (unit-tested,
+  #     unexercised) — restoring this leg takes six things: (1) re-add the
+  #     `macos-latest` include with `args: --target universal-apple-darwin`,
+  #     (2) `hub-targets: "darwin-arm64 darwin-x64"`, (3) the x86_64 credstore
+  #     cross-build for the universal lipo, (4) the APPLE_* signing env on
+  #     tauri-action, (5) the toolchain's darwin `targets:`, and (6) add
+  #     `build-hub` to `notarize-macos`'s `needs:` — that job downloads `*.dmg`
+  #     as soon as `build` finishes, so a hub `.dmg` still in flight would ship
+  #     un-notarized (see that job's header).
+  #
+  #     No Linux leg: tao emits no tray-click events on Linux (tray-icon 0.24.1
+  #     — "**Linux**: Unsupported. The event is not emmited even though the icon
+  #     is shown"), and since ADR-0050 the popout summoned by exactly that event
+  #     is the app's ONLY tray surface — the native menu was deleted, so the
+  #     right-click context menu that same doc says Linux DOES still show would
+  #     be empty. A Linux bundle would install a tray icon nothing opens. Linux
+  #     hub hosts run the headless `maxprice-hub serve` daemon instead
+  #     (ADR-0036). Restoring this leg means re-adding the `ubuntu-latest`
+  #     include with `hub-targets: "linux-x64"` AND an
+  #     `if: matrix.platform == 'ubuntu-latest'` deps step installing
+  #     libwebkit2gtk-4.1-dev / libappindicator3-dev / librsvg2-dev / patchelf
+  #     (the Tauri GTK+webkit deps) plus libdbus-1-dev + pkg-config (required by
+  #     the credstore's keyring `sync-secret-service` backend) — and, first,
+  #     giving Linux a tray surface that actually opens.
+  #
+  #     The desktop app (job 3) is unaffected and still builds for macOS,
+  #     Windows, and Linux.
+  # --------------------------------------------------------------------------
+  build-hub:
+    needs: [preflight, create-release]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            hub-targets: "windows-x64"
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-03-27
+        # No extra `targets:` — the sole leg builds host-native. The darwin pair
+        # goes back when the macOS leg does (see the job header).
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "apps/hub-desktop/src-tauri -> target"
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # One of TWO bun-version pins in this file (`build`, `build-hub`) —
+          # bump both together; `build`'s pin carries the rationale (it applies
+          # verbatim to the compiled `maxprice-hub` binary this leg embeds).
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build credstore helper (host arch)
+        # The keyring helper is a bundled externalBin (Contract §10) so the
+        # packaged app keeps at-rest claude.ai key custody. Built per-OS — the
+        # windows-native keyring backend on this leg; a restored Linux leg would
+        # use sync-secret-service and need the libdbus-1-dev + pkg-config deps
+        # step named in the job header. The next step's build:binaries copies
+        # this host-arch binary into the tray app's binaries dir,
+        # triple-suffixed. Host arch is enough for the Windows leg; the macOS
+        # universal build's second-arch cross-compile went with its leg.
+        run: bun --filter @maxprice/hub build:credstore
+
+      - name: Compile hub binaries
+        # build:binaries (apps/hub/scripts/build-binaries.ts::TARGETS) emits
+        # maxprice-hub-<triple> AND copies it — plus the host-arch
+        # maxprice-credstore-<triple> built above — into
+        # apps/hub-desktop/src-tauri/binaries/ for Tauri's externalBin to bundle.
+        env:
+          HUB_TARGETS: ${{ matrix.hub-targets }}
+        # Force bash: on windows-latest the default shell is pwsh, where
+        # `$HUB_TARGETS` expands to nothing and build:binaries would silently
+        # fall back to the host target only.
+        shell: bash
+        run: bun --filter @maxprice/hub build:binaries $HUB_TARGETS
+
+      - name: Build, sign, and upload (tauri-action)
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No APPLE_* here: the only leg is Windows, so signing has nothing to
+          # sign. They return with the macOS leg (job header).
+          #
+          # The minisign key is NOT Apple signing and is needed on every leg that
+          # builds an updater bundle, this one included — the hub has its own
+          # channel (hub-latest.json) and its own pubkey, though both products
+          # are signed by the one keypair.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/hub-desktop
+          tagName: ${{ github.ref_name }}
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          includeUpdaterJson: false
+          # `--bundles nsis` for the reason the desktop matrix records: "all"
+          # would add an .msi this release does not ship. `--config` merges the
+          # CI-only updater overlay (ADR-0071). Everything after the `--` is
+          # passed through by `tauri build` to the runner (cargo): enforces the
+          # committed apps/hub-desktop/src-tauri/Cargo.lock instead of letting
+          # the release build silently re-resolve it.
+          args: "--bundles nsis --config src-tauri/tauri.updater.conf.json -- --locked"
+
+  # --------------------------------------------------------------------------
+  # 5. Notarize macOS bundles — separate job so a slow (10+ min) notarization
+  #    can never fail the build jobs. Covers the DESKTOP .dmg only: the hub tray
+  #    app has no macOS leg (ADR-0050 — Windows-only for now), so no hub .dmg
+  #    exists to notarize. Restoring the hub's macOS leg requires adding
+  #    `build-hub` to this job's `needs:` — the `*.dmg` glob below is a
+  #    `gh release download` that fires the moment `build` finishes, so a hub
+  #    `.dmg` uploaded after that point would never be picked up and would ship
+  #    un-notarized. Skipped entirely when the notarization secrets are absent;
+  #    failures here are non-blocking for the release.
+  #
+  #    Auth is an App Store Connect API key (`--key/--key-id/--issuer`), NOT an
+  #    Apple ID + app-specific password. The key is team-scoped and revocable on
+  #    its own, so a compromise of this public repo's secret store costs one
+  #    credential rather than the Apple ID behind every app on the account.
+  # --------------------------------------------------------------------------
+  notarize-macos:
+    needs: [build]
+    # `build` is the only producer of macOS bundles, so this no longer waits on
+    # build-hub at all.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: macos-latest
+    # Cap the job — `notarytool submit --wait` can hang on Apple's service;
+    # without this it could burn to the 6h runner ceiling and stall `publish`.
+    timeout-minutes: 30
+    # Don't gate the release on notarization succeeding.
+    continue-on-error: true
+    steps:
+      - name: Check for notarization secrets
+        id: gate
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          # All three are required — a partial set is a misconfiguration, not a
+          # "notarization is off" signal, so say which one is missing rather
+          # than skipping silently and shipping un-notarized .dmgs.
+          missing=""
+          [ -n "$APPLE_API_KEY" ]    || missing="$missing APPLE_API_KEY"
+          [ -n "$APPLE_API_KEY_ID" ] || missing="$missing APPLE_API_KEY_ID"
+          [ -n "$APPLE_API_ISSUER" ] || missing="$missing APPLE_API_ISSUER"
+          if [ -z "$missing" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Notarization secrets absent ($missing ) — skipping macOS notarization."
+          fi
+
+      - name: Download macOS release assets
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p notarize
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "*.dmg" \
+            --dir notarize
+
+      - name: Notarize and staple
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          shopt -s nullglob
+          # notarytool takes a FILE path for --key, so the base64 secret has to
+          # touch disk. Keep it in RUNNER_TEMP under a 0600 umask and remove it
+          # on every exit path, failures included.
+          key_file="$RUNNER_TEMP/AuthKey.p8"
+          umask 077
+          trap 'rm -f "$key_file"' EXIT
+          # `openssl base64` rather than `base64 -d`: identical on LibreSSL
+          # (/usr/bin/openssl) and OpenSSL 3, and -A tolerates the single
+          # unwrapped line `gh secret set` stores.
+          printf '%s' "$APPLE_API_KEY" | openssl base64 -d -A > "$key_file"
+          for dmg in notarize/*.dmg; do
+            echo "Submitting $dmg for notarization…"
+            xcrun notarytool submit "$dmg" \
+              --key "$key_file" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
+              --wait
+            echo "Stapling $dmg…"
+            xcrun stapler staple "$dmg"
+          done
+
+      - name: Re-upload notarized assets
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          shopt -s nullglob
+          for dmg in notarize/*.dmg; do
+            gh release upload "$TAG" "$dmg" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          done
+
+  # --------------------------------------------------------------------------
+  # 6. Move the updater freight off this release and onto MP-Updates (ADR-0071).
+  #
+  #    Runs BEFORE publish, which is the whole point: the draft is not public,
+  #    so the .sig files and the .app.tar.gz are removed from it without ever
+  #    having been visible. Publishing first and tidying afterwards would leave
+  #    a window where the asset list is wrong, and would leave it wrong forever
+  #    if this job failed.
+  #
+  #    What lands in MP-Updates is a PRERELEASE. GitHub excludes prereleases
+  #    from `releases/latest`, so `latest/download/latest.json` — the URL both
+  #    apps poll — keeps serving the PREVIOUS release throughout. Nothing here
+  #    changes what any installed app sees; only verify-updater's flip does.
+  # --------------------------------------------------------------------------
+  compose-updater:
+    needs: [preflight, create-release, build, build-hub]
+    if: >-
+      !cancelled()
+      && needs.build.result == 'success'
+      && needs.build-hub.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # Runs the composer only — no binary is compiled here, so this pin is
+          # hygiene rather than the load-bearing floor the two build jobs carry.
+          bun-version: "1.3.14"
+
+      - name: Stage the updater bundles off the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p staged/desktop staged/hub staged/mac
+          # Tolerated non-zero: `gh release download` fails when its pattern
+          # matches nothing, with a generic message. The likeliest cause by far
+          # is that --config stopped merging the updater overlay, so no leg
+          # signed anything — and the explicit check below names that, where
+          # gh's own error would send someone hunting through gh.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sig' --dir staged || true
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.app.tar.gz' --dir staged/mac || true
+          if ! ls staged/*.sig >/dev/null 2>&1; then
+            echo "::error::No .sig assets on the draft release. No leg produced a signed updater bundle — check that the build jobs still pass --config src-tauri/tauri.updater.conf.json, and that TAURI_SIGNING_PRIVATE_KEY reached them."
+            exit 1
+          fi
+          # Split by product. GitHub rewrites the space in the hub's
+          # "MaxPrice Hub_…" bundle to a dot on upload, so on the release the
+          # character after "MaxPrice" is the discriminator: "." is the hub,
+          # "_" is the desktop app. Reading the names back off the release
+          # rather than out of the build's bundle directory is what keeps the
+          # manifest's URLs and the release's asset names the same strings.
+          for f in staged/*.sig; do
+            case "$(basename "$f")" in
+              MaxPrice.Hub_*) mv "$f" staged/hub/ ;;
+              *) mv "$f" staged/desktop/ ;;
+            esac
+          done
+          echo "desktop:"; ls -1 staged/desktop
+          echo "hub:"; ls -1 staged/hub
+          echo "macOS bundle:"; ls -1 staged/mac
+
+      - name: Rehome the macOS bundle to MP-Updates
+        env:
+          GH_TOKEN: ${{ secrets.UPDATES_REPO_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          darwin_src="$(find staged/mac -name '*.app.tar.gz' -print -quit)"
+          if [ -z "$darwin_src" ]; then
+            echo "::error::The macOS leg produced no .app.tar.gz. Either --config stopped merging the updater overlay, or --bundles no longer includes 'app'."
+            exit 1
+          fi
+          # Tauri names this ONE artifact with no version in it at all
+          # ("MaxPrice.app.tar.gz"). Give it one here — it is about to sit in a
+          # repo whose entire content is one of these per release.
+          darwin_asset="MaxPrice_${version}_universal.app.tar.gz"
+          mv "$darwin_src" "staged/mac/$darwin_asset"
+          echo "DARWIN_ASSET=$darwin_asset" >> "$GITHUB_ENV"
+          if ! gh release view "$TAG" --repo "$UPDATES_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$UPDATES_REPO" --prerelease \
+              --title "MaxPrice $TAG" \
+              --notes "Update-channel metadata for MaxPrice $TAG. Installers are at https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          fi
+          gh release upload "$TAG" "staged/mac/$darwin_asset" --repo "$UPDATES_REPO" --clobber
+
+      - name: Compose both manifests
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          bun scripts/compose-updater-manifest.ts compose \
+            --channel desktop --version "$version" --tag "$TAG" \
+            --dir staged/desktop \
+            --installers-repo "$GITHUB_REPOSITORY" \
+            --updates-repo "$UPDATES_REPO" \
+            --darwin-asset "$DARWIN_ASSET" \
+            --out latest.json
+          bun scripts/compose-updater-manifest.ts compose \
+            --channel hub --version "$version" --tag "$TAG" \
+            --dir staged/hub \
+            --installers-repo "$GITHUB_REPOSITORY" \
+            --updates-repo "$UPDATES_REPO" \
+            --out hub-latest.json
+
+      - name: Upload the manifests to MP-Updates
+        env:
+          GH_TOKEN: ${{ secrets.UPDATES_REPO_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" latest.json hub-latest.json --repo "$UPDATES_REPO" --clobber
+
+      - name: Strip the updater freight from the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Last, deliberately — every step above reads these assets. Detached
+          # .sig files are published nowhere at all: the signature travels
+          # inside the manifest, which is the only place Tauri reads one from.
+          # `while read` rather than `for name in $(...)`: GitHub rewrites a
+          # space in an uploaded filename to a dot, so no published asset name
+          # can contain one today — but a word-splitting loop that deletes
+          # release assets is not the place to depend on that.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+            | while IFS= read -r name; do
+                case "$name" in
+                  *.sig | *.app.tar.gz)
+                    echo "removing $name"
+                    gh release delete-asset "$TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes
+                    ;;
+                esac
+              done
+          echo "remaining on the draft:"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
+
+  # --------------------------------------------------------------------------
+  # 7. Publish — un-draft the release once both products' builds are green.
+  # --------------------------------------------------------------------------
+  publish:
+    needs: [create-release, build, build-hub, notarize-macos, compose-updater]
+    # All-or-nothing publish: BOTH products' builds must be green, or the release
+    # stays a draft. `notarize-macos` is the ONLY tolerated failure — it is
+    # continue-on-error and deliberately NOT referenced below, so an Apple-notary
+    # hiccup alone still publishes. `!cancelled()` (not `always()`) keeps a
+    # manually-cancelled run from publishing.
+    #
+    # compose-updater IS referenced, and must be: it is what strips the updater
+    # freight off the draft, so publishing without it would put the very assets
+    # this design exists to hide onto the public release page.
+    if: >-
+      !cancelled()
+      && needs.build.result == 'success'
+      && needs.build-hub.result == 'success'
+      && needs.compose-updater.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Un-draft the release
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          TAG: ${{ github.ref_name }}
+        with:
+          # Retry the un-draft: a transient API flake here is the one real
+          # bad half-state — assets attached but the release stuck as a draft.
+          # If all attempts fail the job goes red; the owner must then manually
+          # un-draft the release in the GitHub UI (Releases → edit → Publish).
+          script: |
+            const tag = process.env.TAG;
+            const release_id = Number(process.env.RELEASE_ID);
+            const attempts = 3;
+            for (let i = 1; i <= attempts; i++) {
+              try {
+                await github.rest.repos.updateRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id,
+                  draft: false,
+                });
+                core.info(`Published release ${tag} (id ${release_id}).`);
+                return;
+              } catch (err) {
+                if (i === attempts) {
+                  core.setFailed(
+                    `Failed to un-draft release ${tag} (id ${release_id}) after ` +
+                      `${attempts} attempts: ${err.message}. ` +
+                      `Manually un-draft it in the GitHub UI (Releases → edit → Publish).`,
+                  );
+                  throw err;
+                }
+                core.warning(`Un-draft attempt ${i} failed: ${err.message} — retrying…`);
+                await new Promise((r) => setTimeout(r, 5000 * i));
+              }
+            }
+
+  # --------------------------------------------------------------------------
+  # 8. Verify the update channel, then switch it over.
+  #
+  #    This is the gate the two-repo split makes necessary. A manifest and the
+  #    artifacts it names are now published by different steps, to different
+  #    repos, and a manifest advertising a 404 is worse than no manifest at all
+  #    — every client would retry the same dead download on every launch, and
+  #    nothing about the release page would look wrong.
+  #
+  #    So: fetch every URL in both manifests for real, and only then flip the
+  #    MP-Updates prerelease off. That flip is the single moment the channel
+  #    switches, and it is the last thing that happens in the whole pipeline.
+  #    Every failure path above it leaves the previous release serving, which is
+  #    the one outcome that is never worse than doing nothing.
+  #
+  #    It has to run AFTER publish for a mechanical reason, not just a tidy one:
+  #    a draft release's assets 404 on their public download URLs, so the
+  #    Windows entries — which point back at the installers on that release —
+  #    are unverifiable until the release is public.
+  # --------------------------------------------------------------------------
+  verify-updater:
+    needs: [compose-updater, publish]
+    if: >-
+      !cancelled()
+      && needs.compose-updater.result == 'success'
+      && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Download the composed manifests
+        env:
+          GH_TOKEN: ${{ secrets.UPDATES_REPO_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        # Downloaded rather than recomposed: verifying the bytes that are
+        # actually attached is the point. A manifest that composed cleanly and
+        # then failed to upload would otherwise verify green.
+        run: |
+          set -euo pipefail
+          mkdir -p manifests
+          gh release download "$TAG" --repo "$UPDATES_REPO" --pattern '*latest.json' --dir manifests
+          ls -1 manifests
+
+      - name: Verify every manifest URL resolves
+        run: bun scripts/compose-updater-manifest.ts verify manifests/latest.json manifests/hub-latest.json
+
+      - name: Switch the channel over
+        env:
+          GH_TOKEN: ${{ secrets.UPDATES_REPO_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --repo "$UPDATES_REPO" --prerelease=false --latest
+
+      - name: Confirm the live endpoint serves this version
+        env:
+          TAG: ${{ github.ref_name }}
+        # The end-to-end proof, and the only step that exercises the URL the
+        # apps actually poll: `releases/latest/download/…` is a GitHub redirect
+        # resolved at request time, so nothing before the flip can test it. The
+        # retry is for that redirect catching up, which is not instant.
+        run: |
+          set -uo pipefail
+          version="${TAG#v}"
+          fail=0
+          for manifest in latest.json hub-latest.json; do
+            url="https://github.com/$UPDATES_REPO/releases/latest/download/$manifest"
+            got=""
+            for attempt in 1 2 3 4 5 6; do
+              got="$(curl -fsSL "$url" 2>/dev/null | jq -r '.version' 2>/dev/null || true)"
+              [ "$got" = "$version" ] && break
+              echo "attempt $attempt: $manifest serves '${got:-<nothing>}', want $version — retrying in 5s"
+              sleep 5
+            done
+            if [ "$got" = "$version" ]; then
+              echo "✓ $url serves $version"
+            else
+              echo "::error::$url serves '${got:-<nothing>}', expected $version. The release is published and its installers are fine, but the update channel did not switch over — check the MP-Updates release is published, not a prerelease, and is marked latest."
+              fail=1
+            fi
+          done
+          exit "$fail"

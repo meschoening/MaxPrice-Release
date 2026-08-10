@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "popout",
+  "description": "PLUGIN permissions for the tray popout (ADR-0050): core:default and nothing else — never process/updater/autostart. This list does NOT gate the app's own #[tauri::command]s: tauri only ACL-screens those when the app ships an app-level ACL manifest, which this crate deliberately does not, so at a local origin every command is reachable from every window. The seven the popout actually invokes are set_tray_tooltip, open_main_window, quit_app, hide_popout, get_hub_url, get_operator_token (via hubFetch) and check_firewall (via useFirewallCheck); the remaining two are never invoked from here — fix_firewall must never raise UAC from here and is refused by a window-label guard in lib.rs rather than by this file, and autostart_status is a read-only registry read that needs no guard.",
+  "windows": ["popout"],
+  "permissions": ["core:default"]
+}
