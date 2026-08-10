@@ -242,12 +242,17 @@ jobs:
       # argument.
       matrix:
         include:
-          # macOS — a single universal binary; the sidecar must be compiled for
-          # BOTH darwin triples so Tauri can lipo them. `app` is bundled as well
-          # as `dmg` because the .app.tar.gz updater bundle is derived from it.
+          # macOS — a single universal binary. Tauri lipos its OWN binary for
+          # this target but NOT externalBin sidecars: it looks for exactly one
+          # `binaries/maxprice-sidecar-universal-apple-darwin` and fails bundling
+          # if it is absent (tauri-apps/tauri#3355, unchanged in v2). Handing it
+          # the two arch-suffixed sidecars instead is what broke v0.4.0's first
+          # run, so `darwin-universal` compiles both slices AND lipos them.
+          # `app` is bundled as well as `dmg` because the .app.tar.gz updater
+          # bundle is derived from it.
           - platform: macos-latest
             args: "--target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.updater.conf.json -- --locked"
-            sidecar-targets: "darwin-arm64 darwin-x64"
+            sidecar-targets: "darwin-universal"
           - platform: ubuntu-latest
             args: "--bundles deb -- --locked"
             sidecar-targets: "linux-x64"
@@ -313,6 +318,48 @@ jobs:
         # fall back to the host target only.
         shell: bash
         run: bun run build:binaries $SIDECAR_TARGETS
+
+      # The fused sidecar is the one artifact whose correctness NOTHING
+      # downstream would notice. Bundling only checks that the file exists;
+      # codesign, spctl and Apple's notary service all pass on a Bun binary
+      # whose embedded payload no longer resolves (the same blindness that made
+      # the pre-1.3.14 Intel bug ship green). So run it and wait for the ADR-0002
+      # handshake — if lipo ever mangles Bun's Mach-O payload, this goes red here
+      # instead of shipping a macOS app whose sidecar dies on every launch.
+      #
+      # Covers the arm64 slice only: the runner is macos-*-arm64 and Rosetta is
+      # not guaranteed on it, so the x86_64 slice is verified structurally
+      # (build:binaries asserts `lipo -archs`) but never executed. That is the
+      # same coverage the local pipeline's cross-built Intel .dmg has always had.
+      - name: Smoke the fused universal sidecar (macOS)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="apps/desktop/src-tauri/binaries/maxprice-sidecar-universal-apple-darwin"
+          lipo -info "$bin"
+
+          log="$RUNNER_TEMP/sidecar-smoke.log"
+          : > "$log"
+          "$bin" > "$log" 2>&1 &
+          pid=$!
+          # It prints LISTENING before the corpus scan, so this settles in ~1s;
+          # the ceiling only has to outlast a cold runner.
+          for _ in $(seq 1 30); do
+            grep -q '^LISTENING [0-9]' "$log" && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+
+          echo "--- sidecar output ---"
+          cat "$log"
+          echo "----------------------"
+          if ! grep -q '^LISTENING [0-9]' "$log"; then
+            echo "::error::The fused universal sidecar never printed its LISTENING handshake. lipo produced a binary whose embedded Bun payload no longer resolves — every macOS install would come up with a dead sidecar. Refusing to build a release around it."
+            exit 1
+          fi
 
       - name: Build, sign, and upload (tauri-action)
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
