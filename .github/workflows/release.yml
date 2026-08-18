@@ -450,6 +450,16 @@ jobs:
         # release and legs run in parallel, so this lists all assets and touches
         # only the ones matching its own glob AND suffix. An asset already
         # renamed no longer matches.
+        #
+        # The `gh api` endpoints below carry NO leading slash, and must not
+        # grow one back. `shell: bash` on windows-latest is Git Bash, whose
+        # MSYS argument conversion rewrites any argument that looks like an
+        # absolute POSIX path into a Windows one: "/repos/..." reaches gh as
+        # "C:/Program Files/Git/repos/...", which gh rejects as an invalid
+        # endpoint. That listed zero assets on both Windows legs of v0.5.0 and
+        # tripped the rename-expect guard below. gh accepts a slashless
+        # endpoint identically on every platform, so this is the whole fix.
+        # (macOS and Linux were unaffected, which is why only Windows failed.)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
@@ -474,11 +484,11 @@ jobs:
             new="${base%"$FROM"}${TO}${sig}"
             echo "renaming $name -> $new"
             gh api --method PATCH \
-              "/repos/$GITHUB_REPOSITORY/releases/assets/$id" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$id" \
               -f "name=$new" --jq '.name'
             renamed=$((renamed + 1))
           done < <(gh api --paginate \
-            "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
             --jq '.[] | "\(.id)\t\(.name)"')
           if [ "$renamed" -ne "$EXPECT" ]; then
             echo "::error::Renamed $renamed asset(s) matching '$GLOB' with suffix '$FROM', expected $EXPECT. Tauri's bundle naming has changed, or a bundle failed to upload. Refusing to publish a half-renamed asset set — for the Windows legs that would mean an installer and its .sig disagreeing, which puts a dead URL in the update manifest."
@@ -646,11 +656,11 @@ jobs:
             new="${base%"$FROM"}${TO}${sig}"
             echo "renaming $name -> $new"
             gh api --method PATCH \
-              "/repos/$GITHUB_REPOSITORY/releases/assets/$id" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$id" \
               -f "name=$new" --jq '.name'
             renamed=$((renamed + 1))
           done < <(gh api --paginate \
-            "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
             --jq '.[] | "\(.id)\t\(.name)"')
           if [ "$renamed" -ne "$EXPECT" ]; then
             echo "::error::Renamed $renamed asset(s) matching '$GLOB' with suffix '$FROM', expected $EXPECT. Tauri's bundle naming has changed, or a bundle failed to upload. Refusing to publish a half-renamed asset set — for the Windows legs that would mean an installer and its .sig disagreeing, which puts a dead URL in the update manifest."

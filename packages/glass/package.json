@@ -1,6 +1,6 @@
 {
   "name": "@maxprice/glass",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "The Glass design system (ADR-0043): tokens, wash, material recipes, and form primitives shared by the desktop app and the hub console. CSS-only — no TypeScript, no build step.",
   "main": "./index.css",
