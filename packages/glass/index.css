@@ -39,6 +39,14 @@
   --frost-panel: blur(24px);
   --frost-chip: blur(12px);
   --frost-toast: blur(16px);
+  /* the lists' sticky column head — deliberately above every tier above:
+     this is the system's one frost whose backdrop is TEXT rather than the
+     wash, and 13px row type has to dissolve outright for a 10.5px uppercase
+     label to read over it (the chip's 12px only softens letterforms that then
+     still parse). Radius is free (the blur budget's radius sweep: 8→40
+     measured flat on both engines), so it gets spent where legibility needs
+     it. */
+  --frost-head: blur(30px);
 
   /* ink */
   --text: oklch(22% 0.03 280);
@@ -192,6 +200,7 @@
   --frost-panel: none;
   --frost-chip: none;
   --frost-toast: none;
+  --frost-head: none;
 }
 
 :root[data-reduce-transparency][data-theme="dark"] {

@@ -75,6 +75,17 @@ export const settingsSchema = z
     // never reach the engine's `tz-clock` formatter, which is h23-pinned because
     // `localDate` buckets every daily total through it.
     timeFormat: timeFormatSchema.default(hostTimeFormat).catch(hostTimeFormat),
+    // Whether the user has collapsed the sidebar to its 64px icon rail
+    // (map #151 / T11, ADR-0073). Renderer-only, like `timeFormat`: it reaches
+    // no endpoint and no query key.
+    //
+    // This is only ONE HALF of what the sidebar draws. The rule is "collapsed =
+    // the user collapsed it OR the window is too narrow", and the second half is
+    // a container query on `frame` that no field can see — so `false` here means
+    // "the user has not asked for the rail", never "the sidebar is expanded".
+    // Expanding below that threshold is a transient flyout and deliberately does
+    // NOT write this field.
+    sidebarCollapsed: z.boolean().default(false).catch(false),
     // The hub base URL (e.g. "http://my-desktop.tailnet-name.ts.net:47100"),
     // empty = no hub (ADR-0035). The optional hub PASSWORD (ADR-0037)
     // deliberately does not live here — settings.json is plaintext and

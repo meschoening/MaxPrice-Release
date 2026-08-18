@@ -27,6 +27,13 @@ import { cn } from "@/lib/utils";
 // connection lines go soft rather than keep asserting a reading no one has
 // confirmed since it dropped, and the saturation line — whose mere presence IS
 // its assertion — hides outright.
+//
+// T11 (map #151, ADR-0073) made each line a MORPH ROW: a dot plus a clipped
+// label, so the collapsed rail's dot stack and the expanded foot's labelled
+// lines are the SAME THREE NODES rather than two renderings of one state. That
+// is why the collapse re-homes nothing and why everything above this comment
+// runs exactly once, unchanged. Every row keeps its `title`, so a collapsed dot
+// still says what it means on hover.
 export function StatusBar() {
   const connectionState = useLiveStatus((s) => s.connectionState);
   const usageConnection = useLiveStatus((s) => s.usageConnection);
@@ -56,16 +63,16 @@ export function StatusBar() {
   if (!footHasLines(usage, hub, showSaturation)) return null;
 
   return (
-    <div className="mt-auto shrink-0">
-      <div className="sep" aria-hidden />
-      <div className="px-1 flex flex-col gap-2 text-[10.5px] text-soft">
+    <div className="shrink-0">
+      <div className="sep sb-footsep" aria-hidden />
+      <div className="sb-footlines">
         {showSaturation && (
           <span
-            className="inline-flex items-center gap-1.5 text-warn"
+            className="sb-footrow text-warn"
             title="The engine's event loop is saturated — numbers may lag while it catches up."
           >
             <span aria-hidden className="dot warn pulse-anim" />
-            engine catching up
+            <span className="sb-label">engine catching up</span>
           </span>
         )}
         {usage.kind === "expired" ? (
@@ -74,24 +81,20 @@ export function StatusBar() {
           // scoped to the Settings status line (usage-status.ts:56-59). The
           // foot's expired line is amber, matching its own dot; only the dot
           // comes from the shared map.
-          <Link
-            to="/settings"
-            className="inline-flex items-center gap-1.5 text-warn hover:underline"
-            title={usage.title}
-          >
+          <Link to="/settings" className="sb-footrow text-warn" title={usage.title}>
             <span aria-hidden className={cn("dot", usage.variant)} />
-            Session expired
+            <span className="sb-label">Session expired</span>
           </Link>
         ) : usage.kind === "state" ? (
-          <span className="inline-flex items-center gap-1.5" title={usage.title}>
+          <span className="sb-footrow" title={usage.title}>
             <span aria-hidden className={cn("dot", usage.variant)} />
-            claude.ai limits
+            <span className="sb-label">claude.ai limits</span>
           </span>
         ) : null}
         {hub !== null && (
-          <span className="inline-flex items-center gap-1.5" title={hub.title}>
+          <span className="sb-footrow" title={hub.title}>
             <span aria-hidden className={cn("dot", hub.variant)} />
-            Hub
+            <span className="sb-label">Hub</span>
           </span>
         )}
       </div>

@@ -103,6 +103,99 @@ body {
 }
 
 /* ============================================================
+   --- responsive thresholds ---  (map #151 / T1 #152)
+
+   THE SOURCE OF TRUTH for every arrangement rule in this file.
+   `@container` conditions cannot take var() — same limitation as
+   @media — so the two boundaries below are repeated as literals at
+   every use site. Every one of them cites this block; if a number
+   moves, grep for the literal, not for a custom property.
+
+   Three arrangements, measured on the `content` container:
+
+     narrow   content < 800px
+     medium   800px <= content < 1520px
+     wide     content >= 1520px         (unbounded — see below)
+
+   Three containers, each existing for a reason the others cannot
+   serve:
+
+     frame     the app frame, viewport - 32. Queried ONLY by the
+               sidebar: the sidebar decides the split, so it cannot
+               query the content column it sizes without a cycle.
+     content   the main column (topbar + <main>), viewport - 304
+               with the sidebar expanded, viewport - 116 collapsed.
+               Page ARRANGEMENT queries this.
+               Deliberately NOT on <main> itself: <main> is the
+               scroll container and .thin-scroll is a classic
+               (layout-consuming) scrollbar on Chromium/WebView2 but
+               an overlay one on WKWebView, so a container there
+               would measure ~11px narrower on Windows only, and
+               could oscillate across a boundary as the scrollbar
+               appears and leaves.
+     tile      `.tiles`, the ROW — deliberately NOT `.tile`. T1
+               declared it on the tile itself and T6 (#158) measured
+               that this cannot work: a container query styles its
+               container's DESCENDANTS, never the container, and the
+               tiles' large state IS the tile's own flex-direction
+               (a 613px tile still computed `column`). So each tile
+               queries its row. The one COMPONENT container so far;
+               others earn one by proving a state exists — a
+               container with no @container rule is dead weight.
+
+   The sidebar collapse is the FIRST BOUNDARY expressed in frame
+   space: it collapses to an icon rail below `frame: 1072px`
+   (= 800 content + 252 sidebar + 20 gap; ~1104 viewport). Placed
+   there so medium sits on BOTH sides of it — the arrangement never
+   flips when the sidebar does. Consequence: a narrow window always
+   wears the collapsed rail, so narrow's real range is 640-800
+   content, not the 452-656 the map's bench table shows.
+
+   Where the four benches land (viewport -> content):
+     756->640 narrow    864->748 narrow    960->844 medium
+     1280->976 medium   1512->1208 medium  1728->1424 medium
+     1920->1616 wide    2560->2256 wide
+
+   One COMPONENT threshold exists beside the two boundaries, and it
+   is not derived from them:
+
+     1021     `.tiles` breaks from 3-up to `duo` below this content
+              width. It is the SUM OF THE THREE TILES' MEASURED
+              FLOORS plus the gaps plus margin (T2 #153) — see the
+              derivation at `.tiles` itself. It is a component's
+              floor, so it moves when the tiles' copy moves — and
+              when the worst case those floors are priced against
+              moves, which is what took it from #161's 1056 — and
+              the arrangement boundaries do not move with it.
+
+   ACCEPTANCE (T1's, as amended by what T2 measured): at viewport
+   1280 (content 976) `.tiles` must NOT draw 3-up. T1 wrote that as
+   "a SINGLE track"; the shipped answer is two — Today | This week
+   over a spanning Active block — which breaks the letter of the
+   condition and keeps its intent. 3-up at a cramped 1280 is the
+   reported "hierarchy doesn't hold" bug, and that is what the
+   check exists to forbid.
+
+   Above 2560 is UNBENCHED, not designed-against: wide is unbounded
+   on purpose (a ceiling would re-litigate the frame cap this map
+   removed). If an ultrawide ever matters the answer is a fourth
+   band, not a cap.
+
+   The vocabulary is CSS-only. The list tables are exempt — they
+   keep fr-above-minWidth with horizontal scroll at every width,
+   because their columns are TypeScript objects and no @container
+   rule can reach them.
+   ============================================================ */
+.app-frame {
+  container-type: inline-size;
+  container-name: frame;
+}
+.app-content {
+  container-type: inline-size;
+  container-name: content;
+}
+
+/* ============================================================
    M2 — chrome + Live page recipes (glass.html, NOTES §Option C).
    Page-level styling only; the material itself (.panel/.chip/.seg/
    .menu/.opt/.toggle/.eyebrow/.pulse/.logo) lives in @maxprice/glass.
@@ -114,11 +207,229 @@ body {
   scrollbar-color: color-mix(in oklch, var(--text) 20%, transparent) transparent;
 }
 
-/* --- detached frosted sidebar --- */
+/* ============================================================
+   --- detached frosted sidebar ---
+
+   ONE PANEL AT TWO WIDTHS (map #151 / T11 #162, ADR-0073). 252
+   collapses to a 64px icon rail; the collapsed rail and the
+   expanded sidebar are the SAME NODES, so nothing is re-homed and
+   the status foot's rules (foot-status.ts) run once.
+
+   THE STATE, and why it is expressed as custom properties:
+
+     collapsed = the user collapsed it OR the window is too narrow
+
+   Two triggers — `@container frame (max-width: 1071px)` for the
+   window's half and `[data-collapsed]` from settings.json for the
+   user's — and neither can see the other. Written per element that
+   morphs, every one of the dozen rules below would need four
+   selector variants. So the two triggers instead set ONE VAR SET on
+   `.sidebar` and every rule downstream reads it. The collapsed set
+   is therefore written twice, and only twice; keep the two blocks
+   identical.
+
+   The two triggers PARTITION the frame axis — trigger 2 is guarded
+   by the complement of trigger 1's query — so exactly one of them
+   can ever match. That is what lets trigger 2 do without
+   `:not(.open)`; the reason it must is in its own comment.
+
+   `:not(.open)` is what lets the EXPANDED set live in trigger 1's
+   base rule alone: the flyout does not override the collapsed
+   values, it stops them matching. `--sb-slot` is the one var
+   outside that guard — the slot stays 64px while the flyout is
+   open, which is what makes expanding an OVERLAY rather than a push
+   (T1: pushing would put narrow back at 452 content).
+
+   1071 = the T1 collapse boundary, `frame < 1072px`, and 1071.02 is
+   its complement. See "responsive thresholds" above; both are
+   repeated literals, declared as SIDEBAR_RAIL_MAX_FRAME and
+   SIDEBAR_RAIL_MIN_FRAME_QUERY in lib/arrangement.ts and pinned
+   there by arrangement.test.ts.
+   ============================================================ */
+
+/* The slot: the width the LAYOUT sees. Expanded is the base state. */
+.sidebar {
+  --sb-slot: 252px;
+  --sb-panel: 252px;
+  --sb-pad: 18px 16px;
+  --sb-overflow: auto;
+  --sb-label-max: 180px;
+  --sb-label-op: 1;
+  --sb-label-gap: 10px;
+  /* The label fades in a beat BEHIND the widening edge, and leaves
+     immediately on the way back — a label still fading while the panel
+     narrows gets clipped mid-word. */
+  --sb-label-delay: 0s, 0.09s, 0s;
+  /* The expanded position is a true centring, not a measured offset: the
+     pulse used to be `margin-left: auto` in an `align-items: center` row,
+     and a px top would pin it to one platform's line box. */
+  --sb-pulse-top: 50%;
+  --sb-pulse-shift: -50%;
+  --sb-pulse-right: 12px;
+  --sb-sep-m: 12px 2px;
+  --sb-door-op: 0;
+  --sb-door-h: 0px;
+  /* `visibility` is what actually removes a hidden surface from the tab
+     order, and it is discrete — so each one hides only AFTER its fade and
+     reappears immediately, via a per-state delay. */
+  --sb-door-vis: hidden;
+  --sb-door-vis-delay: 0.14s;
+  --sb-fields-max: 560px;
+  --sb-fields-op: 1;
+  --sb-fields-op-delay: 0.08s;
+  --sb-fields-vis: visible;
+  --sb-fields-vis-delay: 0s;
+  --sb-footsep-op: 1;
+  --sb-foot-pl: 4px;
+  --sb-foot-gap: 6px;
+  /* The toggle joins the status lines expanded and re-becomes an icon box
+     collapsed — see `.sb-toggle`. 4px puts its icon on the dots' column. */
+  --sb-toggle-pl: 4px;
+  --sb-toggle-pv: 5px;
+  --sb-persist: flex;
+  --sb-flyout: none;
+
+  position: relative;
+  width: var(--sb-slot);
+  flex-shrink: 0;
+  transition: width 0.24s var(--ease-glass);
+}
+
+/* COLLAPSED, trigger 1: the window is too narrow to hold 252px. */
+@container frame (max-width: 1071px) {
+  .sidebar {
+    --sb-slot: 64px;
+    /* The affordance swap: below the threshold the only honest click is
+       the transient flyout, because a durable "expanded" is a state this
+       width could not honour. */
+    --sb-persist: none;
+    --sb-flyout: flex;
+  }
+  .sidebar:not(.open) {
+    --sb-panel: 64px;
+    --sb-pad: 16px 12px 14px;
+    --sb-overflow: hidden;
+    --sb-label-max: 0px;
+    --sb-label-op: 0;
+    --sb-label-gap: 0px;
+    --sb-label-delay: 0s;
+    --sb-pulse-top: 7px;
+    --sb-pulse-shift: 0;
+    --sb-pulse-right: 7px;
+    --sb-sep-m: 10px 4px;
+    --sb-door-op: 1;
+    --sb-door-h: 40px;
+    --sb-door-vis: visible;
+    --sb-door-vis-delay: 0s;
+    --sb-fields-max: 0px;
+    --sb-fields-op: 0;
+    --sb-fields-op-delay: 0s;
+    --sb-fields-vis: hidden;
+    --sb-fields-vis-delay: 0.14s;
+    --sb-footsep-op: 0;
+    --sb-foot-pl: 16.5px;
+    --sb-foot-gap: 0px;
+    --sb-toggle-pl: 12px;
+    --sb-toggle-pv: 7.5px;
+  }
+}
+/* COLLAPSED, trigger 2: the user asked for the rail, at a width that could
+   have held the sidebar. Identical to the block above by construction — an
+   attribute selector cannot be joined to a container query — with ONE
+   deliberate omission: it does not swap the affordance. A user collapse at a
+   width that could hold the sidebar must keep the DURABLE toggle, because
+   that toggle is the way back.
+
+   IT IS GUARDED BY THE COMPLEMENT of trigger 1's query, and that is what lets
+   it drop `:not(.open)`. Below the threshold trigger 1 already emits this
+   exact set (plus the affordance swap), so this block has nothing to add
+   there; above it, the flyout button — the ONLY writer of `.open` — is
+   `display: none` (`--sb-flyout: none`), so an `.open` still hanging on from a
+   narrower window can only be STALE. React never clears it on resize: the
+   flyout is dismissed on Esc, outside-mousedown, route change, nav click and
+   the persist toggle, and none of those fire when the window merely widens.
+   Honouring that stale class here left `--sb-panel: 252px` inside a 64px slot
+   — a full panel floating over the rail, with the durable toggle underneath
+   it still offering to "Expand sidebar".
+
+   The +0.02 step, not +1: the two queries must leave no width between them,
+   and a fractional-DPI Windows frame can be 1071.33. See
+   SIDEBAR_RAIL_MIN_FRAME_QUERY in lib/arrangement.ts. The declarations below
+   are one rule rather than trigger 1's two only because there is no `.open`
+   to hold `--sb-slot` out of; the LIST is still line-for-line identical. */
+@container frame (min-width: 1071.02px) {
+  .sidebar[data-collapsed] {
+    --sb-slot: 64px;
+    --sb-panel: 64px;
+    --sb-pad: 16px 12px 14px;
+    --sb-overflow: hidden;
+    --sb-label-max: 0px;
+    --sb-label-op: 0;
+    --sb-label-gap: 0px;
+    --sb-label-delay: 0s;
+    --sb-pulse-top: 7px;
+    --sb-pulse-shift: 0;
+    --sb-pulse-right: 7px;
+    --sb-sep-m: 10px 4px;
+    --sb-door-op: 1;
+    --sb-door-h: 40px;
+    --sb-door-vis: visible;
+    --sb-door-vis-delay: 0s;
+    --sb-fields-max: 0px;
+    --sb-fields-op: 0;
+    --sb-fields-op-delay: 0s;
+    --sb-fields-vis: hidden;
+    --sb-fields-vis-delay: 0.14s;
+    --sb-footsep-op: 0;
+    --sb-foot-pl: 16.5px;
+    --sb-foot-gap: 0px;
+    --sb-toggle-pl: 12px;
+    --sb-toggle-pv: 7.5px;
+  }
+}
+
+/* The panel: absolute in the slot, so its width and the layout's are
+   free to disagree — which is exactly what the flyout is. */
+.sidebar-panel {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--sb-panel);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  padding: var(--sb-pad);
+  overflow-x: hidden;
+  overflow-y: var(--sb-overflow);
+  transition:
+    width 0.24s var(--ease-glass),
+    padding 0.24s var(--ease-glass);
+}
+
+/* Every word the rail hides. Zero-width and transparent collapsed; it
+   stays in the tree, so a collapsed nav icon keeps its accessible name. */
+.sb-label {
+  max-width: var(--sb-label-max);
+  opacity: var(--sb-label-op);
+  margin-left: var(--sb-label-gap);
+  overflow: hidden;
+  white-space: nowrap;
+  transition:
+    max-width 0.24s var(--ease-glass),
+    opacity 0.1s ease,
+    margin-left 0.24s var(--ease-glass);
+  transition-delay: var(--sb-label-delay);
+}
+
+/* The identity row is the one thing that does NOT morph: the 32px orb
+   already centres in the collapsed panel's 40px content box under the same
+   4px padding it wears expanded, so it holds still while the wordmark
+   grows out beside it. */
 .identity {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-shrink: 0;
   padding: 2px 4px;
 }
 .wordmark {
@@ -139,11 +450,17 @@ body {
   flex-direction: column;
   gap: 3px;
   margin: 16px 0 4px;
+  flex-shrink: 0;
 }
+/* The pill's own 12px horizontal padding centres a 16px icon inside the
+   collapsed panel's 40px content box for free, so the ICONS NEVER MOVE
+   during the morph — only the pill grows around them. The 10px gap moved
+   onto the label as a margin, because a `gap` cannot animate to nothing
+   without leaving a hole where the label was. */
 .nav a {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 10px;
   padding: 7.5px 12px;
   border-radius: 999px;
   font-size: 13px;
@@ -168,14 +485,210 @@ body {
   background: color-mix(in oklch, var(--accent) 25%, transparent);
   box-shadow: var(--panel-inner);
 }
+/* The pulse travels: the icon's corner collapsed, the pill's right edge
+   expanded. It was `margin-left: auto`, which cannot travel — an auto
+   margin against a zero-width label snaps rather than slides. */
 .nav .pulse {
-  margin-left: auto;
+  position: absolute;
+  top: var(--sb-pulse-top);
+  right: var(--sb-pulse-right);
+  transform: translateY(var(--sb-pulse-shift));
+  transition:
+    top 0.24s var(--ease-glass),
+    right 0.24s var(--ease-glass),
+    transform 0.24s var(--ease-glass);
 }
+/* One element, two readings: a 32px rule over the filter door collapsed
+   (the panel's 40px content box less 4px each side), the sidebar's
+   full-width separator expanded. The width follows the panel's content
+   box for free; the margins carry it. The fallback is the expanded value,
+   for any `.sep` outside the sidebar. */
 .sep {
   height: 1px;
   background: var(--hairline);
-  margin: 12px 2px;
+  margin: var(--sb-sep-m, 12px 2px);
   flex-shrink: 0;
+  transition: margin 0.24s var(--ease-glass);
+}
+
+/* --- the collapsed rail's own surfaces --- */
+
+/* The filter door. It dissolves under the hairline as the fields take its
+   place; `visibility` and not just `opacity`/`height`, because an
+   invisible-but-tabbable control is a trap. */
+.sb-door {
+  position: relative;
+  /* Stretch, not a 40px box: the collapsed panel's content box is not
+     exactly 40px at every device scale, and a fixed width would centre the
+     door half a pixel off the nav pills above it. */
+  align-self: stretch;
+  height: var(--sb-door-h);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  overflow: hidden;
+  flex-shrink: 0;
+  opacity: var(--sb-door-op);
+  visibility: var(--sb-door-vis);
+  color: var(--soft);
+  transition:
+    opacity 0.12s ease,
+    height 0.24s var(--ease-glass),
+    visibility 0s linear var(--sb-door-vis-delay),
+    color 0.15s,
+    background-color 0.15s;
+}
+.sb-door svg {
+  width: 16px;
+  height: 16px;
+}
+.sb-door:hover,
+.sb-door[data-state="open"] {
+  color: var(--text);
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+}
+/* How many axes are narrowed — the one thing a closed door cannot say. */
+.sb-badge {
+  position: absolute;
+  top: 4px;
+  right: 3px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 15px;
+  text-align: center;
+  color: var(--text);
+  background: color-mix(in oklch, var(--accent) 60%, transparent);
+}
+/* The door's leaf is FilterRail verbatim at roughly its native width. */
+.filter-leaf {
+  width: 260px;
+  padding: 14px 14px 2px;
+}
+
+/* The fields. 560px is the animation's endpoint and therefore also a
+   ceiling: the rail measures ~300px with all three selects present. */
+.sb-fields {
+  max-height: var(--sb-fields-max);
+  opacity: var(--sb-fields-op);
+  visibility: var(--sb-fields-vis);
+  overflow: hidden;
+  flex-shrink: 0;
+  transition:
+    max-height 0.26s var(--ease-glass),
+    opacity 0.12s ease var(--sb-fields-op-delay),
+    visibility 0s linear var(--sb-fields-vis-delay);
+}
+
+/* --- the foot: status lines, then the collapse toggle --- */
+.sb-foot {
+  margin-top: auto;
+  flex-shrink: 0;
+}
+.sb-footsep {
+  opacity: var(--sb-footsep-op);
+  transition:
+    margin 0.24s var(--ease-glass),
+    opacity 0.16s ease;
+}
+.sb-footlines {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 2px;
+}
+/* A status line and a rail dot are the same node. Padding-left centres the
+   7px dot in the collapsed 40px box, then travels in. */
+.sb-footrow {
+  display: flex;
+  align-items: center;
+  font-size: 10.5px;
+  color: var(--soft);
+  padding-left: var(--sb-foot-pl);
+  transition: padding-left 0.24s var(--ease-glass);
+}
+/* The amber lines have to say their colour a second time. `.sb-footrow` sets
+   `color`, and this whole file is UNLAYERED, so it outranks the layered
+   `text-warn` utility no matter how specific that utility is — the same
+   cascade fact `.tl-row`'s wide grid-template cites ("Unlayered, so it
+   outranks the utility"). Without this the saturation and Session-expired rows
+   drew grey words beside an amber dot. Dropping the base `color` instead is
+   NOT the fix: `.sb-footlines` sets none, so the two calm rows (claude.ai
+   limits, Hub) would then inherit full-strength `--text` and shout. */
+.sb-footrow.text-warn {
+  color: var(--warn);
+}
+.sb-footrow .sb-label {
+  margin-left: var(--sb-foot-gap);
+}
+a.sb-footrow:hover .sb-label {
+  text-decoration: underline;
+}
+
+/* The two collapse toggles. Exactly one is ever displayed: the durable one
+   above the collapse threshold, the transient flyout below it (see the state
+   header).
+
+   IT IS A LINE EXPANDED AND AN ICON BOX COLLAPSED. Expanded, the toggle is the
+   foot's fourth LINE: `--sb-toggle-pl` 4px puts its icon on the status dots'
+   left column, which is the whole point — the dots sat at 20 (16 --sb-pad + 4
+   --sb-foot-pl) and this icon at 28 (16 + a 12px pill pad), and those were the
+   panel's last two rows disagreeing with nothing between them to explain it.
+   Collapsed it goes back to 12px and is an icon box again, because 12px is what
+   centres a 16px icon in the 64px rail's 40px content box (the same number that
+   keeps every OTHER icon still through the morph).
+
+   THE HOVER FILL IS GONE IN BOTH STATES. It could not survive the 4px — a 999px
+   pill hugging its icon on the left and running 12px past its label on the right
+   reads as a mistake rather than a choice — and once expanded had lost it, the
+   rail kept it for one release and read as a different control at the two widths.
+   So hover is now the colour lift alone, plus the underline the foot's own link
+   row uses. Collapsed there is no word for that underline to draw on (the label
+   is zero-width there, by design), which leaves the lift carrying it unaided:
+   accepted, and the reason this is the ONE icon in the rail without a wash — the
+   pills and the door above it are navigation, this is the panel's own control.
+   `border-radius` stays for the focus ring, which is the global
+   `:focus-visible` outline and never depended on the fill.
+
+   The dot and the icon still differ by 9px of WIDTH, so their labels cannot
+   also line up (46.67 vs the foot's 33.67 — see the prototype commit for the
+   four other answers to that). Alignment here is of glyph edges, deliberately. */
+.sb-toggle {
+  display: var(--sb-persist);
+  align-items: center;
+  margin-top: 8px;
+  padding: var(--sb-toggle-pv) 12px var(--sb-toggle-pv) var(--sb-toggle-pl);
+  border-radius: 999px;
+  /* The foot's size, not the nav's: it reads as one block of four lines. */
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--soft);
+  flex-shrink: 0;
+  transition:
+    color 0.15s,
+    padding 0.24s var(--ease-glass);
+}
+.sb-toggle-flyout {
+  display: var(--sb-flyout);
+}
+/* 16px, like .nav a svg — so the collapsed column reads as ONE stack of
+   centred icons. Expanded it is the widest glyph in the foot AND the one that
+   moves: 20 is the foot's own column, and three status rows do not shift to
+   meet one control. */
+.sb-toggle svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+.sb-toggle:hover {
+  color: var(--text);
+}
+.sb-toggle:hover .sb-label {
+  text-decoration: underline;
 }
 .field {
   margin-bottom: 15px;
@@ -291,11 +804,102 @@ body {
   flex-wrap: wrap;
 }
 
-/* --- floating stat tiles --- */
+/* --- floating stat tiles ---
+
+   TWO arrangements (map #151 / T2 #153, ADR-0073):
+
+     duo    Today | This week on row 1, Active block spanning row 2
+     3-up   Today | Active block | This week, at 1 : 1.62 : 1
+
+   The stat tiles get NO new state for this. The row simply stops handing
+   a tile more width than its column composition wants — the shipped tile
+   was already correct at every width, and 3-up at 1280 was the row's
+   fault, not the tile's.
+
+   WHERE 1021 COMES FROM. Every ROW of every tile was cloned in place at
+   `width: max-content` — the width at which nothing wraps — carrying
+   worst-case realistic strings ($999.99 values, 999.9M token counts,
+   4-digit deltas with a reference figure, AM/PM window chips and reset
+   times, both limit rows at 100%):
+
+     Today        235.7   bound by its DELTA CHIP, not its figure
+     This week    284.4   bound by the whole limit ROW, not the bar
+     Active block 445.6   ring 100 + gap 20 + value row 283.6
+
+   each + 42px of tile chrome (1px border + 20px padding either side;
+   `box-sizing: border-box`, so the border comes out of the track too —
+   built with 40 first and both binding rows landed ~1.5px short, which
+   is exactly the tell). 967 + two 18px gaps = 1003, and `.tiles` is up
+   to 10px narrower than the content box (`.thin-scroll` on <main> is a
+   layout-consuming scrollbar on Chromium/WebView2), so the threshold is
+   1021 — the floor with 8px of margin, verified by bisection.
+
+   WHERE THE ACTIVE BLOCK'S BOUND CAME DOWN. #161 shipped it at 480.8,
+   reserving for a `$12345.67` five-hour block — around 800M output tokens,
+   which is not a number this product can actually produce. The reserve is
+   real (every one of those 35px is consumed at the bound, so it is not
+   padding to be trimmed) but it was priced against an impossible worst
+   case, and the cost was paid at every width: with a realistic block the
+   tile sat 50px wider than its content and 3-up was withheld until 1360px
+   of window. The bound is now `$999.99` at `999.9M` tokens and 100% —
+   still generous for five hours — measured the same way, at 445.6.
+
+   `.num` is `tabular-nums`, so the tile cannot resize as figures tick;
+   only a change in DIGIT COUNT moves this, which is what makes pricing
+   the reserve by magnitude meaningful rather than a snapshot of one
+   moment's data. Past the bound the tile degrades rather than overflows:
+   the value row breaks off its meta and the foot wraps, both of which the
+   composition already does correctly (`flex-wrap` + `text-align: center`).
+
+   NOT taken, on purpose: `.tile`'s 20px side padding. Trimming it to 14
+   would buy another 36px of threshold, but 20 is the shared card padding
+   (`.chart-card`, `.rail-card`), and a tile that hugs tighter than the
+   chart directly below it on the same page reads as a mistake.
+
+   The floors are what make the tracks a shrink-priority engine with no
+   logic written anywhere: grid freezes a track whose proportional share
+   would fall under its base and re-splits the rest, so the Active block
+   freezes first, then This week, and Today absorbs the whole remaining
+   shortfall alone. The 1 : 1.62 : 1 ratio therefore governs only the
+   SLACK above the floors — it is a taste decision again, not the thing
+   that sets the threshold. */
 .tiles {
   display: grid;
-  grid-template-columns: 1fr 1.62fr 1fr;
+  /* duo. `minmax(0, 1fr)` rather than a bare `1fr` (= minmax(auto, 1fr)):
+     the auto floor is the tile's min-content, and the tile is no longer a
+     query container (below), so nothing contains that contribution away
+     any more. Writing the floor down is what keeps a too-narrow window
+     overflowing INSIDE a tile instead of blowing the row out. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-areas:
+    "today week"
+    "block block";
   gap: 18px;
+  /* The one component container (see "responsive thresholds" above). It is
+     the ROW, not the tile: a container query styles its container's
+     descendants, never the container itself, so a tile cannot query its
+     own width to flip its own flex-direction (T6 #158, measured). */
+  container-type: inline-size;
+  container-name: tile;
+}
+/* Placed by position, which is the same authority the areas below rely on.
+   NOT `.block-tile`: the Active block drops that class in its empty-inset
+   state and would fall out of its own cell. */
+.tiles > :nth-child(1) {
+  grid-area: today;
+}
+.tiles > :nth-child(2) {
+  grid-area: block;
+}
+.tiles > :nth-child(3) {
+  grid-area: week;
+}
+/* 3-up. See "responsive thresholds" and the derivation above for 1021. */
+@container content (min-width: 1021px) {
+  .tiles {
+    grid-template-columns: minmax(236px, 1fr) minmax(446px, 1.62fr) minmax(285px, 1fr);
+    grid-template-areas: "today block week";
+  }
 }
 .tile {
   padding: 17px 20px 16px;
@@ -336,16 +940,150 @@ body {
   background: color-mix(in oklch, var(--text) 6%, transparent);
 }
 
-/* active block tile */
+/* The two stat tiles' delta chips share one baseline (map #151 / T2 #153).
+   Today has four rows and This week has five (the weekly limit row), so
+   stacking from the top left two chips of the same kind, read across, on
+   different vertical levels. `margin-top: auto` eats the leftover space
+   above the chip instead of leaving it below, and the tiles share a grid
+   row, so both chips land on the row's bottom edge and therefore on each
+   other.
+
+   The 10px gap moves onto whatever PRECEDES the chip rather than staying
+   on the chip, because an auto margin replaces it: left on the chip, the
+   tile with no slack (This week — the taller one, which sets the row
+   height) would resolve auto to 0 and pull its chip 10px tighter than it
+   ships. Carried by the sibling it survives as a floor in both tiles.
+
+   Selected by position rather than `:not(.block-tile)` for the reason
+   given at `.tiles` — the Active block's empty-inset state drops the
+   class. Neither rule can match it anyway (it has no `.delta`); the
+   positional form is used throughout so "the two stat tiles" reads the
+   same everywhere. */
+.tiles > :nth-child(1) > .delta,
+.tiles > :nth-child(3) > .delta {
+  margin-top: auto;
+}
+.tiles > :nth-child(1) > *:has(+ .delta),
+.tiles > :nth-child(3) > *:has(+ .delta) {
+  margin-bottom: 10px;
+}
+
+/* --- the stat tiles' LARGE state (map #151 / T6 #158, ADR-0073) ---
+
+   At content 2256 a 3-up stat tile is 613px holding ~160px of ink; at
+   1616 it is ~390px, still wider than the stack needs. So at wide the
+   column becomes one line and the void inside the tile fills with ink —
+   "data takes the space", which at this end means "wide adds ink".
+
+   The threshold is wide's own boundary (1520) read in ROW space, and
+   that is not laziness: a tile-space number is not available, because
+   the tile-space reading is INVERTED. A duo tile is (row - 18)/2, which
+   at the top of duo is ~514px — wider than a 3-up tile at 1616. Any
+   threshold on the tile's own width would therefore flip the tall duo
+   tiles horizontal before it ever reached the wide 3-up ones it exists
+   for. So the honest statement is that this state belongs to the wide
+   ARRANGEMENT, and the row is where an arrangement is legible.
+
+   The row is 0-10px narrower than `content` (the scrollbar, see the
+   thresholds block), so the flip can trail content: 1520 by up to 10px —
+   three px of tile width, deliberately not corrected with a second
+   literal.
+
+   The Active block is EXCLUDED: T2 locked it to one state, and it is
+   already a row. */
+@container tile (min-width: 1520px) {
+  .tiles > :nth-child(1),
+  .tiles > :nth-child(3) {
+    flex-direction: row;
+    align-items: baseline;
+    gap: 26px;
+    /* `flex-wrap` is not about wrapping — it is what makes `align-content`
+       apply, and align-content is the only way to centre a single flex LINE
+       while keeping `align-items: baseline` inside it. Without it the line
+       pins to the top of a 134px box (the Active block's ring sets the row
+       height) and the horizontal void is simply traded for a vertical one. */
+    flex-wrap: wrap;
+    align-content: center;
+  }
+  .tiles > :nth-child(1) > .value,
+  .tiles > :nth-child(3) > .value {
+    margin: 0;
+  }
+  /* Undo the shared-baseline pair above: in a row-direction line an auto top
+     margin bottom-aligns the item and breaks the baseline it was written to
+     protect, and the sibling's 10px is a gap below the line. */
+  .tiles > :nth-child(1) > *:has(+ .delta),
+  .tiles > :nth-child(3) > *:has(+ .delta) {
+    margin-bottom: 0;
+  }
+  .tiles > :nth-child(1) > .delta,
+  .tiles > :nth-child(3) > .delta {
+    align-self: center;
+    margin-top: 0;
+    margin-left: auto;
+  }
+  .tiles > :nth-child(1) > .limit-row,
+  .tiles > :nth-child(3) > .limit-row {
+    flex: 1;
+    margin-top: 0;
+    margin-left: auto;
+  }
+}
+
+/* active block tile — ONE state at every width (map #151 / T2 #153):
+   the ring is attached to the left of the text and the pair centres as
+   one lockup. Nothing centred before this; the ring sat flush left with
+   `.block-body { flex: 1 }` filling the rest, which is the complaint the
+   map was opened with. The alternative reading — the body centred in the
+   whole tile with the ring hanging into the empty half on a `cqw` ramp —
+   is built and measured (commit 9bbd7f6) and left explicitly open in
+   ADR-0073: the tile is centred to 0.1px and STILL reads ~60px
+   off-centre, because the ring is a hollow 100px box and the eye weighs
+   ink, not boxes. Taking it is a choice, not a fix. */
 .block-tile {
   flex-direction: row;
   align-items: center;
-  gap: 20px;
+  justify-content: center;
+  /* 25, not the 20 this shipped with: 4.6875px of the old gap was the
+     ring's own dead inset (see `.ring-wrap`), which the negative margin
+     below hands back. 25 keeps the VISIBLE ring-to-text distance where
+     it was. */
+  gap: 25px;
 }
+/* The box is 100px; the ring inside it is 90.625px. `viewBox="0 0 96 96"`
+   with r=40 and a 7 stroke puts the outer edge at 43.5 of a 48 half-view,
+   which scales to 45.3125 in the 100px box — so 4.6875px of every side is
+   dead space.
+
+   `justify-content: center` centres the flex line, and a flex line is made
+   of BOXES, so the lockup was centred to the pixel while its ink was not:
+   the ring's left inset is an outer edge and lands wholly in the left gap,
+   its right inset falls between ring and body where it reads as gap, and
+   the body's own box ends on its widest row's ink. Left gap came out
+   4.6875px wider than right — measured 60.46 / 55.77 at the 481px tile
+   floor #161 shipped with (that floor is now 446, which moves both
+   figures but not the 4.6875 between them: the inset is a property of
+   the ring, not of the track), and visible.
+
+   Negative inline margins make the line measure the INK: the margin box is
+   90.625px, so the line's edges are the circle's edges. Nothing about the
+   drawing moves, `.ring-label { inset: 0 }` still centres on the same
+   point, `.ring-fill`'s 6px glow keeps its overflow room, and `height` is
+   deliberately untouched — the ring sets the tiles row's height (ADR-0073)
+   and this is a horizontal defect only. Measured after: 57.96 / 57.96 at
+   that same 481px floor; re-measured at the current 446px floor it is
+   36.05 / 36.06, which is the same result — equal, and narrower only
+   because the track is.
+
+   This does not reopen ADR-0073's `pair` decision; it corrects the inputs
+   to the centring that decision chose. The round-vs-flat edge effect that
+   ADR notes ("the eye weighs ink, not boxes") is untouched and separate —
+   an overshoot would be an asymmetric margin here, and is not taken. */
 .ring-wrap {
   position: relative;
   width: 100px;
   height: 100px;
+  margin-inline: -4.6875px;
   flex-shrink: 0;
 }
 .ring-wrap svg {
@@ -391,9 +1129,15 @@ body {
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
+/* `flex: 0 1 auto`, not `flex: 1`: the body must be its own width for the
+   lockup to have a width to centre. `min-width: 0` keeps it shrinkable
+   below its content rather than pushing the ring out of the tile. */
 .block-body {
   min-width: 0;
-  flex: 1;
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 .block-head {
   display: flex;
@@ -422,6 +1166,9 @@ body {
 .block-meta {
   font-size: 11.5px;
   color: var(--soft);
+  /* The lockup centres, so the two prose lines centre with it when they
+     wrap — `align-items: center` on `.block-body` only centres the boxes. */
+  text-align: center;
 }
 .limit-row {
   display: flex;
@@ -434,9 +1181,25 @@ body {
   color: var(--soft);
   white-space: nowrap;
 }
+/* A real defect, not a responsive one (map #151 / T2 #153): this shipped
+   as `flex: 1; max-width: 170px` — a basis of 0 with no floor. It only
+   ever drew a bar because `.limit-row` was a full-width block in a roomy
+   tile. Squeeze the row and the basis resolves toward 0: the bar VANISHES
+   while the label and the percentage keep rendering, which reads as a
+   live 0% rather than as a broken layout. It also made the tile
+   unmeasurable, since a `flex: 1` item contributes nothing to max-content.
+
+   110 is the narrowest bar that still reads as a proportion, and it is
+   the ceiling as well as the floor so both bars are the same length
+   wherever they appear — the block's row lives in a shrink-to-fit column
+   and always resolved to 110, while This week's grew to the old 170,
+   putting two readings of the same kind side by side at visibly
+   different lengths. Measured: the floor buys no width either way (a
+   flex basis is what max-content sees, so the tile floors are identical
+   at 110 and at 170), while 170 would push the 3-up threshold out 52px
+   for 60px of bar. */
 .limit-meter {
-  flex: 1;
-  max-width: 170px;
+  flex: 0 0 110px;
   height: 6px;
   border-radius: 3px;
   background: var(--ring-track);
@@ -459,6 +1222,7 @@ body {
   margin-top: 6px;
   font-size: 11.5px;
   color: var(--soft);
+  text-align: center;
 }
 .block-foot b {
   font-weight: 800;
@@ -666,6 +1430,23 @@ body {
     width 0.45s var(--ease-glass),
     height 0.45s var(--ease-glass);
 }
+/* …but NOT while the window is being dragged. Above a 1152px box (and below
+   720px) every pixel of drag width resolves to a distinct view width, so each
+   frame restarts a 450ms ease on up to ~7,700 rects — while the ghost bar's
+   `d`, the gridlines, the axis labels and the now-line are not transitioned at
+   all and land on the new geometry instantly. The bars therefore do not merely
+   lag: they tear away from everything else INSIDE their own cluster, which
+   reads as the chart coming apart rather than as motion. `glass-chart.tsx`
+   marks the `<svg>` `.resizing` for the duration of the drag, and its
+   `GhostBar` already takes the instant `!sameShape` path on every reshape — the
+   two have to agree about landing instantly or the ghost arrives at a geometry
+   its own bar has not reached yet. Keep this element list and the property list
+   above equal; `lib/arrangement.test.ts` pins the pair, because a rename on
+   either side disables the freeze silently. */
+.chart-svg.resizing rect.seg,
+.chart-svg.resizing rect.clip-rect {
+  transition: none;
+}
 /* The glass package styles a `.seg` of its own (segmented controls) with a
    backdrop-filter; on our SVG rects that declaration is at best a no-op and
    at worst a per-rect compositing layer. Sever the name collision here. */
@@ -769,12 +1550,48 @@ body {
   border-radius: 2px;
 }
 
-/* --- quality floor (mock breakpoints) --- */
-@media (max-width: 1150px) {
-  .tiles {
-    grid-template-columns: 1fr;
+/* The rail row at wide (map #151 / T13 #164, ADR-0073): 337.5px of ink in a
+   1103px card is the same untrackable-row defect the tables have, so it gets
+   the same answer — the row goes to ONE line and the 92px model split
+   STRETCHES across the gap it used to sit beside.
+
+   The four children are placed explicitly because the DOM order is title,
+   cost, meta, split: sparse auto-placement would put the cost where the meta
+   belongs. */
+@container content (min-width: 1520px) {
+  .rail-row {
+    grid-template-columns: minmax(120px, 240px) minmax(0, 1fr) minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0 18px;
+  }
+  .rail-row .row-title {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .rail-row .row-meta {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .rail-row .split {
+    grid-column: 3;
+    grid-row: 1;
+    width: auto;
+    justify-self: stretch;
+    height: 6px;
+  }
+  .rail-row .row-cost {
+    grid-column: 4;
+    grid-row: 1;
   }
 }
+
+/* --- quality floor (mock breakpoints) ---
+   The tiles' `@media (max-width: 1150px)` partner is GONE (map #151 / T2
+   #153): content is viewport - 304, so it fired ~304px later than the
+   thing it described and a 1280 viewport tripped neither breakpoint —
+   the reported bug. `.tiles` is now a container query on `content`; see
+   its own rules above. The rails keep this one until the pass that owns
+   them. */
 @media (max-width: 1020px) {
   .rails {
     grid-template-columns: 1fr;
@@ -1031,6 +1848,21 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* The panel's OWN frost is deliberately dropped — it is what made
+     `.sticky-head`'s frost a no-op. An element carrying `backdrop-filter` is a
+     backdrop root for its descendants, and Chromium hands a nested
+     `backdrop-filter` that root's own backdrop rather than the root's painted
+     contents: the sticky head was blurring the wash it already sat on and
+     never the rows, so row text slid under it perfectly sharp at ANY radius
+     (probed: blur(12) and blur(40) pixel-identical; an opaque background
+     confirmed the rows really are behind it, and removing this line is what
+     made the blur bite). Only one of the two frosts can sample content, so it
+     goes to the one whose backdrop has any: nothing sits behind a table panel
+     but the smooth radial wash, where blur(24) is visually an identity, while
+     the sticky head sits over 13px text. The panel keeps its tint, border,
+     shadow and radius — the wash still bleeds through, merely unblurred. */
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
 }
 .head-bar {
   display: flex;
@@ -1107,18 +1939,20 @@ body {
   );
 }
 
-/* The sticky header block — frost WITHIN the panel (same nested-frost
-   precedent as the sidebar's .menu leaf; one surface, mounts once). Rows
-   visibly blur as they slide beneath it: the material demo of the page.
-   Carries the column-header row AND the Blocks page's pinned active row so
-   both stay put over the scrolling body without a second frost surface. */
+/* The sticky header block — the panel's frost, relocated here (see
+   `.table-panel`: the two cannot both sample content, and this is the one
+   whose backdrop is not the wash). Rows visibly blur as they slide beneath
+   it: the material demo of the page. Carries the column-header row AND the
+   Blocks page's pinned active row so both stay put over the scrolling body
+   without a second frost surface. */
 .sticky-head {
   position: sticky;
   top: 0;
   z-index: 10;
   background: color-mix(in oklch, var(--panel) 60%, transparent);
-  -webkit-backdrop-filter: var(--frost-chip);
-  backdrop-filter: var(--frost-chip);
+  /* Above every other tier by design — see `--frost-head` in packages/glass. */
+  -webkit-backdrop-filter: var(--frost-head);
+  backdrop-filter: var(--frost-head);
 }
 /* Reduced transparency: a 60%-of-opaque mix would still let scrolled rows
    ghost through the sticky header sharply (no frost to soften them) — go
@@ -1316,6 +2150,258 @@ body {
   text-align: center;
   font-size: 12.5px;
   color: var(--soft);
+}
+
+/* The row floor for BOTH row surfaces — the three list tables' scroll body and
+   the session timeline's — as a variable rather than an inline `min-width`
+   (the seam is in data-table.tsx and session-timeline.tsx): below it the
+   wrapper scrolls horizontally instead of letting the flexible tracks collapse.
+   At narrow the arrangement cancels it, which an inline style could only have
+   been overridden with `!important` — and that cancelling rule is a few lines
+   below this one on purpose, since equal specificity makes it a question of
+   source order. */
+.table-scroll,
+.tl-scroll {
+  min-width: var(--row-floor, 0px);
+}
+
+/* ============================================================
+   THE ROW SURFACES AT BOTH ENDS  (map #151 / T13 #164, ADR-0073)
+
+   Three list tables and the session timeline are one surface asked
+   the same question twice, from opposite ends:
+
+     narrow   there is LESS space than the data wants. Every row
+              here is 54-152px too wide for the 604-748 band, and
+              two fail worse than "a column is off-screen": Blocks
+              hands WINDOW 113px for a 166px label and ellipsises
+              16 of 16 rows INSIDE the scroller, where panning can
+              never reach it, and the timeline pushes COST — the
+              page's whole subject — past the right edge.
+              The row takes a second line. Nothing is dropped and
+              nothing scrolls; the price is height (Blocks 91px,
+              Sessions 118px, Projects 160px per row).
+
+     wide     there is MORE. At content 2256 the sessions table is
+              578px of ink in 2245, and a row whose label and value
+              are 1300px apart is not spacious, it is untrackable.
+              The void inside the row fills with ink: a cost bar in
+              the flexible track, which both adds ink AND takes the
+              slack that separated the two.
+
+   Medium writes no rule at all — its dilution reads as air, which
+   is why the band between these two blocks is empty.
+
+   The literals are the boundaries from "responsive thresholds" at
+   the top of this file; `799.98` is `content < 800` written as an
+   inclusive max (see lib/arrangement.ts, which pins both).
+   ============================================================ */
+
+@container content (max-width: 799.98px) {
+  /* --- the list tables --- */
+
+  /* The row stops being a grid and becomes a wrapping flex line, which is
+     also what makes the inline `grid-template-columns` (a TypeScript
+     `Column.width` join, unreachable from here) simply inert. No `!important`
+     anywhere in this block. */
+  .row,
+  .col-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    row-gap: 2px;
+    column-gap: 11px;
+  }
+  /* Line one is the identity cell, full width. */
+  .row > .cell:first-child {
+    flex: 1 0 100%;
+    min-width: 0;
+  }
+  /* Everything else shares the lines below, each sized to its own ink — with a
+     line floor of 22px, the height of the tallest thing a cell can hold (a
+     `.row-action` button). Without it a row that HAS an action is 7px taller
+     than one that does not, which on Projects is every parent against every
+     worktree child: uniform row height is what makes a stacked table read as
+     ordered, and it cannot be a property of which controls a row happens to
+     carry. */
+  .row > .cell:not(:first-child) {
+    flex: 0 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    min-height: 22px;
+    text-align: left;
+    font-size: 11.5px;
+  }
+  /* The label CSS could not otherwise invent — `content: attr()` is the only
+     way a stylesheet writes text, which is why the cell carries `data-col`. */
+  .row > .cell:not(:first-child)::before {
+    content: attr(data-col) " ";
+    color: var(--soft);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin-right: 3px;
+  }
+  /* A `.num` cell right-aligns by the shipped rule; on a shared line that
+     alignment has nothing to align against. */
+  .row > .cell.num {
+    justify-content: flex-start;
+  }
+  /* `.trunc` is a BLOCK, which is right in a column of its own and wrong in a
+     labelled run: it put the value on a line below its own label (measured —
+     "PROJECT" over "MaxPrice"). Truncation has nothing to do here anyway, since
+     the run wraps rather than clipping. */
+  .row > .cell:not(:first-child) .trunc {
+    display: inline;
+  }
+  /* A cell holding only a control has no text baseline, so baseline alignment
+     falls back to its bottom margin edge and drops it 3.17px below its
+     neighbours — enough to make every Projects parent 3px taller than every
+     worktree child. It centres on the line instead. */
+  .row > .cell:has(> .row-action) {
+    align-self: center;
+  }
+  /* An absent value is not worth a labelled slot: without this a done Blocks
+     row spends three of its six on "BURN RATE —" and runs a line longer than
+     the active row's. The fact comes from `Column.isEmpty` — CSS cannot select
+     on text. It is written AFTER the cell rules on purpose: it ties with
+     `.row > .cell:not(:first-child)` on specificity, so source order is what
+     decides whether the suppressed cell stays hidden. */
+  .row > .cell[data-empty="1"] {
+    display: none;
+  }
+  /* The row takes over the padding its cells were carrying. In a grid each
+     cell's 12px flanks are the column gutters, and in a labelled run they are
+     dead weight — five cells' worth is 120px, which at content 604 is the
+     difference between a run that fits on one line and one that wraps for some
+     rows and not others (measured: 608 wanted against 593 available, so rows
+     came out 138 and 101 side by side). Removing it leaves ~105px of slack, so
+     the run holds one line for every row on the page. */
+  .row {
+    height: auto;
+    min-height: 0;
+    padding: 7px 12px;
+  }
+  .row > .cell {
+    padding: 0;
+  }
+
+  /* THE HEADER KEEPS EVERY COLUMN, as a wrapping run of sort chips.
+     The prototype hid all but the identity header, on the grounds that a
+     second stacked row of labels says nothing the per-cell labels have not
+     already said — true of a header that only LABELS, and false of this one,
+     which is also the only sort control the app has. Hiding it left narrow
+     unable to sort by anything but the identity column, which was the map's
+     one unpaid bill; this pays it with no new component, no popover, and
+     `aria-sort` untouched. */
+  .col-head {
+    padding: 6px 12px 7px;
+  }
+  .col-head [role="columnheader"] {
+    flex: 0 1 auto;
+    padding: 0;
+    letter-spacing: 0.06em;
+  }
+  .col-head [role="columnheader"]:first-child {
+    flex: 1 0 100%;
+  }
+  .col-head [role="columnheader"].num {
+    justify-content: flex-start;
+  }
+  /* A column with no name (the Projects merge action) draws no chip — a blank
+     one would be a control that reads as an accident. */
+  .col-head [role="columnheader"][data-col=""] {
+    display: none;
+  }
+
+  /* Nothing is off-screen any more, so the floor has to go or the scroller
+     keeps a phantom scrollbar under a row that fits. */
+  .table-scroll,
+  .tl-scroll {
+    min-width: 0;
+  }
+
+  /* --- the session timeline: the same rule, its own class names --- */
+  .tl-row,
+  .col-head:has(.tl-cell) {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    row-gap: 2px;
+    column-gap: 11px;
+    height: auto;
+  }
+  /* Time and model lead the run unlabelled — they are the identity, and the
+     time is soft while the model is family-coloured, so neither needs naming.
+     The run then wraps where it wraps: forcing the break after them was tried
+     and is BOTH impossible in flex (a line break follows hypothetical sizes,
+     which `flex-grow` does not change) and undesirable, since it would leave
+     the six labelled values sharing one line with ~79px of slack against ~640
+     for the free run — and this row's height is a constant that a third line
+     would overrun. */
+  .tl-row > .tl-cell:first-child,
+  .tl-row > .tl-cell:nth-child(2) {
+    flex: 0 0 auto;
+  }
+  .tl-row > .tl-cell:nth-child(n + 3) {
+    flex: 0 1 auto;
+    text-align: left;
+    font-size: 11.5px;
+  }
+  .tl-row > .tl-cell:nth-child(n + 3)::before {
+    content: attr(data-col) " ";
+    color: var(--soft);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin-right: 3px;
+  }
+  /* The timeline head names the identity pair only: it carries no sort
+     controls at any width, so beyond those two it would be the duplicate run
+     the tables' header is not. */
+  .col-head:has(.tl-cell) > .tl-cell:nth-child(n + 3) {
+    display: none;
+  }
+  .col-head:has(.tl-cell) > .tl-cell {
+    padding: 8px 0;
+  }
+  .col-head:has(.tl-cell) {
+    padding: 0 12px;
+  }
+}
+
+@container content (min-width: 1520px) {
+  /* The timeline's template is a Tailwind class rather than a `Column<Row>`,
+     so unlike the three list tables its extra TRACK comes from here and only
+     the cell is TypeScript. Unlayered, so it outranks the utility. The bar
+     sits second from the right, immediately left of Cost. */
+  .tl-row,
+  .col-head:has(.tl-cell) {
+    grid-template-columns:
+      96px minmax(88px, 1.1fr) repeat(4, minmax(74px, 0.9fr))
+      minmax(120px, 3fr) 92px 100px;
+  }
+}
+
+/* Wide's ink: the row's own cost, drawn instead of merely printed
+   (components/cost-bar.tsx). Outside the arrangement blocks on purpose — the
+   column exists only where the page already decided the arrangement is wide,
+   and a second width test here would be a lie about where that decision
+   lives. */
+.cost-bar {
+  display: block;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: color-mix(in oklch, var(--text) 8%, transparent);
+  overflow: hidden;
+}
+.cost-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: color-mix(in oklch, var(--accent) 72%, transparent);
 }
 
 /* colored model-family text tokens (the mock's .fam) */
@@ -1533,6 +2619,9 @@ body {
 .tl-scroll {
   max-height: 60vh;
   overflow-y: auto;
+  /* Its row floor is declared with the list tables' (`.table-scroll`), beside
+     the arrangement rule that cancels it — the two must not be able to drift
+     apart, and the cancelling rule has to come after them both. */
 }
 
 /* --- timeline cells (the mock's .tl-cell): tighter than the list `.cell`
@@ -1682,6 +2771,35 @@ body {
   align-items: flex-start;
 }
 
+/* Settings at wide (map #151 / T13 #164, ADR-0073) — the one place the map's
+   "prose keeps its measure; data takes the space" line has to be read
+   carefully. The page is NOT re-columned: it stays one reading order top to
+   bottom, because its clusters are deliberate and a two-column settings page
+   scans badly (built at 2256 as T6's variant B, and rejected there). What goes
+   wide is the ROW: the column stops centring, the form caps at 980 as a
+   measure rather than as a frame, and each section becomes text-beside-control
+   with the `.desc` 60-64ch cap untouched.
+
+   `.s-text` (Settings.tsx) exists only for this: CSS cannot pair two siblings
+   into one grid cell. It is inert at every other width, verified to the pixel,
+   and is permanent markup bought by a single arrangement's state. */
+@container content (min-width: 1520px) {
+  .settings-form {
+    max-width: 980px;
+    margin-left: 0;
+    margin-right: auto;
+  }
+  .s-section {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 400px);
+    align-items: center;
+    gap: 2px 36px;
+  }
+  .s-section .control {
+    margin-top: 0;
+  }
+}
+
 /* --- section internals --- */
 .status-line {
   display: flex;
@@ -1730,6 +2848,14 @@ body {
    12px bump serves the detail page's states, not these). */
 .settings-form .inset p {
   font-size: 11px;
+}
+/* The Updates row's in-flight track (#150): the T6 streaming hairline at ROW
+   scale, sitting under the control instead of inside a panel — the section's
+   whole shape is that it never grows into one. Narrow on purpose: a
+   full-width bar under a 150px chip reads as a page load. */
+.update-track {
+  max-width: 260px;
+  margin-top: 2px;
 }
 /* --- App info: the read-only label/value grammar (T3's `pairs`, map #100;
    NOTES §"Settings › App info"). Labels anchor to the TOP of their value, so
@@ -2843,9 +3969,24 @@ body {
      measures nothing, but a measured chart would silently get zero width;
    - scoping the rise to the revealed state is what re-triggers it AT the
      reveal. On `.boot-frame` unconditionally it would run and be spent while
-     hidden, and the frame would pop in flat. */
+     hidden, and the frame would pop in flat.
+
+   `opacity` RIDES ALONGSIDE the visibility, and is not redundant with it:
+   `visibility` is the one inherited property a DESCENDANT can opt back out
+   of — a child that declares `visibility: visible` paints inside a hidden
+   ancestor. T11's collapsing sidebar declares exactly that on `.sb-fields`
+   and `.sb-door` (each reads a var that resolves to `visible` in one of the
+   two widths), so the filter fields painted straight through the held frame
+   and, the splash having no surface of its own, straight through the splash:
+   date range / project / model / machine floating alone on the wash while
+   the whole rest of the app was correctly hidden. Opacity cannot be escaped
+   that way — it composites the subtree as a group — so the hold is now
+   structurally un-escapable and no future `visibility: visible` can reopen
+   this. Both are kept: opacity alone would leave the held frame in the tab
+   order, which is what `visibility` is here for. */
 .boot-frame[data-boot="hold"] {
   visibility: hidden;
+  opacity: 0;
 }
 .boot-frame[data-boot="reveal"] {
   animation: boot-rise 0.4s var(--ease-glass);

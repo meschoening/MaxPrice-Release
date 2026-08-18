@@ -1,4 +1,4 @@
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   formatAbsoluteTimestamp,
@@ -11,6 +11,8 @@ import { useNowTick } from "@/state/use-now-tick";
 import { useTimeDisplay } from "@/state/use-settings";
 import { formatCost, familyColor } from "@/lib/list-format";
 import { cn } from "@/lib/utils";
+import { useArrangement } from "@/state/use-arrangement";
+import { CostBar } from "@/components/cost-bar";
 
 // M5 (T6 `lens`) — the per-message timeline as ONE tall frosted panel: the
 // T5 lists table language (sticky frosted column head inside the panel,
@@ -24,6 +26,20 @@ import { cn } from "@/lib/utils";
 // `estimateSize` means appending rows mid-stream never re-measures and never
 // thrashes layout.
 const ROW_HEIGHT = 38;
+// Narrow's stacked row (map #151 / T13 #164, ADR-0073). This constant is the
+// ONE named exception to "an arrangement is CSS": the three list tables get
+// their taller rows for free because `DataTable`'s virtualizer calls
+// `measureElement`, and this one deliberately does not — so the height a CSS
+// rule produces has to be told to the virtualizer as well.
+//
+// Measured rather than chosen: an 18px identity line, the 2px row gap, a 17px
+// value run and the hairline — 38, with 2px of cushion. It is also the one
+// number on this map a row could outgrow, since the value run takes a third
+// line if its six labelled cells ever exceed the row's width (measured at
+// content 604 with ~45px to spare, which is well past seven-digit token
+// counts). Such a row would crowd its neighbour rather than clip, and the fix
+// would be this constant — never a re-measure.
+const ROW_HEIGHT_STACKED = 40;
 
 // The ONE grid-track definition shared by the header row and every data row.
 // Hand-duplicating this string between the two is a real misalignment-bug
@@ -32,7 +48,9 @@ const ROW_HEIGHT = 38;
 const GRID_TEMPLATE = "grid-cols-[96px_minmax(88px,1.1fr)_repeat(4,minmax(74px,0.9fr))_92px_100px]";
 
 // Below this width the wrapper scrolls horizontally instead of letting the
-// flexible tracks collapse (the mock's .tl-scroll min-width).
+// flexible tracks collapse (the mock's .tl-scroll min-width). It travels as a
+// custom property so the narrow arrangement can drop it without `!important` —
+// see `.tl-scroll` in globals.css and the same seam in data-table.tsx.
 const MIN_TABLE_WIDTH = 780;
 
 // Relative timestamps must keep ageing while the page is open ("just now" →
@@ -60,6 +78,16 @@ export function SessionTimeline({
   const now = useNowTick(NOW_TICK_MS);
   const display = useTimeDisplay();
 
+  // The arrangement, at both ends (ADR-0073). The timeline's one ~800px gap
+  // (model → in) at wide is the same defect the list tables have and gets the
+  // same answer — the difference being that this template is a Tailwind class,
+  // so the extra TRACK comes from CSS and only the CELL is TypeScript. At narrow
+  // the row wraps like theirs, but its height is this file's constant.
+  const arrangement = useArrangement();
+  const wide = arrangement === "wide";
+  const stacked = arrangement === "narrow";
+  const barMax = useMemo(() => events.reduce((m, e) => (e.cost > m ? e.cost : m), 0), [events]);
+
   // Running cost total through each row — cumulative sum of `event.cost`.
   const runningTotals = useMemo(() => {
     const out: number[] = [];
@@ -74,9 +102,21 @@ export function SessionTimeline({
   const virtualizer = useVirtualizer({
     count: events.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: () => (stacked ? ROW_HEIGHT_STACKED : ROW_HEIGHT),
     overscan: 16,
   });
+
+  // A NEW `estimateSize` does not invalidate the virtualizer's measurement
+  // memo on its own — that memo keys on the count and the size cache, not on
+  // the option — so crossing the narrow boundary re-rendered every row at the
+  // old height and left the rows overlapping their slots (measured: slots stayed
+  // 38 while the stacked row wanted 40). `measure()` drops the cache and lets
+  // the current estimate answer. It is free here precisely because this
+  // virtualizer never measures elements: there is nothing to re-measure, only a
+  // constant to re-read.
+  useEffect(() => {
+    virtualizer.measure();
+  }, [stacked, virtualizer]);
 
   return (
     <section className="panel table-panel tl-wrap" aria-label="Per-message timeline">
@@ -112,13 +152,16 @@ export function SessionTimeline({
       <div className="overflow-x-auto flex-1 min-h-0 flex flex-col">
         <div
           ref={scrollRef}
-          style={{ minWidth: MIN_TABLE_WIDTH }}
+          style={{ "--row-floor": `${MIN_TABLE_WIDTH}px` } as React.CSSProperties}
           className="thin-scroll tl-scroll"
         >
           <div role="table" aria-label="Per-message events">
             {/* The sticky frosted surface — rows visibly blur sliding
                 beneath it (the page's material proof, per T5). */}
             <div className="sticky-head">
+              {/* The wide track comes from CSS (globals.css re-tracks
+                  `.tl-row` and this head), so the class stays the base
+                  template at every width and only the cell is conditional. */}
               <div role="row" className={cn("grid col-head", GRID_TEMPLATE)}>
                 <span className="tl-cell">Time</span>
                 <span className="tl-cell">Model</span>
@@ -126,6 +169,7 @@ export function SessionTimeline({
                 <span className="tl-cell num">Out</span>
                 <span className="tl-cell num">Cache w</span>
                 <span className="tl-cell num">Cache r</span>
+                {wide ? <span className="tl-cell">Cost share</span> : null}
                 <span className="tl-cell num">Cost</span>
                 <span className="tl-cell num">Running</span>
               </div>
@@ -154,6 +198,8 @@ export function SessionTimeline({
                       key={vi.key}
                       event={event}
                       runningTotal={runningTotals[vi.index] ?? 0}
+                      wide={wide}
+                      barMax={barMax}
                       now={now}
                       display={display}
                       fresh={freshFrom !== null && vi.index >= freshFrom}
@@ -185,6 +231,8 @@ function TimelineRow({
   display,
   fresh,
   style,
+  wide,
+  barMax,
 }: {
   event: SessionEventFrame;
   runningTotal: number;
@@ -192,6 +240,9 @@ function TimelineRow({
   display: TimeDisplay;
   fresh: boolean;
   style: React.CSSProperties;
+  // Wide only: the cost bar's cell (ADR-0073). Its track comes from CSS.
+  wide: boolean;
+  barMax: number;
 }): React.ReactElement {
   const family = normalizeModelName(event.model);
   return (
@@ -204,7 +255,11 @@ function TimelineRow({
         role="row"
         className={cn("tl-row grid h-full items-center", GRID_TEMPLATE, fresh && "new")}
       >
-        <span className="tl-cell time" title={formatAbsoluteTimestamp(event.timestamp, display)}>
+        <span
+          className="tl-cell time"
+          data-col="time"
+          title={formatAbsoluteTimestamp(event.timestamp, display)}
+        >
           {formatRelativeTime(event.timestamp, now)}
         </span>
         <span className="tl-cell">
@@ -212,17 +267,31 @@ function TimelineRow({
             {family}
           </span>
         </span>
-        <TokenCell value={event.inputTokens} />
-        <TokenCell value={event.outputTokens} />
-        <TokenCell value={event.cacheCreationTokens} />
-        <TokenCell value={event.cacheReadTokens} />
-        <span className="tl-cell num cost">{formatCost(event.cost)}</span>
-        <span className="tl-cell num running">{formatCost(runningTotal)}</span>
+        <TokenCell value={event.inputTokens} col="in" />
+        <TokenCell value={event.outputTokens} col="out" />
+        <TokenCell value={event.cacheCreationTokens} col="cache w" />
+        <TokenCell value={event.cacheReadTokens} col="cache r" />
+        {wide ? (
+          <span className="tl-cell">
+            <CostBar value={event.cost} max={barMax} />
+          </span>
+        ) : null}
+        <span className="tl-cell num cost" data-col="cost">
+          {formatCost(event.cost)}
+        </span>
+        <span className="tl-cell num running" data-col="running">
+          {formatCost(runningTotal)}
+        </span>
       </div>
     </div>
   );
 }
 
-function TokenCell({ value }: { value: number }): React.ReactElement {
-  return <span className={cn("tl-cell num", value === 0 && "zero")}>{value.toLocaleString()}</span>;
+function TokenCell({ value, col }: { value: number; col: string }): React.ReactElement {
+  return (
+    // PROTOTYPE — map #151 / T7 (#159), variant C: `data-col`. Throwaway.
+    <span className={cn("tl-cell num", value === 0 && "zero")} data-col={col}>
+      {value.toLocaleString()}
+    </span>
+  );
 }

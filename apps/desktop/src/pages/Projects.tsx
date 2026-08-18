@@ -37,6 +37,8 @@ import { aggregateProjectsRange, type ProjectsRangeAggregate } from "@/lib/aggre
 import { daysSince, formatCost, RANGE_LABEL, STALE_DAYS, topModelFamily } from "@/lib/list-format";
 import { abbreviate } from "@/lib/active-block";
 import { ProjectMergeDialog } from "@/components/project-merge-dialog";
+import { useArrangement } from "@/state/use-arrangement";
+import { costBarColumn } from "@/components/cost-bar";
 
 // Fixed axes for the compact strip charts — model split, no ghost, no project.
 // Hoisted to module level for referential stability (avoids memo dep churn).
@@ -86,10 +88,14 @@ const projectSearchKeys = (r: ProjectTableRow): string[] => [
 function projectColumn(
   c: Column<ProjectRow> & { sortValue: (row: ProjectRow) => number | string },
 ): Column<ProjectTableRow> {
+  const isEmpty = c.isEmpty;
   return {
     ...c,
     sortValue: (r) => c.sortValue(r.project),
     cell: (r) => c.cell(r.project),
+    // Lifted like the other two per-row accessors, but optional: a column that
+    // declares no `isEmpty` must not acquire one that calls `undefined`.
+    isEmpty: isEmpty === undefined ? undefined : (r) => isEmpty(r.project),
   };
 }
 
@@ -282,6 +288,18 @@ export function ProjectsPage(): React.ReactElement {
     navigate("/live");
   };
 
+  // Wide's cost bar (ADR-0073). Projects is the surface it gains least on — a
+  // corpus with one project has no variance to draw — and it gets one anyway:
+  // the bar appears wherever the arrangement is wide, so its absence is never a
+  // fact the reader has to interpret, and a machine with twenty projects gets
+  // exactly what Sessions gets. Worktree children scale against the same max as
+  // their parent, which is what makes a disclosed family readable.
+  const wide = useArrangement() === "wide";
+  const barMax = useMemo(
+    () => rows.reduce((m, r) => (r.costRange > m ? r.costRange : m), 0),
+    [rows],
+  );
+
   const columns = useMemo<Column<ProjectTableRow>[]>(
     () => [
       {
@@ -325,6 +343,7 @@ export function ProjectsPage(): React.ReactElement {
           const fam = topModelFamily(p.modelBreakdowns);
           return fam ? <ModelBadges models={[fam]} /> : <span className="text-soft">—</span>;
         },
+        isEmpty: (p) => !topModelFamily(p.modelBreakdowns),
       }),
       // The Machines column (ADR-0041 M6) — one dot per alias-folded machine;
       // present ONLY while the machine axis is enabled.
@@ -335,6 +354,7 @@ export function ProjectsPage(): React.ReactElement {
               header: "Machines",
               width: "130px",
               sortValue: (p) => foldedIds(p.machines).length,
+              isEmpty: (p) => foldedIds(p.machines).length === 0,
               cell: (p) => {
                 const ids = foldedIds(p.machines);
                 if (ids.length === 0) return <span className="text-soft">—</span>;
@@ -368,6 +388,10 @@ export function ProjectsPage(): React.ReactElement {
         sortValue: (p) => p.totalTokens,
         cell: (p) => abbreviate(p.totalTokens),
       }),
+      // Wide only, immediately left of Cost (ADR-0073).
+      ...(wide
+        ? [costBarColumn<ProjectTableRow>({ max: barMax, get: (r) => r.project.costRange })]
+        : []),
       projectColumn({
         id: "costRange",
         // `(range)` is gone with the all-time column it contrasted against —
@@ -402,6 +426,9 @@ export function ProjectsPage(): React.ReactElement {
         // No `sortValue`: a column of action buttons has nothing to order by,
         // so its header renders inert rather than as a sort control (see
         // Column.sortValue in data-table.tsx).
+        // A worktree row has no merge action, so at narrow its slot is dropped
+        // rather than wrapped as an empty one (ADR-0073).
+        isEmpty: (r) => r.child,
         cell: (r) =>
           r.child ? null : (
             <button
@@ -422,7 +449,7 @@ export function ProjectsPage(): React.ReactElement {
     ],
     // `tz` is captured per render; openInLive is stable enough for cells.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [tz, machineAxis, foldedIds, projectAxis.index],
+    [tz, machineAxis, foldedIds, projectAxis.index, wide, barMax],
   );
 
   // An empty result while the corpus is non-empty is just a filtered-out date
@@ -495,7 +522,8 @@ export function ProjectsPage(): React.ReactElement {
             // + cost 90 + last activity 132 + merge 48) + ≥150px for the
             // project name. Below this the table scrolls horizontally instead
             // of crushing the name. The Machines column adds its own 130px to
-            // the floor when enabled (ADR-0041 M6).
+            // the floor when enabled (ADR-0041 M6). Dropped entirely at narrow,
+            // where the row wraps and nothing is off-screen (ADR-0073).
             minWidth={machineAxis.enabled ? 850 : 720}
             defaultSort={{ columnId: "costRange", dir: "desc" }}
             searchKeys={projectSearchKeys}

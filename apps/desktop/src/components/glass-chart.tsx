@@ -2,6 +2,8 @@ import { Fragment, memo, useId, useLayoutEffect, useMemo, useRef, useState } fro
 import type { Span } from "@maxprice/shared";
 import {
   buildChartLayout,
+  chartViewAt,
+  chartViewWidth,
   roundTopPath,
   CHART_VIEW,
   COMPACT_VIEW,
@@ -52,6 +54,101 @@ function rectStyle(r: { x: number; y: number; w: number; h: number }): React.CSS
   } as React.CSSProperties;
 }
 
+// The app's FIRST ResizeObserver (there were none before ADR-0073), and the
+// whole runtime cost of the fluid view. Four things about it are load-bearing:
+//   - `useLayoutEffect` plus a SYNCHRONOUS first read, so the very first paint
+//     is already at the right width. Without it the chart draws once at the
+//     base 720 and then corrects, visibly, on every mount.
+//   - the observed element is the caller's wrapper, never the svg (see the
+//     call site).
+//   - the measurement is rounded to whole px before anything is derived from
+//     it: sub-pixel churn from a flexible track is noise, not a resize.
+//   - the state is the derived VIEW width, not the box — so below the cap,
+//     where every box from 720 to 1152 maps to exactly 720, a drag across that
+//     whole range sets no state, renders nothing, and rebuilds nothing. Storing
+//     the box and deriving downstream would re-render the chart per pixel of
+//     drag for a geometry that did not move.
+// `enabled` false keeps a chart out of the observer entirely rather than
+// measuring and ignoring it (the compact strips).
+//
+// The hook also reports `resizing`, which the svg wears as a class so the
+// globals.css rect transitions are OFF for the duration of a drag. Why that is
+// needed, and why it is correct:
+//   - outside the 720…1152 plateau every whole px of drag is a distinct view
+//     width, so the layout rebuilds ~60×/s, and shapeKey is deliberately
+//     WIDTH-BLIND (no remount) — so every seg/clip rect MORPHS through the
+//     0.45s ease, restarted every frame.
+//   - nothing else in the chart eases on a resize: GhostBar reads an x/w change
+//     as `!sameShape` and lands instantly, and the gridlines, labels, now-line
+//     and dense bands are plain attributes that snap. The bars easing alone
+//     tears each cluster apart mid-drag. The flag makes them agree.
+//   - the mechanism is a single commit: React writes the class and the new
+//     x/width together, so `transition: none` is already computed when the new
+//     geometry lands — no animation is ever STARTED, rather than one being
+//     started and cancelled. Clearing the flag afterwards likewise changes no
+//     geometry, so re-enabling the transition starts nothing either.
+// The measurement itself stays per-frame and exact (no quantizing, no rAF
+// throttle): the view width feeds ADR-0073's clamp, and only the paint is
+// suppressed.
+const RESIZE_SETTLE_MS = 150;
+
+function useChartViewWidth(
+  enabled: boolean,
+): [React.RefObject<HTMLDivElement | null>, number | null, boolean] {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [w, setW] = useState<number | null>(null);
+  const [resizing, setResizing] = useState(false);
+  useLayoutEffect(() => {
+    let settle: ReturnType<typeof setTimeout> | undefined;
+    const clearSettle = (): void => {
+      if (settle !== undefined) {
+        clearTimeout(settle);
+        settle = undefined;
+      }
+    };
+    const el = ref.current;
+    if (!enabled || !el) {
+      setW(null);
+      setResizing(false);
+      return clearSettle;
+    }
+    // The last view width this effect published, kept locally rather than read
+    // back off state: `read` must know whether the width MOVED (a plateau drag
+    // is not a resize) without depending on the state it sets.
+    let last: number | null = null;
+    // `live` false is the mount measurement below — nothing has geometry to
+    // morph yet, so it must not raise the flag (and so must not schedule a
+    // second render 150ms later on every mount).
+    const read = (box: number, live: boolean): void => {
+      const px = Math.round(box);
+      if (px <= 0) return;
+      const next = chartViewWidth(px);
+      if (next === last) return;
+      last = next;
+      setW(next);
+      if (!live) return;
+      // Same batch as setW, so the class and the geometry land in one commit.
+      setResizing(true);
+      clearSettle();
+      settle = setTimeout(() => {
+        settle = undefined;
+        setResizing(false);
+      }, RESIZE_SETTLE_MS);
+    };
+    read(el.getBoundingClientRect().width, false);
+    const ro = new ResizeObserver((entries) => {
+      const e = entries[0];
+      if (e) read(e.contentRect.width, true);
+    });
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      clearSettle();
+    };
+  }, [enabled]);
+  return [ref, w, resizing];
+}
+
 export function GlassChart({
   model,
   compact,
@@ -60,11 +157,21 @@ export function GlassChart({
 }: GlassChartProps): React.ReactElement {
   const [hover, setHover] = useState<Hover | null>(null);
 
+  // The chart's own box, measured, as the view width it resolves to (ADR-0073).
+  // Compact strips are deliberately excluded: fluid makes them worse — the
+  // 22-unit bar cap starves them where preserveAspectRatio="none" already fills
+  // — so they never observe and keep COMPACT_VIEW.
+  const [boxRef, viewW, resizing] = useChartViewWidth(!compact);
+  // One object per distinct view width, so an unchanged width can never
+  // invalidate the layout memo below (300 buckets × up to 64 path strings).
+  const viewOverride = useMemo(() => (viewW === null ? undefined : chartViewAt(viewW)), [viewW]);
+
   const layout = useMemo(
-    () => (model ? buildChartLayout(model, { compact, labelMode, span }) : null),
-    [model, compact, labelMode, span],
+    () =>
+      model ? buildChartLayout(model, { compact, labelMode, span, view: viewOverride }) : null,
+    [model, compact, labelMode, span, viewOverride],
   );
-  const view: ChartView = layout?.view ?? (compact ? COMPACT_VIEW : CHART_VIEW);
+  const view: ChartView = layout?.view ?? viewOverride ?? (compact ? COMPACT_VIEW : CHART_VIEW);
   // Stable per-render: seg rects key by series id (morph stability — the same
   // rect count and identity survive any same-shape data change).
   const seriesIds = useMemo(() => (model ? model.series.map((s) => s.id) : []), [model]);
@@ -97,13 +204,16 @@ export function GlassChart({
   const crosshairX = hoverIndex !== null && layout ? (layout.centersX[hoverIndex] ?? null) : null;
 
   return (
-    <div className={cn("relative", compact && "h-full")}>
+    // `boxRef` is the measured element, and it is this wrapper rather than the
+    // svg: the svg is width:100% of it at height:auto, so observing the svg
+    // would feed its own height back into the measurement.
+    <div ref={boxRef} className={cn("relative", compact && "h-full")}>
       {/* The accessible name lives on cost-chart's wrapper (role="img"
           aria-label); the svg is decoration to AT and its clusters are
           pointer-only — focusable clusters inside an aria-hidden tree were
           an axe violation, resolved at the #61 gate by dropping tabIndex. */}
       <svg
-        className={cn("chart-svg", compact && "compact")}
+        className={cn("chart-svg", compact && "compact", resizing && "resizing")}
         viewBox={`0 0 ${view.w} ${view.h}`}
         role="presentation"
         aria-hidden

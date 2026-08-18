@@ -11,10 +11,11 @@ name: release
 #                         nothing builds or releases on a mismatched tag.
 #   2. create-release   — opens a DRAFT GitHub Release for the tag.
 #   3. build (matrix)   — macOS universal / Windows x64 / Linux x64; compiles the
-#                         Bun sidecar binary per target, then `tauri build`, and
-#                         uploads bundles to the draft release.
+#                         Bun sidecar binary per target, then `tauri build`,
+#                         uploads bundles to the draft release, and renames them
+#                         to carry their platform (see below).
 #   4. build-hub        — the MaxPrice Hub tray app, Windows only; uploads to the
-#                         same draft release.
+#                         same draft release, and renames the same way.
 #   5. notarize-macos   — separate, slow (10+ min) Apple notarization step that
 #                         cannot fail the build job above.
 #   6. compose-updater  — moves the updater freight OFF this release and onto the
@@ -35,6 +36,21 @@ name: release
 # A manifest is just URLs, so nothing is copied that does not have to be:
 # Windows entries point straight back at the .exe on THIS release. Only macOS
 # needs a home in MP-Updates, because a .app.tar.gz is not an installer.
+#
+# ASSET NAMES SAY THE PLATFORM. Tauri names its bundles after the ARCHITECTURE
+# ("_universal.dmg", "_amd64.deb", "_x64-setup.exe"), which on a release page
+# reads as three unrelated files rather than one release for three platforms. A
+# rename step at the end of each build leg fixes that in place, via the assets
+# API, before any consumer reads a name:
+#
+#   MaxPrice_<v>_mac.dmg              MaxPrice_<v>_x64-setup-win.exe
+#   MaxPrice_<v>_linux.deb            MaxPrice.Hub_<v>_x64-setup-win.exe
+#
+# The rules live in each job's matrix. Two things they must not break: a
+# renamed bundle keeps its EXTENSION (compose-updater classifies platforms by
+# it), and the hub keeps its "MaxPrice.Hub_" prefix (that dot is how the two
+# products are told apart). The macOS .app.tar.gz is untouched — it never
+# appears on this release at all.
 #
 # `createUpdaterArtifacts` stays FALSE in both committed tauri.conf.json files.
 # The build jobs below merge `src-tauri/tauri.updater.conf.json` over it with
@@ -250,15 +266,43 @@ jobs:
           # run, so `darwin-universal` compiles both slices AND lipos them.
           # `app` is bundled as well as `dmg` because the .app.tar.gz updater
           # bundle is derived from it.
+          #
+          # `rename-*` renames this leg's uploaded assets so every installer
+          # names its platform — see the "Rename release assets" step below for
+          # why a rename, rather than a differently-named bundle, is what this
+          # is. `rename-glob` scopes the rule to this leg's own product prefix
+          # (all four legs upload to ONE release and may run concurrently);
+          # `rename-from` is matched as a literal suffix; `rename-expect` is the
+          # exact number of assets the rule must hit, so a Tauri bundle-name
+          # change goes red here instead of shipping a half-renamed set.
           - platform: macos-latest
             args: "--target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.updater.conf.json -- --locked"
             sidecar-targets: "darwin-universal"
+            # The .app.tar.gz is deliberately NOT renamed: it is not an installer
+            # and never appears on this release — compose-updater rehomes it to
+            # MP-Updates under a name it picks itself.
+            rename-glob: "MaxPrice_*"
+            rename-from: "_universal.dmg"
+            rename-to: "_mac.dmg"
+            rename-expect: 1
           - platform: ubuntu-latest
             args: "--bundles deb -- --locked"
             sidecar-targets: "linux-x64"
+            rename-glob: "MaxPrice_*"
+            rename-from: "_amd64.deb"
+            rename-to: "_linux.deb"
+            rename-expect: 1
           - platform: windows-latest
             args: "--bundles nsis --config src-tauri/tauri.updater.conf.json -- --locked"
             sidecar-targets: "windows-x64"
+            # TWO assets: the installer and its detached .sig. Both must move
+            # together — the .sig's basename is how compose-updater learns the
+            # installer's published name, so renaming one without the other
+            # would put a 404 in the Windows entry of latest.json.
+            rename-glob: "MaxPrice_*"
+            rename-from: "-setup.exe"
+            rename-to: "-setup-win.exe"
+            rename-expect: 2
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -387,6 +431,60 @@ jobs:
           includeUpdaterJson: false
           args: ${{ matrix.args }}
 
+      - name: Rename release assets to carry their platform
+        # Tauri's own bundle names say the ARCHITECTURE and not the OS
+        # ("_universal.dmg", "_amd64.deb", "_x64-setup.exe"), which reads as
+        # three unrelated files on a release page. This renames them in place so
+        # each installer says which platform it is for.
+        #
+        # A rename of the PUBLISHED asset, not of the built file, because
+        # tauri-action builds and uploads in one step — there is no moment in
+        # between where a file could be renamed on disk. The GitHub assets API
+        # renames without re-uploading a byte.
+        #
+        # It runs inside the build job, not as a job of its own, so the names are
+        # final before ANY consumer starts: notarize-macos and compose-updater
+        # both `needs:` these builds, and both read assets by name.
+        #
+        # Idempotent and concurrency-safe: every leg uploads to the SAME draft
+        # release and legs run in parallel, so this lists all assets and touches
+        # only the ones matching its own glob AND suffix. An asset already
+        # renamed no longer matches.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          GLOB: ${{ matrix.rename-glob }}
+          FROM: ${{ matrix.rename-from }}
+          TO: ${{ matrix.rename-to }}
+          EXPECT: ${{ matrix.rename-expect }}
+        # Force bash: the windows-latest default is pwsh, where none of this parses.
+        shell: bash
+        run: |
+          set -euo pipefail
+          renamed=0
+          while IFS=$'\t' read -r id name; do
+            # Unquoted on purpose — $GLOB is a pattern here, not a literal.
+            case "$name" in $GLOB) ;; *) continue ;; esac
+            # A detached signature rides along with the bundle it signs: strip
+            # the .sig, rename the base, put it back. This is what keeps
+            # "<installer>.sig" naming the installer after the move.
+            base="$name"; sig=""
+            case "$base" in *.sig) base="${base%.sig}"; sig=".sig" ;; esac
+            case "$base" in *"$FROM") ;; *) continue ;; esac
+            new="${base%"$FROM"}${TO}${sig}"
+            echo "renaming $name -> $new"
+            gh api --method PATCH \
+              "/repos/$GITHUB_REPOSITORY/releases/assets/$id" \
+              -f "name=$new" --jq '.name'
+            renamed=$((renamed + 1))
+          done < <(gh api --paginate \
+            "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            --jq '.[] | "\(.id)\t\(.name)"')
+          if [ "$renamed" -ne "$EXPECT" ]; then
+            echo "::error::Renamed $renamed asset(s) matching '$GLOB' with suffix '$FROM', expected $EXPECT. Tauri's bundle naming has changed, or a bundle failed to upload. Refusing to publish a half-renamed asset set — for the Windows legs that would mean an installer and its .sig disagreeing, which puts a dead URL in the update manifest."
+            exit 1
+          fi
+
   # --------------------------------------------------------------------------
   # 4. Build the MaxPrice Hub tray app (ADR-0036) and upload to the same draft
   #     release. Distinct artifact (com.maxprice.hub); its bundles share the
@@ -438,6 +536,14 @@ jobs:
         include:
           - platform: windows-latest
             hub-targets: "windows-x64"
+            # See the desktop matrix for what these mean. The glob is the hub's
+            # own prefix: GitHub rewrites the space in "MaxPrice Hub_…" to a dot
+            # on upload, and that dot is the same discriminator compose-updater
+            # splits the two products on. Renaming must preserve it.
+            rename-glob: "MaxPrice.Hub_*"
+            rename-from: "-setup.exe"
+            rename-to: "-setup-win.exe"
+            rename-expect: 2
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
@@ -515,6 +621,41 @@ jobs:
           # committed apps/hub-desktop/src-tauri/Cargo.lock instead of letting
           # the release build silently re-resolve it.
           args: "--bundles nsis --config src-tauri/tauri.updater.conf.json -- --locked"
+
+      - name: Rename release assets to carry their platform
+        # Verbatim twin of the desktop job's step (that one carries the
+        # rationale); only the matrix rule differs. Duplicated rather than
+        # factored into a composite action because a local action would be a
+        # fifth file in the overlay subtree for twenty lines of shell.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          GLOB: ${{ matrix.rename-glob }}
+          FROM: ${{ matrix.rename-from }}
+          TO: ${{ matrix.rename-to }}
+          EXPECT: ${{ matrix.rename-expect }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          renamed=0
+          while IFS=$'\t' read -r id name; do
+            case "$name" in $GLOB) ;; *) continue ;; esac
+            base="$name"; sig=""
+            case "$base" in *.sig) base="${base%.sig}"; sig=".sig" ;; esac
+            case "$base" in *"$FROM") ;; *) continue ;; esac
+            new="${base%"$FROM"}${TO}${sig}"
+            echo "renaming $name -> $new"
+            gh api --method PATCH \
+              "/repos/$GITHUB_REPOSITORY/releases/assets/$id" \
+              -f "name=$new" --jq '.name'
+            renamed=$((renamed + 1))
+          done < <(gh api --paginate \
+            "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            --jq '.[] | "\(.id)\t\(.name)"')
+          if [ "$renamed" -ne "$EXPECT" ]; then
+            echo "::error::Renamed $renamed asset(s) matching '$GLOB' with suffix '$FROM', expected $EXPECT. Tauri's bundle naming has changed, or a bundle failed to upload. Refusing to publish a half-renamed asset set — for the Windows legs that would mean an installer and its .sig disagreeing, which puts a dead URL in the update manifest."
+            exit 1
+          fi
 
   # --------------------------------------------------------------------------
   # 5. Notarize macOS bundles — separate job so a slow (10+ min) notarization

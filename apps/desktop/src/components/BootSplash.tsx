@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { Update } from "@tauri-apps/plugin-updater";
 import { exit, relaunch } from "@tauri-apps/plugin-process";
 import { useLiveStatus } from "@/state/use-live-status";
 import { insideTauri } from "@/lib/tauri";
@@ -34,11 +35,12 @@ import {
 // timeout (which may yet complete), so the timeout is never a false claim of
 // failure. "Try again" relaunches the whole app (T4's recorded call): the Rust
 // shell never respawns a dead sidecar in place, so a full relaunch is the only
-// true rerun of the boot sequence. "Check for updates" runs the OTA flow in
-// place — pre-ready, UpdateGate (which wraps below BootGate) has not yet
-// probed, so the error card is the only place the one thing that could ship a
-// fix is reachable. A healed connection (the `open` handler clears
-// `bootFailure`) drops the card back to the loading arc; `ready` always wins.
+// true rerun of the boot sequence. "Check for updates" PROBES in place and
+// names what it found; installing it takes a second, explicit click (#150) —
+// pre-ready, UpdateGate (which wraps below BootGate) has not yet probed, so the
+// error card is the only place the one thing that could ship a fix is
+// reachable. A healed connection (the `open` handler clears `bootFailure`)
+// drops the card back to the loading arc; `ready` always wins.
 
 export function BootGate({ children }: { children: React.ReactNode }): React.ReactElement {
   const ready = useLiveStatus((s) => s.ready);
@@ -135,7 +137,8 @@ function quitApp(): void {
 type UpdateAction =
   | { phase: "idle" }
   | { phase: "checking" }
-  | { phase: "installing" }
+  | { phase: "available"; version: string; note?: string }
+  | { phase: "installing"; version: string }
   | { phase: "note"; text: string };
 
 function BootSplash({ revealing }: { revealing: boolean }): React.ReactElement {
@@ -153,6 +156,11 @@ function BootSplash({ revealing }: { revealing: boolean }): React.ReactElement {
   // Guard the async update flow against setState-after-unmount (BootGate
   // unmounts the splash once the fade completes).
   const cancelled = useRef(false);
+  // The probed handle, held across the two steps. Re-probing to install would
+  // double the round-trips and could answer differently in between, so step 2
+  // installs exactly the update step 1 named. A ref, not state: it is never
+  // rendered, and the plugin handle is not a value to diff on (UpdatesSection).
+  const held = useRef<Update | null>(null);
 
   // Pre-ready failure only: once ready is known (or the reveal has begun)
   // the card can never appear — post-ready trouble belongs to the StatusBar.
@@ -195,26 +203,29 @@ function BootSplash({ revealing }: { revealing: boolean }): React.ReactElement {
     if (phase === "error") retryBtn.current?.focus();
   }, [phase]);
 
-  // Run the OTA flow in place (mirrors UpdateGate's install handler). A manual
-  // click is itself the consent; applyUpdate relaunches on success, so its
-  // resolved branch never runs — only a failure returns us to the card.
+  // Step 1: probe only. The click that asks a question must not also answer it
+  // — being told a version exists and agreeing to take it are the two moments
+  // #150 exists to keep apart, and the card's `timedOut` variant is a boot that
+  // may yet succeed, so an unasked-for install would kill a working launch.
   const checkForUpdates = (): void => {
     setUpdateAction({ phase: "checking" });
     detectUpdate()
       .then((probe) => {
         if (cancelled.current) return;
         if (probe.status === "available") {
-          setUpdateAction({ phase: "installing" });
-          applyUpdate(probe.update).catch((err: unknown) => {
-            console.error("[boot] update install failed:", err);
-            if (cancelled.current) return;
-            setUpdateAction({ phase: "note", text: "The update failed to install." });
-          });
-        } else if (probe.status === "up-to-date") {
-          setUpdateAction({ phase: "note", text: "You’re up to date." });
-        } else {
-          setUpdateAction({ phase: "note", text: "Updates aren’t available here." });
+          held.current = probe.update;
+          setUpdateAction({ phase: "available", version: probe.version });
+          return;
         }
+        // `unsupported` stays its own answer: this channel does not serve every
+        // platform (ADR-0071 excludes Linux), and reporting that as "up to
+        // date" would be a lie in the one direction that matters.
+        held.current = null;
+        setUpdateAction(
+          probe.status === "up-to-date"
+            ? { phase: "note", text: "You’re up to date." }
+            : { phase: "note", text: "Updates aren’t available here." },
+        );
       })
       .catch((err: unknown) => {
         console.warn("[boot] update check failed:", err);
@@ -223,9 +234,24 @@ function BootSplash({ revealing }: { revealing: boolean }): React.ReactElement {
       });
   };
 
+  // Step 2: install exactly what step 1 named, on a second explicit click.
+  const installUpdate = (version: string): void => {
+    const update = held.current;
+    if (update === null) return;
+    setUpdateAction({ phase: "installing", version });
+    // applyUpdate relaunches on success, so only the rejection is reachable —
+    // it lands back on `available` with the offer intact (UpdatesSection).
+    applyUpdate(update).catch((err: unknown) => {
+      console.error("[boot] update install failed:", err);
+      if (cancelled.current) return;
+      setUpdateAction({ phase: "available", version, note: "The update failed to install." });
+    });
+  };
+
   // The Check button locks while a probe/install is in flight; the escape
   // hatches (Try again / Quit) lock only during the destructive install — a
-  // hung probe must never trap the user on the card.
+  // hung probe must never trap the user on the card, and a named-but-unaccepted
+  // offer is deliberately not busy at all.
   const updateInstalling = updateAction.phase === "installing";
   const updateBusy = updateAction.phase === "checking" || updateInstalling;
   const updateLabel =
@@ -233,7 +259,15 @@ function BootSplash({ revealing }: { revealing: boolean }): React.ReactElement {
       ? "Checking…"
       : updateAction.phase === "installing"
         ? "Installing…"
-        : "Check for updates";
+        : updateAction.phase === "available"
+          ? `Update to ${updateAction.version}`
+          : "Check for updates";
+  // One control, two jobs, decided by the state rather than by a second button
+  // appearing on a card that already carries three.
+  const onUpdateClick =
+    updateAction.phase === "available"
+      ? () => installUpdate(updateAction.version)
+      : checkForUpdates;
 
   return (
     <div className="boot-splash" data-phase={phase}>
@@ -262,6 +296,12 @@ function BootSplash({ revealing }: { revealing: boolean }): React.ReactElement {
             <p>Trying again restarts MaxPrice and its data engine.</p>
           </div>
           {updateAction.phase === "note" ? <p>{updateAction.text}</p> : null}
+          {updateAction.phase === "available" ? (
+            <p>
+              {updateAction.note ??
+                `MaxPrice ${updateAction.version} is available. Installing it restarts the app.`}
+            </p>
+          ) : null}
           <div className="err-actions" style={{ flexWrap: "wrap" }}>
             <button
               ref={retryBtn}
@@ -272,7 +312,7 @@ function BootSplash({ revealing }: { revealing: boolean }): React.ReactElement {
             >
               Try again
             </button>
-            <button type="button" className="chip" disabled={updateBusy} onClick={checkForUpdates}>
+            <button type="button" className="chip" disabled={updateBusy} onClick={onUpdateClick}>
               {updateLabel}
             </button>
             <button type="button" className="chip" disabled={updateInstalling} onClick={quitApp}>

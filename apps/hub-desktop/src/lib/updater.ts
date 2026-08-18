@@ -11,16 +11,21 @@ import { insideTauri } from "@/lib/tauri";
 //
 // It is not a straight copy, and the difference is the point:
 //
-//  - The client FUSES probe and install (`checkForUpdate`), because a click in
-//    its Settings page is itself consent — relaunching the client inconveniences
-//    only the person clicking. Here the operator acts on behalf of a fleet: the
-//    daemon holds the claude.ai poll and every connected client's HTTP+SSE
-//    connection, so "the hub will restart" is a fact to read BEFORE it happens.
-//    Probe and install are therefore SEPARATELY callable and never fused.
-//  - The platform gate is STATIC. `check()` returns null for BOTH "you are up to
-//    date" and "the manifest has no entry for your platform", indistinguishably,
-//    so a manifest-driven answer would print "Up to date" to a macOS host a
+//  - Probe and install are SEPARATELY callable and never fused. The client
+//    reached the same shape later (#150), so this is no longer a difference —
+//    but the reason here is stronger and worth keeping stated: the operator acts
+//    on behalf of a fleet. The daemon holds the claude.ai poll and every
+//    connected client's HTTP+SSE connection, so "the hub will restart" is a fact
+//    to read BEFORE it happens, not a consequence to discover.
+//  - The platform gate is STATIC — and narrower. The client allows Mac + Windows
+//    (`updatesSupportedOn`); ADR-0050 scopes this app to Windows alone. Either
+//    way a manifest-driven answer could not do the job: `check()` returns null
+//    for BOTH "you are up to date" and "the manifest has no entry for your
+//    platform", indistinguishably, so it would print "Up to date" to a host a
 //    version behind. `platform()` cannot make that mistake.
+//  - `applyUpdate` here does NOT `relaunch()`. On Windows the NSIS installer
+//    owns the restart (see below); the client's copy relaunches because it also
+//    serves macOS.
 //
 // Both `check()` and the plugin calls throw outside a Tauri host (standalone
 // Vite dev), so every entry point guards on `insideTauri()` first.

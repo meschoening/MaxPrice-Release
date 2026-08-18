@@ -39,6 +39,17 @@ export type Column<Row> = {
   cellClass?: string;
   // CSS grid track for the column. Defaults to `minmax(0,1fr)`.
   width?: string;
+  // Does this row's cell hold nothing worth a labelled slot? Read ONLY by the
+  // narrow arrangement, where the row wraps to a second line and each value
+  // carries its column's name (map #151 / T13, ADR-0073). Without it a done
+  // Blocks row spends three of its six slots printing "BURN RATE —" and runs to
+  // a third line against the active row's two — rows that no longer measure the
+  // same height, which is what makes a table read as improvised.
+  //
+  // It lives on the Column because CSS cannot select on text at all and the
+  // component cannot know what an em dash means. A column whose cells are
+  // always populated omits it.
+  isEmpty?: (row: Row) => boolean;
 };
 
 export type DataTableProps<Row> = {
@@ -110,7 +121,34 @@ export function DataTable<Row>({
   error,
   headerAction,
 }: DataTableProps<Row>): React.ReactElement {
-  const [sort, setSort] = useState(defaultSort);
+  // The user's REQUEST, which may name a column that is not currently on the
+  // table: the active sort column can disappear beneath the sort. `costShare`
+  // exists only in the wide arrangement (ADR-0073) and the machine columns only
+  // while the machine axis is on, so maximizing, sorting by Cost share, and
+  // un-maximizing used to leave `find` returning undefined — every row silently
+  // ordered by the first column in the stale direction, with `aria-sort="none"`
+  // and no arrow anywhere, so the table looked unsorted while being sorted by a
+  // column nobody chose.
+  //
+  // So the request is remembered but not applied while its column is away:
+  // re-widening (or re-enabling the axis) restores the choice without a click,
+  // and because the ordering below and the header indicator both read the two
+  // derived values, they can never disagree about what is sorted.
+  //
+  // Derived during render rather than reset from an effect for two reasons: an
+  // effect costs a second render on every resize, and it could not honestly
+  // name `defaultSort` in its dependency array — all three call sites pass it
+  // as an inline object literal, so its identity is fresh every render. Two
+  // primitives rather than one derived object for the same identity reason:
+  // an object would churn the `entries` memo below every render.
+  //
+  // The state is `sortRequest`, not `sort`, so that no site downstream can read
+  // the raw request by accident — `tsc` is the coverage this repo's missing
+  // component-test rig would otherwise have to provide.
+  const [sortRequest, setSort] = useState(defaultSort);
+  const sortIsVisible = columns.some((c) => c.id === sortRequest.columnId);
+  const sortColumnId = sortIsVisible ? sortRequest.columnId : defaultSort.columnId;
+  const sortDir = sortIsVisible ? sortRequest.dir : defaultSort.dir;
   const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
   // Which rows are disclosed. Deliberately ephemeral and collapsed on mount:
@@ -135,7 +173,7 @@ export function DataTable<Row>({
   // can call it once per row instead of once per comparison (some columns
   // derive their key from a path per call, with no memo).
   const { entries, topCount, disclosed } = useMemo(() => {
-    const col = columns.find((c) => c.id === sort.columnId) ?? columns[0];
+    const col = columns.find((c) => c.id === sortColumnId) ?? columns[0];
     const needle = search.trim().toLowerCase();
     return flattenTreeRows<Row>({
       rows: rows.filter((r) => rowId(r) !== pinnedId),
@@ -144,7 +182,7 @@ export function DataTable<Row>({
       // leaves the rows in the order the caller gave them. Unreachable by click:
       // an unsortable header is not a button.
       sortKey: col?.sortValue ?? (() => 0),
-      dir: sort.dir === "asc" ? 1 : -1,
+      dir: sortDir === "asc" ? 1 : -1,
       matches:
         needle && searchKeys
           ? (r) => searchKeys(r).some((k) => k.toLowerCase().includes(needle))
@@ -152,7 +190,7 @@ export function DataTable<Row>({
       childrenOf: tree ? tree.childrenOf : null,
       expanded,
     });
-  }, [rows, columns, sort, search, searchKeys, rowId, pinnedId, tree, expanded]);
+  }, [rows, columns, sortColumnId, sortDir, search, searchKeys, rowId, pinnedId, tree, expanded]);
 
   const rowVirtualizer = useVirtualizer({
     count: entries.length,
@@ -164,10 +202,13 @@ export function DataTable<Row>({
   const virtualize = entries.length > VIRTUALIZE_THRESHOLD;
   const gridTemplateColumns = columns.map((c) => c.width ?? "minmax(0,1fr)").join(" ");
 
+  // Compares against the EFFECTIVE column, not the remembered request: while a
+  // request is parked, the header shows the fallback as sorted, and a first
+  // click on what the user can see must flip it rather than restate it as asc.
   const toggleSort = (columnId: string): void => {
-    setSort((s) =>
-      s.columnId === columnId
-        ? { columnId, dir: s.dir === "asc" ? "desc" : "asc" }
+    setSort(
+      sortColumnId === columnId
+        ? { columnId, dir: sortDir === "asc" ? "desc" : "asc" }
         : { columnId, dir: "asc" },
     );
   };
@@ -237,7 +278,20 @@ export function DataTable<Row>({
         )}
       >
         {columns.map((col, i) => (
-          <div key={col.id} role="cell" className={cn("cell", col.numeric && "num", col.cellClass)}>
+          <div
+            key={col.id}
+            role="cell"
+            /* The two inert attributes the narrow arrangement needs on an
+               otherwise unchanged element tree (ADR-0073). `data-col` is the
+               column's name beside its value, because `content: attr()` is the
+               only way a stylesheet can write text; `data-empty` suppresses the
+               slot entirely, because CSS cannot select on text. Both are dead
+               weight in every other arrangement, on purpose — the alternative
+               is a different element tree per width. */
+            data-col={col.header}
+            data-empty={col.isEmpty?.(row) ? "1" : undefined}
+            className={cn("cell", col.numeric && "num", col.cellClass)}
+          >
             {i === 0 && tree ? (
               // The disclosure control lives in the first column so the tree
               // reads down the name axis. `stopPropagation` because the row
@@ -284,14 +338,25 @@ export function DataTable<Row>({
       />
 
       {/* Everything below the head bar shares one horizontal scroll container;
-          minWidth lands on the vertical scroll body — its content is
+          the row floor lands on the vertical scroll body — its content is
           width:auto and follows — so below the floor this wrapper scrolls
-          horizontally with row backgrounds still painting their full width. */}
+          horizontally with row backgrounds still painting their full width.
+
+          The floor travels as a CUSTOM PROPERTY rather than as `min-width`
+          itself: at narrow the row wraps and nothing is off-screen any more, so
+          the floor has to go or the scroller keeps a phantom scrollbar under a
+          row that fits — and an inline `min-width` could only be overridden
+          with `!important`. A variable lets the arrangement's rule simply
+          declare `min-width: 0` (globals.css, `.table-scroll`). */}
       <div className="overflow-x-auto flex-1 min-h-0 flex flex-col">
         <div
           ref={scrollRef}
-          style={{ minWidth }}
-          className="thin-scroll flex-1 min-h-0 overflow-y-auto"
+          style={
+            {
+              "--row-floor": minWidth === undefined ? "0px" : `${minWidth}px`,
+            } as React.CSSProperties
+          }
+          className="table-scroll thin-scroll flex-1 min-h-0 overflow-y-auto"
         >
           <div role="table" aria-label={title}>
             {/* One sticky frosted surface: the column-header row plus (on
@@ -306,26 +371,34 @@ export function DataTable<Row>({
                   // still matches the rows'.
                   if (!col.sortValue) {
                     return (
-                      <div key={col.id} role="columnheader" className={cn(col.numeric && "num")}>
+                      <div
+                        key={col.id}
+                        role="columnheader"
+                        // The same attribute the body cells carry, for the same
+                        // reason in reverse: at narrow the header becomes a
+                        // wrapping run of sort chips, and a column with no name
+                        // (the Projects merge action) must not draw a blank one.
+                        data-col={col.header}
+                        className={cn(col.numeric && "num")}
+                      >
                         <span>{col.header}</span>
                       </div>
                     );
                   }
-                  const active = sort.columnId === col.id;
+                  const active = sortColumnId === col.id;
                   return (
                     <button
                       key={col.id}
                       type="button"
                       role="columnheader"
-                      aria-sort={
-                        active ? (sort.dir === "asc" ? "ascending" : "descending") : "none"
-                      }
+                      data-col={col.header}
+                      aria-sort={active ? (sortDir === "asc" ? "ascending" : "descending") : "none"}
                       onClick={() => toggleSort(col.id)}
                       className={cn(col.numeric && "num", active && "sorted")}
                     >
                       <span>{col.header}</span>
                       {active ? (
-                        sort.dir === "asc" ? (
+                        sortDir === "asc" ? (
                           <ArrowUp aria-hidden strokeWidth={2.5} />
                         ) : (
                           <ArrowDown aria-hidden strokeWidth={2.5} />

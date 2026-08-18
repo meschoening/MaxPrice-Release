@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
+use tauri_plugin_window_state::AppHandleExt;
 
 #[derive(Default)]
 enum SidecarStatus {
@@ -106,6 +107,53 @@ fn append_if_open(slot: &Mutex<Option<std::sync::Arc<sidecar_log::RotatingLog>>>
 #[tauri::command]
 fn log_client_event(state: State<'_, ClientLog>, line: String) {
     append_if_open(&state.0, &line);
+}
+
+/// What the window-state plugin persists across launches (map #151, T8).
+///
+/// Three of the six flags, and the three exclusions are each load-bearing:
+///
+/// - **VISIBLE would break the boot splash.** The plugin restores in its
+///   `on_window_ready` hook — before the webview has run a line — and the
+///   restore ends with `if flags.contains(VISIBLE) && should_show { show();
+///   set_focus() }`, where `should_show` defaults to `true` when there is no
+///   saved state. So with VISIBLE set, the FIRST launch shows the window
+///   instantly and every later one restores `visible: true` (the window is
+///   always visible when we save), which is exactly the blank-window-then-
+///   assemble sequence `visible: false` + the renderer-driven show exists to
+///   prevent (ADR-0066, `lib/window-show.ts`). Excluding it leaves the show
+///   entirely to the renderer, unchanged.
+/// - **DECORATIONS** is a constant of the product, set in tauri.conf.json.
+///   Nothing in the app toggles it, so persisting it can only ever restore a
+///   value the config already asserts — or, after a config change, fight it.
+/// - **FULLSCREEN** is not what the ticket asked for, and it is the one flag
+///   whose restore runs unconditionally (`set_fullscreen(state.fullscreen)`)
+///   against a window that is still hidden. Left out until something wants it.
+///
+/// Geometry restore lands before the window is on screen for the same reason
+/// VISIBLE is excluded — the window is hidden until the splash has painted — so
+/// there is no visible jump, no matter how the restore is sequenced.
+fn window_state_flags() -> tauri_plugin_window_state::StateFlags {
+    use tauri_plugin_window_state::StateFlags;
+    StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED
+}
+
+/// Flush the window geometry to disk NOW, for an exit that will not run a hook.
+///
+/// The plugin saves on `CloseRequested` and on `RunEvent::Exit`, which together
+/// cover every ordinary end — including `relaunch()`, whose plugin-process
+/// command calls `app.request_restart()` and so goes through the event loop.
+/// The one exit that reaches neither is the Windows update install: the updater
+/// hands the installer to `ShellExecuteW` and calls `std::process::exit(0)`
+/// (tauri-plugin-updater 2.10.1, updater.rs:865) — the same abrupt exit
+/// ADR-0072 gives the sidecar a kernel-enforced lifetime for. Its
+/// `on_before_exit` hook is not reachable from the renderer's install path
+/// (the plugin sets it to `cleanup_before_exit` itself), so the renderer calls
+/// this immediately before `downloadAndInstall`.
+#[tauri::command]
+fn save_window_geometry(app: AppHandle) -> Result<(), String> {
+    app.save_window_state(window_state_flags())
+        .map_err(|e| format!("window state save: {e}"))
 }
 
 #[tauri::command]
@@ -623,6 +671,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state_flags())
+                .build(),
+        )
         .manage(SidecarState::default())
         .manage(ClientLog::default())
         .invoke_handler(tauri::generate_handler![
@@ -634,7 +687,8 @@ pub fn run() {
             set_credential,
             get_hub_password,
             set_hub_password,
-            log_client_event
+            log_client_event,
+            save_window_geometry
         ])
         .setup(|app| {
             if let Err(e) = spawn_sidecar(app.handle()) {

@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "maxprice-desktop"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "getrandom 0.2.17",
  "keyring",
@@ -2183,6 +2183,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-shell",
  "tauri-plugin-updater",
+ "tauri-plugin-window-state",
  "tempfile",
  "time",
  "tokio",
@@ -4211,6 +4212,21 @@ dependencies = [
  "url",
  "windows-sys 0.60.2",
  "zip",
+]
+
+[[package]]
+name = "tauri-plugin-window-state"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73736611e14142408d15353e21e3cca2f12a3cfb523ad0ce85999b6d2ef1a704"
+dependencies = [
+ "bitflags 2.11.1",
+ "log",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

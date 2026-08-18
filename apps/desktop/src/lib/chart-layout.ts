@@ -19,11 +19,69 @@ import type { ChartModel } from "@/lib/chart-model";
 //   visible and bar bottoms stay square; the prototype's clip ended at y1,
 //   rounding the baseline corners too.
 
+// The full chart's view at its BASE width — the box the app drew at before the
+// view went fluid (ADR-0073), and still the fallback a chart builds against
+// before its own box has been measured. Every geometry test is authored here.
 export const CHART_VIEW = { w: 720, h: 240, x0: 36, x1: 704, y0: 20, y1: 220 } as const;
 export const COMPACT_VIEW = { w: 720, h: 64, x0: 0, x1: 720, y0: 2, y1: 62 } as const;
 
 export type ChartView = { w: number; h: number; x0: number; x1: number; y0: number; y1: number };
 export type LabelMode = "day" | "time";
+
+// --- the fluid view (ADR-0073) ----------------------------------------------
+// `k` — CSS px per view unit — is the one free parameter a fluid view needs,
+// and before this it was not a constant at all but `svgPx / 720`: a zoom that
+// measured 0.818 → 1.604 across the bench and 3.06 at 2560 once the frame cap
+// came off, taking 8.2px axis type to 30.6px. The view is now clamped at both
+// ends instead, `k ∈ [1.0, 1.60]`:
+//
+//   view.w = min(px, max(720, px / 1.60))     view.h = 240, always
+//
+// 1.60 is the rung the shipped app already topped out at against the old
+// `max-w-[1500px]` frame, so nothing reachable before this change moves; only
+// the width that cap forbade is new (a 2215px box → view 1384×240, plot 1332u,
+// 384px tall). Above the cap the drawing stops growing and the window resolves
+// more room instead — note ROOM, not buckets: every bucket size is an engine
+// decision and none is derived from `view.w`.
+//
+// Written as `max(720, …)` rather than `px / min(px/720, 1.60)` deliberately:
+// below a 1152px box `max` returns EXACTLY 720, where the division form returns
+// 720 ± a float epsilon that would leak into every geometry number and into the
+// layout memo's identity. "Identical to the shipped chart below the cap" is
+// structural here, not an arithmetic coincidence someone has to re-derive.
+//
+// The outer `min` floors k at 1.0, which only bites below a 720px box — the
+// narrow arrangement, where the view NARROWS instead of the drawing shrinking:
+// same buckets, fewer units, the authored 10px axis type at 10px in a 240px-
+// tall box rather than 8.2px in a 196px one.
+//
+// `view.h` stays 240 VIEW UNITS at every width. The rendered px height
+// therefore stops growing above the cap (384px) and still scales below it,
+// which is the chosen behaviour, not a rounding to correct.
+const K_MAX = 1.6;
+
+// Half a clamped day label, kept in view units — derived from the base view so
+// the two can never drift.
+const RIGHT_GUTTER = CHART_VIEW.w - CHART_VIEW.x1;
+
+export function chartViewWidth(px: number): number {
+  return Math.min(px, Math.max(CHART_VIEW.w, px / K_MAX));
+}
+
+// The full chart's gutters at any view width: 36 left (tick labels),
+// RIGHT_GUTTER right, 20 top (the `now` label), 20 bottom (the day axis). At
+// w = 720 this IS CHART_VIEW — pinned by test, since that identity is what
+// makes the sub-cap chart byte-identical to the one that shipped.
+export function chartViewAt(w: number): ChartView {
+  return {
+    w,
+    h: CHART_VIEW.h,
+    x0: CHART_VIEW.x0,
+    x1: w - RIGHT_GUTTER,
+    y0: CHART_VIEW.y0,
+    y1: CHART_VIEW.y1,
+  };
+}
 
 export type SegLayout = { x: number; y: number; w: number; h: number; color: string };
 export type ClusterLayout = {
@@ -131,7 +189,30 @@ function barGeom(view: ChartView, n: number, ghost: boolean, compact: boolean) {
   const bw = Math.min(22, Math.max(BAR_MIN_W, cw * (compact ? 0.42 : 0.28)));
   const gw = Math.max(GHOST_MIN_W, bw * 0.55);
   const gap = Math.min(4, Math.max(GAP_MIN_W, cw * 0.05));
-  return { cw, bw, gw, gap, contentW: ghost ? gw + gap + bw : bw };
+  const raw = ghost ? gw + gap + bw : bw;
+  // Scale the whole cluster's content down proportionally when the slot cannot
+  // hold the authored floors, so the marks always fit — bar, ghost and gap keep
+  // their 2.5 : 1.5 : 1.5 ratio and together fill the slot exactly.
+  //
+  // `fit === 1` AT EVERY BOX >= 720, by construction and by test: the last
+  // sparse n is 121, and against the base view's 668-unit plot that is 5.521
+  // units per cluster against 5.5 of content (122 is already dense). So the base
+  // view, every above-cap view, and therefore every authored geometry number in
+  // this module are byte-identical to what shipped — the clamp only exists
+  // BELOW the base width.
+  //
+  // Below it the fit does bite, because the view narrows while the dense
+  // threshold does not: at a 553px box the plot is 501 units, so the floors stop
+  // fitting at n = 92 while sparse mode runs to 121. That is the exact cost of
+  // pinning SPARSE_MAX_N absolute (see its comment / ADR-0073 §148 — a
+  // view-derived threshold would be 97 here, and would remount the marks layer
+  // mid-drag). This clamp is that decision's counterpart: it accepts bars below
+  // their authored 2.5-unit floor at narrow widths — at n = 121 / 553px, fit is
+  // 0.753, giving a 1.88u bar — in exchange for never letting bucket i+1's
+  // ~40%-alpha ghost paint on top of bucket i's bar, which is what the
+  // unclamped geometry did (up to 1.36u of a 2.5u bar, at 1 unit = 1 CSS px).
+  const fit = Math.min(1, cw / raw);
+  return { cw, bw: bw * fit, gw: gw * fit, gap: gap * fit, contentW: raw * fit };
 }
 
 // The narrowest cluster that still fits a side-by-side bar + ghost twin, at the
@@ -149,8 +230,21 @@ function barGeom(view: ChartView, n: number, ghost: boolean, compact: boolean) {
 // number keeps a given window's appearance stable under that toggle.
 export const SPARSE_MIN_CLUSTER_W = GHOST_MIN_W + GAP_MIN_W + BAR_MIN_W;
 
-export function isDenseLayout(view: ChartView, n: number): boolean {
-  return n > 0 && (view.x1 - view.x0) / n < SPARSE_MIN_CLUSTER_W;
+// The last sparse bucket count — an ABSOLUTE `n`, derived once against the BASE
+// view and then standing at every width (ADR-0073 amending ADR-0046's
+// derivation, not its number: 121 stays, it just stops moving).
+//
+// SPARSE_MIN_CLUSTER_W is doing two jobs, and only one of them is fluid: a
+// geometric fit, which scales with `view.w`, and ADR-0046's node budget, which
+// does not. Re-derived against a fluid view the threshold moves 121 → 242 at
+// wide and 121 → 97 at narrow, so a `block` between minute 122 and 242 would be
+// sparse bars maximized and dense bands half-screen — and the two modes share
+// no elements, so crossing the boundary REMOUNTS the marks layer and replays
+// the rise animation partway through a window drag.
+export const SPARSE_MAX_N = Math.floor((CHART_VIEW.x1 - CHART_VIEW.x0) / SPARSE_MIN_CLUSTER_W);
+
+export function isDenseLayout(n: number): boolean {
+  return n > SPARSE_MAX_N;
 }
 
 // A dense band as one closed step-area polygon: the top edge walked
@@ -298,16 +392,20 @@ export function buildChartLayout(
   // recoverable from the model, yet it decides both whether a bucket-count
   // change means "the window grew" or "a different window", and whether two
   // same-shaped layouts are the same chart at all.
-  opts: { compact: boolean; labelMode: LabelMode; span?: Span },
+  // `view` is the caller's measured, width-fluid box (ADR-0073) — every number
+  // this layer emits already reads it, so going fluid changed nothing below
+  // this line. Absent, the module constants stand: before the first
+  // measurement, and for the compact strips, which are deliberately fixed.
+  opts: { compact: boolean; labelMode: LabelMode; span?: Span; view?: ChartView },
 ): ChartLayout {
-  const view: ChartView = opts.compact ? COMPACT_VIEW : CHART_VIEW;
+  const view: ChartView = opts.view ?? (opts.compact ? COMPACT_VIEW : CHART_VIEW);
   const n = model.buckets.length;
   const plotH = view.y1 - view.y0;
   const geom = barGeom(view, n, model.ghost, opts.compact);
   // Dense mode is a BARS concern: lines are already one element per series at
   // any bucket count. Compact strips are daily-fed (≤30 buckets) and never
   // reach the threshold, but the check is uniform rather than mode-gated.
-  const dense = model.mark === "bars" && isDenseLayout(view, n);
+  const dense = model.mark === "bars" && isDenseLayout(n);
 
   // --- y-mapping + gridlines -----------------------------------------------
   let y: (v: number) => number;
@@ -536,19 +634,28 @@ export function buildChartLayout(
         isNow: i === n - 1 && model.nowIndex !== null,
       });
     }
-    // `labelIndices` always forces n - 1 on top of the stepped set, so the last
-    // two can sit closer than the step suggests once the last one is clamped
-    // inward. Drop the stepped neighbour rather than let two labels overprint —
-    // reachable today on the 12-hour dated line axes (7d/30d at the 15-min
-    // bucket: n = 672 / 2880, whose forced last label clamps ~24 units left of
-    // its center and lands inside a "05/21 12:00 AM" of the stepped one).
-    // Never the forced n - 1 label: the last bucket is the now/today bucket the
-    // axis must name.
-    const a = dayLabels[dayLabels.length - 2];
-    const b = dayLabels[dayLabels.length - 1];
-    if (a && b) {
+    // Middle-anchored labels overprint as soon as two centers close to within
+    // their averaged half-widths, and `labelIndices` cannot see that coming: it
+    // picks a label COUNT from n alone, then forces n - 1 on top of the stepped
+    // set. Sweep right to left, dropping the EARLIER label of any colliding
+    // pair — right to left because the last bucket is the now/today one the
+    // axis must name, so it is the one label that can never be dropped.
+    //
+    // Two things reach this. At the base view it fires exactly once, on the
+    // 12-hour dated line axes (7d/30d at the 15-min bucket: n = 672 / 2880,
+    // whose forced last label clamps ~24 units left of its center and lands
+    // inside a "05/21 12:00 AM" of the stepped one) — which is why it was
+    // written as a single check. The fluid view (ADR-0073) is the second: below
+    // a 720px box the FRAME narrows while a label keeps its width in units, so
+    // a 553-unit view asks seven dated AM/PM labels at ~81 units each to sit in
+    // ~71 units of pitch, and thinning one of them is nowhere near enough.
+    for (let i = dayLabels.length - 1; i > 0; i--) {
+      // After a splice at i - 1 the kept label shifts down into i - 1, and the
+      // loop's own `i--` lands on it — so `b` is always the last KEPT label.
+      const b = dayLabels[i]!;
+      const a = dayLabels[i - 1]!;
       const need = (estimateLabelWidth(a.text) + estimateLabelWidth(b.text)) / 2;
-      if (b.x - a.x < need) dayLabels.splice(dayLabels.length - 2, 1);
+      if (b.x - a.x < need) dayLabels.splice(i - 1, 1);
     }
   }
 

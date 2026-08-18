@@ -42,8 +42,16 @@ function Section({
 }): React.ReactElement {
   return (
     <section className="s-section" aria-label={title}>
-      <h2>{title}</h2>
-      <p className="desc">{description}</p>
+      {/* PROTOTYPE — map #151 / T6 (#158), variant C. The wrapper is VISUALLY
+          INERT in the shipped layout (`.s-section` is block flow and both rules
+          below are descendant selectors), and it is here because CSS alone
+          cannot pair two siblings into one grid cell: C's wide settings row
+          wants title+desc as one column beside the control. That is the cost of
+          C on this page — one element — and it is a finding, not a shortcut. */}
+      <div className="s-text">
+        <h2>{title}</h2>
+        <p className="desc">{description}</p>
+      </div>
       <div className="control">{children}</div>
     </section>
   );

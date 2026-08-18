@@ -17,6 +17,8 @@ import { formatRelativeTime, formatWallDayMonth } from "@maxprice/shared";
 import { abbreviate, formatRange } from "@/lib/active-block";
 import { formatCost, RANGE_LABEL } from "@/lib/list-format";
 import { WINDOW_SOURCE } from "@/components/window-source";
+import { useArrangement } from "@/state/use-arrangement";
+import { costBarColumn } from "@/components/cost-bar";
 import { cn } from "@/lib/utils";
 
 type BlockKind = "active" | "gap" | "done";
@@ -118,6 +120,14 @@ export function BlocksPage(): React.ReactElement {
   // before the columns memo / early return below so the hook order is stable.
   const corpusEmpty = useCorpusEmpty();
 
+  // Wide's cost bar (ADR-0073) — Blocks is its best case: 15 rows whose ~1600px
+  // WINDOW void becomes a spend profile readable at a glance.
+  const wide = useArrangement() === "wide";
+  const barMax = useMemo(
+    () => blocks.reduce((m, b) => (b.costUSD > m ? b.costUSD : m), 0),
+    [blocks],
+  );
+
   const columns = useMemo<Column<BlockRow>[]>(
     () => [
       {
@@ -162,6 +172,10 @@ export function BlocksPage(): React.ReactElement {
         width: "110px",
         sortValue: (b) => b.burnRate?.tokensPerMinute ?? -1,
         cell: (b) => (b.burnRate ? `${abbreviate(b.burnRate.tokensPerMinute)}/min` : DASH),
+        // A burn rate is a live-block property, so on a done row this is an em
+        // dash — and at narrow a labelled "BURN RATE —" slot is what took a done
+        // row to a third line against the active row's two (ADR-0073).
+        isEmpty: (b) => b.burnRate === null,
       },
       {
         id: "tokens",
@@ -171,6 +185,8 @@ export function BlocksPage(): React.ReactElement {
         sortValue: (b) => b.totalTokens,
         cell: (b) => abbreviate(b.totalTokens),
       },
+      // Wide only, immediately left of Cost (ADR-0073).
+      ...(wide ? [costBarColumn<BlockRow>({ max: barMax, get: (b) => b.costUSD })] : []),
       {
         id: "cost",
         header: "Cost",
@@ -187,6 +203,7 @@ export function BlocksPage(): React.ReactElement {
         width: "100px",
         sortValue: (b) => b.projection?.totalCost ?? -1,
         cell: (b) => (b.projection ? formatCost(b.projection.totalCost) : DASH),
+        isEmpty: (b) => b.projection === null,
       },
       {
         id: "5h-limit",
@@ -195,9 +212,12 @@ export function BlocksPage(): React.ReactElement {
         width: "90px",
         sortValue: (b) => b.fiveHourLimitPct ?? -1,
         cell: (b) => (b.fiveHourLimitPct === null ? DASH : `${Math.round(b.fiveHourLimitPct)}%`),
+        // Null on every heuristic-windowed row (ADR-0030), which is most of
+        // them in a history hole — the same labelled-slot cost as Burn rate.
+        isEmpty: (b) => b.fiveHourLimitPct === null,
       },
     ],
-    [now, display],
+    [now, display, wide, barMax],
   );
 
   // An empty result while the corpus is non-empty is just a filtered-out date
@@ -247,7 +267,11 @@ export function BlocksPage(): React.ReactElement {
             onSelect={onSelect}
             selectedId={selectedId}
             // 590px of fixed columns + ≥160px for the window label. Below this
-            // the table scrolls horizontally instead of crushing it.
+            // the table scrolls horizontally instead of crushing it — except at
+            // narrow, where the row wraps and the floor is dropped (ADR-0073:
+            // this table is the surface that fails worst without the wrap, its
+            // WINDOW label ellipsised on 16 of 16 rows inside a scroller that
+            // could never reveal it).
             minWidth={750}
             defaultSort={{ columnId: "window", dir: "desc" }}
             pinnedRow={activeBlock}

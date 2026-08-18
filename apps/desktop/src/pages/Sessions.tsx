@@ -23,6 +23,8 @@ import { StripPage } from "@/components/strip-page";
 import { DetailStrip, StripIdentity, StripSection, StripStat } from "@/components/detail-strip";
 import { ModelBadges } from "@/components/model-badges";
 import { ModelSplitBar } from "@/components/model-split-bar";
+import { useArrangement } from "@/state/use-arrangement";
+import { costBarColumn } from "@/components/cost-bar";
 import { aggregateSessions, type SessionsAggregate } from "@/lib/aggregate";
 import { formatCost, RANGE_LABEL } from "@/lib/list-format";
 import { abbreviate } from "@/lib/active-block";
@@ -68,6 +70,18 @@ export function SessionsPage(): React.ReactElement {
     models,
     machines: machineAxis.machineParams,
   });
+
+  // Wide's cost bar (ADR-0073). Gated in JS, not by an @container rule, because
+  // a column is a TypeScript object no stylesheet can reach — see
+  // `state/use-arrangement.ts`. The scale is the range's largest session cost.
+  const wide = useArrangement() === "wide";
+  // Keyed on `query.data`, NOT on `query.data?.sessions ?? []`: the `?? []` mints
+  // a fresh array every render, which would defeat the memo outright. `query.data`
+  // is stable across equal refetches (TanStack structural sharing).
+  const barMax = useMemo(
+    () => (query.data?.sessions ?? []).reduce((m, s) => (s.totalCost > m ? s.totalCost : m), 0),
+    [query.data],
+  );
 
   // The Machine column (dot + resolved name) lands after Project, present ONLY
   // while the machine axis is enabled (ADR-0041 M6). Built as a memo so it can
@@ -129,6 +143,9 @@ export function SessionsPage(): React.ReactElement {
         sortValue: (s: SessionRow) => s.totalTokens,
         cell: (s: SessionRow) => abbreviate(s.totalTokens),
       },
+      // Wide only, and immediately left of Cost so the drawing and its number
+      // read as one lockup (ADR-0073).
+      ...(wide ? [costBarColumn<SessionRow>({ max: barMax, get: (s) => s.totalCost })] : []),
       {
         id: "cost",
         header: "Cost",
@@ -151,7 +168,7 @@ export function SessionsPage(): React.ReactElement {
         ),
       },
     ],
-    [machineAxis],
+    [machineAxis, wide, barMax],
   );
   const rows = useMemo(() => query.data?.sessions ?? [], [query.data]);
 
@@ -252,7 +269,10 @@ export function SessionsPage(): React.ReactElement {
             // 332px of fixed columns + 96px models minimum + ≥264px shared by
             // the session / project name columns. Below this the table scrolls
             // horizontally instead of crushing them. The Machine column adds
-            // 120px to the floor when the axis is enabled (ADR-0041 M6).
+            // 120px to the floor when the axis is enabled (ADR-0041 M6). At
+            // narrow the row wraps and the floor is dropped entirely — nothing
+            // is off-screen there, so keeping it would leave a phantom scrollbar
+            // under a row that fits (globals.css `.table-scroll`).
             minWidth={machineAxis.enabled ? 812 : 692}
             defaultSort={{ columnId: "lastActivity", dir: "desc" }}
             searchKeys={searchKeys}

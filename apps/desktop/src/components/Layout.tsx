@@ -81,13 +81,24 @@ export function Layout() {
 // and dialog, and ToastHost's dismiss timers. `data-boot` drives both the
 // hidden hold and the rise (which would otherwise be spent while hidden and
 // leave the frame popping in flat).
+//
+// `.app-frame` / `.app-content` are the two layout query containers (map #151
+// T1) — see globals.css "responsive thresholds" for why the content container
+// sits on this wrapper rather than on <main>, which is the scroll container.
 function AppFrame(): React.ReactElement {
   const phase = useBootPhase();
+  // The frame no longer caps its width (map #151 / T5 #157). It was
+  // `max-w-[1500px] mx-auto`, which pinned the content column at 1196px for
+  // EVERY viewport at or above 1532 — so a maximized MacBook Pro 16" and a
+  // 2560 monitor rendered the identical layout, and the top half of the medium
+  // band did not exist to be designed against. `mx-auto` goes with it: with no
+  // cap it can never do anything, and leaving it would imply a centring rule
+  // that is not there. Wide (content >= 1520) is now reachable and is T6's.
   return (
     <div
       data-boot={phase}
       aria-hidden={phase === "hold" || undefined}
-      className="boot-frame h-screen w-screen flex gap-5 p-4 max-w-[1500px] mx-auto text-text"
+      className="app-frame boot-frame h-screen w-screen flex gap-5 p-4 text-text"
     >
       {phase === "reveal" ? (
         <>
@@ -96,7 +107,7 @@ function AppFrame(): React.ReactElement {
         </>
       ) : null}
       <Sidebar />
-      <div className="flex-1 min-w-0 flex flex-col gap-[18px]">
+      <div className="app-content flex-1 min-w-0 flex flex-col gap-[18px]">
         <Topbar />
         <main className="thin-scroll flex-1 min-h-0 overflow-auto -m-2 p-2">
           <Outlet />

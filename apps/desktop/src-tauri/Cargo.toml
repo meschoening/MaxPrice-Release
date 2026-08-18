@@ -1,6 +1,6 @@
 [package]
 name = "maxprice-desktop"
-version = "0.4.1"
+version = "0.5.0"
 description = "MaxPrice desktop"
 authors = ["Max Schoening"]
 license = "MIT"
@@ -20,6 +20,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
+tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync", "macros", "rt", "io-util"] }

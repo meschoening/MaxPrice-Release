@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "MaxPrice",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "identifier": "com.maxprice.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -16,7 +16,7 @@
         "label": "main",
         "width": 1280,
         "height": 800,
-        "minWidth": 960,
+        "minWidth": 720,
         "minHeight": 600,
         "resizable": true,
         "fullscreen": false,
