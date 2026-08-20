@@ -34,8 +34,11 @@
   --panel-shadow: 0 8px 32px oklch(30% 0.05 280 / 0.12);
   --chip-shadow: 0 2px 10px oklch(30% 0.05 280 / 0.1);
 
-  /* frost radii per recipe tier — collapsed to none by the
-     reduce-transparency fallback below (mode-independent, so :root only) */
+  /* frost radii per tier — collapsed to none by the reduce-transparency
+     fallback below (mode-independent, so :root only). Opt-in per surface
+     (ADR-0075): only content-overlap surfaces spend them — floating leaves
+     (menu/kmenu/toast + per-app leaves and dialogs), sticky heads, and the
+     sidebar flyout. The base .panel/.chip/.seg recipes carry NO frost. */
   --frost-panel: blur(24px);
   --frost-chip: blur(12px);
   --frost-toast: blur(16px);
@@ -243,21 +246,27 @@ kbd {
 }
 
 /* ================= the glass material ================= */
+/* NO backdrop-filter here — frost is opt-in, per surface, and only for
+   surfaces that can have CONTENT behind them (ADR-0075). A docked panel's
+   backdrop is the static wash, and blurring a soft gradient reproduces it
+   (measured: <0.5% of pixels move); meanwhile Chromium re-renders EVERY
+   backdrop-filter surface on EVERY composited frame, so with the system's
+   always-on pulses a page of frosted panels pins 15–50% of a GPU doing
+   nothing. The glass read lives in the tint + border + inner highlight +
+   shadow below. Surfaces that do overlap content (floating leaves, sticky
+   heads, the sidebar FLYOUT state) declare their own frost from the
+   --frost-* tiers. */
 .panel {
   background: var(--panel);
-  -webkit-backdrop-filter: var(--frost-panel);
-  backdrop-filter: var(--frost-panel);
   border: 1px solid var(--panel-border);
   box-shadow: var(--panel-shadow), var(--panel-inner);
   border-radius: 20px;
 }
 
-/* Every control is a pill wearing the panel material at reduced blur. */
+/* Every control is a pill wearing the panel material. */
 .chip,
 .seg {
   background: var(--panel);
-  -webkit-backdrop-filter: var(--frost-chip);
-  backdrop-filter: var(--frost-chip);
   border: 1px solid var(--panel-border);
   box-shadow: var(--chip-shadow), var(--panel-inner);
   border-radius: 999px;
@@ -310,8 +319,6 @@ kbd {
   background: transparent;
   border-color: transparent;
   box-shadow: none;
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
 }
 .chip.ghost-btn:hover:not(:disabled) {
   color: var(--text);
@@ -508,7 +515,17 @@ kbd {
 }
 
 /* The toast pill — bottom-center, one at a time, auto-dismissed by the
-   caller (~2.2s dwell). */
+   caller (~2.2s dwell). Both apps' ToastHost mounts the pill permanently and
+   hides it with opacity alone, so unlike every other floating leaf (the menus
+   unmount when closed) this element is always in the tree — which makes it the
+   one place where ADR-0075's per-state rule has to be spelled out: the frost
+   lives on .show, so a hidden pill asks the compositor for no backdrop work at
+   all. The blur is in the transition list beside opacity for a reason — drop
+   .show with the frost on the element and the backdrop snaps sharp under a
+   still-opaque tint for the whole 250ms fade-out; sharing the duration lets it
+   ease out with the pill. (Fading IN needs no such care: backdrop output is
+   composited with the element's own alpha, and `none` interpolates as
+   blur(0).) */
 .toast {
   position: fixed;
   left: 50%;
@@ -521,8 +538,6 @@ kbd {
   border-radius: 999px;
   white-space: nowrap;
   background: var(--panel);
-  -webkit-backdrop-filter: var(--frost-toast);
-  backdrop-filter: var(--frost-toast);
   border: 1px solid var(--panel-border);
   box-shadow: var(--panel-shadow), var(--panel-inner);
   font-size: 12px;
@@ -530,11 +545,15 @@ kbd {
   color: var(--text);
   transition:
     opacity 0.25s,
-    transform 0.25s;
+    transform 0.25s,
+    -webkit-backdrop-filter 0.25s,
+    backdrop-filter 0.25s;
 }
 .toast.show {
   opacity: 1;
   transform: translate(-50%, 0);
+  -webkit-backdrop-filter: var(--frost-toast);
+  backdrop-filter: var(--frost-toast);
 }
 
 /* ================= in-app identity ================= */
@@ -634,8 +653,8 @@ kbd {
 }
 
 /* ================= T1 form primitives ================= */
-/* Glass input — recessed tint fill, deliberately NO backdrop-filter of its
-   own: nested frost inside a frosted panel buys nothing and costs a layer. */
+/* Glass input — recessed tint fill, no backdrop-filter (like every
+   wash-backed surface since ADR-0075; it never had one even before). */
 .input {
   width: 100%;
   padding: 6.5px 11px;

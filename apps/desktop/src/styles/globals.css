@@ -402,9 +402,37 @@ body {
   padding: var(--sb-pad);
   overflow-x: hidden;
   overflow-y: var(--sb-overflow);
+  /* The frost rides the same 0.24s as the width. `.open` drops synchronously
+     (Esc, outside-mousedown, route change, nav click, persist toggle), so an
+     untransitioned `backdrop-filter` falls to `none` on frame one while ~188px
+     of a half-opaque panel still overlays content — the text behind snaps
+     sharp for the whole ease. `none` interpolates against a filter list as
+     that list's defaults, so this fades blur(24px) → blur(0px). Three facts
+     keep it cheap: (a) the frosted surface exists only for the 240ms of a
+     dismissal, so ADR-0075's per-frame rest cost is untouched; (b) under
+     `data-reduce-transparency` both endpoints are `none` and `--panel` goes
+     opaque, so it is a no-op there; (c) the transition lives out here while
+     the frost lives inside the container query, so a resize across 1071px
+     carrying a stale `.open` now fades the frost off instead of snapping —
+     and still cannot re-frost a docked panel. The `-webkit-` line is
+     required: macOS WKWebView snaps without it. */
   transition:
     width 0.24s var(--ease-glass),
-    padding 0.24s var(--ease-glass);
+    padding 0.24s var(--ease-glass),
+    -webkit-backdrop-filter 0.24s var(--ease-glass),
+    backdrop-filter 0.24s var(--ease-glass);
+}
+
+/* The flyout is the ONE sidebar state with content behind it — the panel
+   widens over the page instead of pushing it — so it alone wears frost
+   (ADR-0075; the docked panel's backdrop is only the wash). Scoped to
+   trigger 1's query because `.open` above the threshold can only be stale
+   (see the trigger-2 note above) and must not re-frost a docked panel. */
+@container frame (max-width: 1071px) {
+  .sidebar.open .sidebar-panel {
+    -webkit-backdrop-filter: var(--frost-panel);
+    backdrop-filter: var(--frost-panel);
+  }
 }
 
 /* Every word the rail hides. Zero-width and transparent collapsed; it
@@ -1447,13 +1475,6 @@ a.sb-footrow:hover .sb-label {
 .chart-svg.resizing rect.clip-rect {
   transition: none;
 }
-/* The glass package styles a `.seg` of its own (segmented controls) with a
-   backdrop-filter; on our SVG rects that declaration is at best a no-op and
-   at worst a per-rect compositing layer. Sever the name collision here. */
-.chart-svg .seg {
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-}
 .bars-layer {
   animation: rise 0.4s var(--ease-glass);
 }
@@ -1841,26 +1862,33 @@ a.sb-footrow:hover .sb-label {
   border-radius: 2.5px;
 }
 
-/* --- the table panel: ONE frosted surface; rows are flat tints --- */
+/* --- the table panel: NO frost — the sticky head owns it; rows are flat tints --- */
 /* The page's flex column supplies the height (ADR-0016: the table card is
    the viewport remainder under the strip) — not the mock's fixed 58vh. */
 .table-panel {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  /* The panel's OWN frost is deliberately dropped — it is what made
-     `.sticky-head`'s frost a no-op. An element carrying `backdrop-filter` is a
-     backdrop root for its descendants, and Chromium hands a nested
-     `backdrop-filter` that root's own backdrop rather than the root's painted
-     contents: the sticky head was blurring the wash it already sat on and
-     never the rows, so row text slid under it perfectly sharp at ANY radius
-     (probed: blur(12) and blur(40) pixel-identical; an opaque background
-     confirmed the rows really are behind it, and removing this line is what
-     made the blur bite). Only one of the two frosts can sample content, so it
-     goes to the one whose backdrop has any: nothing sits behind a table panel
-     but the smooth radial wash, where blur(24) is visually an identity, while
-     the sticky head sits over 13px text. The panel keeps its tint, border,
-     shadow and radius — the wash still bleeds through, merely unblurred. */
+  /* No frost here — since ADR-0075 that is every panel's default, but for
+     THIS panel it is also a correctness constraint that predates it: an
+     element carrying `backdrop-filter` is a backdrop root for its
+     descendants, and Chromium hands a nested `backdrop-filter` that root's
+     own backdrop rather than the root's painted contents — so a frosted
+     table panel makes `.sticky-head`'s frost a no-op (probed: blur(12) and
+     blur(40) pixel-identical over rows that slid under it perfectly sharp;
+     removing the panel frost is what made the head's blur bite). Only one
+     of the two frosts can sample content; it must stay with the sticky
+     head. Never reintroduce one here.
+
+     The explicit `none` below is the mechanical half of that: `globals.css`
+     imports `@maxprice/glass` at the top, so at equal single-class
+     specificity this declaration wins on source order and a frost re-added
+     to `.panel`/`.chip`/`.seg` cannot reach this element. The guard is
+     PARTIAL, not total — frost on some OTHER ancestor (`.list-page`,
+     `.page`) or reaching `.table-panel` through a more specific selector
+     would still make a backdrop root above the head and blind it. `none`
+     is the initial value and creates no render surface, so ADR-0075's
+     per-frame cost is untouched. */
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }
@@ -3452,7 +3480,9 @@ a.sb-footrow:hover .sb-label {
 }
 /* --- the dwell popover: the legend's descriptions, out of the resting list.
    Portalled to <body>, so `fixed` resolves against the viewport rather than
-   the backdrop-filtered panel above it (see NotePopover).
+   against an ancestor that establishes a containing block for it — a
+   `transform`, `filter`, or `contain` anywhere on the panels above would
+   otherwise capture it (see NotePopover).
 
    `pointer-events: none` is load-bearing, not decoration: the popover opens
    UNDER the cursor's path and would otherwise steal the hover that opened it,
@@ -3621,8 +3651,6 @@ a.sb-footrow:hover .sb-label {
   padding: 30px 28px 26px;
   border-radius: 20px;
   background: var(--panel);
-  -webkit-backdrop-filter: var(--frost-panel);
-  backdrop-filter: var(--frost-panel);
   border: 1px dashed color-mix(in oklch, var(--soft) 45%, var(--panel-border));
   box-shadow: var(--panel-shadow), var(--panel-inner);
   display: flex;

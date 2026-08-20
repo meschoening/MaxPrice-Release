@@ -21,7 +21,7 @@ import {
 import { defaultDataDir, loadOrInitConfig, savePasswordHash } from "./config";
 import { createMachineDirectory } from "./machine-directory";
 import { createHubAuth, mintOperatorSecret } from "./auth";
-import { resolveBindHosts } from "./bind";
+import { startBindReconciler } from "./rebind";
 import { createClientRegistry } from "./clients";
 import { createHubFanout, type HubFanout } from "./fanout";
 import { buildHubApp, fleetEventsStatus } from "./server";
@@ -72,6 +72,22 @@ export function createEmitUsageSample(
   return (sample) => {
     if (sample !== null) fanout.emitSample(sample);
     fanout.patchStatus({ sampleCount: store.all().length, usageCurrentSample: sample });
+  };
+}
+
+// Bind reconciler → status adapter (ADR-0074). The reconciler reports a changed
+// bind set; the console reads it off HubStatus. Exported as a factory for the
+// same reason createMergeSamples is: the test drives THIS closure rather than a
+// hand-copied double — a reconciler that binds Tailscale correctly but never
+// reaches the fanout would leave the console asserting a stale "Local only"
+// forever, which is the half of the fix a user actually sees.
+export function createBindStatusPatcher(
+  fanout: Pick<HubFanout, "patchStatus">,
+  warn: (message: string) => void = (message) => console.warn(message),
+): (patch: { bindHosts: string[]; bindWarning: string | null }) => void {
+  return (patch) => {
+    fanout.patchStatus(patch);
+    if (patch.bindWarning !== null) warn(`[hub] ${patch.bindWarning}`);
   };
 }
 
@@ -234,14 +250,6 @@ async function serve(): Promise<void> {
   identityStore.load();
   const identityDirectory = resolveIdentityDirectory(identityStore);
 
-  // Resolved BEFORE the initial status so the fanout can carry what we are
-  // about to bind (ADR-0038): the console's Listening row and its Windows
-  // firewall warning both key off the real bound hosts, fell-back-to-loopback
-  // included. Resolution is pure (config + interfaces); the actual binds
-  // happen below, after the app is built.
-  const { hosts, warning } = resolveBindHosts(config.bind);
-  if (warning !== null) console.warn(`[hub] ${warning}`);
-
   const initialStatus: HubStatus = {
     service: "maxprice-hub",
     protocolVersion: HUB_PROTOCOL_VERSION,
@@ -250,10 +258,20 @@ async function serve(): Promise<void> {
     usageCurrentSample: null,
     sampleCount: 0,
     credentialPresent: false,
-    bindHosts: hosts,
-    // The resolution's diagnosis rides the wire too (ADR-0049) — the console
-    // needs it to tell a chosen loopback bind from a failed tailnet one.
-    bindWarning: warning,
+    // Seeded EMPTY on purpose (ADR-0074). The bind reconciler's first pass runs
+    // synchronously below and patches both of these before any socket can
+    // accept a request, so nothing ever observes the empty seed. Resolving the
+    // interface table a second time here to pre-fill them was the bug: if the
+    // tailnet appeared between that read and the reconciler's own (the login
+    // boot, with the credstore probes and all of buildHubApp in between), the
+    // reconciler bound everything, saw its state already equal to this snapshot,
+    // and never patched — leaving HubStatus asserting "loopback only, no tailnet
+    // interface" for the daemon's whole life while the log below printed the
+    // real tailnet address. One resolution, one report.
+    bindHosts: [],
+    // The bind's diagnosis rides the wire too (ADR-0049) — the console needs it
+    // to tell a chosen loopback bind from a failed tailnet one.
+    bindWarning: null,
     // ADR-0037: reflect the persisted gate at boot; POST /api/password patches
     // it live so the console's Access card re-renders on set/clear.
     passwordProtected: config.passwordHash !== null,
@@ -364,29 +382,37 @@ async function serve(): Promise<void> {
     ready,
   });
 
-  // Deliberately UNGUARDED binds: a throw here (port in use — e.g. a second
-  // hub instance — or a stale bind IP) is a fatal unhandled rejection, loud
-  // exit 1, no zombie. Any future try/catch MUST server.stop() the
-  // already-bound servers, or a partial bind leaves a half-listening daemon.
-  const servers = hosts.map((hostname) =>
-    Bun.serve({ hostname, port: config.port, fetch: app.fetch, idleTimeout: 0 }),
-  );
+  // The bind reconciler owns every bind from here on (ADR-0074). Its FIRST pass
+  // runs synchronously, inside this call, and is deliberately UNGUARDED: a
+  // throw here is a fatal unhandled rejection, loud exit 1, no zombie. With
+  // presence gating in front of it that throw now means exactly one thing —
+  // another process owns the port, i.e. a second hub instance — because an
+  // address the machine doesn't have is never attempted. Every LATER pass is
+  // guarded and retries, which is what stops a hub launched at login from being
+  // stranded on loopback when it beats Tailscale to the interface.
+  const binds = startBindReconciler({
+    bind: config.bind,
+    port: config.port,
+    fetch: app.fetch,
+    onBoundChange: createBindStatusPatcher(fanout),
+    log: (line) => console.log(line),
+  });
   // Stdout handshake (ADR-0036; mirrors the sidecar's ADR-0002). Phase 2's Rust
   // shell reads `LISTENING <port>` to learn the port (get_hub_url) and captures
   // `OPERATOR_TOKEN` for the webview's Authorization header WITHOUT echoing it.
-  // Every bind shares config.port, so the first LISTENING is canonical.
-  for (const server of servers) {
-    await writeLine(`LISTENING ${server.port}\n`);
-  }
+  // Every bind shares config.port — and the set of bound hosts now changes over
+  // the daemon's life — so the port is announced exactly once, from the config.
+  await writeLine(`LISTENING ${config.port}\n`);
   // OPERATOR_TOKEN: the per-launch operator secret, for the embedding parent
   // ONLY (ADR-0037). Gated on MAXPRICE_HUB_EMBEDDED so headless `serve` never
   // prints a secret to its journal.
   if (isEmbedded() && operatorSecret !== null) {
     await writeLine(`OPERATOR_TOKEN ${operatorSecret}\n`);
   }
-  // Human-readable logs (unchanged — preserved from the original block).
-  for (const server of servers) {
-    console.log(`[hub] listening on http://${server.hostname}:${server.port}`);
+  // Human-readable logs (unchanged — preserved from the original block). This
+  // is the boot snapshot only; the reconciler logs every later bind and drop.
+  for (const hostname of binds.hosts()) {
+    console.log(`[hub] listening on http://${hostname}:${config.port}`);
   }
   console.log(
     config.passwordHash === null
@@ -410,7 +436,8 @@ async function serve(): Promise<void> {
         await sampleStore.flush();
         await fleetEvents.close();
         fanout.close();
-        for (const server of servers) await server.stop(true);
+        // Stops the reconcile timer first, then every bind it owns (ADR-0074).
+        await binds.stop();
       } catch (err) {
         console.error("[hub] shutdown teardown error:", err);
       }

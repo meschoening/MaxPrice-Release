@@ -87,9 +87,12 @@ export const hubStatusSchema = z.object({
   // protocol stayed v1 when introduced (a pre-0037 hub omits it). Consumed by the operator
   // console's Access card; clients may use it for Settings copy.
   passwordProtected: z.boolean().optional(),
-  // The addresses the daemon ACTUALLY bound (ADR-0038) — loopback plus the
-  // tailnet IP in the default bind mode, loopback alone when the tailnet
-  // interface was missing at boot. Optional — additive; protocol stayed v1 when introduced.
+  // The addresses the daemon is bound to RIGHT NOW (ADR-0038) — loopback plus
+  // the tailnet IPs in the default bind mode, loopback alone while no tailnet
+  // interface exists. Since ADR-0074 this is live truth, not a boot record: the
+  // hub re-resolves its bind every 10s and patches this field when the set
+  // changes, so a hub that started before Tailscale reports loopback first and
+  // the full set moments later. Optional — additive; protocol stayed v1 when introduced.
   // Consumed by the operator console: the Listening row shows what clients can
   // really connect to, and the Windows firewall warning gates on a
   // non-loopback host being present (no inbound is expected of a

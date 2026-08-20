@@ -6,6 +6,7 @@ Release code and binaries for MaxPrice, a Claude Code cost/token tracker.
 
 - Plots token usage and price of usage as if you had to pay API rates.
 - Pulls latest (USD) model pricing from LiteLLM, supports every Claude Haiku/Sonnet/Opus/Fable model.
+- Allows split by model, machine, cache type, or git/folder-defined project.
 - Connects to claude.ai for convenient comparison to account limits.
 - (Optional) Hub app connects and tracks project usage across multiple devices.
 - And more!
@@ -14,7 +15,7 @@ Release code and binaries for MaxPrice, a Claude Code cost/token tracker.
 
 ### Client:
 
-- macOS (Intel and Apple Silicon)
+- macOS (Universal .dmc, Intel or Apple Silicon)
 - Windows (Installer, portable coming soon)
 - Linux (.deb Installer)
 
