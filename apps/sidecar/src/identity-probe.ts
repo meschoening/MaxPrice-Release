@@ -38,27 +38,59 @@ export function selfExactProjectPaths(
   return out;
 }
 
+// A local probe is a stat plus a kilobyte-scale config read: ~5 ms each, ~75 ms
+// cold for 15 projects. Five seconds is three orders of magnitude past that, so
+// crossing it means something is wrong rather than slow — and the thing it is
+// built to catch ran for nearly ten minutes.
+export const SLOW_PROBE_WARN_MS = 5_000;
+
+// The other half: a probe that never answers must not strand the round behind
+// it. Option A moved the read off the event loop, so a wedged `open(2)` costs
+// one Bun pool thread instead of the whole sidecar — but probes are
+// SEQUENTIAL, so without a deadline one stuck path still holds up every
+// project after it, for as long as the wait lasts (observed: 9m51s).
+//
+// 30s is far past any plausible healthy probe — ~5 ms each, ~75 ms cold for a
+// whole 15-project round, and the watchdog above has already said something at
+// 5 s — and far short of what was actually observed. Erring EARLY is cheap by
+// construction: ADR-0062 §2 makes an `unreachable` result never overwrite a
+// persisted row, so a deadline that fires on a merely-slow probe costs one
+// skipped re-stamp and nothing else.
+export const PROBE_DEADLINE_MS = 30_000;
+
 export type IdentityProber = {
   // Probe every locally-resolvable project. The boot + manual-rescan trigger.
   //
-  // TWO costs, not one, and the scan half is the bigger surprise: recovering
-  // "which project lives where" walks EVERY stored event (the fleet corpus,
-  // not just this machine's), so that half is O(events) — while the probe half
-  // is bounded by local project count, a stat plus a small config read each.
-  // Measured on the real corpus: ~18 ms for the scan over 77,669 events, plus
-  // ~75 ms cold / ~3 ms warm for 15 local projects on Windows — ~95 ms cold, on
-  // a loop whose saturation detector trips at 30% of a 60 s window (ADR-0056)
-  // and behind a rescan walk that itself costs ~300 ms (ADR-0059). So it runs
-  // straight through on the loop rather than pacing itself. (The store query is
-  // the memoized shared sorted snapshot — iterated, never copied.)
+  // TWO costs, not one, and they now live on different threads.
+  //
+  // The SCAN half — recovering "which project lives where" — walks EVERY
+  // stored event (the fleet corpus, not just this machine's), so it is
+  // O(events) and it runs on the loop. Measured on the real corpus: ~18 ms
+  // over 77,669 events. That is affordable against a rescan walk of ~300 ms
+  // (ADR-0059) and a saturation detector that trips at 30% of a 60 s window
+  // (ADR-0056). (The store query is the memoized shared sorted snapshot —
+  // iterated, never copied.)
+  //
+  // The PROBE half is bounded by local project count — a stat plus a small
+  // config read each, ~75 ms cold / ~3 ms warm for 15 projects on Windows —
+  // and since issue #183 it is ASYNCHRONOUS, so those reads occupy a thread
+  // from Bun's pool rather than the one event loop. That is not a speed
+  // change; it is the difference between a wedged `open(2)` costing one probe
+  // and costing the entire sidecar for as long as it lasts.
+  //
+  // Probes stay SEQUENTIAL. Nothing here is latency-critical, one path at a
+  // time bounds the pool cost to a single thread, and it keeps the
+  // one-record-call-per-probe-event rule below trivially true. Sequential is
+  // also why each probe carries a DEADLINE (`PROBE_DEADLINE_MS`): without one,
+  // a single wedged path would hold up every project queued behind it.
   //
   // Revisit if either the fleet corpus or the local project count grows by an
-  // order of magnitude; the shapes to reach for then are a store-maintained
-  // slug → cwd map, or chunking the probes across macrotasks.
-  runAll: () => void;
+  // order of magnitude; the shape to reach for then is a store-maintained
+  // slug → cwd map for the scan half.
+  runAll: () => Promise<void>;
   // A slug the watcher just landed rows for. First sighting probes; every
   // sighting after that is a no-op, so the per-flush hot path costs a Set hit.
-  noticeSlug: (slug: string) => void;
+  noticeSlug: (slug: string) => Promise<void>;
 };
 
 export function createIdentityProber(deps: {
@@ -67,21 +99,135 @@ export function createIdentityProber(deps: {
   // fleet.recordProbes — persists + emits identity:changed + (share-gated)
   // pushes. Called with the probed rows of ONE probe event, never per row.
   record: (rows: ProjectIdentityRow[]) => void;
-  probe?: (path: string) => ProbeResult; // seam; default probeRepoId
+  probe?: (path: string) => Promise<ProbeResult>; // seam; default probeRepoId
   nowIso?: () => string; // seam; default () => new Date().toISOString()
+  // Slow-probe watchdog seams (issue #183).
+  warn?: (line: string) => void;
+  monoImpl?: () => number;
+  slowProbeMs?: number;
+  probeDeadlineMs?: number;
+  setTimeoutImpl?: (cb: () => void, ms: number) => unknown;
+  clearTimeoutImpl?: (handle: unknown) => void;
 }): IdentityProber {
   const probe = deps.probe ?? probeRepoId;
   // `toISOString` is UTC at millisecond precision — the merge everywhere
   // compares probedAt LEXICOGRAPHICALLY, so a second-precision or
   // offset-bearing spelling would sort backwards.
   const nowIso = deps.nowIso ?? ((): string => new Date().toISOString());
+  const warn = deps.warn ?? ((line: string) => console.warn(line));
+  const mono = deps.monoImpl ?? ((): number => performance.now());
+  const slowProbeMs = deps.slowProbeMs ?? SLOW_PROBE_WARN_MS;
+  const probeDeadlineMs = deps.probeDeadlineMs ?? PROBE_DEADLINE_MS;
+  const setTimeoutImpl =
+    deps.setTimeoutImpl ?? ((cb: () => void, ms: number): unknown => setTimeout(cb, ms));
+  const clearTimeoutImpl =
+    deps.clearTimeoutImpl ??
+    ((handle: unknown): void => clearTimeout(handle as ReturnType<typeof setTimeout>));
   const seen = new Set<string>();
+  // Paths whose probe blew the deadline and has STILL not returned. Skipped
+  // while they sit here — see `abandon`.
+  const abandoned = new Set<string>();
 
-  function probePaths(paths: Map<string, string>): void {
+  // Names the path a probe is stuck on (issue #183, the half that async alone
+  // cannot supply). `lsof` cannot answer this — a blocking `open(2)` has no
+  // file descriptor yet — and the wedged process could not log it either,
+  // because the loop that would write the line was the thing that stopped.
+  // Now the loop survives the wait, so it can say which file it is waiting on
+  // while it is still waiting. Silent on a healthy probe.
+  async function timedProbe(path: string): Promise<ProbeResult> {
+    const startedAt = mono();
+    let warned = false;
+    const timer = setTimeoutImpl(() => {
+      warned = true;
+      warn(`[identity-probe] still reading git metadata under ${path} after ${slowProbeMs}ms`);
+    }, slowProbeMs);
+    try {
+      return await probe(path);
+    } finally {
+      clearTimeoutImpl(timer);
+      // Only after a warning — the pair is what makes the episode bounded in
+      // the log, and an unwarned probe has nothing worth saying.
+      if (warned) {
+        warn(`[identity-probe] finished ${path} after ${Math.round(mono() - startedAt)}ms`);
+      }
+    }
+  }
+
+  // Walk away from a probe that blew the deadline — and keep walking away from
+  // that path until the read it is waiting on returns.
+  //
+  // The skip is not tidiness. The abandoned read still holds a Bun pool thread
+  // (the OS does not cancel an `open` in progress), so re-probing the same
+  // wedged path on every rescan would leak one thread per gesture until the
+  // pool is gone — issue #183's own failure mode, one indirection out. One
+  // stuck path costs one thread, whatever the user does.
+  //
+  // If it ever DOES return, the path is healthy again: the skip lifts, and a
+  // definite answer is recorded then rather than discarded, because the round
+  // that would re-probe it may never come — `runAll` fires at boot and on the
+  // manual rescan, and `noticeSlug` fires once per slug per process.
+  function abandon(slug: string, path: string, pending: Promise<ProbeResult>): void {
+    abandoned.add(path);
+    warn(
+      `[identity-probe] giving up on ${path} after ${probeDeadlineMs}ms ` +
+        `— its identity row stays as it was`,
+    );
+    void pending
+      .then((late) => {
+        abandoned.delete(path);
+        if (late.kind !== "probed") return; // unreachable never overwrites
+        // Its own probe EVENT, hence its own record call: the round it
+        // belonged to finished long ago.
+        deps.record([
+          {
+            machineId: deps.machineId,
+            projectSlug: slug,
+            path,
+            repoId: late.repoId,
+            probedAt: nowIso(),
+          },
+        ]);
+      })
+      // Nothing above may reject unattended. This continuation outlives the
+      // round, so there is no caller left to guard it, and an unhandled
+      // rejection exits a sidecar the Rust shell never respawns. Covers both a
+      // rejecting probe and a throwing `record`; in either case the path did
+      // return, so the skip lifts.
+      .catch((err: unknown) => {
+        abandoned.delete(path);
+        warn(`[identity-probe] the abandoned probe of ${path} failed: ${String(err)}`);
+      });
+  }
+
+  async function probeWithDeadline(slug: string, path: string): Promise<ProbeResult> {
+    // Raced OUTSIDE `timedProbe`, deliberately: that leaves its `finally`
+    // intact, so whenever the abandoned read finally lands, the closing
+    // "finished ... after Nms" line still reaches the log. An opening line
+    // with no closing one reads as "still stuck" forever.
+    const pending = timedProbe(path);
+    let timer: unknown;
+    const deadline = new Promise<"deadline">((resolve) => {
+      timer = setTimeoutImpl(() => resolve("deadline"), probeDeadlineMs);
+    });
+    let outcome: ProbeResult | "deadline";
+    try {
+      outcome = await Promise.race([pending, deadline]);
+    } finally {
+      clearTimeoutImpl(timer);
+    }
+    if (outcome !== "deadline") return outcome;
+    abandon(slug, path, pending);
+    return { kind: "unreachable" };
+  }
+
+  async function probePaths(paths: Map<string, string>): Promise<void> {
     const rows: ProjectIdentityRow[] = [];
     for (const [slug, path] of paths) {
       seen.add(slug);
-      const r = probe(path);
+      // Still wedged from an earlier round. `abandon` announced it once; a
+      // line per skipped round would only bury it.
+      if (abandoned.has(path)) continue;
+      const r = await probeWithDeadline(slug, path);
       if (r.kind !== "probed") continue; // unreachable never overwrites (ADR-0062 §2)
       // Stamped on EVERY successful probe, unchanged result included: that
       // re-stamp is what makes the directory's newest-probedAt merge treat each
@@ -100,8 +246,13 @@ export function createIdentityProber(deps: {
   }
 
   return {
-    runAll: () => probePaths(selfExactProjectPaths(deps.getStore().query(), deps.machineId)),
-    noticeSlug: (slug) => {
+    // `async` so the SCAN half's failures (a throwing `getStore`, a throwing
+    // walk) arrive as a rejection like the probe half's. Both call sites guard
+    // a promise; a synchronous throw would sail straight past that guard, and
+    // the boot one would then reach `unhandledRejection` — which exits the
+    // sidecar the Rust shell never respawns.
+    runAll: async () => probePaths(selfExactProjectPaths(deps.getStore().query(), deps.machineId)),
+    noticeSlug: async (slug) => {
       if (seen.has(slug)) return;
       // The scope is SEMANTIC, not a saving. An unfiltered `query()` hands back
       // the store's memoized sorted snapshot — no copy, no iteration — so a
@@ -126,7 +277,7 @@ export function createIdentityProber(deps: {
       // flush for that slug re-queries (and re-stats a dead directory). The
       // boot/rescan runAll re-covers it once a capture or the directory lands.
       seen.add(slug);
-      probePaths(paths);
+      await probePaths(paths);
     },
   };
 }

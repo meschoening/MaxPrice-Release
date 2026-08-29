@@ -16,8 +16,11 @@ export type ResolveWatchRootsParams = {
   configDir: string | undefined;
   homedir: string;
   // Injected so the resolver stays pure and unit-testable. Production wires
-  // this to a real existsSync + isDirectory check.
-  dirExists: (path: string) => boolean;
+  // this to a real `stat` + isDirectory check — ASYNCHRONOUS, because these
+  // are the user's own claudePaths and may live on a network mount, where a
+  // synchronous stat that does not return would stop the event loop (issue
+  // #183, the audit).
+  dirExists: (path: string) => Promise<boolean>;
 };
 
 // Resolve the JSONL project roots chokidar should watch. $CLAUDE_CONFIG_DIR
@@ -29,7 +32,7 @@ export type ResolveWatchRootsParams = {
 // branch still does). Mirrors how Claude Code itself lays out the data. Non-existent
 // candidates are dropped, so the watcher only ever sees real directories and
 // the status bar reflects what's actually live.
-export function resolveWatchRoots(params: ResolveWatchRootsParams): string[] {
+export async function resolveWatchRoots(params: ResolveWatchRootsParams): Promise<string[]> {
   const { configDir, homedir, dirExists } = params;
 
   const candidates =
@@ -46,7 +49,7 @@ export function resolveWatchRoots(params: ResolveWatchRootsParams): string[] {
   for (const path of candidates) {
     if (seen.has(path)) continue;
     seen.add(path);
-    if (dirExists(path)) roots.push(path);
+    if (await dirExists(path)) roots.push(path);
   }
   return roots;
 }

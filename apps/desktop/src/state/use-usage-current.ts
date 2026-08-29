@@ -17,13 +17,16 @@ export function buildUsageCurrentUrl(base: string): string {
   return `${base}/api/usage/current`;
 }
 
-export async function fetchUsageCurrent(): Promise<UsageCurrent> {
+export async function fetchUsageCurrent(signal?: AbortSignal): Promise<UsageCurrent> {
   const base = await getSidecarUrl();
-  const res = await fetch(buildUsageCurrentUrl(base));
+  const res = await fetch(buildUsageCurrentUrl(base), { signal });
   if (!res.ok) throw new Error(`usage/current ${res.status}`);
   return usageCurrentSchema.parse(await res.json());
 }
 
 export function useUsageCurrent() {
-  return useQuery({ queryKey: usageCurrentQueryKey(), queryFn: fetchUsageCurrent });
+  return useQuery({
+    queryKey: usageCurrentQueryKey(),
+    queryFn: ({ signal }) => fetchUsageCurrent(signal),
+  });
 }

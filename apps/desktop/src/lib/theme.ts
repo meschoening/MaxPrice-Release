@@ -37,6 +37,15 @@ function resolve(pref: ThemePref): "light" | "dark" {
   return resolveTheme(pref, window.matchMedia("(prefers-color-scheme: dark)").matches);
 }
 
+// Re-stamp <html data-theme> from the stored preference (the hub popout's
+// pattern; map #168 M3): the popout webview is created at launch and only ever
+// hidden/shown — never reloaded — so theme-boot.js's before-first-paint stamp
+// would otherwise freeze it in the launch-time mode while the main window's
+// chip cycles on. Called on every popout show.
+export function applyStoredTheme(): void {
+  document.documentElement.dataset.theme = resolve(readPref());
+}
+
 export function useTheme(): { pref: ThemePref; cycle: () => void } {
   const [pref, setPref] = useState<ThemePref>(readPref);
   const cycle = (): void => {

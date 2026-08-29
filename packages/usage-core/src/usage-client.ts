@@ -24,9 +24,48 @@ const upstreamWindowSchema = z.object({
   utilization: z.number(),
   resets_at: z.string().nullable(),
 });
-const upstreamUsageSchema = z
-  .object({ five_hour: upstreamWindowSchema, seven_day: upstreamWindowSchema })
+// The newer `limits[]` list (observed 2026-08-26) restates the two windows and
+// adds the model-scoped weekly one — `kind: "weekly_scoped"` with
+// `scope.model.display_name` naming the family ("Fable"; `scope.model.id` was
+// null, so the display name is the only handle). `five_hour`/`seven_day` keep
+// being read from their proven top-level fields; only the scoped window comes
+// from here, and the whole list is optional so an older payload still parses.
+// Entries are `.passthrough()` + `.catch` so one unexpected entry shape drops
+// that entry rather than the poll.
+const upstreamLimitSchema = z
+  .object({
+    kind: z.string(),
+    percent: z.number(),
+    resets_at: z.string().nullable(),
+    scope: z
+      .object({
+        model: z.object({ display_name: z.string().nullable() }).passthrough().nullable(),
+      })
+      .passthrough()
+      .nullable(),
+  })
   .passthrough();
+const upstreamUsageSchema = z
+  .object({
+    five_hour: upstreamWindowSchema,
+    seven_day: upstreamWindowSchema,
+    limits: z.array(upstreamLimitSchema.nullable().catch(null)).optional(),
+  })
+  .passthrough();
+
+// The first `weekly_scoped` entry with a model scope and a reset in flight —
+// the Model-scoped weekly limit. Exported for its tests.
+export function modelScopedWindow(
+  limits: z.infer<typeof upstreamUsageSchema>["limits"],
+): UsageSample["weeklyModel"] {
+  for (const limit of limits ?? []) {
+    if (limit === null || limit.kind !== "weekly_scoped") continue;
+    const model = limit.scope?.model?.display_name;
+    if (typeof model !== "string" || model === "" || limit.resets_at === null) continue;
+    return { model, utilizationPct: limit.percent, resetAt: limit.resets_at };
+  }
+  return undefined;
+}
 
 // Orgs carry `capabilities` so the caller can pick the SUBSCRIPTION org, not an
 // API-only org (the spike showed the user has both; the API org does not return
@@ -117,6 +156,8 @@ export async function fetchUsage(opts: FetchUsageOptions): Promise<FetchUsageRes
       fiveHour: { utilizationPct: u.five_hour.utilization, resetAt: u.five_hour.resets_at },
       weekly: { utilizationPct: u.seven_day.utilization, resetAt: u.seven_day.resets_at },
     };
+    const weeklyModel = modelScopedWindow(u.limits);
+    if (weeklyModel !== undefined) sample.weeklyModel = weeklyModel;
     return { ok: true, sample };
   } catch (err) {
     console.warn(

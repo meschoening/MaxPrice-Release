@@ -5,8 +5,8 @@
 // overshoot past its due time is exactly how long the loop kept scheduled work
 // waiting. One contiguous synchronous block of length L yields exactly ONE
 // sample of lag ≈ L (no timer can fire mid-block), so the window's SUMMED lag
-// approximates its total blocked wall time — `blockedPct` = sum/window is the
-// verdict statistic. p50 + max still ride the wire as the spread diagnostic,
+// approximates its total blocked RUNNING time — `blockedPct` = sum/window is
+// the verdict statistic. p50 + max still ride the wire as the spread diagnostic,
 // and the process's CPU share of one core rides alongside as the calibration
 // channel against an external `TotalProcessorTime` reading.
 //
@@ -21,6 +21,33 @@
 // pause at 1.5% — the margins the p50 was chosen for, kept, on the statistic
 // that actually measures the condition).
 //
+// Every measurement rides a MONOTONIC, suspend-excluding clock (`monoImpl`,
+// default `performance.now()`), and this is load-bearing rather than
+// fastidious (issue #183, Finding A; ADR-0056 amended). A wall clock cannot
+// tell a suspended machine from a blocked loop: both present as one enormous
+// overshoot, and magnitude cannot discriminate them either — the awake stalls
+// #183 reports (168s, 213s) sit INSIDE the range of the overnight DarkWake
+// cycles that produced the false positives (423s, 1058s), so any plausibility
+// ceiling that catches the sleep also silences the detector on the real
+// defect. The clock is the whole fix: measured on the reference Mac across a
+// real 120s suspend, `dWall=120635ms` against `dMono=326ms`, so two minutes of
+// sleep costs 76ms of apparent lag and reports itself as the noise it is.
+//
+// `performance.now()` is NOT that clock on Windows — measured across a real
+// 705s S3 suspend (#186), it advanced by the whole wall span, 10.2x the
+// running time. So the default is platform-resolved (`monotonicClock()` in
+// @maxprice/usage-core): QueryUnbiasedInterruptTimePrecise on win32,
+// `performance.now()` elsewhere. Linux is deliberately unresolved — untested,
+// no machine, and the headless Linux hub runs no sampler at all.
+//
+// Both the sample timestamps AND the window's eviction cutoff ride it — they
+// must move together, or a suspend-spanning window would evict against
+// inflated time while the lag it holds is real running time.
+//
+// `nowImpl` survives on the REPORTING layer alone, for the episode clock in
+// the durable log line: the sampler measures running time, but a human reading
+// "recovered after …" wants real elapsed time.
+//
 // The verdict is owned here, not by consumers: trips above `tripBlockedPct`,
 // clears only below half of it — hysteresis, so a process hovering at the
 // boundary cannot flap the verdict (verdict EDGES emit SSE frames, so flapping
@@ -32,7 +59,12 @@
 // seam to drive the loop's starvation by hand. The one import below does not
 // weaken that: it is type-only (fully erased, so `bun build --compile` is
 // untouched) and it is `@maxprice/shared`, which the hub package already
-// depends on — not the engine, not the hub.
+// depends on — not the engine, not the hub. The same holds for the value
+// import of `@maxprice/usage-core` beside it (the platform clock, #186): the
+// hub package already depends on that too, so adopting this module unchanged
+// still costs the hub nothing — and the platform clock has to be the DEFAULT
+// rather than a call-site argument, or a hub that adopts the sampler and
+// forgets to pass one silently measures the calendar on Windows.
 //
 // `SaturationSnapshot` is NOT declared here because it is a wire shape: it
 // rides `GET /api/status` and every `status:changed` frame verbatim, so the
@@ -42,6 +74,7 @@
 // status object strips on the way to the renderer's `safeParse`.
 
 import type { SaturationSnapshot } from "@maxprice/shared";
+import { monotonicClock } from "@maxprice/usage-core";
 
 export type { SaturationSnapshot };
 
@@ -49,7 +82,11 @@ export type SaturationSamplerDeps = {
   sampleIntervalMs?: number;
   windowMs?: number;
   tripBlockedPct?: number;
-  nowImpl?: () => number;
+  // Monotonic and suspend-excluding — NOT a wall clock. See the header: this
+  // is the difference between measuring the loop and measuring the calendar.
+  // Defaults to the platform-resolved clock, which is `performance.now()`
+  // everywhere except win32 (#186).
+  monoImpl?: () => number;
   cpuUsageImpl?: () => { user: number; system: number }; // µs, process.cpuUsage shape
   setTimeoutImpl?: (cb: () => void, ms: number) => unknown;
   clearTimeoutImpl?: (handle: unknown) => void;
@@ -78,6 +115,11 @@ export type SaturationReportingDeps = Omit<SaturationSamplerDeps, "onVerdictChan
   // one field, and always with a WHOLE saturation object (the
   // fleetEventsStatus patch-whole rule).
   patch: (partial: { saturation: SaturationSnapshot }) => void;
+  // Wall clock, and only here: the `recovered after …` duration in the durable
+  // log should read real elapsed time, so an episode that spanned a suspend
+  // reports the two minutes a reader lived through rather than the ten seconds
+  // the process was awake for.
+  nowImpl?: () => number;
   // Durable-log line sink (default console.warn → stdout pipe → the Rust tee).
   warn?: (line: string) => void;
   // Re-patch cadence while saturated, so a "catching up" UI isn't frozen on
@@ -146,7 +188,8 @@ export function startSaturationReporting(deps: SaturationReportingDeps): Saturat
         warn(
           `[saturation] event loop saturated: blocked=${snapshot.blockedPct}% ` +
             `p50=${snapshot.p50LagMs}ms max=${snapshot.maxLagMs}ms ` +
-            `cpu=${snapshot.cpuPercent}% (window ${Math.round(snapshot.windowMs / 1000)}s)`,
+            `cpu=${snapshot.cpuPercent === null ? "?" : `${snapshot.cpuPercent}%`} ` +
+            `(window ${Math.round(snapshot.windowMs / 1000)}s)`,
         );
         heartbeat = setIntervalImpl(() => patchSaturation(sampler.snapshot()), heartbeatMs);
       } else {
@@ -183,7 +226,7 @@ export function createSaturationSampler(deps?: SaturationSamplerDeps): Saturatio
   const sampleIntervalMs = deps?.sampleIntervalMs ?? SATURATION_SAMPLE_INTERVAL_MS;
   const windowMs = deps?.windowMs ?? SATURATION_WINDOW_MS;
   const tripBlockedPct = deps?.tripBlockedPct ?? SATURATION_TRIP_BLOCKED_PCT;
-  const nowImpl = deps?.nowImpl ?? (() => Date.now());
+  const monoImpl = deps?.monoImpl ?? monotonicClock().now;
   const cpuUsageImpl = deps?.cpuUsageImpl ?? (() => process.cpuUsage());
   const setTimeoutImpl =
     deps?.setTimeoutImpl ?? ((cb: () => void, ms: number): unknown => setTimeout(cb, ms));
@@ -197,7 +240,7 @@ export function createSaturationSampler(deps?: SaturationSamplerDeps): Saturatio
   let dueAt = 0;
 
   function schedule(): void {
-    dueAt = nowImpl() + sampleIntervalMs;
+    dueAt = monoImpl() + sampleIntervalMs;
     pending = setTimeoutImpl(onFire, sampleIntervalMs);
   }
 
@@ -221,11 +264,15 @@ export function createSaturationSampler(deps?: SaturationSamplerDeps): Saturatio
   function onFire(): void {
     try {
       pending = null;
-      const now = nowImpl();
+      const now = monoImpl();
       const cpu = cpuUsageImpl();
       samples.push({
         at: now,
-        lagMs: Math.max(0, now - dueAt),
+        // Rounded because the monotonic clock is fractional where `Date.now()`
+        // was integral, and the durable log is a forensic artifact a human
+        // reads: `max=590904.0004169999ms` says nothing `max=590904ms` does
+        // not. Sub-millisecond precision has no meaning for a 250ms sampler.
+        lagMs: Math.max(0, Math.round(now - dueAt)),
         cpuUs: cpu.user + cpu.system,
       });
       const cutoff = now - windowMs;
@@ -249,8 +296,11 @@ export function createSaturationSampler(deps?: SaturationSamplerDeps): Saturatio
   }
 
   // The verdict statistic: the window's summed lag as a share of the window —
-  // ≈ the fraction of wall time the loop spent inside synchronous blocks (each
-  // block yields one sample carrying roughly its full length; see the header).
+  // ≈ the fraction of RUNNING time the loop spent inside synchronous blocks
+  // (each block yields one sample carrying roughly its full length; see the
+  // header). Suspended time is in neither term: not in the numerator because
+  // the monotonic clock did not advance across it, and not in the denominator
+  // because the window evicts on that same clock.
   // Clamped at 100: one block longer than the window is still just "all of it".
   function blockedPct(): number {
     let sumLagMs = 0;
@@ -271,8 +321,15 @@ export function createSaturationSampler(deps?: SaturationSamplerDeps): Saturatio
     for (const s of samples) maxLagMs = Math.max(maxLagMs, s.lagMs);
 
     // CPU share over the window needs two readings to have a delta; with fewer
-    // it reports 0 rather than inventing a rate from no baseline.
-    let cpuPercent = 0;
+    // it is UNKNOWN — `null`, never 0. This is not pedantry: the window that
+    // leaves one sample is precisely the interesting one (a block outlasting
+    // the window; the `p50 === max` signature), so the old `0` fabricated its
+    // most alarming reading exactly where it had measured nothing, and issue
+    // #183 reasoned from it. The denominator is running time for the same
+    // reason the numerator is: `process.cpuUsage()` does not accrue while the
+    // machine is suspended, so a wall-clock span would divide real CPU by time
+    // the process never had.
+    let cpuPercent: number | null = null;
     const first = samples[0];
     const last = samples[samples.length - 1];
     if (first !== undefined && last !== undefined && last.at > first.at) {

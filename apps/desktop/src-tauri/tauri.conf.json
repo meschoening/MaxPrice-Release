@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "MaxPrice",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "identifier": "com.maxprice.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -22,6 +22,20 @@
         "fullscreen": false,
         "decorations": true,
         "visible": false
+      },
+      {
+        "title": "MaxPrice",
+        "label": "popout",
+        "width": 236,
+        "height": 260,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "shadow": true,
+        "acceptFirstMouse": true,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {

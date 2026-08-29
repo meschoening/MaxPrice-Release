@@ -107,3 +107,68 @@ export function installStdinWatchdog(opts: StdinWatchdogOptions): void {
   stdin.on("end", fire);
   stdin.on("error", fire);
 }
+
+// A watchdog must be armed BEFORE anything that can hang, and the teardown it
+// fires is built long after that point. Issue #182: the sidecar installed its
+// watchdog as the last statement of `main()`, downstream of the one
+// post-handshake top-level `await` (`createWatcher`, which resolves on
+// chokidar's `ready`). A `ready` that never fires — a known FSEvents failure
+// mode over large or permission-restricted trees — left `main()` unfinished
+// while the HTTP server, started earlier, kept serving: a listening,
+// CPU-burning sidecar with NO parent watchdog, observed in the wild at ppid 1
+// for 2d6h. That is layer 2 of "the sidecar dies when the desktop dies,
+// always" failing silently and indefinitely (ADR-0078).
+//
+// The fix is to arm at module scope, before `main()` is even called — which
+// means `onOrphaned` has to name a `shutdown` that does not exist yet. Hence
+// this: a one-slot late binding, shared because both binaries that must not
+// outlive their spawner need it and compose their watchdogs differently (the
+// sidecar installs the parent watchdog alone on non-win32; the embedded hub
+// daemon installs stdin + parent).
+//
+// `fire()` before `set()` is a REAL path, not a defensive one — a parent can
+// die during boot — and it exits immediately rather than awaiting a teardown
+// that may never arrive. Nothing is lost by that: a process orphaned before
+// its shutdown exists has, by construction, no store to flush and no
+// connections to drain.
+export type DeferredShutdown = {
+  // Install the real teardown. Last writer wins; a call after `fire()` is a
+  // no-op, since the process is already on its way out.
+  set: (fn: () => void) => void;
+  // Run the teardown, or exit if there isn't one yet. Idempotent.
+  fire: () => void;
+};
+
+export type DeferredShutdownOptions = {
+  // Log-prefix label, as installParentWatchdog's.
+  label?: string;
+  // Injectable so a test can exercise the pre-assignment path without exiting
+  // the test runner.
+  exitImpl?: () => void;
+  log?: (line: string) => void;
+};
+
+export function createDeferredShutdown(opts?: DeferredShutdownOptions): DeferredShutdown {
+  const label = opts?.label ?? "watchdog";
+  const exitImpl = opts?.exitImpl ?? ((): void => process.exit(0));
+  const log = opts?.log ?? ((line: string): void => console.error(line));
+  let teardown: (() => void) | null = null;
+  let fired = false;
+
+  return {
+    set: (fn: () => void): void => {
+      if (fired) return;
+      teardown = fn;
+    },
+    fire: (): void => {
+      if (fired) return;
+      fired = true;
+      if (teardown === null) {
+        log(`[${label}] orphaned before shutdown was wired — exiting now`);
+        exitImpl();
+        return;
+      }
+      teardown();
+    },
+  };
+}

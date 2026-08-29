@@ -108,6 +108,49 @@ let pendingSessionSweep = false;
 // follow-up. Mirrors connectGeneration for the EventSource lifecycle below.
 let roundGeneration = 0;
 
+// ── The visibility pause (F9) ──
+// A hidden main window is still a fully mounted React tree with live query
+// observers, so every round it runs refetches every report on screen for
+// nobody. On `/live` that is five queries, two of which — intraday and blocks —
+// sit outside ADR-0057's report cache, so each round costs at minimum one
+// whole-corpus `aggregateBlocks` fold plus an intraday fold. The worst case is
+// not a closed window at all but a `--hidden` autostart launch (ADR-0077),
+// which never shows the main window and so would run the machinery for the
+// entire session with nothing ever on screen.
+//
+// COALESCE, NEVER SKIP. This is the hazard the pause must not create:
+// show-side staleness — a user reopening the app must never read minutes-old
+// numbers that only correct on the next file event. So a paused round is OWED,
+// not dropped: `pendingSessionIds` keeps accumulating (they are added in
+// `scheduleUsageInvalidation` ahead of every gate) and resume pays exactly one
+// catch-up round, whatever arrived while hidden.
+//
+// Driven from Rust, never from `visibilityState` — this webview cannot see its
+// own window hide (src-tauri/src/popout.rs's "Window-visibility events" note).
+// `lib/window-visibility.ts` is the driver; this module just holds the flag.
+let invalidationPaused = false;
+
+/**
+ * Park (or release) invalidation rounds while the main window is off screen.
+ *
+ * Releasing pays the one round owed, if anything asked while paused. It goes
+ * through `flushUsageInvalidation` rather than calling `startRound` directly so
+ * the one-round-in-flight invariant survives the case where the window was
+ * hidden mid-round: that round is still running, and the catch-up is owed to
+ * its settle handler exactly like any other arrival.
+ */
+export function setInvalidationPaused(paused: boolean): void {
+  invalidationPaused = paused;
+  if (paused) return;
+  if (roundPending || pendingSessionIds.size > 0 || pendingSessionSweep) {
+    // Cleared first: `flushUsageInvalidation` re-sets it if a round is in
+    // flight, and leaving it set through a start would buy a spurious
+    // follow-up round on settle.
+    roundPending = false;
+    flushUsageInvalidation(queryClient);
+  }
+}
+
 // Start a round: every report family plus each distinct per-session detail key
 // accumulated so far. The gate releases when ALL its refetches settle —
 // allSettled, so a rejected refetch releases it rather than wedging it.
@@ -143,6 +186,13 @@ function flushUsageInvalidation(client: QueryClient): void {
     usageInvalidateTimer = null;
   }
   usageInvalidateFirstPendingAt = null;
+  // Ahead of the in-flight check: while the window is hidden a round is owed
+  // rather than run, and `pendingSessionIds` keeps every id that asked for it
+  // (F9). Resume starts exactly one round carrying the lot.
+  if (invalidationPaused) {
+    roundPending = true;
+    return;
+  }
   if (roundInFlight) {
     roundPending = true;
     return;
@@ -198,12 +248,22 @@ function cancelUsageInvalidation(): void {
   roundInFlight = false;
   roundPending = false;
   pendingSessionSweep = false;
+  // Teardown symmetry: the pause is stream-scoped state like everything else
+  // here, and a torn-down stream that came back paused would be silent until
+  // the next `main:shown` — which a window already on screen will never send.
+  invalidationPaused = false;
   roundGeneration++;
 }
 
 // `usage:new` — a JSONL write landed. Pulse the refresh pill immediately, then
 // schedule a debounced refetch of every report family plus the per-session
 // detail key (a Part 5 stub today).
+//
+// `markEvent` stays UNGATED by the F9 visibility pause, as do
+// `handleStatusEvent` and `handleUsageSampleEvent`'s `setQueryData` below:
+// none of the three fetches anything, and the first two feed the live-status
+// store the sidebar foot reads — so a window coming back must find that store
+// current, not replaying an outage it never had. Only the refetch half pauses.
 export function handleUsageEvent(client: QueryClient, dataText: string): void {
   const event = parseEvent(usageEventSchema, dataText);
   if (event === null) return;
@@ -224,6 +284,12 @@ export function handleUsageEvent(client: QueryClient, dataText: string): void {
 // with no file activity. Only span=block is targeted — block:tick fires every
 // 30s and must not trigger a refetch of every span's chart (ADR-0031).
 export function handleBlockTick(client: QueryClient): void {
+  // Pure refetch pressure on a 30s timer, and nothing else: no store is fed
+  // from here and no UI state depends on it, so a hidden window has nothing to
+  // keep current (F9). Deliberately a plain skip rather than a coalesced debt —
+  // the next round refetches the blocks family wholesale anyway, and a tick is
+  // a "time passed" signal whose value expires with the tick.
+  if (invalidationPaused) return;
   void client.invalidateQueries({ queryKey: BLOCKS_KEY_ROOT });
   void client.invalidateQueries({
     predicate: (q) => isBlockSpanIntradayKey(q.queryKey),

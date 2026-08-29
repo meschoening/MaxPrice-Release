@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "popout",
+  "description": "PLUGIN permissions for the client tray popout (map #168 / M2; ADR-0050 is the pattern): core:default and nothing else — never updater/process/dialog/opener. This list does NOT gate the app's own #[tauri::command]s: tauri only ACL-screens those when the app ships an app-level ACL manifest, which this crate deliberately does not, so at a local origin every command is reachable from every window. The secret-bearing and state-mutating commands (get/set_credential, get/set_hub_password, get_usage_auth_token, write_settings, save_window_geometry, set_autostart — M4) therefore refuse non-main windows via a window.label() guard in lib.rs rather than via this file; the popout invokes only get_sidecar_url, read_settings, hide_popout, open_main_window, quit_app, log_client_event and get_pending_update (M3 — a public release version, neither secret nor mutating); its event surface is listening for popout:shown / popout:hidden / update:available and emitting update:open-gate, all under core:default's event permissions.",
+  "windows": ["popout"],
+  "permissions": ["core:default"]
+}

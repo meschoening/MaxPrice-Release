@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { Outlet } from "react-router-dom";
 import { useLiveStream } from "@/lib/live-stream";
+import { useMainWindowVisibility } from "@/lib/window-visibility";
 import { useManualRefreshHotkey } from "@/state/use-manual-refresh-hotkey";
 import { readCredential, pushCredentialToSidecar } from "@/lib/usage-credential";
 import { readHubPassword, pushHubConfigToSidecar } from "@/lib/hub-config";
@@ -15,6 +16,11 @@ import { ToastHost } from "./toast";
 
 export function Layout() {
   useLiveStream();
+  // Follows the main window on/off screen so a window hidden in the tray — or
+  // never shown at all on a `--hidden` autostart launch — stops refetching
+  // every report for nobody (F9). Mounted beside useLiveStream because it
+  // drives that module's invalidation pause and shares its lifetime.
+  useMainWindowVisibility();
   useManualRefreshHotkey();
   const { data: settings } = useSettings();
 
@@ -109,7 +115,18 @@ function AppFrame(): React.ReactElement {
       <Sidebar />
       <div className="app-content flex-1 min-w-0 flex flex-col gap-[18px]">
         <Topbar />
-        <main className="thin-scroll flex-1 min-h-0 overflow-auto -m-2 p-2">
+        {/* `relative` is load-bearing, not decoration: <main> is the app's ONLY
+            scroll container, and an absolutely-positioned descendant whose
+            containing block is the initial one is NOT clipped by an ancestor's
+            `overflow` — it is laid out against the document and stretches it.
+            Settings' four `sr-only` storage notes (Tailwind's utility is
+            `position: absolute`) sat ~1127px down, so the DOCUMENT became
+            scrollable by ~442px on that page alone; wheeling past <main>'s end
+            chained into it and dragged the whole frame — sidebar included —
+            off screen. Making <main> a containing block clips every such
+            escapee back into the scroll region it visually belongs to, for any
+            page, not just the one that revealed it. */}
+        <main className="thin-scroll relative flex-1 min-h-0 overflow-auto -m-2 p-2">
           <Outlet />
         </main>
       </div>

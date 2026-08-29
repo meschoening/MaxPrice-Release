@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -31,6 +31,7 @@ import {
   type IntradayResponse,
   type ProjectMergeMutationRequest,
   type ProjectMergeMutationResponse,
+  type ReadoutResponse,
   type RescanResponse,
   type StorageCleanResponse,
   type StorageForgetResponse,
@@ -42,6 +43,7 @@ import {
   type UsageSample,
 } from "@maxprice/shared";
 import { aggregateSessionEvents, type SessionEventsAggregate } from "./engine/session-events";
+import { createBootTrace } from "./boot-trace";
 import { buildPricingStatus, wirePricingRefresh } from "./pricing-refresh";
 import { createLiveHub, type LiveHub } from "./live-hub";
 import { createWatcher, type CreateWatcherOptions, type Watcher } from "./watcher";
@@ -62,12 +64,14 @@ import { createScanCache, type ScanCache } from "./engine/scan-cache";
 import { createEventStore, type EventStore, type ScanProgress } from "./engine/store";
 import {
   constantTimeEqual,
+  createDeferredShutdown,
   createHubClient,
   createSampleStore,
   createUsagePoller,
   discoverOrg,
   installParentWatchdog,
   libcGetppid,
+  monotonicClock,
   streamSSEPump,
   type DiscoverOrgResult,
   type UsagePollerCurrent,
@@ -76,6 +80,7 @@ import { loadOrCreateMachineId } from "./machine-id";
 import { startSaturationReporting, type SaturationSnapshot } from "./saturation";
 import { createBootProgressReporter, type BootProgressReporter } from "./boot-progress";
 import { defaultTimeZone, isValidTimeZone } from "./engine/timezone";
+import { localDateUncached } from "./engine/local-date";
 import { aggregateDaily, aggregateDailyByMachine, aggregateDailyByProject } from "./engine/daily";
 import { aggregateIntraday } from "./engine/intraday";
 import { createReportCache } from "./engine/report-cache";
@@ -168,7 +173,9 @@ export type BuildAppDeps = {
   // side channel for "the corpus was just re-read on the user's say-so", the
   // one gesture that can surface a project whose directory appeared (or moved)
   // since boot.
-  onRescan?: () => void;
+  // Returns a promise since #183 made the probe asynchronous, and the rescan
+  // handler deliberately does NOT await it — see the call site.
+  onRescan?: () => Promise<void>;
   // The Settings › Storage report (map #124). A dedicated accessor rather than
   // a field on the status snapshot: status is patch-merged and broadcast ~1/min
   // to every client, so putting a directory walk behind it would mean paying
@@ -348,7 +355,10 @@ export function wireScanCachePersist(
  * Returns the settled chain so tests can await the probe deterministically;
  * main() `void`s it.
  */
-export function wireIdentityProbe(engineReady: Promise<void>, runAll: () => void): Promise<void> {
+export function wireIdentityProbe(
+  engineReady: Promise<void>,
+  runAll: () => Promise<void>,
+): Promise<void> {
   return engineReady
     .catch(() => {
       // Logged by wireReadySignal; the probe cares only that the boot settled.
@@ -356,7 +366,7 @@ export function wireIdentityProbe(engineReady: Promise<void>, runAll: () => void
     .then(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
       try {
-        runAll();
+        await runAll();
       } catch (err) {
         console.error("[sidecar] boot identity probe failed:", err);
       }
@@ -1075,6 +1085,58 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // are poller-internal bookkeeping surfaced via the status snapshot, not here.
   app.get("/api/usage/current", (c) => c.json({ sample: deps.usage.getCurrent().sample }));
 
+  // --- /api/readout ---  (map #168 T5/M3; ADR-0076) the tray readout's one
+  // wire: the desktop shell's Rust ambient writer polls this ~1/min and renders
+  // the Windows tray tooltip / macOS menu-bar title from it. Composed here, not
+  // in Rust, so the tray is penny-exact with Live by construction: `todayCost`
+  // is the same store query + `aggregateDaily` fold the Today tile reads
+  // (bounded to today's local date in the requested zone), and `blockLive`
+  // mirrors the renderer's usage-ring rule — a current sample whose
+  // fiveHour.resetAt is still ahead (NaN-guarded, like usageRingState). The
+  // shell supplies `mode`/`tz` from settings.json per poll; the sidecar keeps
+  // its no-ambient-params invariant. GET, unauthenticated like every report.
+  app.get(
+    "/api/readout",
+    withEngineErrors("/api/readout", async (c) => {
+      const mode = parseMode(c);
+      if (mode instanceof Response) return mode;
+      const tz = parseTz(c);
+      if (tz instanceof Response) return tz;
+      await deps.engineReady();
+
+      const now = deps.now();
+      const sample = deps.usage.getCurrent().sample;
+      const resetMs = sample === null ? Number.NaN : Date.parse(sample.fiveHour.resetAt);
+      const blockLive = !Number.isNaN(resetMs) && resetMs > now;
+
+      // `localDateUncached`, not `localDate`: `now` is a wall-clock reading, so
+      // the memoized form would mint one permanently-retained entry per call —
+      // and the ADR-0079 tray polls this endpoint every 60s for the life of a
+      // process it deliberately keeps alive (≥1440 entries/day). The memo is
+      // keyed by immutable corpus timestamps by design; this is the documented
+      // uncached entry point for a synthetic instant, and it takes the epoch-ms
+      // directly rather than round-tripping through an ISO string.
+      // Null only for an unparseable timestamp; the injected clock always
+      // parses, so the fallback is theoretical.
+      const today = localDateUncached(now, tz);
+      let todayCost = 0;
+      if (today !== null) {
+        const events = deps.store().query({ since: today.ymd, until: today.ymd, timeZone: tz });
+        const daily = aggregateDaily(events, mode, { projectFilterCount: 0, timeZone: tz });
+        todayCost = daily.daily.find((row) => row.date === today.dashed)?.totalCost ?? 0;
+      }
+
+      const body: ReadoutResponse = {
+        blockLive,
+        utilizationPct: blockLive && sample !== null ? sample.fiveHour.utilizationPct : null,
+        todayCost,
+        hasData: deps.liveHub.getStatus().hasData,
+        hasModelWindow: sample?.weeklyModel !== undefined,
+      };
+      return c.json(body);
+    }),
+  );
+
   // Bearer-token guard for EVERY POST endpoint (f22) — the two usage endpoints,
   // /api/hub/config, and POST /api/rescan. Enforced ONLY when `deps.authToken`
   // is set (the Tauri shell passes MAXPRICE_AUTH_TOKEN); null (standalone dev /
@@ -1297,11 +1359,16 @@ export function buildApp(deps: BuildAppDeps): Hono {
         // awaited: nothing about the identity side channel may
         // turn a rescan that in fact succeeded into a 500 (this handler's
         // errors reach the user as "refresh failed", ADR-0059).
-        try {
-          deps.onRescan?.();
-        } catch (err) {
+        //
+        // Since #183 the probe is asynchronous, so "never awaited" now also
+        // means the refresh returns while the reads are still in flight — which
+        // is the improvement: a wedged probe can no longer hold the gesture
+        // open. The catch moved onto the promise for the same reason; a
+        // synchronous try/catch around a promise-returning call would guard
+        // nothing.
+        void deps.onRescan?.().catch((err: unknown) => {
           console.error("[sidecar] rescan identity probe failed:", err);
-        }
+        });
         const body: RescanResponse = { added: changed, total };
         return c.json(body);
       },
@@ -1455,6 +1522,13 @@ async function writeLine(line: string): Promise<void> {
   }
 }
 
+// The parent-death watchdog's late-bound teardown (ADR-0078). Declared at
+// module scope because the watchdog is ARMED at module scope, before `main()`
+// runs — `main()` calls `.set(shutdown)` once it has a teardown to give.
+// Constructing it costs nothing (no timers, no handles), so importing this
+// module for `buildApp` in tests is unaffected.
+const deferredShutdown = createDeferredShutdown({ label: "sidecar" });
+
 async function main(): Promise<void> {
   const desiredPort = parsePort(process.env.PORT);
 
@@ -1477,12 +1551,26 @@ async function main(): Promise<void> {
   // pre-existing resolveWatchRoots($CLAUDE_CONFIG_DIR) behaviour unchanged.
   const settingsPath = process.env.MAXPRICE_SETTINGS_PATH;
 
-  function resolveRoots(): string[] {
+  // ASYNC since issue #183's audit: every path tested below is one the USER
+  // chose, and a `stat` on a dead network mount does not return. On the
+  // synchronous form that wait belonged to the event loop. (The settings.json
+  // read a line below stays synchronous on purpose — that path is ours, a
+  // regular file in the OS app-data dir, not somewhere the user can point.)
+  async function isDir(p: string): Promise<boolean> {
+    try {
+      return (await stat(p)).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  async function resolveRoots(): Promise<string[]> {
     if (settingsPath !== undefined) {
       const fromSettings = readClaudePathsFromSettings(settingsPath);
       if (fromSettings !== null) {
         // The watcher still drops non-existent dirs at watch time.
-        const existing = fromSettings.filter((p) => existsSync(p) && statSync(p).isDirectory());
+        const existing: string[] = [];
+        for (const p of fromSettings) if (await isDir(p)) existing.push(p);
         // Safety net: if settings yields no existing dir, fall through to the
         // $CLAUDE_CONFIG_DIR / standard-path resolution below. Harmless when
         // settings has valid paths; rescues a user whose data lives only at a
@@ -1490,14 +1578,18 @@ async function main(): Promise<void> {
         if (existing.length > 0) return existing;
       }
     }
-    return resolveWatchRoots({
+    return await resolveWatchRoots({
       configDir: process.env.CLAUDE_CONFIG_DIR,
       homedir: homedir(),
-      dirExists: (p) => existsSync(p) && statSync(p).isDirectory(),
+      dirExists: isDir,
     });
   }
 
-  let watchRoots = resolveRoots();
+  // Awaited BEFORE the handshake, deliberately unchanged in that respect: the
+  // roots are what the watcher and the boot scan are built from. A hang here
+  // therefore delays `LISTENING` and trips the Rust shell's 5 s handshake
+  // timeout — loud and specific, not the silent post-handshake wedge #183 was.
+  let watchRoots = await resolveRoots();
 
   // Saturation self-report (issue #116 / F4): starts sampling immediately so
   // even the boot scan is measured. The patch sink is installed once `liveHub`
@@ -1854,6 +1946,14 @@ async function main(): Promise<void> {
   // to the renderer via `get_sidecar_url`. ADR-0002.
   await writeLine(`LISTENING ${server.port}\n`);
 
+  // Issue #183: everything below is `void`ed and says nothing until it
+  // finishes, which is why a launch that answered the handshake and then went
+  // silent for minutes could only be narrowed to "somewhere in here". The
+  // trace stamps every phase from the handshake and heartbeats the in-flight
+  // set, so a gap in the ticks localizes the block instead of merely proving
+  // it happened. Constructed HERE so `+0ms` means the handshake.
+  const bootTrace = createBootTrace();
+
   // The event store's initial full scan and the watcher both come up after the
   // handshake so a large initial filesystem walk can't delay the LISTENING
   // line past the Rust shell's 5s timeout. The scan runs concurrently with the
@@ -1863,20 +1963,30 @@ async function main(): Promise<void> {
   // `ignoreInitial: true` — the boot corpus never replays through `onRecords`,
   // so without this poke, work done while the app was closed would sit unpushed
   // until the 5-min sweep on an otherwise-idle machine.
-  void scanAndPoke(eventStore, fleet, watchRoots, "boot", bootProgress.onScanProgress);
+  void scanAndPoke(eventStore, fleet, watchRoots, "boot", (p) => {
+    // Piggybacks the splash's existing per-file callback: the tick line gets
+    // to say WHERE in the corpus the walk was when the loop stopped, which is
+    // the difference between "the scan blocked" and "the scan blocked at file
+    // 412 of 1253".
+    bootTrace.detail("scan", `${p.filesParsed}/${p.filesTotal} files`);
+    bootProgress.onScanProgress(p);
+  });
 
   // Kick the replica load beside the scan (ADR-0041) and gate the data handlers
   // on BOTH: engineReady resolves once the local scan AND the replica file load
   // finish. Deferred to here so the replica's disk read can't delay the LISTENING
   // line either; NEVER the network (the hub pull is background). A hub-less
   // client's loadReplicaAtBoot resolves immediately, so this is just the scan.
-  engineReady = Promise.all([
-    eventStore.ready,
-    fleet.loadReplicaAtBoot(),
-    // The archive's disk load (never rejects — a failure degrades instead,
-    // ADR-0069 §3). Local disk only, like the replica: never the network.
-    localArchive.loadAtBoot(),
-  ]).then(() => undefined);
+  engineReady = bootTrace.track(
+    "engine",
+    Promise.all([
+      bootTrace.track("scan", eventStore.ready),
+      bootTrace.track("replica", fleet.loadReplicaAtBoot()),
+      // The archive's disk load (never rejects — a failure degrades instead,
+      // ADR-0069 §3). Local disk only, like the replica: never the network.
+      bootTrace.track("archive", localArchive.loadAtBoot()),
+    ]).then(() => undefined),
+  );
 
   // The corpus walk's end (ADR-0067): announce the `merging` phase to anyone
   // still on the splash. Off `eventStore.ready` rather than `engineReady`,
@@ -1889,16 +1999,25 @@ async function main(): Promise<void> {
   // status:changed frame — when the SAME local gate the data handlers await
   // settles. Never the network; never cleared again this process. Carries the
   // terminal `bootProgress` in the same patch (ADR-0067).
-  void wireReadySignal(engineReady, liveHub, bootProgress);
+  void bootTrace.track("ready-signal", wireReadySignal(engineReady, liveHub, bootProgress));
 
   // The scan cache's one write (ADR-0048): after the same gate, behind a
   // macrotask yield so the ready frame's flush always beats the serialization.
-  void wireScanCachePersist(engineReady, scanCache);
+  void bootTrace.track("scan-cache", wireScanCachePersist(engineReady, scanCache));
 
   // The Identity directory's boot probe (ADR-0062): after the same gate, behind
   // the same macrotask yield — the scanned corpus is what tells the prober
   // which projects exist and where.
-  void wireIdentityProbe(engineReady, () => identityProber.runAll());
+  // Tracked with particular care (issue #183): a live reproduction on
+  // 2026-08-26 put a 590,904 ms block's start at +2.141 s — 0.53 s after the
+  // rest of the fan-out finished, which is exactly here. `runAll()`'s reads
+  // are asynchronous now, so a repeat costs this phase rather than the loop;
+  // the trace is what will say so, since the phase stays in flight and the
+  // heartbeat keeps naming it.
+  void bootTrace.track(
+    "identity-probe",
+    wireIdentityProbe(engineReady, () => identityProber.runAll()),
+  );
 
   // The archive's boot sweep (ADR-0069 §5): once the corpus scan has landed,
   // reconcile engine → archive — this is the retroactive first-boot capture,
@@ -1911,22 +2030,30 @@ async function main(): Promise<void> {
   // also what keeps the interval armed at all: an uncaught derivation of
   // `engineReady` would reach the `unhandledRejection` handler below, which
   // exits(1) — the sidecar would die moments after LISTENING and never sweep.
-  void engineReady
-    .catch(() => {
-      // Logged by wireReadySignal; the sweep cares only that the boot settled.
-    })
-    .then(() => {
-      void localArchive.sweep();
-      localArchive.startSweeps();
-    });
+  void bootTrace.track(
+    "archive-sweep",
+    engineReady
+      .catch(() => {
+        // Logged by wireReadySignal; the sweep cares only that the boot settled.
+      })
+      .then(() => {
+        void localArchive.sweep();
+        localArchive.startSweeps();
+      }),
+  );
 
   // Load the persisted usage history after the handshake, for the same reason
   // the event-store scan is deferred — a large read mustn't gate the LISTENING
   // line. The poller (started below) reads `latest()` lazily, so an in-flight
   // load just means the first reading lands once it resolves.
-  void sampleStore
-    .loadHistory()
+  void bootTrace
+    .track("usage-history", sampleStore.loadHistory())
     .catch((err: unknown) => console.error("[sidecar] usage-history load failed:", err));
+
+  // `bootTrace.seal()` used to sit here. It moved DOWN to just after the
+  // watcher phase is registered (issue #182) — every statement between here and
+  // there is synchronous, so the trace loses no time, and the watcher was the
+  // one boot phase the trace could not see.
 
   // Once the initial scan settles, reflect whether it found any usage data in
   // the status snapshot — a first-launch corpus stays `hasData: false`.
@@ -2026,6 +2153,10 @@ async function main(): Promise<void> {
     })();
     return shutdownPromise;
   };
+  // Hand the real teardown to the parent-death watchdog, which was armed at
+  // module scope long before this point (issue #182 — see `deferredShutdown`
+  // below). Until this line lands, an orphaning exits immediately instead.
+  deferredShutdown.set(() => void shutdown());
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
   process.on("unhandledRejection", (err) => {
@@ -2060,11 +2191,15 @@ async function main(): Promise<void> {
       // No live throw path exists today (probeRepoId, persist and broadcast all
       // catch); this is symmetry and defence against a future one, not a fix
       // for an observed crash.
-      try {
-        identityProber.noticeSlug(projectSlug);
-      } catch (err) {
+      //
+      // Since #183 the probe is asynchronous, and this call site is the one
+      // that gains the most from it: it shares a `flush()` with the watcher's
+      // `onEvent`, so a blocking read here used to stop the live pipeline for
+      // as long as it lasted. The guard moved onto the promise — a synchronous
+      // try/catch around a promise-returning call would guard nothing.
+      void identityProber.noticeSlug(projectSlug).catch((err: unknown) => {
         console.error("[sidecar] watcher identity probe failed:", err);
-      }
+      });
       // First data for a first-launch user who started a Claude session while
       // the app was open — broadcast `hasData: true` so the renderer's empty
       // state clears live. No-op once already `true`.
@@ -2077,9 +2212,68 @@ async function main(): Promise<void> {
       liveHub.emitUsage(event);
     },
     onError: (err) => console.error("[sidecar] watcher error:", err),
+    // Self-healing degrade (issue #182): a `ready` that shows up after the
+    // timeout clears the amber line, so the field means what is true now.
+    // Wired for every watcher this process builds — the boot one and each
+    // roots-change replacement — since either can time out.
+    //
+    // KNOWN GAP (pre-existing, deliberately not fixed here): this body is shared
+    // by every watcher and closes over nothing identifying which one fired it,
+    // so a SUPERSEDED watcher whose `ready` arrives late clears the flag for the
+    // degraded replacement that took its place. Closing it needs per-watcher
+    // identity in the options builder, which is a wider change than the
+    // roots-change flag wiring below.
+    onReadyLate: () => {
+      console.log("[sidecar] watcher 'ready' arrived late — file watching confirmed");
+      liveHub.patchStatus({ watcherDegraded: false });
+    },
   });
 
-  watcher = await createWatcher(jsonlWatcherOptions(watchRoots));
+  // The watcher joins the traced fan-out rather than blocking `main()` on a
+  // top-level `await` (issue #182). Two things come from that: a hung `ready`
+  // now shows up as `watcher` sitting in every boot-trace tick's in-flight set
+  // — in a log the Tauri shell tees to disk (ADR-0056) — instead of producing
+  // ticks that look healthy right up to silence; and `main()` has NO top-level
+  // await after the handshake at all, which is a far easier invariant to keep
+  // than "the watchdog goes above the awaits" (ADR-0078).
+  void bootTrace
+    .track(
+      "watcher",
+      createWatcher(jsonlWatcherOptions(watchRoots)).then((w) => {
+        watcher = w;
+        if (w.readyTimedOut) {
+          bootTrace.detail("watcher", "ready timed out");
+          liveHub.patchStatus({ watcherDegraded: true });
+        }
+        // The settings watch is built HERE, inside the watcher's `.then`, and
+        // not concurrently: `onRootsChanged` is the sole writer of
+        // `watcher`/`watchRoots`, and racing it against this assignment could
+        // clobber a newer watcher with the boot one — leaving `watcher` on the
+        // old roots while `watchRoots` claims the new ones, exactly the
+        // invariant `settings-watch.ts` is built around. The delay it costs is
+        // bounded by WATCHER_READY_TIMEOUT_MS and covers nothing that worked
+        // before: the settings watcher runs `ignoreInitial: true`, so an edit
+        // predating its creation was never seen anyway.
+        wireSettingsWatch();
+      }),
+    )
+    .catch((err: unknown) => {
+      // A rejecting createWatcher leaves the sidecar serving reports from a
+      // static corpus — degraded exactly as a timed-out ready does, so it says
+      // the same thing rather than dying.
+      console.error("[sidecar] watcher creation failed:", err);
+      liveHub.patchStatus({ watcherDegraded: true });
+      wireSettingsWatch();
+    });
+
+  // Every phase is registered — including the watcher above; start the
+  // heartbeat. The four `engineReady` wirings are still in flight when the
+  // fan-out's own phases settle, which is the point: the first version of this
+  // trace declared "fan-out complete" half a second BEFORE the observed block
+  // began, and would have named nothing. After this the trace is
+  // self-terminating — the last phase to settle stops it, and a boot that never
+  // settles stops it at the tick cap.
+  bootTrace.seal();
 
   // Watch settings.json for `claudePaths` edits (ADR-0014). The renderer is
   // the file's sole writer and writes atomically (temp + rename), so a `change`
@@ -2087,76 +2281,125 @@ async function main(): Promise<void> {
   // install the renderer creates settings.json *after* the sidecar boots, so
   // the first observed event is an `add`. The reentrancy-safe restart
   // orchestration lives in `createSettingsWatch` (review I1/I2).
-  if (settingsPath !== undefined) {
-    settingsWatch = createSettingsWatch({
-      settingsPath,
-      resolveRoots,
-      getCurrentRoots: () => watchRoots,
-      createJsonlWatcher: (roots) => createWatcher(jsonlWatcherOptions(roots)),
-      onRootsChanged: ({ watcher: next, roots }) => {
-        const previous = watcher;
-        watcher = next;
-        watchRoots = roots;
-        // Close the superseded watcher; a failure here is logged, not fatal.
-        if (previous)
-          void previous.close().catch((err: unknown) => {
-            console.error("[sidecar] superseded watcher close failed:", err);
-          });
-        // Broadcast the new watched paths so the status bar updates live.
-        liveHub.patchStatus({ watchedPaths: roots });
-      },
-      scan: (roots) => {
-        // Through the live accessor (ADR-0041): a fleet rebuild may have swapped
-        // the store since boot, so scan whatever store is current. A newly-added
-        // root's history lands outside the watcher path, so `scanAndPoke` pushes
-        // it now rather than on the next flush/sweep.
-        void scanAndPoke(getEngineStore(), fleet, roots, "root change");
-      },
-      // The ADR-0041 fleet-toggle hook — fired on every settings edit (roots
-      // changed or not), so a share/replica toggle applies in-session without a
-      // relaunch. `settingsPath` is narrowed to string inside this block.
-      onSettingsChanged: () => {
-        const s = readSettingsFile(settingsPath);
-        if (s !== null)
-          fleet.applySettings({
-            hubShareEvents: s.hubShareEvents,
-            hubFleetReplica: s.hubFleetReplica,
-          });
-      },
-    });
-  }
-
-  // Windows: bun:ffi has no libc.<suffix> to dlopen, so the getppid(2) watchdog
-  // can't run here. We no-op to avoid crashing the serving sidecar
-  // (libcGetppid()'s dlopen throws on win32, and this runs after the LISTENING
-  // handshake — an uncaught throw would tear down the already-serving sidecar).
-  //
-  // This is COVERED, and not from here: ADR-0072 puts the sidecar in a Win32 Job
-  // Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, created by the Rust shell
-  // and held for its lifetime, so the KERNEL terminates this process when the
-  // shell goes away by any route at all — including the updater's
-  // `std::process::exit(0)`, which never reaches kill_sidecar. That is strictly
-  // stronger than anything reachable from in here, and needs no code in this
-  // file.
-  //
-  // The other candidate — a stdin-'end' watchdog like the hub daemon's — was
-  // declined rather than deferred (#147 Q11): that Bun on win32 emits stdin
-  // 'end' after a TerminateProcess'd parent is asserted, not proven
-  // (parent-watchdog.test.ts drives a fake emitter), so it would be an
-  // unverifiable second mechanism behind a kernel-enforced first one.
-  if (process.platform !== "win32") {
-    const getPpid = libcGetppid();
-    installParentWatchdog({
-      getPpid,
-      initialPpid: getPpid(),
-      label: "sidecar",
-      onOrphaned: () => {
-        void shutdown();
-      },
-    });
+  function wireSettingsWatch(): void {
+    if (settingsPath !== undefined) {
+      settingsWatch = createSettingsWatch({
+        settingsPath,
+        resolveRoots,
+        getCurrentRoots: () => watchRoots,
+        createJsonlWatcher: (roots) => createWatcher(jsonlWatcherOptions(roots)),
+        onRootsChanged: ({ watcher: next, roots }) => {
+          const previous = watcher;
+          watcher = next;
+          watchRoots = roots;
+          // Close the superseded watcher; a failure here is logged, not fatal.
+          if (previous)
+            void previous.close().catch((err: unknown) => {
+              console.error("[sidecar] superseded watcher close failed:", err);
+            });
+          // Broadcast the new watched paths so the status bar updates live.
+          liveHub.patchStatus({ watchedPaths: roots });
+          // …and the replacement's own health. UNCONDITIONAL, not
+          // `if (readyTimedOut)`: this is the only writer on the roots-change
+          // path, so it must both RAISE the flag for a replacement whose `ready`
+          // timed out (previously the flag was set only on the boot path, so a
+          // degraded replacement looked healthy) and HEAL it when a healthy
+          // replacement supersedes a degraded boot watcher.
+          liveHub.patchStatus({ watcherDegraded: next.readyTimedOut });
+        },
+        scan: (roots) => {
+          // Through the live accessor (ADR-0041): a fleet rebuild may have swapped
+          // the store since boot, so scan whatever store is current. A newly-added
+          // root's history lands outside the watcher path, so `scanAndPoke` pushes
+          // it now rather than on the next flush/sweep.
+          void scanAndPoke(getEngineStore(), fleet, roots, "root change");
+        },
+        // The ADR-0041 fleet-toggle hook — fired on every settings edit (roots
+        // changed or not), so a share/replica toggle applies in-session without a
+        // relaunch. `settingsPath` is narrowed to string inside this block.
+        onSettingsChanged: () => {
+          const s = readSettingsFile(settingsPath);
+          if (s !== null)
+            fleet.applySettings({
+              hubShareEvents: s.hubShareEvents,
+              hubFleetReplica: s.hubFleetReplica,
+            });
+        },
+        // A restart that failed leaves the PREVIOUS watcher installed on the
+        // PREVIOUS roots — file watching no longer matches the configured
+        // paths, which is precisely what `watcherDegraded` tells the user. This
+        // also fires for a rejecting `resolveRoots()`, and that is still honest:
+        // either way the installed watcher may not match the settings on disk.
+        // No self-heal here — only a later successful `onRootsChanged` (or a
+        // late `ready`) clears it, which is the correct polarity.
+        onRestartFailed: () => liveHub.patchStatus({ watcherDegraded: true }),
+      });
+    }
   }
 }
 
+// Arm the parent-death watchdog BEFORE `main()` — the whole point of ADR-0078.
+// It used to be the last statement of `main()`, downstream of the awaits, so a
+// `createWatcher` that never resolved (chokidar's `ready` hanging on macOS)
+// left a serving sidecar with no watchdog at all, forever (issue #182). It
+// depends on nothing `main()` produces, so nothing justifies it waiting.
+//
+// Windows: bun:ffi has no libc.<suffix> to dlopen, so the getppid(2) watchdog
+// can't run there. We no-op rather than crash.
+//
+// Windows is COVERED, and not from here: ADR-0072 puts the sidecar in a Win32
+// Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, created by the Rust shell
+// and held for its lifetime, so the KERNEL terminates this process when the
+// shell goes away by any route at all — including the updater's
+// `std::process::exit(0)`, which never reaches kill_sidecar. That is strictly
+// stronger than anything reachable from in here, and needs no code in this
+// file.
+//
+// The other candidate — a stdin-'end' watchdog like the hub daemon's — stays
+// declined rather than deferred (#147 Q11, re-affirmed by ADR-0078): that Bun
+// on win32 emits stdin 'end' after a TerminateProcess'd parent is asserted, not
+// proven (parent-watchdog.test.ts drives a fake emitter), so it would be an
+// unverifiable second mechanism behind a kernel-enforced first one.
+function armParentWatchdog(): void {
+  if (process.platform === "win32") return;
+  // Guarded because this now runs BEFORE the server exists: a `dlopen` failure
+  // must leave a sidecar that boots and serves (degraded to `kill_sidecar`
+  // alone, exactly the pre-ADR-0078 Windows posture), never one that dies on
+  // launch. The log line is the artifact the #182 verification greps for — it
+  // must appear ahead of `LISTENING`, which is what distinguishes this
+  // ordering from the one that shipped the bug.
+  try {
+    const getPpid = libcGetppid();
+    const initialPpid = getPpid();
+    installParentWatchdog({
+      getPpid,
+      initialPpid,
+      label: "sidecar",
+      onOrphaned: () => deferredShutdown.fire(),
+    });
+    console.log(`[sidecar] parent watchdog armed (ppid ${initialPpid})`);
+  } catch (err) {
+    console.error("[sidecar] parent watchdog unavailable — shell teardown only:", err);
+  }
+}
+
+// One line naming the clock every saturation measurement rides (#186). It is
+// resolved here rather than at first use so the answer lands in the durable
+// log BEFORE anything can go wrong, and so a Windows host that fell back to
+// `performance.now()` — which counts suspended time there, and would report
+// every wake as a minute of "engine catching up" — says so out loud instead of
+// miscounting in silence. Cheap: the resolution is memoized for the process.
+function logMonotonicClock(): void {
+  const clock = monotonicClock();
+  if (clock.warning !== undefined) {
+    console.error(`[sidecar] saturation clock DEGRADED: ${clock.warning}`);
+    return;
+  }
+  console.log(`[sidecar] saturation clock: ${clock.source}`);
+}
+
 if (import.meta.main) {
+  armParentWatchdog();
+  logMonotonicClock();
   void main();
 }

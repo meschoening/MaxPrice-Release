@@ -2,6 +2,8 @@
 
 Release code and binaries for MaxPrice, a Claude Code cost/token tracker.
 
+**Transparency Note: This project was entirely generated and is entirely maintained through the use of Anthropic's Claude and OpenAI's GPT AI models. However, a human is always behind these AI-made changes.**
+
 ## Features:
 
 - Plots token usage and price of usage as if you had to pay API rates.

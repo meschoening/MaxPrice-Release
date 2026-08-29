@@ -106,6 +106,22 @@ export const settingsSchema = z
     //                     rebuild; re-toggling on is an ordinary reseed).
     hubShareEvents: z.boolean().default(true).catch(true),
     hubFleetReplica: z.boolean().default(true).catch(true),
+    // Background residency (map #168 / M1): closing the main window hides it
+    // and keeps the app + sidecar alive; OFF restores close-means-quit.
+    // Governs the CLOSE BUTTON only — quitting (tray Quit, macOS Cmd+Q) always
+    // exits. Default ON per the map's charter. The Rust shell reads this field
+    // straight out of settings.json at close time (it cannot run Zod), with
+    // the same absent/non-bool → true semantics — keep the two in lockstep.
+    keepRunningInBackground: z.boolean().default(true).catch(true),
+    // Whether the tray popout draws the Model-scoped weekly limit row
+    // (CONTEXT.md) — default OFF, an opt-in for the one account shape that
+    // reports one. Two gates AND together: this field and the sample actually
+    // carrying the window (the Settings switch itself only renders while it
+    // does). The Rust shell reads this field straight out of settings.json to
+    // size the popout before showing it (`model_limit_row_enabled`, the
+    // `keepRunningInBackground` precedent) — absent/non-bool → false; keep the
+    // two in lockstep. Popout only: the Live page and the readout ignore it.
+    showModelLimit: z.boolean().default(false).catch(false),
   })
   .passthrough();
 

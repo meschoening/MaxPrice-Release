@@ -1,6 +1,6 @@
 [package]
 name = "maxprice-desktop"
-version = "0.5.2"
+version = "0.6.0"
 description = "MaxPrice desktop"
 authors = ["Max Schoening"]
 license = "MIT"
@@ -14,15 +14,29 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon: the permanent tray (map #168 / M2) — the icon exists always while
+# the app runs (charter decision 10); both clicks toggle the popout (ADR-0050).
+# image-png: the ambient writer's runtime tray-icon swaps (map #168 / M3) —
+# Image::from_bytes over the checked-in tray PNGs (badge + macOS templates).
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-window-state = "2"
+# Second-launch handling (map #168 / M1): a second instance shows + focuses the
+# running window and exits itself. Registered FIRST in the builder, per the
+# plugin's own guidance, so it wins before any other plugin touches state.
+tauri-plugin-single-instance = "2"
+# The "Start at login" toggle (map #168 / M4; ADR-0077). `enable()` registers
+# with the `--hidden` launch arg so a login launch is tray-only.
+tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The ambient tray writer's loopback HTTP client (map #168 / M3; ADR-0076).
+# Default features OFF: loopback plain HTTP never needs a TLS stack.
+ureq = { version = "2", default-features = false }
 tokio = { version = "1", features = ["sync", "macros", "rt", "io-util"] }
 parking_lot = "0.12"
 getrandom = "0.2"
@@ -33,12 +47,46 @@ tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
+# The popout's rounded corners (ADR-0050's revisit): AppKit will round a
+# window through public API — mask the content view's layer — which is why
+# this needs no `macos-private-api`. All three crates are already in the lock
+# as tao/tauri transitives at these versions, so naming them adds no PACKAGE
+# to the graph (the windows-sys precedent below) — but only because both
+# framework crates are taken with `default-features = false`. Their defaults
+# are "every class in the framework", which is how they reach CAMetalLayer and
+# CVBuffer and drag objc2-metal + objc2-core-video in behind them; tao asks for
+# neither, so the cost of leaving defaults on lands entirely on us. Four
+# classes and two CGFloat setters is the whole of what this file needs. Add a
+# feature when the code needs the class, not to make a compile error go away.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSColor",
+  "NSView",
+  "NSWindow",
+  "objc2-quartz-core",
+] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+  "std",
+  "CALayer",
+  "objc2-core-foundation",
+] }
 
 # windows-sys carries the job-object calls that give the sidecar a
 # kernel-enforced lifetime (ADR-0072). 0.61 is already in the lock as a
 # transitive dependency, so pinning it here adds no new version to the graph.
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+# The one-time first-close toast (map #168 / M1) — Windows-only by charter
+# decision 9; the other platforms never load the plugin.
+tauri-plugin-notification = "2"
+# Read-only HKCU access for the autostart self-heal (ADR-0051's arrangement,
+# adopted in map #168 / M4). The autostart plugin can only tell us an entry
+# EXISTS, never where it points, so we read the Run value ourselves;
+# `enable()` stays the only writer. auto-launch (the plugin's own backend)
+# links its own older winreg on the unmaintained winapi shim — the duplicate
+# is deliberate, and the two need not stay aligned.
+winreg = "0.55"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",

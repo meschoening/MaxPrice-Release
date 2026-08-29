@@ -19,7 +19,7 @@ export type CreateSettingsWatchOptions = {
   // $CLAUDE_CONFIG_DIR on a missing/unparseable file). Called on every
   // settings-file event; a parse failure surfacing as the fallback roots is
   // simply "no change" when it equals the current roots.
-  resolveRoots: () => string[];
+  resolveRoots: () => Promise<string[]>;
   // The current JSONL roots — read fresh on each restart so a coalesced
   // re-check compares against the roots the *previous* restart installed.
   getCurrentRoots: () => string[];
@@ -41,6 +41,14 @@ export type CreateSettingsWatchOptions = {
   // early return). Fired at the top of `scheduleRestart`, before the reentrancy
   // gates, so a settings edit landing mid-restart still applies its toggles.
   onSettingsChanged?: () => void;
+  // A restart attempt failed — either `resolveRoots()` or `createJsonlWatcher()`
+  // rejected. Either way the JSONL watcher still installed is the PREVIOUS one,
+  // on the previous roots, and nothing else signals that: the loop below logs
+  // and moves on, and a failed restart leaves no observable trace on the status
+  // snapshot. The caller uses this to raise `watcherDegraded`, which is exactly
+  // the "file watching may not reflect your settings" condition the status bar
+  // documents that flag for. Fired once per failed iteration.
+  onRestartFailed?: (err: unknown) => void;
   // Injectable chokidar factory — defaults to the real `watch`. Tests pass a
   // fake to drive `add`/`change` synchronously.
   watchFactory?: (path: string) => FSWatcher;
@@ -76,7 +84,7 @@ export function createSettingsWatch(opts: CreateSettingsWatchOptions): SettingsW
   let closed = false;
 
   async function restartOnce(): Promise<void> {
-    const nextRoots = opts.resolveRoots();
+    const nextRoots = await opts.resolveRoots();
     if (rootsEqual(nextRoots, opts.getCurrentRoots())) return;
 
     // Build the replacement first; only hand it to `onRootsChanged` (which
@@ -124,6 +132,14 @@ export function createSettingsWatch(opts: CreateSettingsWatchOptions): SettingsW
               await restartOnce();
             } catch (err) {
               console.error("[sidecar] settings-driven watcher restart failed:", err);
+              // Surface the failure to the caller — wrapped like
+              // `onSettingsChanged` above, so a throwing hook can't abort the
+              // coalescing loop and strand a `pendingRecheck`.
+              try {
+                opts.onRestartFailed?.(err);
+              } catch (hookErr) {
+                console.warn("[sidecar] settings onRestartFailed hook failed:", hookErr);
+              }
             }
             // Loop while events arrived mid-restart — `restartOnce` re-reads
             // the roots, so a coalesced run is a fresh evaluation. A recheck

@@ -27,7 +27,16 @@ export const usageSampleSchema = z.object({
   capturedAt: z.string(),
   fiveHour: usageWindowSchema,
   weekly: usageWindowSchema,
+  // The Model-scoped weekly limit (CONTEXT.md): Anthropic's weekly cap on one
+  // model family's share, reported beside the all-model weekly limit as a
+  // `weekly_scoped` entry of the upstream `limits[]` with a model scope. Which
+  // family is scoped rides along as `model` (today "Fable"), so every surface
+  // labels it from the wire and nothing assumes the family. OPTIONAL by the
+  // forward-compat rule above AND by meaning: absent when the account reports
+  // no scoped window — a complete sample, not a broken one.
+  weeklyModel: usageWindowSchema.extend({ model: z.string() }).optional(),
 });
+export type ModelScopedWindow = NonNullable<UsageSample["weeklyModel"]>;
 export type UsageSample = z.infer<typeof usageSampleSchema>;
 
 // Connection lifecycle for the subtle status indicator (ADR-0023).

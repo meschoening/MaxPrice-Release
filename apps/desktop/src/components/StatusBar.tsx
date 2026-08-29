@@ -1,7 +1,13 @@
 import { Link } from "react-router-dom";
 import { useLiveStatus } from "@/state/use-live-status";
 import { useNowTick } from "@/state/use-now-tick";
-import { footHasLines, hubFootLine, saturationFootLine, usageFootLine } from "@/lib/foot-status";
+import {
+  footHasLines,
+  hubFootLine,
+  saturationFootLine,
+  usageFootLine,
+  watcherFootLine,
+} from "@/lib/foot-status";
 import { isStale } from "@/lib/stale-status";
 import { cn } from "@/lib/utils";
 
@@ -48,6 +54,10 @@ export function StatusBar() {
   // behind" surface, visible from every page. Verdict-only: the renderer never
   // re-derives it from the lag numbers.
   const saturated = useLiveStatus((s) => s.saturation?.saturated ?? false);
+  // The watcher degrade (issue #182) — the other "your numbers may be behind"
+  // surface, and the complementary one: saturation is an engine too busy to keep
+  // up, this is an engine that may not be being told anything has changed.
+  const watcherDegraded = useLiveStatus((s) => s.watcherDegraded);
   // Coarse tick — the usage tooltip's "sampled Nm ago" only needs
   // minute-grained freshness.
   const now = useNowTick(60_000);
@@ -56,11 +66,12 @@ export function StatusBar() {
   const usage = usageFootLine(usageConnection, usageLastSampleAt, now, stale);
   const hub = hubFootLine(hubConnection, lastSettledHub, stale);
   const showSaturation = saturationFootLine(saturated, stale);
+  const showWatcher = watcherFootLine(watcherDegraded, stale);
 
   // Nothing to say — no claude.ai key, no hub, engine keeping up. Render no
   // separator either: a hairline over an empty box reads as a broken surface,
   // not a quiet one.
-  if (!footHasLines(usage, hub, showSaturation)) return null;
+  if (!footHasLines(usage, hub, showSaturation, showWatcher)) return null;
 
   return (
     <div className="shrink-0">
@@ -73,6 +84,20 @@ export function StatusBar() {
           >
             <span aria-hidden className="dot warn pulse-anim" />
             <span className="sb-label">engine catching up</span>
+          </span>
+        )}
+        {showWatcher && (
+          // Steady, not `pulse-anim`: saturation pulses because it is episodic
+          // and clears on a seconds scale, where this is a standing condition.
+          // The three-word label overstates slightly — events may still be
+          // flowing, only the `ready` signal was lost — and the title carries
+          // the precision and the remedy, which is what the row is a pointer to.
+          <span
+            className="sb-footrow text-warn"
+            title="The file watcher never finished starting — new activity may not appear until you refresh."
+          >
+            <span aria-hidden className="dot warn" />
+            <span className="sb-label">watcher stalled</span>
           </span>
         )}
         {usage.kind === "expired" ? (

@@ -114,7 +114,13 @@ export const pricingStatusSchema = z.object({
 // legible in one read (their divergence under a pegged core is the
 // duty-cycle signature that retired the p50 as the verdict);
 // `cpuPercent` (of one core) is the calibration channel against an external
-// process-time reading; `windowMs` makes the numbers self-describing.
+// process-time reading, and is NULLABLE because it is genuinely unknowable in
+// the one window that matters most (issue #183, Finding D): a synchronous
+// block longer than the window leaves a single surviving sample, and one CPU
+// reading has no delta to divide. It reported `0` there, which is not a
+// measurement but the most alarming answer inventable from no data — and #183
+// was written around it ("0% CPU, therefore a blocked wait, not slow work").
+// `windowMs` makes the numbers self-describing.
 // Optional on `statusSnapshotSchema` below, where absent means UNKNOWN (a
 // pre-F4 sidecar) — never healthy-by-default, matching `pricing` above — but
 // the object always patches whole (the fleetEventsStatus rule), so its
@@ -130,7 +136,7 @@ export const saturationSnapshotSchema = z.object({
   blockedPct: z.number().nonnegative(),
   p50LagMs: z.number().nonnegative(),
   maxLagMs: z.number().nonnegative(),
-  cpuPercent: z.number().nonnegative(),
+  cpuPercent: z.number().nonnegative().nullable(),
   windowMs: z.number().positive(),
 });
 export type SaturationSnapshot = z.infer<typeof saturationSnapshotSchema>;
@@ -251,6 +257,16 @@ export const statusSnapshotSchema = z.object({
   // absent-means-false (the hubEventsDegraded channel — monorepo-local
   // loopback contract, freely evolvable).
   localArchiveDegraded: z.boolean().optional(),
+  // File-watcher degrade (issue #182): true while the JSONL watcher's chokidar
+  // `ready` never arrived within its timeout. The watcher is kept and may well
+  // be delivering events — the known FSEvents mode loses the SIGNAL, not
+  // necessarily the watching — so this says "unconfirmed", and the remedy in
+  // the tooltip is a manual refresh. SELF-HEALING: a late `ready` patches it
+  // back to false, so the field means what is true now, not what boot found
+  // (ADR-0074's rule for `bindHosts`). Display-only, and presence IS the
+  // assertion, so the foot hides it outright when the SSE channel is stale.
+  // Optional, absent-means-false (the localArchiveDegraded channel).
+  watcherDegraded: z.boolean().optional(),
   // Saturation self-report (issue #116 / F4) — shape and semantics documented
   // on `saturationSnapshotSchema` above. `.optional()` for the same skew
   // tolerance `pricing` carries: absent means UNKNOWN (a pre-F4 sidecar

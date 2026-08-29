@@ -78,6 +78,10 @@ export type LiveStatusState = {
   // line. Absent lands as `false` for the `hubEventsDegraded` reason: a sidecar
   // that never reports the flag is not a sidecar reporting a fault.
   localArchiveDegraded: boolean;
+  // File-watcher degrade (issue #182): the sidecar could not confirm its JSONL
+  // watcher started. Absent-means-false, and self-healing — a late `ready`
+  // patches it back off, so this is what is true now, not what boot found.
+  watcherDegraded: boolean;
   // Saturation self-report (issue #116 / F4): the sidecar-owned verdict that
   // its event loop is starved, with the Loop lag numbers behind it. `null`
   // means UNKNOWN (no frame yet, or a pre-F4 sidecar) — never healthy. The
@@ -109,6 +113,7 @@ export const useLiveStatus = create<LiveStatusState>((set) => ({
   hubSeed: null,
   hubEventsDegraded: false,
   localArchiveDegraded: false,
+  watcherDegraded: false,
   saturation: null,
   setConnectionState: (state) => set({ connectionState: state }),
   setBootFailure: (reason) => set({ bootFailure: reason }),
@@ -138,6 +143,7 @@ export const useLiveStatus = create<LiveStatusState>((set) => ({
       hubSeed: snapshot.hubSeed,
       hubEventsDegraded: snapshot.hubEventsDegraded ?? false,
       localArchiveDegraded: snapshot.localArchiveDegraded ?? false,
+      watcherDegraded: snapshot.watcherDegraded ?? false,
       saturation: snapshot.saturation ?? null,
     })),
   markEvent: (at) => set({ lastEventAt: at }),

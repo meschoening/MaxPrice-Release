@@ -9,36 +9,77 @@
 // regular file — see `readGitMetadata`) never touches one — that is
 // the entire point of persistence, because a probe answers "now" and
 // directories die.
-import { readFileSync, statSync } from "node:fs";
+import { readFile, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { repoIdFromRemote } from "@maxprice/shared";
 
 export type ProbeResult = { kind: "probed"; repoId: string | null } | { kind: "unreachable" };
 
-// A `.git` file, a `commondir`, and a `config` are all kilobyte-scale TEXT.
-// Anything else at those paths is not ours to read: after the first
+// EVERY read here is ASYNCHRONOUS, and that is a correctness property rather
+// than a style (issue #183). Bun runs async file work on a thread pool; the
+// synchronous forms ran on the one event loop. A blocked `open(2)` therefore
+// used to stop the whole sidecar — no reports, no SSE frames, no `/api/status`
+// — and one was caught doing exactly that: a stack sample of a wedged sidecar
+// put 3710 of 3710 samples in `openat$NOCANCEL` on the main thread, 0% CPU,
+// for 9 minutes 51 seconds, starting at the offset this probe runs at.
+//
+// Async does NOT make the open return. It costs one pool thread instead of the
+// loop, so the app keeps answering while one probe waits. That is the whole of
+// the claim; a probe that never finishes still yields no Identity-directory
+// row for its project, and `identity-probe.ts`'s watchdog is what says so out
+// loud.
+//
+// The size/type guard below is the older, narrower defence and still earns its
+// place. A `.git` file, a `commondir`, and a `config` are all kilobyte-scale
+// TEXT. Anything else at those paths is not ours to read: after the first
 // indirection the path chain is derived from BYTES INSIDE the project
 // directory (a tarball can ship a `.git` file AND a FIFO — GNU tar extracts
-// FIFO entries by default), and readFileSync on a FIFO blocks this process's
-// one loop forever, on `open(2)`, waiting for a writer that never comes — at
-// boot, on every rescan, and on every first-seen slug, with no timeout and no
-// recovery. The existing catch cannot help: this blocks, it does not throw.
-// Regular file, modest size, or we treat the whole probe as unreachable.
+// FIFO entries by default), and a read of a FIFO waits on `open(2)` for a
+// writer that never comes. The existing catch cannot help: this blocks, it
+// does not throw. Regular file, modest size, or we treat the whole probe as
+// unreachable.
 //
 // Note the only other type check in this module is `isDirectory()`, which
 // discriminates directory vs EVERYTHING else — so a FIFO, socket, or device
 // named `.git` takes the indirection branch, where the first read below
-// rejects it. Stat-then-read is TOCTOU in principle; it converts an indefinite
-// hang into a bounded read in every non-racing case, which is the whole of the
-// exposure.
+// rejects it. Stat-then-read is TOCTOU in principle, and a `stat` cannot see
+// every reason an `open` might hang, which is why it is now the second line of
+// defence rather than the only one.
 const MAX_GIT_METADATA_BYTES = 1024 * 1024;
 
-function readGitMetadata(path: string): string {
-  const st = statSync(path, { throwIfNoEntry: false });
+// Absence is an ANSWER here (no `commondir` means no indirection), so ENOENT
+// reads as `undefined` — as does ENOTDIR, which is the same absence reached
+// through a non-directory path component (`join(dir, ".git")` under a `dir`
+// that is a file, or a `projectPath` whose parent component is a file). EVERY
+// OTHER errno propagates, and that classification is the point rather than a
+// detail: an earlier form of this helper caught everything and returned
+// `undefined`, which mattered most at the walk head in `probeRepoId`, where an
+// EACCES/EIO/EPERM on `<dir>/.git` (a directory readable but not searchable, a
+// Windows lock/AV/placeholder error) looked exactly like "no repo here" and
+// sent the walk on to the PARENT — yielding a DEFINITE `probed` verdict naming
+// the parent's repo, or a `probed: null` at the filesystem root. A definite
+// verdict may overwrite a persisted Identity-directory row (ADR-0062);
+// `unreachable` never touches one, so swallowing those errnos turned a safe
+// no-op into a persisted wrong-or-erased identity. Propagating instead lands
+// in `probeRepoId`'s outer catch, which is exactly the conservative answer.
+async function statOrUndefined(
+  path: string,
+): Promise<Awaited<ReturnType<typeof stat>> | undefined> {
+  try {
+    return await stat(path);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    throw err;
+  }
+}
+
+async function readGitMetadata(path: string): Promise<string> {
+  const st = await statOrUndefined(path);
   if (st === undefined || !st.isFile() || st.size > MAX_GIT_METADATA_BYTES) {
     throw new Error(`not readable git metadata: ${path}`);
   }
-  return readFileSync(path, "utf8");
+  return await readFile(path, "utf8");
 }
 
 // git-config VALUE grammar, and it lives here rather than in @maxprice/shared's
@@ -106,8 +147,8 @@ export function originUrlFromConfig(config: string): string | null {
 // worktree) names the per-worktree git dir; its `commondir` file (relative to
 // THAT dir) names the shared .git holding the real config. A submodule's git
 // dir has no commondir and carries its own config — also correct.
-function configPathViaIndirection(dotGitFile: string, worktreeRoot: string): string {
-  const gitdirLine = readGitMetadata(dotGitFile).trim();
+async function configPathViaIndirection(dotGitFile: string, worktreeRoot: string): Promise<string> {
+  const gitdirLine = (await readGitMetadata(dotGitFile)).trim();
   const m = /^gitdir:\s*(.+)$/.exec(gitdirLine);
   if (m === null) throw new Error(`unrecognized .git file at ${dotGitFile}`);
   const gitDir = resolve(worktreeRoot, (m[1] as string).trim());
@@ -115,28 +156,28 @@ function configPathViaIndirection(dotGitFile: string, worktreeRoot: string): str
   // ABSENCE is the normal no-indirection case (a submodule's git dir carries
   // its own config), so it stays a plain existence question; anything that IS
   // there goes through the same guard as every other read.
-  if (statSync(commondirFile, { throwIfNoEntry: false }) === undefined) {
+  if ((await statOrUndefined(commondirFile)) === undefined) {
     return join(gitDir, "config");
   }
-  const common = resolve(gitDir, readGitMetadata(commondirFile).trim());
+  const common = resolve(gitDir, (await readGitMetadata(commondirFile)).trim());
   return join(common, "config");
 }
 
-export function probeRepoId(projectPath: string): ProbeResult {
+export async function probeRepoId(projectPath: string): Promise<ProbeResult> {
   try {
-    if (!statSync(projectPath, { throwIfNoEntry: false })?.isDirectory()) {
+    if (!(await statOrUndefined(projectPath))?.isDirectory()) {
       return { kind: "unreachable" };
     }
     const start = resolve(projectPath);
     let dir = start;
     for (;;) {
       const dotGit = join(dir, ".git");
-      const st = statSync(dotGit, { throwIfNoEntry: false });
+      const st = await statOrUndefined(dotGit);
       if (st !== undefined) {
         const configPath = st.isDirectory()
           ? join(dotGit, "config")
-          : configPathViaIndirection(dotGit, dir);
-        const url = originUrlFromConfig(readGitMetadata(configPath));
+          : await configPathViaIndirection(dotGit, dir);
+        const url = originUrlFromConfig(await readGitMetadata(configPath));
         if (url === null) return { kind: "probed", repoId: null };
         // The subpath is the remainder below the RESOLVED toplevel `dir`, never
         // derived from the project path alone: `normalizeSubpath` strips leading

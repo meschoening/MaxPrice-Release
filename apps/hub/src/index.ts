@@ -7,6 +7,7 @@ import {
   type UsageSample,
 } from "@maxprice/shared";
 import {
+  createDeferredShutdown,
   createFleetEventStore,
   createIdentityDirectory,
   createSampleStore,
@@ -445,42 +446,16 @@ async function serve(): Promise<void> {
     })();
     return shutdownPromise;
   };
+  // Hand the real teardown to the watchdogs armed at module scope, before
+  // `serve()` was ever called (ADR-0078 — see `armHubWatchdogs`). Until this
+  // line lands, an orphaning exits immediately instead.
+  deferredShutdown.set(() => void shutdown());
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
   process.on("unhandledRejection", (err) => {
     console.error("[hub] unhandled rejection:", err);
     void shutdown(1);
   });
-  // Embedded-mode parent-death watchdogs (ADR-0036 / F8): when spawned by the
-  // tray shell, couple our lifetime to the parent so an orphaned daemon
-  // self-exits instead of holding the port — a Task-Manager-killed tray shell
-  // would otherwise leave the daemon bound (port 47100), failing the NEXT
-  // launch's bind. Gated on MAXPRICE_HUB_EMBEDDED so headless `serve` keeps its
-  // no-watchdog "must outlive its spawner" contract (ADR-0035). Two mechanisms:
-  //   - stdin EOF (ALL platforms): the tray shell spawns us with a PIPED stdin,
-  //     so its death closes the pipe's write end and Bun fires 'end'. This is
-  //     the ONLY watchdog on win32, where bun:ffi has no libc to dlopen;
-  //     belt-and-braces alongside getppid elsewhere.
-  //   - getppid(2) poll (macOS/Linux only): fires on reparent-to-init; win32
-  //     has no libc.<suffix> to dlopen (libcGetppid() would throw there).
-  if (isEmbedded()) {
-    installStdinWatchdog({
-      onOrphaned: () => {
-        void shutdown();
-      },
-    });
-    if (process.platform !== "win32") {
-      const getPpid = libcGetppid();
-      installParentWatchdog({
-        getPpid,
-        initialPpid: getPpid(),
-        label: "hub",
-        onOrphaned: () => {
-          void shutdown();
-        },
-      });
-    }
-  }
 }
 
 // Set the hub password from the CLI (headless Linux; ADR-0037). The value may
@@ -610,6 +585,50 @@ export async function cliCompact(dataDir: string): Promise<string> {
   }
 }
 
+// The watchdogs' late-bound teardown (ADR-0078). Module scope, because the
+// watchdogs are armed at module scope; `serve()` calls `.set(shutdown)` once it
+// has a teardown to give.
+const deferredShutdown = createDeferredShutdown({ label: "hub" });
+
+// Embedded-mode parent-death watchdogs (ADR-0036 / F8): when spawned by the
+// tray shell, couple our lifetime to the parent so an orphaned daemon
+// self-exits instead of holding the port — a Task-Manager-killed tray shell
+// would otherwise leave the daemon bound (port 47100), failing the NEXT
+// launch's bind. Gated on MAXPRICE_HUB_EMBEDDED so headless `serve` keeps its
+// no-watchdog "must outlive its spawner" contract (ADR-0035). Two mechanisms:
+//   - stdin EOF (ALL platforms): the tray shell spawns us with a PIPED stdin,
+//     so its death closes the pipe's write end and Bun fires 'end'. This is
+//     the ONLY watchdog on win32, where bun:ffi has no libc to dlopen;
+//     belt-and-braces alongside getppid elsewhere.
+//   - getppid(2) poll (macOS/Linux only): fires on reparent-to-init; win32
+//     has no libc.<suffix> to dlopen (libcGetppid() would throw there).
+//
+// Armed BEFORE `serve()` rather than at the end of it (ADR-0078). The hub's own
+// heavy loads already sit off the synchronous path in `runReadySequence`, so
+// this is not the #182 bug the sidecar had — it is the same discipline applied
+// to the same shared module, so that a future `await` added anywhere in
+// `serve()` cannot silently disarm the daemon's lifetime the way one did there.
+// The `dlopen` guard matters more here than in the sidecar: an unarmed daemon
+// must still serve.
+function armHubWatchdogs(): void {
+  if (!isEmbedded()) return;
+  installStdinWatchdog({ onOrphaned: () => deferredShutdown.fire() });
+  if (process.platform === "win32") return;
+  try {
+    const getPpid = libcGetppid();
+    const initialPpid = getPpid();
+    installParentWatchdog({
+      getPpid,
+      initialPpid,
+      label: "hub",
+      onOrphaned: () => deferredShutdown.fire(),
+    });
+    console.log(`[hub] parent watchdog armed (ppid ${initialPpid})`);
+  } catch (err) {
+    console.error("[hub] parent watchdog unavailable — stdin watchdog only:", err);
+  }
+}
+
 if (import.meta.main) {
   const [, , command, sub, value] = process.argv;
   if (command === "password" && sub === "set") {
@@ -617,6 +636,7 @@ if (import.meta.main) {
   } else if (command === "password" && sub === "clear") {
     passwordClear();
   } else if (command === undefined || command === "serve") {
+    armHubWatchdogs();
     void serve();
   } else if (
     command === "rename" ||

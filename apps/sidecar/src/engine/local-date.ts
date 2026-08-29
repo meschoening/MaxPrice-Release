@@ -74,6 +74,16 @@ export function isParseableTimestamp(timestamp: string): boolean {
 // the capped axis: an adversary cycling zones evicts whole zone maps and the
 // worst-case footprint is MAX_ZONES corpus-sized maps. Eviction only ever
 // trades CPU for memory — a re-miss recomputes byte-identically.
+//
+// THE RULE that unboundedness rests on: **every caller of the memoized
+// `localDate` must pass an immutable corpus timestamp** — a stored
+// `UsageRecord.timestamp` or a derived block boundary — never a wall-clock
+// reading. A caller passing `Date.now()` mints one distinct key per call, and
+// against a long-lived poller (the ADR-0079 tray's 60s `/api/readout` poll)
+// that grows an inner map forever: ≥1440 permanently-retained entries a day for
+// a process the tray keeps alive indefinitely. Synthetic / wall-clock instants
+// go through `localDateUncached` below instead, which is byte-identical and
+// simply does not write to the memo.
 const MAX_ZONES = 4;
 const zoneCaches = new Map<string, Map<string, LocalDate | null>>();
 
@@ -121,16 +131,29 @@ export function localDate(timestamp: string, timeZone: string): LocalDate | null
   const cached = zoneCache.get(timestamp);
   if (cached !== undefined) return cached;
 
-  const d = new Date(timestamp);
-  let result: LocalDate | null;
-  if (Number.isNaN(d.getTime())) {
-    result = null;
-  } else {
-    const dashed = formatterFor(timeZone).format(d);
-    result = { dashed, ymd: dashed.replaceAll("-", "") };
-  }
+  const result = localDateUncached(timestamp, timeZone);
   zoneCache.set(timestamp, result);
   return result;
+}
+
+// The same computation as `localDate`, with no memo write — THE entry point for
+// a synthetic or wall-clock instant (`deps.now()`, a request's "right now").
+// Byte-identical results; the only difference is that it leaves no key behind,
+// which is what keeps the memo's unbounded per-zone maps keyed by the corpus
+// rather than by request volume (see the STRUCTURE note above).
+//
+// `timestamp` accepts `string | number | Date` for the same reason `localClock`
+// does: the body's `new Date(...)` handles all three identically, so an epoch-ms
+// caller can skip a `new Date(now).toISOString()` round-trip this would only
+// re-parse.
+export function localDateUncached(
+  timestamp: string | number | Date,
+  timeZone: string,
+): LocalDate | null {
+  const d = new Date(timestamp);
+  if (Number.isNaN(d.getTime())) return null;
+  const dashed = formatterFor(timeZone).format(d);
+  return { dashed, ymd: dashed.replaceAll("-", "") };
 }
 
 // ---------------------------------------------------------------------------

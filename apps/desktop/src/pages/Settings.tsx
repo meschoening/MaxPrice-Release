@@ -6,6 +6,11 @@ import { TimezoneSelect } from "@/components/settings/TimezoneSelect";
 import { TimeFormatControl } from "@/components/settings/TimeFormatControl";
 import { CostModeControl } from "@/components/settings/CostModeControl";
 import { UpdatesSection } from "@/components/settings/UpdatesSection";
+import { BackgroundSection } from "@/components/settings/background-section";
+import { backgroundResidencySupported } from "@/lib/background-residency";
+import { isMacOS } from "@/lib/platform";
+import { AutostartSection } from "@/components/settings/autostart-section";
+import { useAutostart } from "@/state/use-autostart";
 import { TransparencySection } from "@/components/settings/TransparencySection";
 import { ResetSection } from "@/components/settings/ResetSection";
 import { AppInfoSection } from "@/components/settings/app-info-section";
@@ -27,7 +32,11 @@ import { disconnectHub } from "@/lib/hub-config";
 // macOS is the one platform whose Reduce-transparency accessibility setting
 // never reaches the WebView (no prefers-reduced-transparency in WebKit), so
 // only macOS gets the app-side switch (same platform sniff as PathList).
-const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
+const IS_MAC = isMacOS();
+// Whether closing the window can mean anything but "quit" here (map #168).
+// Read once, like IS_MAC: neither the host nor the platform changes under a
+// running renderer.
+const BACKGROUND_RESIDENCY = backgroundResidencySupported();
 
 // One settings section — heading, dim description, and the control block
 // (the T7 section grammar; hairline dividers come from `.s-section`).
@@ -63,6 +72,12 @@ export function SettingsPage(): React.ReactElement {
   const { data: settings } = useSettings();
   const current = settings ?? DEFAULT_SETTINGS;
   const update = useUpdateSettings();
+
+  // Gates the whole "Start at login" section: hidden until the shell answers
+  // (an IPC round trip, so no flash) and hidden for good on "unsupported" —
+  // Linux (autostart is out of this map's scope there, T6) and the Tauri-less
+  // Vite debug host. The section component shares the query via its cache.
+  const autostartState = useAutostart().data;
 
   // Reset tears down the hub too: writing DEFAULT_SETTINGS alone clears hubUrl
   // in settings.json but leaves the running sidecar hub-connected and the
@@ -168,6 +183,23 @@ export function SettingsPage(): React.ReactElement {
 
       <div className="cluster panel">
         <span className="cluster-head eyebrow">Application</span>
+
+        {/* Placement (map #168's "Settings copy + placement" fog, settled at
+            M4): the two residency toggles lead Application — Background first
+            (it governs the more common gesture), Start at login beneath it.
+            Both self-hide where they cannot mean anything: Background off
+            Linux/outside Tauri, Start at login on an "unsupported" state. */}
+        {BACKGROUND_RESIDENCY ? (
+          <Section title="Background" description="Keep MaxPrice running after the window closes.">
+            <BackgroundSection />
+          </Section>
+        ) : null}
+
+        {autostartState !== undefined && autostartState !== "unsupported" ? (
+          <Section title="Start at login" description="Open MaxPrice automatically at sign-in.">
+            <AutostartSection />
+          </Section>
+        ) : null}
 
         <Section
           title="Updates"

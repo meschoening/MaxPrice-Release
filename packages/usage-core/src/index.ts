@@ -12,4 +12,5 @@ export * from "./event-sync";
 export * from "./hub-client";
 export * from "./sse-pump";
 export * from "./parent-watchdog";
+export * from "./mono-clock";
 export * from "./constant-time";

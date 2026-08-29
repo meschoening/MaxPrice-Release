@@ -1,5 +1,7 @@
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+#[cfg(windows)]
+use std::time::Duration;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -470,13 +472,20 @@ mod autostart {
     // `target\release` exe, i.e. a release-profile binary run straight out of
     // the build tree. The build-tree SHAPE is the second signal that catches it.
     //
-    // Two signals, and BOTH must hold: a profile-named parent directory
-    // (`release`/`debug`) with a `target` component somewhere above it. Either
-    // half alone fails closed on a real install — a bare `target` component also
-    // matches an install under a folder that happens to be called that (a user
-    // account named `target`), and requiring `target` IMMEDIATELY above the
-    // profile misses the `--target <triple>` layout,
-    // `target\x86_64-pc-windows-msvc\release\`, which is the very #95 shape.
+    // The signal is the cargo build tree's own shape: a `target` component
+    // IMMEDIATELY followed by a profile directory (`release`/`debug`), or by a
+    // target triple and then the profile — the `--target <triple>` layout. A
+    // bare `target` component alone would also condemn an install under a user
+    // account named `target`, which is why the profile has to sit right beneath
+    // it.
+    //
+    // Adjacency, not "the parent directory is `release`" (map #168 / M6, porting
+    // the client's M5 fix): on macOS the binary lives four levels below the
+    // profile dir — `target/release/bundle/macos/MaxPrice Hub.app/Contents/
+    // MacOS/maxprice-hub-desktop` — so a parent-only test called every locally
+    // built .app an install and would have let a dev bundle claim the
+    // LaunchAgent. The Windows shapes are unaffected: the profile dir IS the
+    // parent there, and it still is under this rule.
     //
     // Deliberately NOT closed, per the fail-open posture above: a custom
     // `CARGO_TARGET_DIR` name, or `--profile dist`. The bare-word check missed
@@ -485,18 +494,17 @@ mod autostart {
         if debug_build {
             return false;
         }
-        let profile_parent = exe
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|n| n.eq_ignore_ascii_case("release") || n.eq_ignore_ascii_case("debug"));
-        let target_ancestor = exe
-            .parent()
-            .map(|p| {
-                p.components()
-                    .any(|c| c.as_os_str().eq_ignore_ascii_case("target"))
-            })
-            .unwrap_or(false);
-        !(profile_parent && target_ancestor)
+        let is_profile = |c: &std::ffi::OsStr| {
+            c.eq_ignore_ascii_case("release") || c.eq_ignore_ascii_case("debug")
+        };
+        let parts: Vec<_> = exe.components().map(|c| c.as_os_str().to_owned()).collect();
+        let in_build_tree = parts.iter().enumerate().any(|(i, part)| {
+            part.eq_ignore_ascii_case("target")
+                && (parts.get(i + 1).is_some_and(|p| is_profile(p))
+                    // `--target <triple>` puts the profile one level deeper.
+                    || parts.get(i + 2).is_some_and(|p| is_profile(p)))
+        });
+        !in_build_tree
     }
 
     // StartupApproved's 12-byte value: byte 0 is 2 (enabled) or 3 (disabled),
@@ -569,13 +577,15 @@ fn bundled_daemon_path() -> Option<PathBuf> {
 // without this the console and the popout each scan at launch and the popout
 // scans again on every tray click. A firewall rule only changes when the
 // operator changes it (and `fix_firewall` invalidates this itself), so a minute
-// of staleness costs nothing an F5 wouldn't fix.
+// of staleness costs nothing an F5 wouldn't fix. Windows-only, like the check.
+#[cfg(windows)]
 const FIREWALL_CACHE_TTL: Duration = Duration::from_secs(60);
 
 // The last firewall verdict and when it was taken. Managed state, so the cache
 // is per-process rather than per-webview — that is the whole point.
 #[derive(Default)]
 struct FirewallCache {
+    #[cfg(windows)]
     verdict: Mutex<Option<(Instant, String)>>,
 }
 
@@ -1092,10 +1102,27 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
     }
 
     let tray = tray_rect_px(rect);
-    let monitor = app
-        .monitor_from_point(tray.x + tray.w / 2.0, tray.y + tray.h / 2.0)
-        .ok()
-        .flatten()
+    // Which monitor the tray icon is on, decided HERE rather than by the
+    // runtime's `monitor_from_point`: that call is implemented per platform
+    // against whatever the platform's own API wants, and the two units do not
+    // agree (`popout::monitor_containing` carries the measurement). Everything
+    // else on this path — the tray rect, the monitor bounds, the work area,
+    // `set_position` — is physical, so the containment is done in physical too
+    // and the whole routine stays in one coordinate space.
+    let monitors = app.available_monitors().unwrap_or_default();
+    let bounds: Vec<popout::Px> = monitors
+        .iter()
+        .map(|m| {
+            popout::Px::new(
+                m.position().x as f64,
+                m.position().y as f64,
+                m.size().width as f64,
+                m.size().height as f64,
+            )
+        })
+        .collect();
+    let monitor = popout::monitor_containing(&bounds, tray.x + tray.w / 2.0, tray.y + tray.h / 2.0)
+        .map(|i| monitors[i].clone())
         .or_else(|| app.primary_monitor().ok().flatten());
     // Position when we can, but never let missing monitor/size info keep the
     // popout from opening — the stale position beats no popout at all.
@@ -1125,26 +1152,48 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
         // outer_size()/scale_factor() rescale, whose whole job was to carry a
         // size across a mixed-DPI move (tauri #7139/#7890).
         //
-        // PHYSICAL, never LogicalSize: set_size would convert through tao's
-        // cached per-window scale factor, which is the very value that goes
-        // stale in this failure.
-        if let Some(inner) = popout_logical_size(app.config())
-            .and_then(|logical| popout::popout_physical_size(logical, monitor.scale_factor()))
-        {
+        // The UNIT is the platform's, not ours (popout::InnerSize): Windows is
+        // held to physical because its per-window scale factor is the value
+        // that goes stale; macOS is held to points because its MONITOR scale
+        // factor is the value that goes wrong — tao answers 1.0 when its
+        // NSScreen lookup misses, and the physical path then hands AppKit a
+        // size it halves.
+        if let Some(logical) = popout_logical_size(app.config()) {
+            let scale = monitor.scale_factor();
             let place = || {
-                let _ = window.set_size(tauri::PhysicalSize::new(
-                    inner.0.round() as u32,
-                    inner.1.round() as u32,
-                ));
+                match popout::popout_inner_size(logical, scale, cfg!(target_os = "macos")) {
+                    Some(popout::InnerSize::Logical(w, h)) => {
+                        let _ = window.set_size(tauri::LogicalSize::new(w, h));
+                    }
+                    Some(popout::InnerSize::Physical(w, h)) => {
+                        let _ = window
+                            .set_size(tauri::PhysicalSize::new(w.round() as u32, h.round() as u32));
+                    }
+                    // Nothing describable to assert — leave the window at
+                    // whatever it already measures and still place it.
+                    None => {}
+                }
                 // Position speaks the OUTER box (set_position moves the outer
                 // rect, and an undecorated Win11 window still carries an
                 // invisible resize frame — 22x13px at 150%). Read it back AFTER
                 // the correction so that frame delta is measured on a
-                // right-sized window; the inner size is a safe stand-in.
-                let pop = window
+                // right-sized window. It also speaks PHYSICAL on every
+                // platform, so the fallback is still derived — config x the
+                // target monitor's scale — with the configured logical size as
+                // the last resort.
+                let anchor = popout::popout_physical_size(logical, scale);
+                let Some(pop) = window
                     .outer_size()
                     .map(|s| (s.width as f64, s.height as f64))
-                    .unwrap_or(inner);
+                    .ok()
+                    .or(anchor)
+                else {
+                    // No physical size from either source. Placing off the
+                    // LOGICAL pair instead would silently mix units (half the
+                    // real box on a 2x display), so leave the popout where it
+                    // is — it still shows, which is the standing trade here.
+                    return;
+                };
                 let (x, y) =
                     popout::popout_position(tray, mon, work, pop, cfg!(target_os = "macos"));
                 let _ = window.set_position(tauri::PhysicalPosition::new(
@@ -1294,7 +1343,7 @@ pub fn run() {
             // (ADR-0036). No-op / absent on other platforms.
             #[cfg(target_os = "macos")]
             {
-                let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
 
             let handle = app.handle();
@@ -1332,12 +1381,9 @@ pub fn run() {
                     // calls (toggle-close, open_main_window) also resign
                     // focus, and stamping those would swallow a deliberate
                     // reopen inside the debounce window.
-                    WindowEvent::Focused(false) => {
-                        if window.is_visible().unwrap_or(false) {
-                            let _ = window.hide();
-                            *window.state::<PopoutState>().last_blur_hide.lock() =
-                                Some(Instant::now());
-                        }
+                    WindowEvent::Focused(false) if window.is_visible().unwrap_or(false) => {
+                        let _ = window.hide();
+                        *window.state::<PopoutState>().last_blur_hide.lock() = Some(Instant::now());
                     }
                     // No close button exists (frameless), but Alt+F4 etc.
                     // must hide, not destroy — the pre-created webview is the
@@ -1625,7 +1671,6 @@ mod tests {
     // --- autostart self-heal (ADR-0051, #95) ---
 
     use autostart::{Action, Entry};
-    use std::path::Path;
 
     // The exact bytes auto_launch writes: `format!("{path} {args}")` with no
     // args, i.e. the path plus ONE trailing space, unquoted.
@@ -1743,20 +1788,80 @@ mod tests {
         assert!(!autostart::approval_disabled(&[]));
     }
 
+    // Built from components rather than written as a literal: the string
+    // constants above are Windows-shaped on purpose (they exercise string
+    // comparison), but `is_installed_build` walks real path COMPONENTS, and a
+    // backslash literal is one component on a unix host — which is why this
+    // test passed on Windows and could never have run anywhere else.
+    fn path_of(parts: &[&str]) -> std::path::PathBuf {
+        parts.iter().collect()
+    }
+
     #[test]
     fn builds_out_of_the_tree_are_not_installs() {
         // The #95 path: a RELEASE-profile binary run straight out of target/.
         // `debug_assertions` alone would have called this an install.
-        assert!(!autostart::is_installed_build(Path::new(STALE), false));
-        assert!(autostart::is_installed_build(Path::new(INSTALLED), false));
+        let stale = path_of(&[
+            "MaxPrice",
+            "apps",
+            "hub-desktop",
+            "src-tauri",
+            "target",
+            "release",
+            "maxprice-hub-desktop.exe",
+        ]);
+        let installed = path_of(&[
+            "Users",
+            "dev",
+            "AppData",
+            "Local",
+            "MaxPrice Hub",
+            "maxprice-hub-desktop.exe",
+        ]);
+        assert!(!autostart::is_installed_build(&stale, false));
+        assert!(autostart::is_installed_build(&installed, false));
         // A debug build is never an install, wherever it sits.
-        assert!(!autostart::is_installed_build(Path::new(INSTALLED), true));
+        assert!(!autostart::is_installed_build(&installed, true));
         // --target <triple> puts the profile dir one level deeper.
-        const CROSS: &str = r"D:\git\MaxPrice\apps\hub-desktop\src-tauri\target\x86_64-pc-windows-msvc\release\maxprice-hub-desktop.exe";
-        assert!(!autostart::is_installed_build(Path::new(CROSS), false));
+        let cross = path_of(&[
+            "MaxPrice",
+            "apps",
+            "hub-desktop",
+            "src-tauri",
+            "target",
+            "x86_64-pc-windows-msvc",
+            "release",
+            "maxprice-hub-desktop.exe",
+        ]);
+        assert!(!autostart::is_installed_build(&cross, false));
         // A real install under a folder that merely SPELLS `target` is an install.
-        const ODD: &str = r"C:\Users\target\AppData\Local\MaxPrice Hub\maxprice-hub-desktop.exe";
-        assert!(autostart::is_installed_build(Path::new(ODD), false));
+        let odd = path_of(&[
+            "Users",
+            "target",
+            "AppData",
+            "Local",
+            "MaxPrice Hub",
+            "maxprice-hub-desktop.exe",
+        ]);
+        assert!(autostart::is_installed_build(&odd, false));
+        // The macOS bundle: the binary sits FOUR levels below the profile dir,
+        // so the old parent-only rule read this as an install and would have
+        // let a locally built .app claim the LaunchAgent (the client's M5 bug).
+        let bundle = path_of(&[
+            "MaxPrice",
+            "apps",
+            "hub-desktop",
+            "src-tauri",
+            "target",
+            "release",
+            "bundle",
+            "macos",
+            "MaxPrice Hub.app",
+            "Contents",
+            "MacOS",
+            "maxprice-hub-desktop",
+        ]);
+        assert!(!autostart::is_installed_build(&bundle, false));
     }
 
     #[test]

@@ -92,10 +92,31 @@
   backdrop-filter: var(--frost-chip);
 }
 
+/* The DOCUMENT never scrolls: `<main>` is the app's only scroll container
+   (see Layout.tsx) and every route renders inside the viewport-sized frame,
+   so a root scrollbar is always a bug — and always an UGLY one, because the
+   document scroller is the one scroll region `.thin-scroll` cannot reach, so
+   it paints the OS's full-size default scrollbars over the glass.
+
+   `overflow: hidden` is the structural guarantee, not a workaround for one
+   symptom. The reveal animation is what exposed it: `boot-rise` translates
+   the `h-screen w-screen` frame down 7px, which hangs 7px below the viewport
+   and raises a document scrollbar — and because `w-screen` is `100vw`, which
+   Chromium measures INCLUDING the scrollbar gutter, that vertical bar
+   immediately overflows the frame horizontally and raises the second one.
+   The pair then sustains each other (the horizontal bar eats 15px of a
+   100vh frame, which keeps the vertical overflow alive) for the whole 400ms
+   of the reveal. Windows only: WKWebView's overlay scrollbars take no layout
+   space and fade out, so macOS never draws either one.
+
+   The Settings `sr-only` escapees that `<main>`'s `relative` fixed were the
+   same class of bug — an unrelated cause reaching the same root scroller.
+   That fix stays; this one closes the class. */
 html,
 body,
 #root {
   height: 100%;
+  overflow: hidden;
 }
 
 body {
@@ -1228,6 +1249,16 @@ a.sb-footrow:hover .sb-label {
    for 60px of bar. */
 .limit-meter {
   flex: 0 0 110px;
+  /* The basis is repeated as a WIDTH because WebKit does not agree with the
+     comment above it: a flex item's px BASIS contributes nothing to its
+     container's max-content size in WebKit, only its content does. Every
+     `.limit-meter` is empty apart from a percentage-width fill, so a WebKit
+     parent measures this bar as ZERO — and where that parent is itself
+     shrink-to-fit (the popout's `.state`, the tiles' lockup column) it then
+     lays out a box too small to hold the bar, which paints anyway and
+     overflows. An explicit width is what both engines measure. Keep the two
+     numbers equal; the flex line is what actually sizes the box. */
+  width: 110px;
   height: 6px;
   border-radius: 3px;
   background: var(--ring-track);
@@ -4024,4 +4055,308 @@ a.sb-footrow:hover .sb-label {
     opacity: 0;
     transform: translateY(7px);
   }
+}
+
+/* ============================================================
+   Tray popout (map #168 M3) — the T3-approved "leaf" mini-dashboard,
+   NOTES.md §"Client tray popout — Glass (T3)". The popout floats over the
+   user's DESKTOP, which backdrop-filter cannot blur through, so it wears
+   the opaque composite (--pop-base = glass's --panel-opaque) with its own
+   miniature internal wash — never the translucent panel recipe. The WINDOW
+   is opaque, fixed-size (236×256 live / ×294 update-pending — toggle_popout
+   re-asserts the height per open) and square-cornered: Win11's DWM rounds
+   and shadows the undecorated window itself. Scoped under the body class
+   main.tsx stamps, exactly like the hub's popout.
+
+   The gutter rule (the T3 sign-off fix): every row's ink sits 17px from
+   the popout edge on BOTH sides — 1px border + 6px container + 10px row
+   padding — and the ring hands back its SVG's 4.6875%-per-side dead space
+   (margin-inline: -2.53px at 54px) so its visible edge shares the gutter.
+   ============================================================ */
+body.popout-window {
+  --pop-base: var(--panel-opaque);
+  --pop-wash:
+    radial-gradient(320px 220px at 12% -6%, oklch(90% 0.06 280 / 0.5), transparent 70%),
+    radial-gradient(300px 210px at 95% 110%, oklch(92% 0.05 60 / 0.42), transparent 66%),
+    radial-gradient(260px 190px at 105% 38%, oklch(91% 0.05 200 / 0.4), transparent 62%);
+  background-color: var(--pop-base);
+  background-image: var(--pop-wash);
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+:root[data-theme="dark"] body.popout-window {
+  --pop-wash:
+    radial-gradient(320px 220px at 12% -6%, oklch(30% 0.09 300 / 0.5), transparent 70%),
+    radial-gradient(300px 210px at 95% 110%, oklch(26% 0.08 220 / 0.45), transparent 66%),
+    radial-gradient(260px 190px at 105% 38%, oklch(24% 0.07 340 / 0.38), transparent 62%);
+}
+/* Reduce transparency: the popout's flourish is its internal wash — drop it. */
+:root[data-reduce-transparency] body.popout-window {
+  background-image: none;
+}
+
+/* The frame IS the window: hairline border + inner highlight at the viewport
+   edge (the OS shadow lives outside the opaque window). */
+.popout-root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px;
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-inner);
+}
+/* macOS gets the mock's radius-14 corners (ADR-0050's deferred aspiration).
+   The curve is TWO halves that must agree: Rust masks the NSWindow's content
+   layer to the same radius (lib.rs `round_popout_corners`, which owns the
+   number — POPOUT_CORNER_RADIUS — and a test binds it to this rule), and this
+   curves the frame that runs along it, so the hairline follows the corner
+   instead of being cut square by the mask.
+
+   Class-gated rather than platform-queried because the OTHER platform is
+   already rounded BY SOMEONE ELSE: Win11's DWM curves the undecorated window
+   at its own radius, so drawing ours inside it would show the body's ground
+   in the gap between the two curves. main.tsx stamps the class on macOS. */
+.popout-window.popout-rounded .popout-root {
+  border-radius: 14px;
+}
+.popout-root .pbody {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.popout-root .pbody.centered {
+  justify-content: center;
+}
+
+/* --- the live head: 54px ring + cost + meta --- */
+.popout-root .a-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 8px 10px 7px;
+}
+.popout-root .a-head .ring-wrap,
+.popout-root .a-head .ring-wrap svg {
+  width: 54px;
+  height: 54px;
+}
+.popout-root .a-head .ring-wrap {
+  margin-inline: -2.53px; /* the globals .ring-wrap compensation, rescaled */
+}
+.popout-root .a-head .ring-label b {
+  font-size: 12px;
+}
+.popout-root .a-head .eyebrow {
+  display: block; /* its own 14.25px line, not the parent's 19.5px line box */
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+}
+.popout-root .a-head .hd {
+  min-width: 0;
+}
+.popout-root .a-head .hd .value {
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  /* Equal air above and below the cost (the generic .value's 3px/1px read
+     lopsided at this size); 4.5px keeps the head's measured height, which
+     popout_content_height's 260px base was taken from. */
+  margin: 4.5px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis; /* the tokens run yields before the cost ever can */
+}
+.popout-root .a-head .hd .value .tokens {
+  margin-left: 5px;
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--soft);
+}
+.popout-root .a-head .hd .meta {
+  font-size: 10.5px;
+  color: var(--soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis; /* never poke the gutter */
+}
+
+/* --- quiet label/value rows --- */
+.popout-root .prow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 6px 10px;
+}
+.popout-root .prow .name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.popout-root .prow .state {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--soft);
+  text-align: right;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.popout-root .prow .state b {
+  font-weight: 700;
+  color: var(--text);
+  font-size: 12px;
+}
+.popout-root .prow.dim {
+  opacity: 0.55;
+}
+.popout-root .prow .limit-meter {
+  /* The tile meter at popout width — width beside basis, per the base
+     recipe: this override is where WebKit's zero-measure actually SHIPPED a
+     defect. `.prow .state` is a shrink-to-fit flex item, so WebKit sized it
+     at gap + percent alone (27px), right-aligned THAT against the gutter,
+     and the 64px bar painted from there straight off the window —
+     taking the percentage with it. */
+  flex: 0 0 64px;
+  width: 64px;
+}
+.popout-root .prow.limit .state .num {
+  /* One value column for "—" through "100%": `.state` is a shrink-to-fit
+     item right-anchored at the gutter, so with a natural-width value the
+     bar's x slid left one digit per digit ("5%" vs "24%" vs "100%"), and
+     the em-dash rows sat further right still. The value takes the widest
+     reading's width and right-aligns inside it, so every bar — live or
+     dimmed — starts at the same x. A px width, not `4ch`: "100%" in Manrope
+     12px/700 measures 33.1px while 4ch is 31.6, so ch still shifted the
+     three-digit row (measured 2026-08-26). */
+  display: inline-block;
+  min-width: 34px;
+  text-align: right;
+}
+.popout-root .pdivider {
+  height: 1px;
+  flex-shrink: 0;
+  background: var(--hairline);
+  margin: 4px 8px;
+}
+
+/* --- the update row (rendered ONLY while an update is pending) --- */
+.popout-root .update-row {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  margin: 2px 0 1px;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  color: var(--text);
+  background: color-mix(in oklch, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.popout-root .update-row:hover {
+  background: color-mix(in oklch, var(--accent) 22%, transparent);
+}
+.popout-root .update-row .up {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: grid;
+  place-content: center;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 800;
+}
+.popout-root .update-row .ver {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--soft);
+}
+
+/* --- menu-item actions (the kmenu recipe at popout width) --- */
+.popout-root .actions-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.popout-root .actions-menu button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 500;
+  text-align: left;
+  color: var(--text);
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.popout-root .actions-menu button:hover {
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+}
+
+/* --- insets (the app's dashed empty / danger recipes, popout-scaled) --- */
+.popout-root .pinset {
+  border: 1px dashed color-mix(in oklch, var(--soft) 45%, transparent);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 4px 6px 6px;
+  font-size: 11.5px;
+  color: var(--soft);
+  text-align: center;
+}
+.popout-root .pinset.bad {
+  border-style: solid;
+  border-color: color-mix(in oklch, var(--bad) 35%, transparent);
+  background: color-mix(in oklch, var(--bad) 8%, transparent);
+  color: var(--text);
+}
+.popout-root .pinset.bad .pdot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--bad);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--bad) 22%, transparent);
+  margin-right: 7px;
+  vertical-align: 1px;
+}
+.popout-root .pinset .mini-orb {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  margin: 0 auto 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(120% 120% at 32% 26%, oklch(100% 0 0 / 0.45), transparent 42%),
+    linear-gradient(135deg, var(--accent), var(--opus));
+  box-shadow: inset 0 1px 1.5px oklch(100% 0 0 / 0.315);
+}
+.popout-root .pinset .mini-orb::after {
+  content: "$";
+  font-size: 14px;
+  font-weight: 800;
+  color: #fff;
 }

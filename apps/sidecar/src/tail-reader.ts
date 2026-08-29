@@ -1,4 +1,4 @@
-import { statSync } from "node:fs";
+import { stat } from "node:fs/promises";
 
 const NEWLINE = 0x0a;
 
@@ -88,7 +88,13 @@ export function createTailReader(): TailReader {
   async function doRead(path: string): Promise<TailResult> {
     let size: number;
     try {
-      size = statSync(path).size;
+      // ASYNC, and that is a correctness property rather than a style (issue
+      // #183, the audit): this runs on EVERY watcher flush, on a path under
+      // the user's own claudePaths — which can be a network mount or a
+      // removable volume. The synchronous form ran that wait on the one event
+      // loop, where a `stat` that does not return stops the whole sidecar. The
+      // rest of this function was already async; only the first call was not.
+      size = (await stat(path)).size;
     } catch {
       // File vanished between the watch event and this read — nothing to do.
       return { count: 0, lines: [], latestTimestamp: null };

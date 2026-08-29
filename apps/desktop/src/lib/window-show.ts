@@ -1,6 +1,8 @@
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { insideTauri } from "@/lib/tauri";
 import { logClientEvent } from "@/lib/client-log";
+import { setMainWindowShown } from "@/lib/window-visibility";
 
 // Putting the OS window on screen — the stage BEFORE the boot gate's two
 // (ADR-0066). The vocabulary is kept distinct on purpose: **show** is the
@@ -96,6 +98,20 @@ let asked = false;
 export function showAppWindow(): void {
   if (asked || !insideTauri()) return;
   asked = true;
+  // A `--hidden` launch (the autostart entry's arg — map #168 / M4) is asked
+  // for by nobody: the window stays hidden and the tray is the only presence.
+  // The shell's 4s force-show fallback is likewise unarmed on that path, so
+  // this gate and that one must move together. Fail OPEN — if the shell can't
+  // answer, showing a window once beats a running app nobody can find.
+  void invoke<boolean>("launched_hidden")
+    .catch(() => false)
+    .then((hidden) => {
+      if (hidden) return;
+      showNow();
+    });
+}
+
+function showNow(): void {
   const win = getCurrentWindow();
   scheduleWindowShow({
     pageIsHidden: () => document.visibilityState === "hidden",
@@ -109,7 +125,14 @@ export function showAppWindow(): void {
     show: () => {
       void win
         .show()
-        .then(() => win.setFocus())
+        .then(() => {
+          // This is the ONE route to the screen that does not go through Rust,
+          // so no `main:shown` is emitted for it and the flag has to be set
+          // here (F9). Every other route — tray Open, a second launch, macOS
+          // Reopen, the shell's 4s fallback — emits.
+          setMainWindowShown(true);
+          return win.setFocus();
+        })
         .catch((err: unknown) => {
           console.error("[boot] window show failed:", err);
           logClientEvent(`[boot] window show failed: ${String(err)}`);

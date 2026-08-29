@@ -1,6 +1,8 @@
-// Tray-popout positioning (ADR-0050, map #89 T2). Pure math, unit-tested;
-// the runtime glue in lib.rs feeds it physical pixels from the tray Click's
-// rect + `available_monitors`/`work_area` and hands the result straight to
+// Tray-popout positioning (ADR-0050; map #168 M2 — ported wholesale from the
+// hub, apps/hub-desktop/src-tauri/src/popout.rs, whose tray popout is the
+// proven template). Pure math, unit-tested; the runtime glue in lib.rs feeds
+// it physical pixels from the tray Click's rect + `available_monitors`/
+// `work_area` and hands the result straight to
 // `set_position(PhysicalPosition)`. Everything here is physical px on ONE
 // monitor — rect, work area, and set_position all speak physical, so no
 // logical conversion ever happens inside (the historical multi-monitor
@@ -18,6 +20,59 @@ use std::time::Duration;
 /// files with `include_str!`.
 pub const POPOUT_LABEL: &str = "popout";
 
+// ---------- Window-visibility events (the ONE fact underneath them) --------
+//
+// **A webview cannot see its own window being hidden or shown.** WebView2
+// leaves `document.visibilityState === "visible"` right through a hide, so on
+// Windows every renderer-side visibility signal — `visibilitychange`,
+// `document.hidden`, and everything layered on them (TanStack Query's
+// `focusManager.isFocused()`, which is literally `visibilityState !==
+// "hidden"`, and therefore `refetchInterval`) — is permanently stuck at
+// "visible" for the life of the process.
+//
+// This is not a quirk of our code and not something a newer Tauri fixes by
+// itself: `tauri-runtime-wry` maps `WindowMessage::Hide` to tao's *window*-level
+// `set_visible(false)` and never touches the WebView2 controller's `IsVisible`
+// (that is the separate `WebviewMessage::Hide`, which `WebviewWindow::hide()`
+// does not send). The window leaves the screen; the webview is never told.
+//
+// It matters far more here than in an ordinary app because of ADR-0079: this
+// app hides and shows windows and NEVER destroys them, so a window can spend
+// the whole session off screen — the pre-created popout, and a main window
+// closed to the tray or never shown at all on a `--hidden` autostart launch —
+// with its React tree mounted, its observers live, and its timers running.
+//
+// Therefore: **every visibility signal in this app is Rust-emitted.** The four
+// strings below are that channel. They live in one place, next to the one
+// explanation, because splitting them across files splits the reasoning too —
+// which is exactly how the hidden popout shipped polling four endpoints every
+// 30s forever. Each is listened for by name on the renderer side; keep them in
+// lockstep with their consumers, named below.
+
+/// Fired at the popout webview on every show (map #168 M3): its queries
+/// refetch and its theme is re-stamped on this poke. Consumer:
+/// `src/state/use-popout-data.ts`.
+pub const POPOUT_SHOWN_EVENT: &str = "popout:shown";
+
+/// Fired at the popout webview on every hide, from `hide_popout_window` in
+/// lib.rs — the one helper all five hide sites route through, so no site can
+/// hide without saying so. Consumer: `src/state/use-popout-data.ts`, which
+/// parks its 30s `refetchInterval` until the next `popout:shown`.
+pub const POPOUT_HIDDEN_EVENT: &str = "popout:hidden";
+
+/// Fired at the MAIN webview whenever it is put on screen — `show_main_window`
+/// (tray Open, a second launch, macOS Reopen) and the boot force-show
+/// fallback. The renderer's own boot show path emits nothing (it never goes
+/// through Rust) and calls `setMainWindowShown` directly instead. Consumer:
+/// `src/lib/window-visibility.ts`.
+pub const MAIN_SHOWN_EVENT: &str = "main:shown";
+
+/// Fired at the MAIN webview when a close-to-tray hides it (ADR-0079).
+/// Consumer: `src/lib/window-visibility.ts`, which pauses ADR-0058's
+/// invalidation rounds — coalescing, never skipping, so a reopen is never
+/// shown stale numbers.
+pub const MAIN_HIDDEN_EVENT: &str = "main:hidden";
+
 /// A rectangle in physical pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Px {
@@ -33,8 +88,60 @@ impl Px {
     }
 }
 
+/// The popout's corner radius in POINTS (logical px) — the mock's radius-14
+/// geometry, NOTES.md §"Client tray popout — Glass (T3)".
+///
+/// macOS only, and it is the reason the number lives in Rust at all: Win11's
+/// DWM rounds the undecorated window itself at its own radius (ADR-0050), so
+/// the Windows popout never asks anyone for a curve. macOS rounds nothing, so
+/// `round_popout_corners` in lib.rs masks the window's content layer to this
+/// radius and globals.css curves the frame that runs along it. Both halves
+/// must carry the same number or the hairline and the mask disagree; a
+/// contract test in lib.rs binds this constant to the stylesheet.
+///
+/// The only non-test reader is that `#[cfg(target_os = "macos")]` call site,
+/// so on Windows and Linux a plain `cargo clippy` (no test target) sees a
+/// constant nobody reads. The `allow` is scoped to exactly those platforms:
+/// on macOS dead_code still bites if the mask call ever goes away.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const POPOUT_CORNER_RADIUS: f64 = 14.0;
+
 /// Gap between the tray icon / work-area edge and the popout, physical px.
 pub const POPOUT_GAP: f64 = 8.0;
+
+/// The popout's logical content heights, ADDITIVE over a measured base (map
+/// #168 M3's T3 pixel contract, re-measured 2026-08-26 when the Weekly-limit
+/// row joined and the Projected row left): the BASE holds the ring head, the
+/// 5-hour / Weekly / Today rows and the two actions; a `<Model> limit` row —
+/// present exactly while the current sample carries a Model-scoped weekly
+/// limit, which the readout reports as `hasModelWindow` — adds one 30px row
+/// plus its 1px gap; the pending-only "Update available" row adds its 38.
+/// The BASE height is also what tauri.conf.json's `popout` window declares —
+/// a lib.rs contract test binds the two — and `toggle_popout` re-derives the
+/// height from the ambient module's state on every open, exactly where it
+/// already re-asserts size against DPI drift. Both extras are shell-side
+/// facts by design: the window is sized BEFORE it is shown (never resized by
+/// the webview — ADR-0050/0076), so a row's presence must be known here.
+pub const POPOUT_HEIGHT: f64 = 260.0;
+pub const POPOUT_MODEL_ROW_HEIGHT: f64 = 31.0;
+pub const POPOUT_UPDATE_ROW_HEIGHT: f64 = 38.0;
+
+/// Which height this open should re-assert: base + each optional row that
+/// the renderer will draw. Named so the call site reads as the contract
+/// ("height follows the rows") rather than as arithmetic.
+pub fn popout_content_height(model_row: bool, update_pending: bool) -> f64 {
+    POPOUT_HEIGHT
+        + if model_row {
+            POPOUT_MODEL_ROW_HEIGHT
+        } else {
+            0.0
+        }
+        + if update_pending {
+            POPOUT_UPDATE_ROW_HEIGHT
+        } else {
+            0.0
+        }
+}
 
 /// The popout's physical inner size on the monitor it is about to open on:
 /// its CONFIGURED logical size (tauri.conf.json — the size the CSS layout was
@@ -48,11 +155,11 @@ pub const POPOUT_GAP: f64 = 8.0;
 /// display sleep/wake, a monitor re-handshake, an RDP session, a scale change
 /// arriving while the window is hidden — therefore strands the window at the
 /// wrong physical size while WebView2 keeps rasterizing at the monitor's real
-/// DPI, collapsing the CSS viewport (224x224 → 149x149 at scale 1.5: the
-/// action row clips away, the state column ellipsizes). The popout is only
-/// ever hidden and shown, never resized or recreated, so nothing corrects it
-/// short of restarting the app. Config × live monitor scale is the one
-/// derivation that cannot inherit that drift.
+/// DPI, collapsing the CSS viewport (236x256 → 157x171 at scale 1.5: the
+/// action rows clip away, the head row ellipsizes). The popout is only ever
+/// hidden and shown, never resized or recreated, so nothing corrects it short
+/// of restarting the app. Config × live monitor scale is the one derivation
+/// that cannot inherit that drift.
 ///
 /// `None` when the inputs can't describe a window (non-finite or non-positive
 /// scale / size): a zero-sized popout is worse than an unmoved one, so the
@@ -78,20 +185,29 @@ pub fn popout_physical_size(logical: (f64, f64), target_scale: f64) -> Option<(f
 /// **Windows: physical.** ADR-0050's rule, and it stands: tao caches a scale
 /// factor per window and `WM_DPICHANGED` rewrites it, so a `LogicalSize` is
 /// multiplied by the very value that goes stale in the failure
-/// `popout_physical_size` exists to defeat.
+/// `popout_physical_size` exists to defeat. Config x the target monitor's live
+/// scale is the derivation that cannot inherit that drift.
 ///
 /// **macOS: logical.** The same rule inverted, for the same reason — asking
-/// for the number you can trust. An NSWindow's content size IS points, so a
-/// `LogicalSize` reaches `setContentSize:` with no scale factor participating
-/// at all. A `PhysicalSize` is divided by the window's live
-/// `backingScaleFactor` on the way in, so it round-trips only while our
-/// multiplier and AppKit's divisor agree — and the multiplier is the half that
-/// can lie: tao's macOS `MonitorHandle::scale_factor()` looks the display up in
-/// `NSScreen::screens` by UUID and **answers 1.0 when it does not find it**
-/// rather than failing. One miss on a 2x display halves the window's points and
-/// collapses the CSS viewport (observed on the client's popout, whose copy of
-/// this module carries the same note: rows paint over each other and the head
-/// clips at the frame, self-healing on the next open).
+/// for the number you can trust. An NSWindow's content size IS points;
+/// `setContentSize:` takes points and AppKit does the DPI work, so a
+/// `LogicalSize` reaches it with no scale factor participating at all (tao's
+/// `to_logical` is the identity on a Logical variant). A `PhysicalSize`, by
+/// contrast, is divided by the window's live `backingScaleFactor` on the way
+/// in — so it round-trips correctly ONLY while our multiplier and AppKit's
+/// divisor agree, and the multiplier is the half that can lie: tao's macOS
+/// `MonitorHandle::scale_factor()` looks the display up in `NSScreen::screens`
+/// by UUID and **answers 1.0 when it does not find it** rather than failing.
+/// One such miss on a 2x display makes `logical x 1.0` a physical size AppKit
+/// then halves, and the window comes back at half its points — 236x260 ->
+/// 118x130, which collapses the CSS viewport exactly the way a stranded
+/// Windows window does (the head's eyebrow wraps, the cost clips at the frame,
+/// and the action rows paint over the limit rows). Nothing corrects it until
+/// the next open, so it reads as an occasional, self-healing glitch.
+///
+/// Sizing in points removes that multiply/divide pair on the platform where it
+/// buys nothing: there is no macOS analogue of `WM_DPICHANGED` stranding a
+/// window's size, because there is no cached macOS scale factor to strand.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InnerSize {
     /// Points — hand straight to `set_size(LogicalSize)`.
@@ -101,10 +217,13 @@ pub enum InnerSize {
 }
 
 /// The size to re-assert on this open, in the unit this platform can be held
-/// to (see [`InnerSize`]). `None` for inputs that can't describe a window.
+/// to (see [`InnerSize`]). `None` for inputs that can't describe a window, the
+/// same shrug `popout_physical_size` gives: a zero-sized popout is worse than
+/// an unresized one.
 ///
-/// Note what the macOS arm does NOT read: `target_scale`. That is the point — a
-/// scale factor cannot corrupt a size it never touches.
+/// Note what the macOS arm does NOT read: `target_scale`. That is the point —
+/// a scale factor cannot corrupt a size it never touches, so the failure above
+/// becomes structurally unreachable rather than merely unlikely.
 pub fn popout_inner_size(logical: (f64, f64), target_scale: f64, macos: bool) -> Option<InnerSize> {
     if macos {
         let (w, h) = logical;
@@ -122,14 +241,17 @@ pub fn popout_inner_size(logical: (f64, f64), target_scale: f64, macos: bool) ->
 /// platform's API wants, and the two do not agree. Windows hands the point to
 /// `MonitorFromPoint`, which is physical — so the tray rect (physical, as
 /// tray-icon emits it) is exactly right. macOS tests it against
-/// `CGDisplayBounds`, which is **points**, so the same physical point is double
-/// the value the comparison expects and lands off the right-hand edge of every
-/// display: the call fails on EVERY open and falls through to
-/// `primary_monitor()`, silently, which is right only while there is one
-/// display.
+/// `CGDisplayBounds`, which is **points**, so the same physical point is
+/// double the value the comparison expects and lands off the right-hand edge
+/// of every display. Measured on a 14" MacBook Pro (built-in display, bounds
+/// `0,0 1512x982` points): the menu-bar item sits at `1014,4 71x24` points, so
+/// the centre reaches the lookup as `2099,32` and matches nothing — the call
+/// fails on EVERY open and has always fallen through to `primary_monitor()`,
+/// silently, which is right only because there is one display.
 ///
-/// Half-open on the far edges so two abutting monitors can never both claim a
-/// point.
+/// Doing the containment here keeps the whole routine in one coordinate space
+/// and makes the answer testable without a screen. Half-open on the far edges
+/// so two abutting monitors can never both claim a point.
 pub fn monitor_containing(bounds: &[Px], x: f64, y: f64) -> Option<usize> {
     bounds
         .iter()
@@ -289,7 +411,7 @@ mod tests {
     #[test]
     fn windows_overflow_flyout_icon_anchors_to_the_icon_not_the_work_floor() {
         // Measured on Windows 11 (1512x949, taskbar 48 tall): the hidden-icons
-        // flyout spans y 827..901 and the hub's icon inside it is 40x40 at
+        // flyout spans y 827..901 and the app's icon inside it is 40x40 at
         // 1276,844. Anchoring to the work floor would put the popout's bottom
         // at 886, right across the flyout's other three icons.
         let work = Px::new(0.0, 0.0, 1512.0, 901.0);
@@ -420,32 +542,50 @@ mod tests {
 
     // --- popout_physical_size: the size is derived, never inherited ---
 
-    // tauri.conf.json's popout window: 224x224 logical. The lib.rs contract
-    // test is what pins these narrations to the real config; here they are
-    // just the numbers the story is told in.
-    const CONFIGURED: (f64, f64) = (224.0, 224.0);
+    // tauri.conf.json's popout window: 236x256 logical (the T3 pixel
+    // contract's `A — leaf`). The lib.rs contract test is what pins these
+    // narrations to the real config; here they are just the numbers the story
+    // is told in.
+    #[test]
+    fn content_height_is_additive_over_the_base() {
+        assert_eq!(popout_content_height(false, false), POPOUT_HEIGHT);
+        assert_eq!(
+            popout_content_height(true, false),
+            POPOUT_HEIGHT + POPOUT_MODEL_ROW_HEIGHT
+        );
+        assert_eq!(
+            popout_content_height(false, true),
+            POPOUT_HEIGHT + POPOUT_UPDATE_ROW_HEIGHT
+        );
+        assert_eq!(
+            popout_content_height(true, true),
+            POPOUT_HEIGHT + POPOUT_MODEL_ROW_HEIGHT + POPOUT_UPDATE_ROW_HEIGHT
+        );
+    }
+
+    const CONFIGURED: (f64, f64) = (236.0, 256.0);
 
     #[test]
     fn physical_size_is_the_configured_logical_size_at_the_target_scale() {
-        assert_eq!(popout_physical_size(CONFIGURED, 1.0), Some((224.0, 224.0)));
-        assert_eq!(popout_physical_size(CONFIGURED, 1.5), Some((336.0, 336.0)));
-        assert_eq!(popout_physical_size(CONFIGURED, 2.0), Some((448.0, 448.0)));
+        assert_eq!(popout_physical_size(CONFIGURED, 1.0), Some((236.0, 256.0)));
+        assert_eq!(popout_physical_size(CONFIGURED, 1.5), Some((354.0, 384.0)));
+        assert_eq!(popout_physical_size(CONFIGURED, 2.0), Some((472.0, 512.0)));
     }
 
     #[test]
     fn a_dpi_stranded_window_is_re_derived_not_carried_forward() {
-        // The observed failure (Windows 11, 4K @ 150%): a stray DPI event
-        // left the window 224x224 PHYSICAL — its logical size applied as
-        // physical — while the monitor stayed at 144dpi. Re-deriving from
-        // config × the monitor's live scale restores the intended 336x336
+        // The failure ADR-0050 observed on the hub (Windows 11, 4K @ 150%): a
+        // stray DPI event left the window at its logical size applied as
+        // PHYSICAL — while the monitor stayed at 144dpi. Re-deriving from
+        // config × the monitor's live scale restores the intended 354x384
         // whatever the window currently measures.
         let stranded = CONFIGURED;
         let corrected = popout_physical_size(CONFIGURED, 1.5).unwrap();
-        assert_eq!(corrected, (336.0, 336.0));
+        assert_eq!(corrected, (354.0, 384.0));
         assert_ne!(corrected, stranded);
 
         // And the size feeds the anchor: positioning off the stranded size
-        // would hang the popout 112px low and 56px right of centre, so the
+        // would hang the popout 128px low and 59px right of centre, so the
         // correction has to happen BEFORE popout_position, not after.
         let work = Px::new(0.0, 0.0, 2560.0, 1392.0);
         let mon = Px::new(0.0, 0.0, 2560.0, 1440.0);
@@ -453,7 +593,7 @@ mod tests {
         let (gx, gy) = popout_position(tray, mon, work, corrected, false);
         let (bx, by) = popout_position(tray, mon, work, stranded, false);
         assert_eq!(gy + corrected.1, 1338.0 - POPOUT_GAP); // bottom on the anchor
-        assert_eq!((by - gy, bx - gx), (112.0, 56.0));
+        assert_eq!((by - gy, bx - gx), (128.0, 59.0));
     }
 
     #[test]
@@ -461,11 +601,11 @@ mod tests {
         assert_eq!(popout_physical_size(CONFIGURED, 0.0), None);
         assert_eq!(popout_physical_size(CONFIGURED, -1.5), None);
         assert_eq!(popout_physical_size(CONFIGURED, f64::NAN), None);
-        assert_eq!(popout_physical_size((0.0, 224.0), 1.5), None);
+        assert_eq!(popout_physical_size((0.0, 256.0), 1.5), None);
         // +INFINITY is the one non-finite that survives `> 0.0`; unguarded it
         // would reach the caller's `as u32` and saturate to u32::MAX.
-        assert_eq!(popout_physical_size((224.0, f64::INFINITY), 1.0), None);
-        assert_eq!(popout_physical_size((f64::INFINITY, 224.0), 1.0), None);
+        assert_eq!(popout_physical_size((236.0, f64::INFINITY), 1.0), None);
+        assert_eq!(popout_physical_size((f64::INFINITY, 256.0), 1.0), None);
         assert_eq!(popout_physical_size(CONFIGURED, f64::INFINITY), None);
     }
 
@@ -475,41 +615,53 @@ mod tests {
     fn macos_sizes_in_points_and_windows_in_physical_pixels() {
         assert_eq!(
             popout_inner_size(CONFIGURED, 2.0, true),
-            Some(InnerSize::Logical(CONFIGURED.0, CONFIGURED.1))
+            Some(InnerSize::Logical(236.0, 256.0))
         );
         assert_eq!(
             popout_inner_size(CONFIGURED, 1.5, false),
-            Some(InnerSize::Physical(CONFIGURED.0 * 1.5, CONFIGURED.1 * 1.5))
+            Some(InnerSize::Physical(354.0, 384.0))
         );
     }
 
     #[test]
     fn a_lying_scale_factor_cannot_shrink_the_macos_popout() {
-        // tao's macOS `MonitorHandle::scale_factor()` answers 1.0 when its
-        // `NSScreen` lookup misses; on a 2x display the physical path then hands
-        // AppKit a size it halves. In points there is nothing to halve.
+        // The bug this arm exists for: tao's macOS `MonitorHandle::scale_factor()`
+        // answers 1.0 when its `NSScreen` lookup misses, and on a 2x display the
+        // physical path then hands AppKit a size it halves — 236x256 -> 118x128,
+        // the collapsed CSS viewport. In points there is nothing to halve, so
+        // EVERY scale (including the ones that are outright nonsense) yields the
+        // same window.
         for scale in [1.0, 1.5, 2.0, 0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(
                 popout_inner_size(CONFIGURED, scale, true),
-                Some(InnerSize::Logical(CONFIGURED.0, CONFIGURED.1)),
+                Some(InnerSize::Logical(236.0, 256.0)),
                 "macOS size must not depend on scale {scale}"
             );
         }
+        // Windows keeps ADR-0050's derivation, and with it the guard: a scale
+        // that cannot describe a window yields no size rather than a zero one.
+        assert_eq!(
+            popout_inner_size(CONFIGURED, 1.0, false),
+            Some(InnerSize::Physical(236.0, 256.0))
+        );
         assert_eq!(popout_inner_size(CONFIGURED, 0.0, false), None);
         assert_eq!(popout_inner_size(CONFIGURED, f64::NAN, false), None);
     }
 
     #[test]
     fn a_size_that_cannot_describe_a_window_is_refused_on_both_platforms() {
-        assert_eq!(popout_inner_size((0.0, 224.0), 2.0, true), None);
-        assert_eq!(popout_inner_size((224.0, f64::INFINITY), 2.0, true), None);
-        assert_eq!(popout_inner_size((0.0, 224.0), 2.0, false), None);
+        assert_eq!(popout_inner_size((0.0, 256.0), 2.0, true), None);
+        assert_eq!(popout_inner_size((236.0, f64::INFINITY), 2.0, true), None);
+        assert_eq!(popout_inner_size((f64::NAN, 256.0), 2.0, true), None);
+        assert_eq!(popout_inner_size((0.0, 256.0), 2.0, false), None);
     }
 
     // --- monitor_containing: one coordinate space, no platform in it ---
 
     #[test]
     fn the_monitor_under_the_point_is_the_one_returned() {
+        // Two 2x displays side by side, physical: built-in then an external
+        // parked to its right.
         let mons = [
             Px::new(0.0, 0.0, 3024.0, 1964.0),
             Px::new(3024.0, 0.0, 2560.0, 1440.0),
@@ -522,18 +674,17 @@ mod tests {
 
     #[test]
     fn the_measured_macos_tray_point_finds_its_display() {
-        // Measured on a 14" MacBook Pro: the menu-bar item sits at 1014,4 71x24
-        // POINTS, which tray-icon emits as physical, so the centre arrives as
-        // (2099, 32). A hit against the display's PHYSICAL bounds; a miss
-        // against the `CGDisplayBounds` POINTS tao compares.
-        assert_eq!(
-            monitor_containing(&[Px::new(0.0, 0.0, 3024.0, 1964.0)], 2099.0, 32.0),
-            Some(0)
-        );
-        assert_eq!(
-            monitor_containing(&[Px::new(0.0, 0.0, 1512.0, 982.0)], 2099.0, 32.0),
-            None
-        );
+        // The live reading this function exists for (14" MacBook Pro, single
+        // built-in display): the menu-bar item is at 1014,4 71x24 POINTS, which
+        // tray-icon emits as physical, so the centre arrives as (2099, 32).
+        // Against the display's PHYSICAL bounds that is a hit; against the
+        // `CGDisplayBounds` POINTS tao compares (0,0 1512x982) it is a miss, and
+        // the runtime's own `monitor_from_point` therefore answered None on
+        // every open.
+        let physical = [Px::new(0.0, 0.0, 3024.0, 1964.0)];
+        assert_eq!(monitor_containing(&physical, 2099.0, 32.0), Some(0));
+        let points = [Px::new(0.0, 0.0, 1512.0, 982.0)];
+        assert_eq!(monitor_containing(&points, 2099.0, 32.0), None);
     }
 
     #[test]
@@ -544,6 +695,15 @@ mod tests {
         ];
         assert_eq!(monitor_containing(&mons, 1919.0, 0.0), Some(0));
         assert_eq!(monitor_containing(&mons, 1920.0, 0.0), Some(1));
+    }
+
+    #[test]
+    fn negative_coordinates_are_ordinary_here() {
+        // A display parked left of the primary: tao reports negative origins and
+        // the containment must not assume a non-negative space.
+        let mons = [Px::new(-1920.0, 0.0, 1920.0, 1080.0), MON];
+        assert_eq!(monitor_containing(&mons, -100.0, 500.0), Some(0));
+        assert_eq!(monitor_containing(&mons, 100.0, 500.0), Some(1));
     }
 
     #[test]

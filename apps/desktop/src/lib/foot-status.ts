@@ -144,12 +144,23 @@ export function saturationFootLine(saturated: boolean, stale: boolean): boolean 
   return saturated && !stale;
 }
 
+// The watcher degrade (issue #182) is the same class as saturation, and hides
+// under the stale rule for the same reason: its presence IS the assertion. Both
+// are also the same KIND of statement — your numbers may be behind — which is
+// why they sit together above the two connection lines. They differ in what is
+// behind: saturation is an engine too busy to keep up, this is an engine that
+// may not be being told.
+export function watcherFootLine(degraded: boolean, stale: boolean): boolean {
+  return degraded && !stale;
+}
+
 // The foot draws a hairline above its lines; with nothing to draw, the hairline
 // is a broken-looking surface rather than a quiet one, so the whole block goes.
 export function footHasLines(
   usage: UsageFootLine,
   hub: HubFootLine | null,
   showSaturation: boolean,
+  showWatcher = false,
 ): boolean {
-  return usage.kind !== "hidden" || hub !== null || showSaturation;
+  return usage.kind !== "hidden" || hub !== null || showSaturation || showWatcher;
 }
