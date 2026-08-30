@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { costModeSchema } from "./cost-mode";
 import { hostTimeFormat, timeFormatSchema } from "./time-format";
+import { DEFAULT_WEEK, weekSettingSchema } from "./week";
 
 // Settings (CONTEXT.md): durable user config, persisted as settings.json in
 // the OS app-data dir. Distinct from ephemeral filter-rail/chart state.
@@ -75,6 +76,11 @@ export const settingsSchema = z
     // never reach the engine's `tz-clock` formatter, which is h23-pinned because
     // `localDate` buckets every daily total through it.
     timeFormat: timeFormatSchema.default(hostTimeFormat).catch(hostTimeFormat),
+    // The Week (ADR-0083): what "this week" means — rolling 7 days (the
+    // original behaviour), the weekly-limit reset window, or a custom
+    // weekday + time in `timezone`. Renderer-only: the sidecar never reads it;
+    // the renderer resolves instants and passes them on the wire.
+    week: weekSettingSchema.default(DEFAULT_WEEK).catch(DEFAULT_WEEK),
     // Whether the user has collapsed the sidebar to its 64px icon rail
     // (map #151 / T11, ADR-0073). Renderer-only, like `timeFormat`: it reaches
     // no endpoint and no query key.

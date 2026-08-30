@@ -39,7 +39,7 @@ export function useChartWindow(): LiveChartSlice {
 
   // The DOUBLED window (previous period + current) in one fetch, sliced into the
   // two densified series below so a ghost toggle never refetches (ADR-0034).
-  // When span is 7d the current and prev windows coincide and TanStack dedupes.
+  // When span is `week` the current and prev windows coincide and TanStack dedupes.
   const chartWindowQ = useDaily({
     since: prevChartStart,
     until: chartUntil,

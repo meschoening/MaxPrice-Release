@@ -16,6 +16,7 @@ import {
   projectMergeMutationRequestSchema,
   spanSchema,
   SPAN_WINDOW_MS,
+  WEEK_BUCKET_MS,
   SSE_EVENT,
   RESCAN_PATH,
   STORAGE_CLEAN_PATH,
@@ -81,6 +82,7 @@ import { startSaturationReporting, type SaturationSnapshot } from "./saturation"
 import { createBootProgressReporter, type BootProgressReporter } from "./boot-progress";
 import { defaultTimeZone, isValidTimeZone } from "./engine/timezone";
 import { localDateUncached } from "./engine/local-date";
+import { isInstantBound, parseRangeBound } from "./engine/range";
 import { aggregateDaily, aggregateDailyByMachine, aggregateDailyByProject } from "./engine/daily";
 import { aggregateIntraday } from "./engine/intraday";
 import { createReportCache } from "./engine/report-cache";
@@ -471,34 +473,39 @@ function parseCommonQuery(c: Context): CommonQuery | Response {
   // `tz` defaults to the host zone (preserving the pre-Part-6 behaviour).
   const tz = parseTz(c);
   if (tz instanceof Response) return tz;
-  if (since && !isValidYmd(since)) {
-    const body: ErrorResponse = { error: `invalid since (expected YYYYMMDD): ${since}` };
+  // Each bound is a `YYYYMMDD` local date or an ISO instant (ADR-0083); the
+  // two must share a form, since the store decides the window's semantics
+  // once per query from whichever bound is present.
+  const sinceB = since ? parseRangeBound(since) : undefined;
+  const untilB = until ? parseRangeBound(until) : undefined;
+  if (since && !sinceB) {
+    const body: ErrorResponse = {
+      error: `invalid since (expected YYYYMMDD or an ISO instant): ${since}`,
+    };
     return c.json(body, 400);
   }
-  if (until && !isValidYmd(until)) {
-    const body: ErrorResponse = { error: `invalid until (expected YYYYMMDD): ${until}` };
+  if (until && !untilB) {
+    const body: ErrorResponse = {
+      error: `invalid until (expected YYYYMMDD or an ISO instant): ${until}`,
+    };
     return c.json(body, 400);
   }
-  if (since && until && until < since) {
+  if (sinceB && untilB && sinceB.kind !== untilB.kind) {
+    const body: ErrorResponse = { error: `invalid range: since and until must share a form` };
+    return c.json(body, 400);
+  }
+  if (
+    sinceB &&
+    untilB &&
+    (sinceB.kind === "ymd"
+      ? untilB.kind === "ymd" && untilB.ymd < sinceB.ymd
+      : untilB.kind === "instant" && untilB.ms < sinceB.ms)
+  ) {
     const body: ErrorResponse = { error: `invalid range: until ${until} precedes since ${since}` };
     return c.json(body, 400);
   }
 
   return { since, until, mode, tz, projects, models, machines };
-}
-
-// A YYYYMMDD string must be both well-formed and a real calendar date.
-// `/^\d{8}$/` alone would forward 20261332 (month 13) or 20260230 (Feb 30)
-// straight through as a since/until bound.
-function isValidYmd(s: string): boolean {
-  if (!/^\d{8}$/.test(s)) return false;
-  const year = Number(s.slice(0, 4));
-  const month = Number(s.slice(4, 6));
-  const day = Number(s.slice(6, 8));
-  if (month < 1 || month > 12) return false;
-  // new Date(year, month, 0) is the last day of `month` (1-indexed here).
-  const daysInMonth = new Date(year, month, 0).getDate();
-  return day >= 1 && day <= daysInMonth;
 }
 
 export function buildApp(deps: BuildAppDeps): Hono {
@@ -697,12 +704,12 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // picks the window length from `SPAN_WINDOW_MS`; the optional `bucketMs` picks
   // the bucket duration (default: the span's native bars granularity from
   // `INTRADAY_SPANS`, which exists only for the three native-rung spans
-  // (15m / 1h / today) — `block` has no native size either (its rung is
-  // engine-picked, ADR-0031), and `7d` / `30d` have no intraday native; so
-  // `7d` / `30d` REQUIRE an explicit `bucketMs`, and omitting `bucketMs` for
-  // `block` triggers the adaptive rung). `bucketMs` must divide the window
-  // evenly. The optional `prev` / `byProject` flags (default `1`) toggle the
-  // ghost `previousBuckets` and the per-project map for the lean line payload.
+  // (15m / 1h / today) — `block` and `week` pin sidecar-side constants
+  // (`BLOCK_BUCKET_MS`, ADR-0031/0046; `WEEK_BUCKET_MS`, ADR-0083), and `30d`
+  // has no intraday native; so only `30d` REQUIRES an explicit `bucketMs`).
+  // `bucketMs` must divide the window evenly. The optional `prev` / `byProject`
+  // flags (default `1`) toggle the ghost `previousBuckets` and the per-project
+  // map for the lean line payload.
   // `mode` is optional and defaults to `"auto"`; any invalid param is HTTP 400.
   //
   // `span=block` (ADR-0031): the active 5-hour quota block's growing frame
@@ -711,6 +718,12 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // passes it to the engine. No active block ⇒ 200 with empty buckets and
   // `blockWindow: null`. `bucketMs` is optional for `block` — the engine picks
   // the adaptive block-dividing rung (ADR-0031) when omitted.
+  //
+  // `span=week` (ADR-0083): the anchored Week's growing frame
+  // (`[weekStart → now]`). The renderer resolves the anchor (`resolveWeekWindow`
+  // is the only resolver) and passes it as the REQUIRED `weekStart` ISO instant
+  // — absent, unparseable, or in the future is a 400. `bucketMs` defaults to
+  // `WEEK_BUCKET_MS` (one anchor-aligned day); `blockWindow` is `null`.
   //
   // Store-query strategy — both the project AND the model filter are store-
   // query axes, the same as every report (ADR-0017). NO `since`/`until`
@@ -728,9 +741,36 @@ export function buildApp(deps: BuildAppDeps): Hono {
       }
       const span = spanResult.data;
 
+      // span=week (ADR-0083): the anchor is required and must be a past (or
+      // present) instant — a future anchor would frame an empty, negative
+      // window, and the engine clamps rather than reports it. It is the same
+      // kind of bound as an instant `since`, so it passes the same gate
+      // (`isInstantBound`): a zone-less time or a bare date is refused rather
+      // than resolved in the sidecar host's zone by a bare `Date.parse`.
+      let weekStartMs: number | undefined;
+      if (span === "week") {
+        const weekStartParam = c.req.query("weekStart");
+        const parsed =
+          weekStartParam !== undefined && isInstantBound(weekStartParam)
+            ? Date.parse(weekStartParam)
+            : Number.NaN;
+        if (Number.isNaN(parsed)) {
+          const body: ErrorResponse = {
+            error: `weekStart is required for span week: ${weekStartParam ?? "(missing)"}`,
+          };
+          return c.json(body, 400);
+        }
+        if (parsed > deps.now()) {
+          const body: ErrorResponse = { error: `weekStart is in the future: ${weekStartParam}` };
+          return c.json(body, 400);
+        }
+        weekStartMs = parsed;
+      }
+
       // Resolve the bucket size: explicit `bucketMs`, else the span's native
-      // bars granularity. `7d` / `30d` have no native size, so an absent
-      // `bucketMs` there is a 400 rather than a 500 from the engine.
+      // bars granularity (`week`'s is the sidecar-pinned `WEEK_BUCKET_MS`).
+      // `30d` has no native size, so an absent `bucketMs` there is a 400 rather
+      // than a 500 from the engine.
       const bucketMsParam = c.req.query("bucketMs");
       let bucketMs: number | undefined;
       if (bucketMsParam !== undefined) {
@@ -741,11 +781,11 @@ export function buildApp(deps: BuildAppDeps): Hono {
         }
         bucketMs = parsed;
       } else {
-        bucketMs = nativeBucketMs(span);
+        bucketMs = span === "week" ? WEEK_BUCKET_MS : nativeBucketMs(span);
       }
-      // `7d` / `30d` have no native size, so an absent `bucketMs` there is a
-      // 400. `block` is the exception (ADR-0031): an absent `bucketMs` means
-      // the engine picks the adaptive block-dividing rung.
+      // `30d` has no native size, so an absent `bucketMs` there is a 400.
+      // `block` is the exception (ADR-0031): an absent `bucketMs` means the
+      // engine picks the adaptive block-dividing rung.
       if (bucketMs === undefined && span !== "block") {
         const body: ErrorResponse = { error: `bucketMs is required for span ${span}` };
         return c.json(body, 400);
@@ -827,6 +867,20 @@ export function buildApp(deps: BuildAppDeps): Hono {
       }
 
       const events = deps.store().query({ projects, models, machines });
+      if (span === "week") {
+        if (weekStartMs === undefined) throw new Error("intraday: span week without weekStart");
+        return c.json(
+          aggregateIntraday(events, mode, {
+            span: "week",
+            weekStartMs,
+            bucketMs,
+            now: deps.now(),
+            includePrevious,
+            includeByProject,
+            includeByMachine,
+          }),
+        );
+      }
       const body = aggregateIntraday(events, mode, {
         span,
         bucketMs,
@@ -1083,7 +1137,12 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // first paint; live updates arrive via the usage:sample SSE event. The WIRE
   // shape is the projected `{ sample }` (f10) — `connection` / `lastSampleAt`
   // are poller-internal bookkeeping surfaced via the status snapshot, not here.
-  app.get("/api/usage/current", (c) => c.json({ sample: deps.usage.getCurrent().sample }));
+  // `weeklyResetAt` rides beside `sample` (ADR-0083): the Week resolver needs
+  // the weekly window even while a poll legitimately reports `sample: null`.
+  app.get("/api/usage/current", (c) => {
+    const cur = deps.usage.getCurrent();
+    return c.json({ sample: cur.sample, weeklyResetAt: cur.weeklyResetAt });
+  });
 
   // --- /api/readout ---  (map #168 T5/M3; ADR-0076) the tray readout's one
   // wire: the desktop shell's Rust ambient writer polls this ~1/min and renders

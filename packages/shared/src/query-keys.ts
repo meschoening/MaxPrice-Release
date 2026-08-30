@@ -82,9 +82,14 @@ export type IntradayQueryInput = {
   mode: CostMode;
   // `tz` (Part 6, ADR-0015) — the `today` span buckets by the local calendar
   // day in this zone (ADR-0020), so `tz` is load-bearing there; the now-relative
-  // spans (`15m`/`1h`/`7d`/`30d`) and the server-resolved `block` window ignore
-  // it. Kept in the key for every span so a Timezone-setting change re-keys.
+  // spans (`15m`/`1h`/`30d`), the anchored `week`, and the server-resolved
+  // `block` window ignore it. Kept in the key for every span so a
+  // Timezone-setting change re-keys.
   tz?: string;
+  // ADR-0083 — required by `span=week`; re-keys because the anchor changes the
+  // body (the window is `weekStart → now`). An ISO instant, absent on every
+  // other span.
+  weekStart?: string;
   // The bucket duration in ms (ADR-0018). Omitted → the endpoint's per-span
   // default (the bars granularity, `INTRADAY_SPANS[span].bucketMs`). The line
   // path passes `lineGranularityFor(span)` (a 15-min floor), so bars and lines
@@ -110,6 +115,7 @@ function normalizeIntraday(input: IntradayQueryInput): IntradayQueryInput {
     span: input.span,
     mode: input.mode,
     tz: input.tz,
+    weekStart: input.weekStart,
     bucketMs: input.bucketMs,
     includePrevious: input.includePrevious,
     includeByProject: input.includeByProject,

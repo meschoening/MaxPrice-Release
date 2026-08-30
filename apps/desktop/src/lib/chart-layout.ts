@@ -28,6 +28,18 @@ export const COMPACT_VIEW = { w: 720, h: 64, x0: 0, x1: 720, y0: 2, y1: 62 } as 
 export type ChartView = { w: number; h: number; x0: number; x1: number; y0: number; y1: number };
 export type LabelMode = "day" | "time";
 
+// The x-axis label mode for a span tab: the daily spans and the span-less
+// compact strips label days, the intraday spans label times. The `week` span
+// splits on the resolved Week (ADR-0083): rolling bars are calendar days from
+// `/api/daily`, but an ANCHORED week reads `/api/intraday` — dated instants
+// aligned to the anchor's time-of-day — and labels times like every other
+// intraday window. Pure so that split pins under test.
+export function labelModeFor(span: Span | undefined, weekAnchored: boolean): LabelMode {
+  if (span === undefined || span === "30d") return "day";
+  if (span === "week") return weekAnchored ? "time" : "day";
+  return "time";
+}
+
 // --- the fluid view (ADR-0073) ----------------------------------------------
 // `k` — CSS px per view unit — is the one free parameter a fluid view needs,
 // and before this it was not a constant at all but `svgPx / 720`: a zoom that
@@ -222,7 +234,7 @@ function barGeom(view: ChartView, n: number, ghost: boolean, compact: boolean) {
 // which ONLY the `block` span ever reaches — about two hours into its window.
 // `1h` tops out at 60 one-minute buckets (~11.1 units per cluster, twice the
 // threshold) and stays comfortably sparse; `today`'s bars stay on the calendar
-// hour at 24, its line is a lines mark (never dense), and 7d/30d bars are daily.
+// hour at 24, its line is a lines mark (never dense), and week/30d bars are daily.
 //
 // Deliberately GHOST-INDEPENDENT. With the ghost off, bars alone would keep
 // fitting to 267 buckets, but deriving the threshold from actual fit would make
@@ -376,14 +388,23 @@ function labelIndices(n: number, mode: LabelMode): Set<number> {
 
 // The spans whose window GROWS a bucket at a time as the clock runs: `block`
 // runs from the active block's start to now (ADR-0031), `today` from local
-// midnight to now (ADR-0020). Both are append-only — bucket i keeps its
-// identity as the window extends — so their bucket count must NOT force a
-// remount: at the one-minute bucket (ADR-0046) that would replay the `rise`
-// animation every single minute for as long as the window stays sparse.
+// midnight to now (ADR-0020), and an ANCHORED `week` from the Week's start to
+// now at anchor-aligned daily buckets — 1 → 7 bars across the week (ADR-0083).
+// All three are append-only — bucket i keeps its identity as the window
+// extends — so their bucket count must NOT force a remount: at the one-minute
+// bucket (ADR-0046) `block`/`today` would replay the `rise` animation every
+// single minute for as long as the window stays sparse, and an anchored week
+// would replay it at every day boundary.
+// `week` is listed UNCONDITIONALLY even though only its anchored form grows:
+// a ROLLING week's bars are seven densified calendar days (`densifyDays`, via
+// chart-source.ts), so its count is a constant 7 and dropping `n` is inert
+// there — and a rolling ⇔ anchored flip changes `labelMode` ("day" ⇔ "time",
+// `labelModeFor`), which rides the key regardless. That keeps the resolved
+// Week out of this layer entirely.
 // Every other span has a fixed bucket count for its window, where a changed
-// count means a genuinely different window (bucket 0 of `7d` is not bucket 0
+// count means a genuinely different window (bucket 0 of `15m` is not bucket 0
 // of `30d`) and rebuilding is right.
-const GROWING_SPANS: ReadonlySet<Span> = new Set<Span>(["block", "today"]);
+const GROWING_SPANS: ReadonlySet<Span> = new Set<Span>(["block", "today", "week"]);
 
 export function buildChartLayout(
   model: ChartModel,
@@ -642,7 +663,7 @@ export function buildChartLayout(
     // axis must name, so it is the one label that can never be dropped.
     //
     // Two things reach this. At the base view it fires exactly once, on the
-    // 12-hour dated line axes (7d/30d at the 15-min bucket: n = 672 / 2880,
+    // 12-hour dated line axes (week/30d at the 15-min bucket: n = 672 / 2880,
     // whose forced last label clamps ~24 units left of its center and lands
     // inside a "05/21 12:00 AM" of the stepped one) — which is why it was
     // written as a single check. The fluid view (ADR-0073) is the second: below
@@ -688,14 +709,16 @@ export function buildChartLayout(
   // different window. Two exemptions:
   //   - dense bands and lines are ONE element per series whose `d` / `points`
   //     simply change, so a bucket-count change never mismatches elements;
-  //   - a GROWING span (`block` / `today`) appends buckets while keeping every
-  //     existing bucket's identity, so its rects should morph through the
-  //     0.45s transitions. At the one-minute bucket both grow every minute,
-  //     and keying on `n` replayed the rise animation that often (ADR-0046).
+  //   - a GROWING span (`block` / `today` / an anchored `week`) appends buckets
+  //     while keeping every existing bucket's identity, so its rects should
+  //     morph through the 0.45s transitions. At the one-minute bucket `block`
+  //     and `today` grow every minute, and keying on `n` replayed the rise
+  //     animation that often (ADR-0046); an anchored week grows one bar a day
+  //     (ADR-0083).
   // The dense flag itself rides the key — the two modes share no elements.
   // The span rides it too: with `n` gone for growing spans and lines, nothing
   // else distinguishes the windows (all four intraday spans label "time",
-  // 7d/30d both label "day"), so a span switch would silently snap the marks
+  // week/30d both label "day"), so a span switch would silently snap the marks
   // instead of rebuilding them.
   const shapeKey = [
     model.mark,

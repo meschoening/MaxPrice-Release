@@ -1,6 +1,7 @@
 import type { CostMode, ProjectRow } from "@maxprice/shared";
 import { computeCostBreakdown } from "@maxprice/shared";
 import { localDate } from "./local-date";
+import { inRange } from "./range";
 import { defaultTimeZone } from "./timezone";
 import type { ModelRollup } from "./model-rollup";
 import { byTimestamp, emptyModelRollup, foldModelUsage } from "./model-rollup";
@@ -209,8 +210,10 @@ function flushRow(slug: string, bucket: ProjectBucket): ProjectRow {
 // The date window rides along because the in-window partition happens PER EVENT
 // inside the fold — `firstActivity` and the `cwd` capture need the out-of-window
 // events, so this cannot be a store-query date filter — which is also why the
-// projects cache keys on the window. `since` / `until` are dashless `YYYYMMDD`;
-// an omitted bound is unbounded on that side.
+// projects cache keys on the window. `since` / `until` are either dashless
+// `YYYYMMDD` (inclusive local dates) or ISO instants (half-open `[since,
+// until)` on the event's own timestamp — ADR-0083 decision 3); `inRange`
+// decides which. An omitted bound is unbounded on that side.
 export function foldProjectEvent(
   buckets: Map<string, ProjectBucket>,
   event: StoredEvent,
@@ -245,11 +248,17 @@ export function foldProjectEvent(
     bucket.firstActivity = date.dashed;
   }
 
-  // In-window partition, inline on the already-computed `date` (f13) — the
-  // retired `inWindow` helper recomputed `localDate` for the same event; its
-  // `date === null` branch is dead here, the fold already returned on it.
-  const within =
-    (since === undefined || date.ymd >= since) && (until === undefined || date.ymd <= until);
+  // In-window partition through the one shared predicate (ADR-0083). Both
+  // arguments are lazy: the ymd branch reads the already-computed `date` (f13
+  // — nothing recomputes `localDate`; `inRange`'s null branch is dead here,
+  // the fold already returned on it) and never parses the timestamp; the
+  // instant branch parses it and never asks for the date.
+  const within = inRange(
+    () => Date.parse(event.timestamp),
+    () => date.ymd,
+    since,
+    until,
+  );
   if (within) {
     // Pricing moved inside the partition with ADR-0068: with the all-time
     // rollup gone, an out-of-window event has nothing left to price.

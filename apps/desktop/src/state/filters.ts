@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import { z } from "zod";
-import { parentProjectSlug, type Span, spanSchema } from "@maxprice/shared";
+import { parentProjectSlug, type Span, spanSchema, type WeekWindow } from "@maxprice/shared";
 import { ymdShift } from "@/lib/dates";
 import { groupByAxisSchema, normalizeAxes, type GroupByAxis } from "@/lib/group-by";
 
@@ -13,11 +13,11 @@ import { groupByAxisSchema, normalizeAxes, type GroupByAxis } from "@/lib/group-
 export type { Span };
 export type { GroupByAxis };
 
-export type DateRangePreset = "24h" | "7d" | "30d" | "90d" | "all";
+export type DateRangePreset = "24h" | "week" | "30d" | "90d" | "all";
 export type Metric = "cost" | "tokens";
 export type ChartStyle = "bars" | "cumulative" | "trend";
 
-const dateRangePresetSchema = z.enum(["24h", "7d", "30d", "90d", "all"]);
+const dateRangePresetSchema = z.enum(["24h", "week", "30d", "90d", "all"]);
 const metricSchema = z.enum(["cost", "tokens"]);
 const chartStyleSchema = z.enum(["bars", "cumulative", "trend"]);
 
@@ -80,13 +80,13 @@ export type FiltersState = {
 export const useFilters = create<FiltersState>()(
   persist(
     (set) => ({
-      dateRange: "7d",
+      dateRange: "week",
       projects: [],
       models: [],
       machines: [],
       metric: "cost",
       groupByAxes: ["model"],
-      span: "7d",
+      span: "week",
       ghostOverlay: true,
       chartStyle: "bars",
       logScale: false,
@@ -117,7 +117,7 @@ export const useFilters = create<FiltersState>()(
     {
       name: "maxprice.filters",
       storage: createJSONStorage(() => localStorage),
-      version: 13,
+      version: 14,
       // Merge runs on every hydration (regardless of version match), so all
       // validation lives here. Same-version corrupt payloads, unknown enum
       // values, missing fields, and migrate→undefined all reach this point.
@@ -152,10 +152,12 @@ export const useFilters = create<FiltersState>()(
       // key "machine" is newly admitted, never renamed). v11 → v12 adds the
       // per-axis `muted` sets (ADR-0042 — default all-empty). v12 → v13 maps a
       // persisted worktree slug onto the project that now owns it (ADR-0061).
+      // v13 → v14 renames `7d` to `week` — BOTH the span and the Date-range
+      // preset, which now follow the Week setting (ADR-0083).
       // A v1 payload chains through every step.
       migrate: (state, version) => {
-        if (version === 13) return state;
-        if (version >= 1 && version <= 12) {
+        if (version === 14) return state;
+        if (version >= 1 && version <= 13) {
           if (!state || typeof state !== "object") return undefined;
           const next = { ...(state as Record<string, unknown>) };
           if (version <= 8) {
@@ -207,6 +209,12 @@ export const useFilters = create<FiltersState>()(
               ),
             ];
           }
+          // v13 → v14 (ADR-0083): `7d` becomes `week` — the span AND the
+          // Date-range preset, both now following the Week setting. Two
+          // independent fields, so each renames on its own value (the v4 → v5
+          // `24h` precedent, which renamed the span only).
+          if (next.span === "7d") next.span = "week";
+          if (next.dateRange === "7d") next.dateRange = "week";
           return next;
         }
         return undefined;
@@ -216,7 +224,8 @@ export const useFilters = create<FiltersState>()(
 );
 
 // Ranges are inclusive on both ends.
-// 24h covers today + yesterday; 7d covers today + 6 prior days (7 total).
+// 24h covers today + yesterday; a ROLLING `week` covers today + 6 prior days
+// (7 total).
 // `tz` (the configured Timezone setting) makes the window edges line up with
 // the engine's tz-aware day bucketing; omitted = the host zone (f8).
 //
@@ -231,18 +240,29 @@ export const useFilters = create<FiltersState>()(
 // the `all` cell as "no since / no until".
 //
 // Safe for `/api/daily` despite ADR-0057's unbounded branch being a latent
-// path: no daily call site takes its window from here. All five bound both ends
-// with explicit `ymdShift` dates (`use-chart-window`, `use-chart-source` ×2,
-// `use-live-data`'s 14-day tile window, and the Projects strip's 30-day chart).
+// path: no daily call site takes its window from here. The rolling daily call
+// sites bound both ends with explicit `ymdShift` dates (`use-chart-window`,
+// `use-chart-source` ×2, `use-live-data`'s 14-day tile window, and the Projects
+// strip's 30-day chart); the ONE open-ended daily query — `use-live-data`'s
+// anchored current-week window, `since` an instant with no `until` — reads its
+// bounds from `useWeekWindow` directly, and an anchored week is at most 7 days,
+// so the unbounded branch stays unreached.
+// `week` is the ONE preset that follows the Week setting (ADR-0083): a rolling
+// week keeps the local-date form, byte-identical to what shipped, while an
+// ANCHORED week (limit reset, or a custom weekday + time) sends the instant
+// form — the ISO start, and NO `until`, since the week runs to now and a
+// local-date right edge would round it out to the end of today.
 export function resolveDateRange(
   preset: DateRangePreset,
   tz?: string,
+  week?: WeekWindow,
 ): { since?: string; until?: string } {
   const until = ymdShift(0, tz);
   switch (preset) {
     case "24h":
       return { since: ymdShift(-1, tz), until };
-    case "7d":
+    case "week":
+      if (week?.kind === "anchored") return { since: new Date(week.startMs).toISOString() };
       return { since: ymdShift(-6, tz), until };
     case "30d":
       return { since: ymdShift(-29, tz), until };

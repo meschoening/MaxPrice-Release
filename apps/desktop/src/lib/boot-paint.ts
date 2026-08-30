@@ -17,7 +17,7 @@ import { useEffect, useSyncExternalStore } from "react";
 // `useChartSource`, which is deliberately scoped AWAY from those five queries
 // (ADR-0033 review f1). On the four intraday spans the chart reads
 // `/api/intraday` — a sixth query `useLiveData().isPending` never observes — so
-// a one-publisher version looks right, passes a 7d/30d smoke, and still reveals
+// a one-publisher version looks right, passes a week/30d smoke, and still reveals
 // mid-load on most boots.
 
 export type BootPaintLatch = {

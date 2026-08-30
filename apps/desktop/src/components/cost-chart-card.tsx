@@ -3,6 +3,7 @@ import { ChartCardBody } from "@/components/chart-card-body";
 import { composeSeries } from "@/lib/composed-series";
 import type { GroupByAxis } from "@/lib/group-by";
 import { useChartSource } from "@/state/use-chart-source";
+import { useWeekWindow } from "@/state/use-week";
 import { useBootPaintPublisher } from "@/lib/boot-paint";
 import type { ChartStyle, Metric, Span } from "@/state/filters";
 
@@ -26,7 +27,9 @@ export type ChartSourceProps = {
 // The ghost-overlay legend label for a span's previous period. `today`'s ghost
 // is the prior calendar day (ADR-0020); `block`'s is the previous block,
 // aligned by time-into-block (ADR-0031); every other span's previous period is
-// the immediately-prior window of the same length.
+// the immediately-prior window of the same length — for `week` that is the
+// previous Week, rolling or anchored alike (ADR-0083; the anchored ghost is
+// `weekStart − 7d` onward, aligned by time-into-week).
 function prevRangeLabelFor(span: Span): string {
   if (span === "today") return "Yesterday";
   if (span === "block") return "Previous block";
@@ -67,7 +70,8 @@ export function CostChartCard(props: ChartSourceProps): React.ReactElement {
     logScale,
     onToggleLogScale,
   } = props;
-  const source = useChartSource({ span, chartStyle, axes, ghostOverlay });
+  const week = useWeekWindow();
+  const source = useChartSource({ span, chartStyle, axes, ghostOverlay, week });
   // The boot gate's chart publisher (ADR-0066), and the reason the gate needs
   // TWO: this card's query lives behind `useChartSource`, scoped away from the
   // five `useLiveData` queries, and on the intraday spans it is `/api/intraday`
@@ -99,6 +103,7 @@ export function CostChartCard(props: ChartSourceProps): React.ReactElement {
       composed={composed}
       labels={source.labels}
       span={span}
+      weekAnchored={week.kind === "anchored"}
       metric={metric}
       axes={axes}
       chartStyle={chartStyle}

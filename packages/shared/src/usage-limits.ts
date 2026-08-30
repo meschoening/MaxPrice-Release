@@ -54,6 +54,9 @@ export type UsageConnection = z.infer<typeof usageConnectionSchema>;
 // duplicated here (review f10).
 export const usageCurrentSchema = z.object({
   sample: usageSampleSchema.nullable(),
+  // ADR-0083: the last-known weekly reset, independent of `sample` (which is
+  // null whenever no 5h window is in flight).
+  weeklyResetAt: z.string().nullable(),
 });
 export type UsageCurrent = z.infer<typeof usageCurrentSchema>;
 

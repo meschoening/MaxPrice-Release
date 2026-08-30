@@ -1,4 +1,4 @@
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, type UseQueryResult } from "@tanstack/react-query";
 import type { CostMode, QueryInput } from "@maxprice/shared";
 import type { z } from "zod";
 import { sidecarFetch } from "@/lib/sidecar";
@@ -76,7 +76,15 @@ export function buildReportUrl(path: string, input: QueryInput): string {
 // The wrapper's per-call query options. `enabled: false` parks the query —
 // mounted but never fetching (the chart-source hook's laziness mechanism: all
 // four source queries are called unconditionally, only the active one fetches).
-export type ReportQueryOptions = { enabled?: boolean };
+//
+// `keepPrevious: true` holds the last key's data while a NEW key's first fetch
+// is in flight, instead of blanking to `undefined`. Per-call rather than a
+// global default in `lib/query.ts`: every report hook would then keep stale
+// rows across an ordinary filter edit, which is a different (and unasked-for)
+// product decision. The one caller today is the anchored previous-week query
+// (ADR-0083), whose instant-bounded `until` moves with the current week's
+// fetch — see use-live-data.ts.
+export type ReportQueryOptions = { enabled?: boolean; keepPrevious?: boolean };
 
 export type ReportHook<T, K extends readonly [string, QueryInput]> = {
   queryKey: (opts: ReportQueryInput) => K;
@@ -112,6 +120,7 @@ export function makeReportHook<
       queryKey: queryKey(opts),
       queryFn: ({ signal }) => fetchReport(opts, signal),
       enabled: options?.enabled ?? true,
+      placeholderData: options?.keepPrevious ? keepPreviousData : undefined,
     });
 
   return { queryKey, buildUrl, fetch: fetchReport, useReport };

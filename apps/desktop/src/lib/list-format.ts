@@ -59,7 +59,10 @@ export function familyColor(family: string): string {
 // (ADR-0016) so the strip and the topbar share one copy.
 export const RANGE_LABEL: Record<DateRangePreset, string> = {
   "24h": "last 24 hours",
-  "7d": "last 7 days",
+  // Not "last 7 days": the week follows the Week setting (ADR-0083), so an
+  // anchored week is not seven days back from today. "this week" is true in
+  // every mode.
+  week: "this week",
   "30d": "last 30 days",
   "90d": "last 90 days",
   all: "all time",

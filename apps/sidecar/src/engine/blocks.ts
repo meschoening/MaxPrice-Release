@@ -52,6 +52,7 @@ import {
   type WindowSpan,
 } from "./block-windows";
 import { localDate } from "./local-date";
+import { inRange, isInstantBound } from "./range";
 import { byTimestamp } from "./model-rollup";
 import { defaultTimeZone } from "./timezone";
 import { lowerModelNeedles, matchesLoweredModelFilter } from "./store";
@@ -444,27 +445,52 @@ function makeGapRow(prevLastEventMs: number, nextMs: number): BlockRow | null {
 // Window post-filter
 // ---------------------------------------------------------------------------
 
-// Drop rows whose `startTime`, formatted to a `YYYYMMDD` in `timeZone` (the
-// request's `tz`, ADR-0015), falls outside `[since, until]` — we window
-// the *built* blocks (gap rows included), not the events (see SPIKE /
-// WINDOWING). `since` / `until` are dashless `YYYYMMDD`; an omitted bound is
-// unbounded on that side. A row whose `startTime` is unparseable is dropped
-// (fails safe — it cannot happen in practice since `startTime` is
-// engine-constructed).
+// Drop rows whose `startTime` falls outside the window — we window the
+// *built* blocks (gap rows included), not the events (see SPIKE / WINDOWING).
+// `inRange` decides the form (ADR-0083 decision 3): a dashless `YYYYMMDD`
+// bound compares `startTime` formatted to a local date in `timeZone` (the
+// request's `tz`, ADR-0015), an ISO instant bound compares `startTime` itself,
+// half-open. An omitted bound is unbounded on that side. A row whose
+// `startTime` is unparseable is dropped (fails safe — it cannot happen in
+// practice since `startTime` is engine-constructed).
+//
+// One exception, on the INSTANT form only: the active row survives an instant
+// `since` whose window still CONTAINS `now`. The instant form exists for the
+// anchored Week (ADR-0083), and a weekly limit reset is not block-aligned —
+// the anchor routinely lands mid-block, and filtering the active block by
+// `startTime` blanked the Active block tile from the reset until that block
+// ended (up to 5h, in exactly the mode the feature exists for). The active
+// block is the quota window containing `now`, so it belongs to any window that
+// also contains `now` — which is what the anchored Week's open right edge
+// guarantees by construction, and what a closed window that ended in the past
+// does not: the wire accepts `since=<instant>&until=<past instant>`, and there
+// the active block is simply outside the requested window like any other row.
+// `until` is half-open (`inRange`: `t >= until` is out), so containment is
+// `now < until`. The ymd form is untouched (golden parity): its bounds are
+// inclusive local DATES, and the oracle windows the active row by its start
+// date like any other.
 function applyWindow(
   rows: BlockRow[],
   timeZone: string,
+  now: number,
   since?: string,
   until?: string,
 ): BlockRow[] {
   if (since === undefined && until === undefined) return rows;
-  return rows.filter((row) => {
-    const date = localDate(row.startTime, timeZone);
-    if (date === null) return false;
-    if (since !== undefined && date.ymd < since) return false;
-    if (until !== undefined && date.ymd > until) return false;
-    return true;
-  });
+  const keepActive =
+    since !== undefined &&
+    isInstantBound(since) &&
+    (until === undefined || now < Date.parse(until));
+  return rows.filter(
+    (row) =>
+      (keepActive && row.isActive) ||
+      inRange(
+        Date.parse(row.startTime),
+        () => localDate(row.startTime, timeZone)?.ymd ?? null,
+        since,
+        until,
+      ),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -651,8 +677,9 @@ export function resolveBlockSpanWindow(
 
 // Controls beyond the cost mode that shape the `/api/blocks` body.
 export type AggregateBlocksOptions = {
-  // Inclusive date window, dashless `YYYYMMDD`. Filters which *built* blocks
-  // appear by each block's `startTime` (local-timezone date) — NOT a filter
+  // Inclusive date window, dashless `YYYYMMDD`, or a half-open ISO-instant
+  // window (ADR-0083). Filters which *built* blocks appear by each block's
+  // `startTime` (local-timezone date, or the instant itself) — NOT a filter
   // on the events fed into block formation (see SPIKE / WINDOWING). An omitted
   // bound is unbounded on that side.
   since?: string;
@@ -807,6 +834,7 @@ export function aggregateBlocks(
     blocks: applyWindow(
       withLimits,
       options.timeZone ?? defaultTimeZone(),
+      now,
       options.since,
       options.until,
     ),

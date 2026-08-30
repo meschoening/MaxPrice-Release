@@ -1,6 +1,7 @@
 import type { CostMode, SessionRow, SessionsResponse } from "@maxprice/shared";
 import { computeCostBreakdown } from "@maxprice/shared";
 import { localDate } from "./local-date";
+import { inRange } from "./range";
 import { defaultTimeZone } from "./timezone";
 import type { ModelRollup } from "./model-rollup";
 import { byTimestamp, emptyModelRollup, foldModelUsage } from "./model-rollup";
@@ -76,8 +77,9 @@ import type { StoredEvent } from "./store";
 // be fed a date-windowed store query (that would truncate the per-session
 // sums). It takes the *unwindowed* event set, builds full per-session
 // rollups, then drops rows whose `lastActivity` falls outside `[since, until]`
-// — `applyWindow` below. (Contrast E5, where the store's date filter is
-// correct because a daily row IS a per-day slice.)
+// — `applyWindow` below; an ISO-instant bound (ADR-0083 decision 3) windows
+// on the raw timestamp of that same last event instead. (Contrast E5, where
+// the store's date filter is correct because a daily row IS a per-day slice.)
 //
 // MODEL FILTER (ADR-0017).
 // The model filter is a store-query axis: this aggregator receives already-
@@ -203,20 +205,22 @@ function flushRow(sessionId: string, bucket: SessionBucket): SessionRow {
 // Window post-filter
 // ---------------------------------------------------------------------------
 
-// Drop rows whose `lastActivity` falls outside `[since, until]` — the
-// whole-session windowing quirk from the module header. `since` / `until` are
-// dashless `YYYYMMDD`; `lastActivity` is dashed `YYYY-MM-DD`, so strip the
-// dashes before the lexical compare. An omitted bound is "no bound on that
-// side". The row's token + cost totals are NOT narrowed — they stay the full
-// session sums (that is the whole point of whole-session windowing).
-function applyWindow(rows: SessionRow[], since?: string, until?: string): SessionRow[] {
-  if (since === undefined && until === undefined) return rows;
-  return rows.filter((row) => {
-    const ymd = row.lastActivity.replace(/-/g, "");
-    if (since !== undefined && ymd < since) return false;
-    if (until !== undefined && ymd > until) return false;
-    return true;
-  });
+// Keep the bucket only if its last event falls inside the window — the
+// whole-session windowing quirk from the module header, decided by `inRange`
+// (ADR-0083 decision 3): a dashless `YYYYMMDD` bound compares the dashed
+// `lastActivity` (dashes stripped), an ISO instant bound compares the raw
+// `latestTimestamp` of that same last event. Windowing runs on the BUCKET
+// because the wire `SessionRow` carries only the date. An omitted bound is "no
+// bound on that side". The row's token + cost totals are NOT narrowed — they
+// stay the full session sums (that is the whole point of whole-session
+// windowing).
+function applyWindow(bucket: SessionBucket, since?: string, until?: string): boolean {
+  return inRange(
+    Date.parse(bucket.latestTimestamp),
+    () => bucket.lastActivity.replace(/-/g, ""),
+    since,
+    until,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -258,18 +262,20 @@ export function assembleSessions(
   // Flush in `(projectPath, sessionId)`-ascending order — the deterministic
   // pre-order the stable cost-descending sort below relies on (module header,
   // ROW ORDERING).
-  const rows = Array.from(buckets.entries())
+  // The window filter runs on the buckets, ahead of the flush: it needs the
+  // last event's raw timestamp, which the wire row does not carry.
+  const windowed = Array.from(buckets.entries())
+    .filter(([, bucket]) => applyWindow(bucket, since, until))
     .map(([sessionId, bucket]) => flushRow(sessionId, bucket))
     .sort(
       (a, b) =>
         a.projectPath.localeCompare(b.projectPath) || a.sessionId.localeCompare(b.sessionId),
     );
 
-  // Window-filter, then sort by cost descending. The sort must be stable so
-  // display-mode all-zero-cost rows keep the pre-order. `Array.prototype.sort`
-  // is stable in V8/JSC, so a plain `b - a` comparator preserves the
-  // `(projectPath, sessionId)` pre-order on ties.
-  const windowed = applyWindow(rows, since, until);
+  // Then sort by cost descending. The sort must be stable so display-mode
+  // all-zero-cost rows keep the pre-order. `Array.prototype.sort` is stable in
+  // V8/JSC, so a plain `b - a` comparator preserves the `(projectPath,
+  // sessionId)` pre-order on ties.
   windowed.sort((a, b) => b.totalCost - a.totalCost);
 
   return { sessions: windowed };
@@ -277,10 +283,10 @@ export function assembleSessions(
 
 // Controls beyond the cost mode that shape the `/api/sessions` body.
 export type AggregateSessionsOptions = {
-  // Inclusive date window, dashless `YYYYMMDD`. Filters which *sessions*
-  // appear by each session's `lastActivity`; the surviving sessions keep their
-  // full, whole-session token + cost sums (see the module header). An omitted
-  // bound is unbounded on that side.
+  // Inclusive date window, dashless `YYYYMMDD`, or a half-open ISO-instant
+  // window (ADR-0083). Filters which *sessions* appear by each session's last
+  // event; the surviving sessions keep their full, whole-session token + cost
+  // sums (see the module header). An omitted bound is unbounded on that side.
   since?: string;
   until?: string;
   // The IANA zone each session's `lastActivity` local date is bucketed in

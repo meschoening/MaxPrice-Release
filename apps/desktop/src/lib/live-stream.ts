@@ -11,6 +11,7 @@ import {
   statusSnapshotSchema,
   usageEventSchema,
   usageSampleEventSchema,
+  type UsageCurrent,
 } from "@maxprice/shared";
 import { queryClient } from "@/lib/query";
 import { getSidecarUrl, resetSidecarUrl, SidecarStartupError } from "@/lib/sidecar";
@@ -312,7 +313,11 @@ export function handleUsageSampleEvent(client: QueryClient, dataText: string): v
   try {
     const parsed = usageSampleEventSchema.safeParse(JSON.parse(dataText));
     if (!parsed.success) return;
-    client.setQueryData(usageCurrentQueryKey(), () => ({ sample: parsed.data }));
+    // A null sample must not drop the last-known weekly reset (ADR-0083).
+    client.setQueryData<UsageCurrent>(usageCurrentQueryKey(), (prev) => ({
+      sample: parsed.data,
+      weeklyResetAt: parsed.data?.weekly.resetAt ?? prev?.weeklyResetAt ?? null,
+    }));
   } catch {
     // Malformed SSE payloads leave the prior cache untouched.
   }

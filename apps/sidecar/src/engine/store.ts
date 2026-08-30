@@ -9,6 +9,7 @@ import {
 import { identityFromPath } from "../identity";
 import { collectUsageRecords } from "./jsonl";
 import { localDate } from "./local-date";
+import { isInstantBound } from "./range";
 import type { ScanCache } from "./scan-cache";
 import { defaultTimeZone } from "./timezone";
 import type { UsageRecord } from "./types";
@@ -78,11 +79,17 @@ export type ScanProgress = { filesParsed: number; filesTotal: number };
 // — it mirrors how the index.ts endpoints treat a missing repeated `project=`
 // / `model=` param (an empty list = unfiltered).
 export type StoreQuery = {
-  // Inclusive lower bound, `YYYYMMDD`. An event is kept if its *local-timezone*
-  // calendar date is >= this. Reproduces the golden oracle's `--since`.
+  // Lower bound, in one of two forms (ADR-0083). `YYYYMMDD`: inclusive — an
+  // event is kept if its *local-timezone* calendar date is >= this
+  // (reproduces the golden oracle's `--since`). An ISO-8601 instant with a
+  // time part (`2026-08-27T13:30:00Z`): an event is kept if its own timestamp
+  // is >= the instant, no zone involved. `since` and `until` must share a
+  // form; the HTTP layer rejects a mix before it reaches the store.
   since?: string;
-  // Inclusive upper bound, `YYYYMMDD`. An event is kept if its local-timezone
-  // calendar date is <= this. Reproduces the golden oracle's `--until`.
+  // Upper bound, same two forms. `YYYYMMDD`: inclusive — local calendar date
+  // <= this (the oracle's `--until`). ISO instant: EXCLUSIVE — timestamp <
+  // the instant, so `[since, until)` is half-open and adjacent windows never
+  // double-count an event on the seam.
   until?: string;
   // The IANA zone the `since`/`until` bounds are interpreted in (ADR-0015).
   // Only consulted when a date bound is set; omitted = the host zone. The
@@ -563,23 +570,46 @@ export function createEventStore(opts: {
     // Iterate the timestamp-sorted snapshot, not `events.values()` (insertion
     // order): a filter preserves order, so `out` comes out sorted with no
     // per-query re-sort.
+    // ADR-0083: the bounds' form is decided ONCE per query (they share a
+    // kind — the HTTP layer rejects a mix) and the instants are parsed once
+    // here rather than per event.
+    const instantBounds =
+      (since !== undefined && isInstantBound(since)) ||
+      (until !== undefined && isInstantBound(until));
+    const sinceMs = instantBounds && since !== undefined ? Date.parse(since) : undefined;
+    const untilMs = instantBounds && until !== undefined ? Date.parse(until) : undefined;
     const out: StoredEvent[] = [];
     for (const event of sortedEvents()) {
       if (since !== undefined || until !== undefined) {
-        // Reproduce the golden oracle's `--since`/`--until` day grouping: an
-        // event is kept if its *local-timezone* calendar date is within the
-        // bound.
-        const date = localDate(event.timestamp, timeZone);
-        // An unparseable timestamp fails the date filter safe — excluded from
-        // any since/until-bounded query rather than leaking past both bounds.
-        if (date === null) {
-          console.warn(
-            `[store] event ${event.messageId} has an unparseable timestamp: ${event.timestamp}`,
-          );
-          continue;
+        if (instantBounds) {
+          // Half-open `[since, until)` window on the event's own timestamp.
+          const t = Date.parse(event.timestamp);
+          // An unparseable timestamp fails the filter safe, as on the ymd path.
+          if (Number.isNaN(t)) continue;
+          if (sinceMs !== undefined && t < sinceMs) continue;
+          // `continue`, never `break`: `sortedEvents` is a plain STRING sort
+          // on `timestamp`, and the parser does not normalize, so a stream
+          // holding an offset-bearing stamp (`...+02:00`) string-sorts hours
+          // away from its instant — a `break` there would drop every later
+          // in-window event. No ordering assumption is made; the ymd branch
+          // already pays the same O(n).
+          if (untilMs !== undefined && t >= untilMs) continue;
+        } else {
+          // Reproduce the golden oracle's `--since`/`--until` day grouping: an
+          // event is kept if its *local-timezone* calendar date is within the
+          // bound.
+          const date = localDate(event.timestamp, timeZone);
+          // An unparseable timestamp fails the date filter safe — excluded from
+          // any since/until-bounded query rather than leaking past both bounds.
+          if (date === null) {
+            console.warn(
+              `[store] event ${event.messageId} has an unparseable timestamp: ${event.timestamp}`,
+            );
+            continue;
+          }
+          if (since !== undefined && date.ymd < since) continue;
+          if (until !== undefined && date.ymd > until) continue;
         }
-        if (since !== undefined && date.ymd < since) continue;
-        if (until !== undefined && date.ymd > until) continue;
       }
       if (matches !== null && !matches(event)) continue;
       out.push(event);

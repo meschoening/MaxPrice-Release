@@ -47,10 +47,12 @@ export function ymdToParts(ymd: string): YmdParts {
 // setting differs from the host zone, host-local window edges would otherwise
 // exclude the most-recent tz-day's events or admit an extra host-day (f8). The
 // N-day shift goes through `Date.UTC(...)` arithmetic — UTC days are exactly
-// 86_400_000 ms — so the result is DST-safe regardless of zone.
-export function ymdShift(days: number, tz?: string): string {
+// 86_400_000 ms — so the result is DST-safe regardless of zone. `now` (epoch-ms)
+// pins "today" for callers that already thread a clock (`TodayClock.now`);
+// it defaults to the wall clock, so every existing call is unchanged.
+export function ymdShift(days: number, tz?: string, now: number = Date.now()): string {
   if (tz === undefined) {
-    const d = new Date();
+    const d = new Date(now);
     d.setDate(d.getDate() + days);
     const y = d.getFullYear();
     const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -60,7 +62,7 @@ export function ymdShift(days: number, tz?: string): string {
   // "Today" in the configured zone — en-CA renders as YYYY-MM-DD, mirroring the
   // engine's `localDate` formatter. Slice to numeric Y/M/D, then shift via UTC
   // math and reformat to dashless YYYYMMDD. Formatter is cached per tz above.
-  const todayInTz = todayInTzFormatter(tz).format(Date.now());
+  const todayInTz = todayInTzFormatter(tz).format(now);
   const year = Number(todayInTz.slice(0, 4));
   const month = Number(todayInTz.slice(5, 7));
   const day = Number(todayInTz.slice(8, 10));

@@ -183,11 +183,14 @@ export function machineUiEnabled(opts: {
   return opts.hubFleetReplica && (opts.hubUrl !== "" || opts.hubConnection !== "off");
 }
 
-// Today's exact subtitle range fragments — liveSubtitle must be byte-identical
-// to the retired SUBTITLE record whenever the fleet gate is off.
+// The subtitle's range fragments — liveSubtitle must be byte-identical to the
+// retired SUBTITLE record whenever the fleet gate is off. The `week` entry is
+// the one deliberate divergence (ADR-0083, below).
 const RANGE_TEXT: Record<DateRangePreset, string> = {
   "24h": "Last 24 hours",
-  "7d": "Last 7 days",
+  // "This week", not "Last 7 days" — the week follows the Week setting
+  // (ADR-0083) and an anchored one is not seven days back from today.
+  week: "This week",
   "30d": "Last 30 days",
   "90d": "Last 90 days",
   all: "All time",

@@ -8,6 +8,7 @@ import {
   nativeBucketMs,
   SPAN_WINDOW_MS,
   todayBucketCount,
+  WEEK_BUCKET_MS,
 } from "@maxprice/shared";
 import type { ResolvedBlockSpan, WindowSpan } from "./block-windows";
 import { localClock, shiftYmd, zonedInstant } from "./local-date";
@@ -39,11 +40,14 @@ import type { StoredEvent } from "./store";
 //     (ADR-0017 — daily's old post-aggregation quirk is retired); for intraday
 //     this was always the case.
 //
-// WINDOWS. The FOUR now-relative spans (`15m`/`1h`/`7d`/`30d`) window by
+// WINDOWS. The THREE now-relative spans (`15m`/`1h`/`30d`) window by
 // epoch-ms relative to `now`, with NO wall-clock snapping (described next).
 // CAVEAT (f10): `today` is the calendar-day exception (ADR-0020) — it DOES
 // wall-clock-snap, anchoring to local midnight in `tz` and binning by tz-local
 // time-of-day; that regime lives in `aggregateToday`, not in the text below.
+// `block` (ADR-0031) and `week` (ADR-0083) are the two ANCHORED growing
+// windows — a caller-resolved start → now — in `aggregateBlockSpan` /
+// `aggregateWeekSpan`.
 //
 // For a now-relative span `S`: `ms = options.bucketMs ?? INTRADAY_SPANS[S].bucketMs`
 // (the explicit override else the span's native bars size), and
@@ -419,9 +423,9 @@ export type AggregateIntradayOptions =
     } & IntradayCommonOptions)
   | ({
       // The chart span — picks the total window length from `SPAN_WINDOW_MS`.
-      // The now-relative spans (`15m`/`1h`/`7d`/`30d`); the line path
-      // requests `7d`/`30d` here too.
-      span: Exclude<Span, "today" | "block">;
+      // The now-relative spans (`15m`/`1h`/`30d`); the line path requests
+      // `30d` here too.
+      span: Exclude<Span, "today" | "block" | "week">;
       // The IANA zone — ignored by the now-relative spans (they window purely by
       // epoch-ms), so optional here.
       tz?: string;
@@ -434,6 +438,15 @@ export type AggregateIntradayOptions =
       // boundary.
       span: "block";
       blockWindow: ResolvedBlockSpan;
+      tz?: string;
+    } & IntradayCommonOptions)
+  | ({
+      // The anchored week (ADR-0083): the HANDLER receives the Week's start as
+      // a `weekStart` instant from the renderer (the ONLY resolver is
+      // `resolveWeekWindow` in `packages/shared`) and hands it in. `tz` is not
+      // load-bearing — the anchor already carries the zone.
+      span: "week";
+      weekStartMs: number;
       tz?: string;
     } & IntradayCommonOptions);
 
@@ -466,6 +479,7 @@ export function aggregateIntraday(
   // below is the `now`-relative windowing the remaining spans share.
   if (options.span === "today") return aggregateToday(events, mode, options);
   if (options.span === "block") return aggregateBlockSpan(events, mode, options);
+  if (options.span === "week") return aggregateWeekSpan(events, mode, options);
 
   // ADR-0041 (M6) lean rule: with the machine axis ON, the project axis defaults
   // OFF (the nested per-machine byProject grid builds only when explicitly asked)
@@ -505,7 +519,7 @@ export function aggregateIntraday(
   // The earliest instant any event can land in (f12): the previous window's
   // start when its ghost is wanted, else the current window's. Combined with the
   // ascending input, this lets the classifier `skip` the long pre-window history
-  // of a `7d`/`30d` query and `stop` once past `now`, without index math.
+  // of a `30d` query and `stop` once past `now`, without index math.
   const windowStart = includePrevious ? previousStart : currentStart;
 
   // Each bucket's `bucketStart` ISO string, precomputed once per window. The
@@ -809,4 +823,84 @@ function aggregateBlockSpan(
       source,
     },
   };
+}
+
+// The `week` span (ADR-0083): an ANCHORED growing window — the Week's start →
+// now — at anchor-aligned daily buckets (bar k covers [start + k·day, start +
+// (k+1)·day)), so a Thursday-08:30 week draws Thu 08:30 → Fri 08:30 bars, the
+// last one live. The ghost is the previous week aligned by time-into-week (the
+// block span's rule). Future in-week events fold into the live bucket (the f13
+// move) so the buckets sum penny-exactly to the This-week tile's instant-
+// bounded /api/daily query. Not tz-aware: the anchor carries the zone already.
+// Unlike `block`, the week never returns `stop` — a future-dated event must
+// fold, like `today`.
+function aggregateWeekSpan(
+  events: StoredEvent[],
+  mode: CostMode,
+  options: AggregateIntradayOptions,
+): IntradayResponse {
+  if (options.span !== "week") throw new Error("intraday: aggregateWeekSpan requires span week");
+  // ADR-0041 (M6) lean rule: machine axis on ⇒ project axis defaults off (see
+  // `aggregateIntraday`); off ⇒ pre-M6 default (on).
+  const {
+    now,
+    includePrevious = true,
+    includeByMachine = false,
+    includeByProject = !includeByMachine,
+  } = options;
+  const startMs = options.weekStartMs;
+  // The type requires the anchor; the runtime guard is the last line of defence
+  // against a NaN from an unchecked `Date.parse` (the `today` tz precedent).
+  if (!Number.isFinite(startMs)) throw new Error("intraday: span week requires weekStartMs");
+  const ms = options.bucketMs ?? WEEK_BUCKET_MS;
+  if (ms <= 0 || SPAN_WINDOW_MS.week % ms !== 0) {
+    throw new Error(`intraday: bucketMs ${ms} does not divide the week`);
+  }
+  // The growing frame: `count` buckets cover start → now, the last in progress.
+  // A renderer-resolved week is at most 7 days old, so the count stays small;
+  // the ceiling guards direct callers with a pathological override regardless.
+  const count = todayBucketCount(Math.max(0, now - startMs), ms);
+  if (count > MAX_INTRADAY_BUCKETS) {
+    throw new Error(
+      `intraday: ${count} buckets for span week at bucketMs ${ms} exceeds the ${MAX_INTRADAY_BUCKETS} ceiling`,
+    );
+  }
+  const prevStart = startMs - SPAN_WINDOW_MS.week;
+  const currentStarts = Array.from({ length: count }, (_, k) =>
+    new Date(startMs + k * ms).toISOString(),
+  );
+  const previousStarts = includePrevious
+    ? Array.from({ length: count }, (_, k) => new Date(prevStart + k * ms).toISOString())
+    : [];
+  // The earliest instant any event can land in: the previous week's start when
+  // its ghost is wanted, else the anchor. Everything earlier is `skip`ped.
+  const lowerBound = includePrevious ? prevStart : startMs;
+  const classify = (event: StoredEvent): EventClass => {
+    const t = Date.parse(event.timestamp);
+    if (Number.isNaN(t) || t < lowerBound) return { kind: "skip" };
+    if (t >= startMs) {
+      // In the current week (including a future-dated event — fold into the
+      // live bucket).
+      return {
+        kind: "bucket",
+        currentIdx: Math.min(Math.floor((t - startMs) / ms), count - 1),
+        previousIdx: null,
+      };
+    }
+    // Same-time-into-week only: the ghost stops where the current frame does.
+    const idx = Math.floor((t - prevStart) / ms);
+    if (includePrevious && idx >= 0 && idx < count) {
+      return { kind: "bucket", currentIdx: null, previousIdx: idx };
+    }
+    return { kind: "skip" };
+  };
+  return assembleWindows(events, mode, {
+    count,
+    currentStarts,
+    previousStarts,
+    includePrevious,
+    includeByProject,
+    includeByMachine,
+    classify,
+  });
 }

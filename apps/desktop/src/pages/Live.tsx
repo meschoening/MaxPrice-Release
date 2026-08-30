@@ -4,6 +4,8 @@ import { Check, ChevronDown } from "lucide-react";
 import { deriveProjectName, deriveProjectPath } from "@maxprice/shared";
 import { useFilters, type ChartStyle, type Metric, type Span } from "@/state/filters";
 import { useLiveData } from "@/state/use-live-data";
+import { useTimeDisplay } from "@/state/use-settings";
+import { useWeekWindow } from "@/state/use-week";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { AXIS_LABELS, GROUP_BY_AXES, selectionLabel, type GroupByAxis } from "@/lib/group-by";
 import { useCorpusEmpty } from "@/state/use-corpus-empty";
@@ -22,12 +24,18 @@ import { cn } from "@/lib/utils";
 // growing window from the block's start, resolved sidecar-side. All six tabs
 // are enabled as of Part 5's T5.4b; `today` was `24h` (a rolling last-24h
 // window) until ADR-0020 made it the local calendar day.
-const SPAN_TABS: readonly Span[] = ["15m", "1h", "block", "today", "7d", "30d"];
+const SPAN_TABS: readonly Span[] = ["15m", "1h", "block", "today", "week", "30d"];
 
-// The display label per span — only `today` and `block` differ from their ids
-// (`today` reads "Today", `block` reads "Block"). The `today` label is honest
-// about being the calendar day rather than a fixed duration (ADR-0020).
-const SPAN_LABELS: Partial<Record<Span, string>> = { today: "Today", block: "Block" };
+// The display label per span — `today`, `block`, and `week` differ from their
+// ids only by capitalization. The `today` label is honest about being the
+// calendar day rather than a fixed duration (ADR-0020); `week` replaced `7d`
+// and follows the Week setting, so it names the concept, not a duration
+// (ADR-0083).
+const SPAN_LABELS: Partial<Record<Span, string>> = {
+  today: "Today",
+  block: "Block",
+  week: "Week",
+};
 
 // The chart card itself — the span × axes → data-source resolution, the
 // compose step, and the block span's empty state — lives in
@@ -101,13 +109,22 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
   // when the cost order changes; the dep is the order itself.
   const sessionFlip = useFlipList(data.topSessions.map((s) => s.sessionId).join("|"));
   const projectFlip = useFlipList(data.topProjects.map((p) => p.slug).join("|"));
+  // ADR-0083: the This-week tile follows the Week setting.
+  const week = useWeekWindow();
+  const display = useTimeDisplay();
 
   return (
     <>
       <section className="tiles" aria-label="Usage summary">
         <TodayTile row={data.todayRow} yesterday={data.yesterdayRow} />
         <ActiveBlockTile block={data.activeBlock} typicalBlockTokens={data.typicalBlockTokens} />
-        <ThisWeekTile rows={data.weekRows} prevRows={data.prevWeekRows} />
+        <ThisWeekTile
+          rows={data.weekRows}
+          prevRows={data.prevWeekRows}
+          rollingStart={data.rollingWeekStart}
+          week={week}
+          display={display}
+        />
       </section>
 
       <section className="panel chart-card" aria-label="Cost over time">

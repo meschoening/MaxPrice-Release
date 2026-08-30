@@ -5,7 +5,9 @@ import { buildProjectOptions } from "@/lib/project-options";
 import { isOptionSelected, selectedOptionCount, toggleOption } from "@/lib/multi-select";
 import { useFilters, type DateRangePreset, resolveDateRange } from "@/state/filters";
 import { corpusExtent, ymdShift } from "@/lib/dates";
-import { useSettings } from "@/state/use-settings";
+import { useSettings, useTimeDisplay } from "@/state/use-settings";
+import { useWeekWindow } from "@/state/use-week";
+import { weekReadout } from "@/lib/week-copy";
 import { useProjects } from "@/state/use-projects";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useProjectAxis } from "@/state/use-project-axis";
@@ -13,7 +15,15 @@ import { shortMachineId } from "@/lib/machines";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 
-const PRESETS: DateRangePreset[] = ["24h", "7d", "30d", "90d", "all"];
+const PRESETS: DateRangePreset[] = ["24h", "week", "30d", "90d", "all"];
+// The preset ids double as their labels except where the id is not a word a
+// reader would recognize: `all` reads "All", and `week` — which replaced `7d`
+// and now follows the Week setting — reads "Week" (ADR-0083).
+function presetLabel(p: DateRangePreset): string {
+  if (p === "week") return "Week";
+  if (p === "all") return "All";
+  return p;
+}
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 // The sidebar's filter fields (glass.html): date presets as a seg pill +
@@ -36,7 +46,11 @@ export function FilterRail() {
   const { data: settings } = useSettings();
   const tz = settings?.timezone;
 
-  const { since, until } = resolveDateRange(dateRange, tz);
+  // ADR-0083: the `week` preset follows the Week setting — an anchored week
+  // resolves to an instant `since` and its own readout below.
+  const week = useWeekWindow();
+  const display = useTimeDisplay();
+  const { since, until } = resolveDateRange(dateRange, tz, week);
   const projectsQ = useProjects({
     since,
     until,
@@ -61,13 +75,18 @@ export function FilterRail() {
   // falls back to a plain label. Like every other date in the app this steps on
   // the next refetch rather than on a timer, so a midnight rollover lands with
   // the next refresh (the ADR-0022 precedent).
+  //
+  // The `week` preset routes through `weekReadout` FIRST: an anchored week's
+  // `since` is an ISO instant, which `rangeReadout`'s `\d{8}` guard would echo
+  // raw rather than crash on — so the branch takes over before it renders one.
   const readout = useMemo(() => {
+    if (dateRange === "week") return weekReadout(week, display, rangeReadout(since, until));
     if (since === undefined && until === undefined) {
       const extent = corpusExtent(projectsQ.data?.projects ?? [], ymdShift(0, tz));
       if (extent) return rangeReadout(extent.since, extent.until);
     }
     return rangeReadout(since, until);
-  }, [since, until, projectsQ.data, tz]);
+  }, [dateRange, week, display, since, until, projectsQ.data, tz]);
 
   const modelOptions = useMemo(
     () => (MODEL_LEGEND_ORDER as readonly string[]).map((m) => ({ value: m, label: m })),
@@ -97,7 +116,7 @@ export function FilterRail() {
               className={cn(p === dateRange && "active")}
               aria-pressed={p === dateRange}
             >
-              {p === "all" ? "All" : p}
+              {presetLabel(p)}
             </button>
           ))}
         </div>

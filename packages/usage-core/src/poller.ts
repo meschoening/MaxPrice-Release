@@ -27,6 +27,10 @@ export type UsagePollerCurrent = {
   connection: UsageConnection;
   sample: UsageSample | null;
   lastSampleAt: string | null;
+  // The last-known weekly reset, INDEPENDENT of `sample` (ADR-0083): a
+  // successful poll with no 5h window in flight reports `sample: null`, but
+  // the weekly window is still known from the latest stored sample.
+  weeklyResetAt: string | null;
 };
 
 export type UsagePoller = {
@@ -178,8 +182,14 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
       currentSample = sample;
     },
     getCurrent: () => {
-      const sample = currentSample === undefined ? opts.store.latest() : currentSample;
-      return { connection, sample, lastSampleAt: opts.store.latest()?.capturedAt ?? null };
+      const latest = opts.store.latest();
+      const sample = currentSample === undefined ? latest : currentSample;
+      return {
+        connection,
+        sample,
+        lastSampleAt: latest?.capturedAt ?? null,
+        weeklyResetAt: sample?.weekly.resetAt ?? latest?.weekly.resetAt ?? null,
+      };
     },
     start: (intervalMs = 60_000) => {
       // pollOnce() owns the single-flight coalescing, so a tick that lands while

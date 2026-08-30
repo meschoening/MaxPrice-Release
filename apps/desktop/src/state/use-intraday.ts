@@ -1,4 +1,4 @@
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, type UseQueryResult } from "@tanstack/react-query";
 import {
   intradayKey,
   intradayResponseSchema,
@@ -16,7 +16,7 @@ import { appendFilterParams, type ReportQueryOptions } from "./report-hook";
 // but does NOT go through `makeReportHook`: that helper builds a `since/until`
 // date-window URL, whereas `/api/intraday` windows itself on a fixed `span`
 // ("15m"/"1h"/"block"/"today" — and, since ADR-0018, the endpoint serves all six
-// spans, "7d"/"30d" included). So the four pieces are spelled out here,
+// spans, "week"/"30d" included). So the four pieces are spelled out here,
 // mirroring `report-hook.ts`'s structure with `span` in place of `since`/`until`.
 //
 // `/api/intraday` returns a plain JSON body (not a stream), so the wrapper is
@@ -30,9 +30,13 @@ export type IntradayHookInput = {
   mode?: CostMode;
   // `tz` (Part 6, ADR-0015) — the `today` span anchors its calendar-day window
   // to local midnight in this zone (ADR-0020), so it is load-bearing there; the
-  // now-relative spans (`15m`/`1h`/`7d`/`30d`) and the server-resolved `block`
+  // now-relative spans (`15m`/`1h`/`week`/`30d`) and the server-resolved `block`
   // window ignore it. Carried for every span so a Timezone-setting change re-keys.
   tz?: string;
+  // ADR-0083: the `span=week` anchor, an ISO instant — REQUIRED by the sidecar
+  // for that span (400 otherwise), absent on every other. Re-keys: the window
+  // is `weekStart → now`.
+  weekStart?: string;
   // The bucket duration in ms (ADR-0018). Omitted → the endpoint's per-span
   // bars default; the line path passes `lineGranularityFor(span)`.
   bucketMs?: number;
@@ -63,6 +67,7 @@ function normalize(opts: IntradayHookInput): IntradayQueryInput {
     span: opts.span,
     mode: opts.mode ?? "auto",
     tz: opts.tz,
+    weekStart: opts.weekStart,
     bucketMs: opts.bucketMs,
     includePrevious: opts.includePrevious,
     includeByProject: opts.includeByProject,
@@ -89,6 +94,9 @@ export function buildIntradayUrl(opts: IntradayHookInput): string {
   const params = new URLSearchParams();
   params.set("span", input.span);
   appendFilterParams(params, input);
+  // ADR-0083: the week anchor, emitted only when set (every non-week URL stays
+  // byte-identical).
+  if (input.weekStart !== undefined) params.set("weekStart", input.weekStart);
   // ADR-0018: an explicit bucket size for the line path. `prev` / `byProject`
   // are only emitted when FALSE — their absent form is the endpoint's `true`
   // default, so the bars/short-span URLs stay byte-identical to before.
@@ -116,7 +124,10 @@ export async function fetchIntraday(
 
 // Piece 4 — the `useQuery` wrapper. `options.enabled: false` parks the query
 // (mounted, never fetching) — the chart-source hook calls every source
-// unconditionally and enables only the active one.
+// unconditionally and enables only the active one. `keepPrevious` is honoured
+// here too: this wrapper is hand-rolled off `makeReportHook`'s SHARED options
+// type, so silently ignoring one of its fields would make the same option mean
+// different things at different call sites.
 export function useIntraday(
   opts: IntradayHookInput,
   options?: ReportQueryOptions,
@@ -125,5 +136,6 @@ export function useIntraday(
     queryKey: intradayQueryKey(opts),
     queryFn: ({ signal }) => fetchIntraday(opts, signal),
     enabled: options?.enabled ?? true,
+    placeholderData: options?.keepPrevious ? keepPreviousData : undefined,
   });
 }

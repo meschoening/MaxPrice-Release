@@ -1,4 +1,4 @@
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, type UseQueryResult } from "@tanstack/react-query";
 import {
   dailyByMachineKey,
   dailyByMachineResponseSchema,
@@ -54,7 +54,9 @@ export async function fetchDailyByMachine(
 }
 
 // Piece 4 — the useQuery wrapper. `options.enabled: false` parks the query
-// (mounted, never fetching) — see report-hook.ts's ReportQueryOptions.
+// (mounted, never fetching) — see report-hook.ts's ReportQueryOptions, whose
+// `keepPrevious` is honoured here as well: this wrapper shares that options
+// type, so every field of it has to mean the same thing at every call site.
 export function useDailyByMachine(
   opts: DailyByMachineHookInput,
   options?: ReportQueryOptions,
@@ -63,5 +65,6 @@ export function useDailyByMachine(
     queryKey: dailyByMachineQueryKey(opts),
     queryFn: ({ signal }) => fetchDailyByMachine(opts, signal),
     enabled: options?.enabled ?? true,
+    placeholderData: options?.keepPrevious ? keepPreviousData : undefined,
   });
 }

@@ -11,6 +11,7 @@ import {
   type ProjectRow,
 } from "@maxprice/shared";
 import { resolveDateRange, useFilters } from "@/state/filters";
+import { useWeekWindow } from "@/state/use-week";
 import { useSettings } from "@/state/use-settings";
 import { useProjects } from "@/state/use-projects";
 import { useMachineAxis } from "@/state/use-machine-axis";
@@ -128,7 +129,8 @@ export function ProjectsPage(): React.ReactElement {
   const models = useFilters((s) => s.models);
   const setProjects = useFilters((s) => s.setProjects);
   const machineAxis = useMachineAxis();
-  const { since, until } = resolveDateRange(dateRange, tz);
+  const week = useWeekWindow();
+  const { since, until } = resolveDateRange(dateRange, tz, week);
 
   const query = useProjects({
     since,

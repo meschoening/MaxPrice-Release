@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { GlassChart } from "@/components/glass-chart";
 import { buildChartModel, type ChartBrand } from "@/lib/chart-model";
-import type { LabelMode } from "@/lib/chart-layout";
+import { labelModeFor, type LabelMode } from "@/lib/chart-layout";
 import type { Composed, LegendGroup } from "@/lib/composed-series";
 import { AXIS_LABELS, logScaleApplies, selectionLabel, type GroupByAxis } from "@/lib/group-by";
 import type { ChartStyle, Metric, MutedState, Span } from "@/state/filters";
@@ -23,11 +23,14 @@ export type CostChartProps = {
   // X-axis labels for the current window (the compose input's `rows[i].date`).
   labels: string[];
   // The active span tab. Drives the x-axis label mode — the daily spans
-  // (7d / 30d) and the span-less compact strips label days, the intraday spans
+  // (week / 30d) and the span-less compact strips label days, the intraday spans
   // label times — and is forwarded to the chart, whose layout puts it in the
   // shapeKey (a span switch rebuilds; a growing span's bucket count doesn't).
   // Compact strip callers omit it (a fixed 30-day strip).
   span?: Span;
+  // ADR-0083: an anchored Week's `week` span reads `/api/intraday` — dated
+  // instants, labeled as times. Absent (compact strips) ⇒ rolling.
+  weekAnchored?: boolean;
   metric: Metric;
   // The normalized group-by selection — only consulted for the log-scale gate
   // (the series split itself is already baked into `composed`).
@@ -67,6 +70,7 @@ export function CostChart(props: CostChartProps): React.ReactElement {
     composed,
     labels,
     span,
+    weekAnchored = false,
     metric,
     axes,
     chartStyle,
@@ -93,7 +97,7 @@ export function CostChart(props: CostChartProps): React.ReactElement {
     if (allMuted) return null;
     if (composed.isEmpty || labels.length === 0) return null;
     // The "now" line marks the rightmost bucket — the in-progress "now" bucket.
-    // True for every span: the daily-resolution tabs (7d / 30d) and, as of
+    // True for every span: the daily-resolution tabs (week / 30d) and, as of
     // Part 5's T5.4b, the intraday tabs (then 15m / 1h / 6h / 24h; since
     // ADR-0031 / ADR-0020: 15m / 1h / block / today), whose rightmost bucket
     // ends at "now" too.
@@ -125,11 +129,12 @@ export function CostChart(props: CostChartProps): React.ReactElement {
     allMuted,
   ]);
 
-  // The x-axis label mode: daily spans (7d / 30d) and the span-less compact
+  // The x-axis label mode: daily spans (week / 30d) and the span-less compact
   // strips label days; the intraday spans (15m / 1h / block / today) label
-  // times. Rides the layout's shapeKey, so a mode flip is a rebuild.
-  const labelMode: LabelMode =
-    span === "7d" || span === "30d" || span === undefined ? "day" : "time";
+  // times — as does an ANCHORED week (ADR-0083), whose buckets are dated
+  // instants from `/api/intraday` rather than calendar days. Rides the
+  // layout's shapeKey, so a mode flip is a rebuild.
+  const labelMode: LabelMode = labelModeFor(span, weekAnchored);
 
   // The svg always renders — with a null model it's the bare 3:1 frame, a
   // stable layout box the loading/error/muted/empty overlays cover. Non-compact

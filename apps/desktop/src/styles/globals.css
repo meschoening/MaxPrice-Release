@@ -970,6 +970,12 @@ a.sb-footrow:hover .sb-label {
   font-size: 12px;
   color: var(--soft);
 }
+/* The This-week eyebrow's mode word ("· since reset", ADR-0083): same
+   eyebrow voice, one step quieter so "THIS WEEK" stays the label. */
+.eyebrow-tag {
+  font-weight: 500;
+  opacity: 0.8;
+}
 .delta {
   align-self: flex-start;
   margin-top: 10px;

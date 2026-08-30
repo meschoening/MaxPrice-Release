@@ -24,6 +24,7 @@ export * from "./live";
 export * from "./pricing";
 export * from "./tz-clock";
 export * from "./time-format";
+export * from "./week";
 export * from "./usage-limits";
 export * from "./usage-status";
 export * from "./hub";

@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
 import type { BlockRow, TimeDisplay } from "@maxprice/shared";
 import { resolveDateRange, useFilters } from "@/state/filters";
+import { useWeekWindow } from "@/state/use-week";
 import { useSettings, useTimeDisplay } from "@/state/use-settings";
 import { useBlocks } from "@/state/use-blocks";
 import { useMachineAxis } from "@/state/use-machine-axis";
@@ -84,7 +85,8 @@ export function BlocksPage(): React.ReactElement {
   const { data: settings } = useSettings();
   const tz = settings?.timezone;
   const display = useTimeDisplay();
-  const { since, until } = resolveDateRange(dateRange, tz);
+  const week = useWeekWindow();
+  const { since, until } = resolveDateRange(dateRange, tz, week);
   const now = useNowTick(60_000);
 
   const query = useBlocks({

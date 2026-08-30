@@ -1,10 +1,16 @@
-import { DAY_MS, lineGranularityFor, SPAN_WINDOW_MS, todayLineBucketMs } from "@maxprice/shared";
+import {
+  DAY_MS,
+  lineGranularityFor,
+  SPAN_WINDOW_MS,
+  todayLineBucketMs,
+  type WeekWindow,
+} from "@maxprice/shared";
 import type { ChartStyle, Span } from "@/state/filters";
 import { msSinceLocalMidnight } from "./dates";
 
 // ADR-0018: the line chart styles (`cumulative` / `trend`) draw a fine 15-min
 // bucket on every span, so they always read from the `/api/intraday` data
-// source — even for `7d` / `30d` — at the size `lineBucketMsFor` picks (the
+// source — even for `week` / `30d` — at the size `lineBucketMsFor` picks (the
 // 15-min floor, or the adaptive `today` size; ADR-0022). Bars are unchanged:
 // they keep the ADR-0013 routing (native per-span bucket).
 export function isLineStyle(style: ChartStyle): boolean {
@@ -12,7 +18,7 @@ export function isLineStyle(style: ChartStyle): boolean {
 }
 
 // 15-min line buckets only need a date-bearing axis label past a 24h window
-// (a bare HH:mm recurs each day on `7d` / `30d` and would collide as a join
+// (a bare HH:mm recurs each day on `week` / `30d` and would collide as a join
 // key). Deliberately excludes `today` (`SPAN_WINDOW_MS["today"] === DAY_MS`, its
 // maximum — a single calendar day stays a bare HH:mm axis; ADR-0020).
 export function lineLabelsNeedDate(span: Span): boolean {
@@ -48,17 +54,25 @@ export type TodayClock = { tz?: string; now?: number };
 // `tz` and pins `now` for tests; omitting it falls back to host-zone
 // `Date.now()` (and an undefined `tz`), a silent behavior change from the
 // pre-ADR-0022 deterministic 15-min bucket. Every other span ignores `clock`.
+//
+// `week` reads the resolved Week (ADR-0083): an ANCHORED week's bars come from
+// `/api/intraday` at the sidecar's default `WEEK_BUCKET_MS` (so `bucketMs`
+// stays omitted, the `block` precedent) as daily buckets aligned to the
+// anchor's time-of-day — dated instants, not calendar days, hence `withDate`.
+// A rolling week (or no `week` at all) is exactly the pre-ADR-0083 request.
 export function lineRequestFor(
   span: Span,
   chartStyle: ChartStyle,
   clock?: TodayClock,
+  week?: WeekWindow,
 ): { bucketMs: number | undefined; withDate: boolean } {
   const line = isLineStyle(chartStyle);
+  const anchoredWeek = span === "week" && week?.kind === "anchored";
   return {
     // `block` never sends a bucketMs — the sidecar supplies the constant
     // `BLOCK_BUCKET_MS` for BOTH styles (ADR-0046, pinning ADR-0031's adaptive
     // rung — the one exception to renderer-owned policy).
     bucketMs: line && span !== "block" ? lineBucketMsFor(span, clock) : undefined,
-    withDate: line && lineLabelsNeedDate(span),
+    withDate: (line && lineLabelsNeedDate(span)) || anchoredWeek,
   };
 }

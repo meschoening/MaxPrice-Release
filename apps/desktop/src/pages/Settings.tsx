@@ -4,6 +4,7 @@ import { useSettings, useUpdateSettings } from "@/state/use-settings";
 import { PathList } from "@/components/settings/PathList";
 import { TimezoneSelect } from "@/components/settings/TimezoneSelect";
 import { TimeFormatControl } from "@/components/settings/TimeFormatControl";
+import { WeekControl } from "@/components/settings/WeekControl";
 import { CostModeControl } from "@/components/settings/CostModeControl";
 import { UpdatesSection } from "@/components/settings/UpdatesSection";
 import { BackgroundSection } from "@/components/settings/background-section";
@@ -123,6 +124,12 @@ export function SettingsPage(): React.ReactElement {
             value={current.timeFormat}
             onChange={(timeFormat) => void update({ timeFormat })}
           />
+        </Section>
+
+        {/* Week sits under Timezone because the anchored modes are wall-clock:
+            a custom weekday/time resolves in the zone chosen just above. */}
+        <Section title="Week" description="What “this week” means across the app.">
+          <WeekControl value={current.week} onChange={(week) => void update({ week })} />
         </Section>
 
         <Section title="Cost mode" description="How each row's cost is sourced from the JSONL.">

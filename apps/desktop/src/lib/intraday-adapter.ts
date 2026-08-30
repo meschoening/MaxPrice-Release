@@ -35,7 +35,7 @@ import { foldMachineEntries, type MachineSeriesEntry } from "@/lib/machines";
 // `packages/shared` changes. Because the by-project join keys on `date`, the
 // labels MUST be unique within a window. For the ≤24h spans a bare `HH:mm` is
 // unique (buckets are ≥1 min apart and a window is ≤24h). For the ADR-0018 line
-// spans `7d` / `30d`, 15-min buckets span MULTIPLE days, so the same `HH:mm`
+// spans `week` / `30d`, 15-min buckets span MULTIPLE days, so the same `HH:mm`
 // recurs each day — those callers pass `withDate`, which prefixes `MM/DD` so
 // every bucket across the window keeps a distinct label. NOTE: `MM/DD HH:mm`
 // is NOT collision-proof across a DST fall-back — the repeated wall-clock hour

@@ -6,8 +6,9 @@ import type {
   HubMachine,
   IntradaySpan,
   TimeDisplay,
+  WeekWindow,
 } from "@maxprice/shared";
-import type { IntradayResponse } from "@maxprice/shared";
+import { weekParamsFor, zonedInstant, type IntradayResponse } from "@maxprice/shared";
 import type { ChartStyle, Span } from "@/state/filters";
 import type { GroupByAxis } from "@/lib/group-by";
 import { ymdShift } from "./dates";
@@ -36,19 +37,54 @@ import { foldMachineProjectSeries, foldProjectSeries } from "./projects";
 
 // The intraday span identifiers — the spans whose bars are served by
 // `/api/intraday` rather than `/api/daily`. A `Span` in this set routes the
-// chart to the intraday data source; `7d` / `30d` keep the daily path.
+// chart to the intraday data source; `week` / `30d` keep the daily path —
+// except an ANCHORED week (`weekIsAnchored` below), which is a growing
+// `[weekStart → now]` frame the daily endpoint cannot serve (ADR-0083).
 const INTRADAY_SPAN_SET = new Set<Span>(["15m", "1h", "block", "today"]);
 
 export function isIntradaySpan(span: Span): span is IntradaySpan {
   return INTRADAY_SPAN_SET.has(span);
 }
 
+// ADR-0083: the `week` tab frames THE Week. Anchored (limit-reset / custom)
+// ⇒ `/api/intraday?span=week` for bars and lines alike; rolling ⇒ the daily
+// path for bars, exactly as before. Deliberately not folded into
+// `isIntradaySpan`, which stays a type guard on the four native spans.
+function weekIsAnchored(span: Span, week: WeekWindow | undefined): boolean {
+  return span === "week" && week?.kind === "anchored";
+}
+
+// The `weekStart` the intraday request carries — REQUIRED by the sidecar for
+// every `span=week` request (400 otherwise), absent on every other span.
+//   anchored ⇒ the resolved Week's start, the same instant `weekParamsFor`
+//     puts on the wire for every other week-scoped report;
+//   rolling + a LINE style ⇒ local midnight six days ago in the Settings tz
+//     (host zone when unset — the `resolveWeekWindow` convention), so the
+//     line's `[weekStart → now]` window IS the rolling tile's calendar-day
+//     window (today−6 → now). Rolling bars never reach `/api/intraday`, so
+//     they carry none. Derived through `ymdShift` on the SAME clock the
+//     window math reads — it advances once a day at local midnight, on the
+//     next render after it (the ADR-0020 inherit-refetch cadence).
+function weekStartFor(
+  span: Span,
+  chartStyle: ChartStyle,
+  week: WeekWindow | undefined,
+  clock: TodayClock | undefined,
+): string | undefined {
+  if (span !== "week") return undefined;
+  const anchored = week ? weekParamsFor(week) : null;
+  if (anchored) return anchored.since;
+  if (!isLineStyle(chartStyle)) return undefined;
+  const zone = clock?.tz ?? new Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return new Date(zonedInstant(ymdShift(-6, zone, clock?.now), 0, zone)).toISOString();
+}
+
 // Map a Span to its day count for the daily-span chart windows. Only the daily
-// spans (7d / 30d) have a meaningful day count; the intraday spans fall back
+// spans (week / 30d) have a meaningful day count; the intraday spans fall back
 // to 7 (their daily window is fetched-but-unused — see use-live-data.ts).
 export function spanDays(span: Span): number {
   if (span === "30d") return 30;
-  if (span === "7d") return 7;
+  if (span === "week") return 7;
   return 7;
 }
 
@@ -63,22 +99,24 @@ export function spanDays(span: Span): number {
 export function chartWindow(
   span: Span,
   tz?: string,
+  now?: number,
 ): { chartStart: string; chartUntil: string; prevChartStart: string; prevChartEnd: string } {
   const days = spanDays(span);
   return {
-    chartStart: ymdShift(-(days - 1), tz),
-    chartUntil: ymdShift(0, tz),
-    prevChartStart: ymdShift(-(2 * days - 1), tz),
-    prevChartEnd: ymdShift(-days, tz),
+    chartStart: ymdShift(-(days - 1), tz, now),
+    chartUntil: ymdShift(0, tz, now),
+    prevChartStart: ymdShift(-(2 * days - 1), tz, now),
+    prevChartEnd: ymdShift(-days, tz, now),
   };
 }
 
 // --- the request derivation ---------------------------------------------------
 
 // Which of the four sources feeds the chart. The two-bit routing the six
-// components encoded as JSX dispatch: line styles and intraday spans read
-// `/api/intraday` (ADR-0018's line override included); daily bars route on the
-// machine bit first (machine outranks project — ADR-0041 M6), then project.
+// components encoded as JSX dispatch: line styles, intraday spans, and the
+// anchored week (ADR-0083) read `/api/intraday` (ADR-0018's line override
+// included); daily bars route on the machine bit first (machine outranks
+// project — ADR-0041 M6), then project.
 export type ChartSourceKind = "daily-flat" | "daily-project" | "daily-machine" | "intraday";
 
 export type ChartSourceRequest = {
@@ -95,6 +133,8 @@ export type ChartSourceRequest = {
     // ADR-0031's adaptive rung).
     bucketMs: number | undefined;
     withDate: boolean;
+    // ADR-0083: the `span=week` anchor (see `weekStartFor`); absent otherwise.
+    weekStart: string | undefined;
     // Bars always fetch the previous window (a ghost toggle never refetches);
     // the dense line spans fetch it only while the ghost is on (ADR-0018).
     includePrevious: boolean;
@@ -120,11 +160,15 @@ export function resolveChartRequest(input: {
   // The Settings tz (window math + today's midnight anchor) and an optional
   // pinned `now` for tests — today's adaptive line bucket reads the clock.
   clock?: TodayClock;
+  // The resolved Week (ADR-0083) — read by the `week` span only. Absent
+  // (the compact strips' span-less callers) ⇒ rolling.
+  week?: WeekWindow;
 }): ChartSourceRequest {
-  const { span, chartStyle, axes, ghostOverlay, clock } = input;
+  const { span, chartStyle, axes, ghostOverlay, clock, week } = input;
   const machineOn = axes.includes("machine");
   const projectOn = axes.includes("project");
-  const intradayActive = isLineStyle(chartStyle) || isIntradaySpan(span);
+  const intradayActive =
+    isLineStyle(chartStyle) || isIntradaySpan(span) || weekIsAnchored(span, week);
   const kind: ChartSourceKind = intradayActive
     ? "intraday"
     : machineOn
@@ -132,8 +176,7 @@ export function resolveChartRequest(input: {
       : projectOn
         ? "daily-project"
         : "daily-flat";
-  const { bucketMs, withDate } = lineRequestFor(span, chartStyle, clock);
-  const tz = clock?.tz;
+  const { bucketMs, withDate } = lineRequestFor(span, chartStyle, clock, week);
   return {
     kind,
     projectOn,
@@ -141,11 +184,12 @@ export function resolveChartRequest(input: {
     intraday: {
       bucketMs,
       withDate,
+      weekStart: weekStartFor(span, chartStyle, week, clock),
       includePrevious: isLineStyle(chartStyle) ? ghostOverlay : true,
       includeByProject: projectOn,
       includeByMachine: machineOn ? true : undefined,
     },
-    window: chartWindow(span, tz),
+    window: chartWindow(span, clock?.tz, clock?.now),
   };
 }
 

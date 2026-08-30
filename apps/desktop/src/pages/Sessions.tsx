@@ -9,6 +9,7 @@ import {
   type SessionRow,
 } from "@maxprice/shared";
 import { resolveDateRange, useFilters } from "@/state/filters";
+import { useWeekWindow } from "@/state/use-week";
 import { useSettings } from "@/state/use-settings";
 import { useSessions } from "@/state/use-sessions";
 import { useMachineAxis } from "@/state/use-machine-axis";
@@ -59,7 +60,8 @@ export function SessionsPage(): React.ReactElement {
   const projects = useProjectAxis().projectParams;
   const models = useFilters((s) => s.models);
   const machineAxis = useMachineAxis();
-  const { since, until } = resolveDateRange(dateRange, tz);
+  const week = useWeekWindow();
+  const { since, until } = resolveDateRange(dateRange, tz, week);
 
   const query = useSessions({
     since,

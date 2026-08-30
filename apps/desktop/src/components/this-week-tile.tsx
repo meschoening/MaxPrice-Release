@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import type { DailyRow } from "@maxprice/shared";
+import type { DailyRow, TimeDisplay, WeekWindow } from "@maxprice/shared";
 import { formatRemainingLong } from "@/lib/active-block";
 import { usageRingState } from "@/lib/usage-ring";
 import { useLiveStatus } from "@/state/use-live-status";
@@ -8,11 +8,19 @@ import { useUsageCurrent } from "@/state/use-usage-current";
 import { useBump } from "@/state/use-bump";
 import { UsageExpiredHint } from "@/components/usage-expired-hint";
 import { DeltaChip } from "./delta-chip";
+import { weekEyebrowTag, weekRefLabel, weekTag } from "@/lib/week-copy";
 import { cn } from "@/lib/utils";
 
 export type ThisWeekTileProps = {
   rows: DailyRow[];
   prevRows: DailyRow[];
+  // The rolling window's first local date (YYYY-MM-DD) — the sub-line's
+  // source while the Week is rolling; an anchored Week reads `week.startMs`.
+  rollingStart: string;
+  // The resolved Week (ADR-0083) — the sub-line, the delta's reference label,
+  // and the fallback line all read it; `display` renders an anchored start.
+  week: WeekWindow;
+  display: TimeDisplay;
 };
 
 // The This-week tile (glass.html): eyebrow, 800-weight value, the week
@@ -20,7 +28,13 @@ export type ThisWeekTileProps = {
 // weekly usage limit — the old weekly ring — relocated to a meter row
 // wearing the same Aurora gradient + glow as the 5-hour tracker: both are
 // live polled-limit readings (NOTES §Option C).
-export function ThisWeekTile({ rows, prevRows }: ThisWeekTileProps): React.ReactElement {
+export function ThisWeekTile({
+  rows,
+  prevRows,
+  rollingStart,
+  week,
+  display,
+}: ThisWeekTileProps): React.ReactElement {
   const total = useMemo(() => rows.reduce((s, r) => s + r.totalCost, 0), [rows]);
   const prevTotal = useMemo(() => prevRows.reduce((s, r) => s + r.totalCost, 0), [prevRows]);
   const delta = total - prevTotal;
@@ -39,11 +53,21 @@ export function ThisWeekTile({ rows, prevRows }: ThisWeekTileProps): React.React
   const weeklyPct =
     ring.kind === "limit" && usage?.sample ? Math.round(usage.sample.weekly.utilizationPct) : null;
 
+  const eyebrowTag = weekEyebrowTag(week);
+
   return (
     <div className="tile panel">
-      <span className="eyebrow">This week</span>
+      <span className="eyebrow">
+        This week
+        {eyebrowTag !== null ? <span className="eyebrow-tag"> · {eyebrowTag}</span> : null}
+      </span>
       <span className={cn("value num", bumping && "bump")}>{valueText}</span>
-      <span className="tile-sub num">{weekTag(rows)}</span>
+      <span className="tile-sub num">{weekTag(week, rollingStart, display)}</span>
+      {week.kind === "rolling" && week.fallback ? (
+        <span className="inline-flex items-center gap-1 text-[11px] text-warn">
+          ⚠ weekly reset unknown — showing last 7 days
+        </span>
+      ) : null}
       {weeklyPct !== null ? (
         <div className="limit-row">
           <label>weekly limit used</label>
@@ -60,23 +84,10 @@ export function ThisWeekTile({ rows, prevRows }: ThisWeekTileProps): React.React
           <b className="num">{weeklyPct}%</b>
         </div>
       ) : null}
-      {/* "prior 7d", not the mock's "last week": the shipped week window is
-          rolling, and the frozen copy stays honest about it. */}
-      <DeltaChip delta={delta} pct={pct} refLabel="prior 7d" refValue={prevTotal} />
+      {/* "prior 7d" / "prior week to date", not the mock's "last week": the
+          copy stays honest about which window the delta compares. */}
+      <DeltaChip delta={delta} pct={pct} refLabel={weekRefLabel(week)} refValue={prevTotal} />
       {usageConnection === "expired" ? <UsageExpiredHint /> : null}
     </div>
   );
-}
-
-const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-// "Mon Jul 13 → now" — the week window tag from the first row's date.
-function weekTag(rows: DailyRow[]): string {
-  const first = rows[0];
-  if (!first) return "";
-  const [y, m, d] = first.date.split("-").map(Number);
-  if (!y || !m || !d) return "";
-  const day = new Date(y, m - 1, d);
-  return `${WEEKDAYS[day.getDay()]} ${MONTHS[m - 1]} ${d} → now`;
 }

@@ -28,6 +28,9 @@ export type ChartCardBodyProps = {
   // X-axis labels for the current window (the compose input's `rows[i].date`).
   labels: string[];
   span: Span;
+  // ADR-0083: whether the `week` span frames an anchored Week — its buckets are
+  // dated instants rather than calendar days, which flips the x-axis label mode.
+  weekAnchored: boolean;
   metric: Metric;
   axes: GroupByAxis[];
   chartStyle: ChartStyle;
@@ -52,6 +55,7 @@ export function ChartCardBody({
   composed,
   labels,
   span,
+  weekAnchored,
   metric,
   axes,
   chartStyle,
@@ -79,6 +83,7 @@ export function ChartCardBody({
         composed={applied}
         labels={labels}
         span={span}
+        weekAnchored={weekAnchored}
         metric={metric}
         axes={axes}
         chartStyle={chartStyle}

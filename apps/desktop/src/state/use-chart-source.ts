@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import type { WeekWindow } from "@maxprice/shared";
 import {
   enabledFor,
   resolveChartRequest,
@@ -39,8 +40,10 @@ export function useChartSource(input: {
   chartStyle: ChartStyle;
   axes: GroupByAxis[];
   ghostOverlay: boolean;
+  // The resolved Week (ADR-0083; `useWeekWindow`) — routes the `week` span.
+  week: WeekWindow;
 }): ChartSource {
-  const { span, chartStyle, axes, ghostOverlay } = input;
+  const { span, chartStyle, axes, ghostOverlay, week } = input;
   const { data: settings } = useSettings();
   const costMode = settings?.costMode ?? "auto";
   const tz = settings?.timezone;
@@ -73,7 +76,14 @@ export function useChartSource(input: {
   // (ADR-0022) reads the clock, and its step cadence is "the next refetch-
   // driven render" (ADR-0020) — a memo keyed on the chart controls would pin
   // the mount-time rung all day. Cheap: a few compares + four ymdShift calls.
-  const request = resolveChartRequest({ span, chartStyle, axes, ghostOverlay, clock: { tz } });
+  const request = resolveChartRequest({
+    span,
+    chartStyle,
+    axes,
+    ghostOverlay,
+    clock: { tz },
+    week,
+  });
   // Which of the three gated source queries fetches — only the active one; the
   // daily-flat path reads `chart` (the chart-window slice) instead of a query.
   const enabled = enabledFor(request.kind);
@@ -83,6 +93,7 @@ export function useChartSource(input: {
       span,
       mode: costMode,
       tz,
+      weekStart: request.intraday.weekStart,
       projects,
       models,
       machines: machineAxis.machineParams,
@@ -127,7 +138,7 @@ export function useChartSource(input: {
 
   // The assembly memo keys on the request's render-stable fields plus each
   // query's data/status — NOT the `request` object itself, which is fresh
-  // every render by design (see above; its only render-unstable field,
+  // every render by design (see above; its render-unstable field,
   // `intraday.bucketMs`, feeds the query key alone and is never read by the
   // assembly). Granular query-field deps mirror the retired six components'
   // memos: TanStack's result object is new each render, but `.data` is stable.
@@ -160,6 +171,12 @@ export function useChartSource(input: {
       request.projectOn,
       request.machineOn,
       request.intraday.withDate,
+      // ADR-0083: the week anchor, as a primitive string. The assembly never
+      // reads it directly — it re-keys the intraday query, whose `.data`
+      // below is what changes — but it rides here so a Week change (a new
+      // anchor, or the rolling line's midnight roll) is an explicit dep of
+      // this hand-maintained array rather than an incidental one.
+      request.intraday.weekStart,
       request.window.chartStart,
       request.window.chartUntil,
       request.window.prevChartStart,

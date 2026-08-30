@@ -53,7 +53,7 @@ function clockFormatterFor(timeZone: string | undefined): Intl.DateTimeFormat {
 
 // An instant's tz-local wall-clock components. `instant` accepts the union both
 // callers need: epoch-ms (renderer `now`, engine `aggregateToday`'s `now`), an
-// ISO string, or a Date (engine `localClock` / `tzOffsetMs`). `timeZone`
+// ISO string, or a Date (engine `localClock`). `timeZone`
 // `undefined` resolves to the host zone.
 export function tzClockParts(
   instant: number | string | Date,
@@ -79,4 +79,29 @@ export function tzClockParts(
 // granularity, so it never changes a bucket assignment.
 export function msSinceMidnightOf(parts: TzClockParts): number {
   return ((parts.hour * 60 + parts.minute) * 60 + parts.second) * 1000;
+}
+
+// `timeZone`'s UTC offset (ms) at `instant`: the zone's wall clock at that
+// instant read as if it were UTC, minus the instant. Positive east of UTC.
+export function tzOffsetMs(instant: number, timeZone: string): number {
+  const { year, month, day, hour, minute, second } = tzClockParts(instant, timeZone);
+  return Date.UTC(year, month - 1, day, hour, minute, second) - instant;
+}
+
+// The UTC instant (epoch-ms) of local wall-clock time `ymd` (dashless) +
+// `msSinceMidnight`, in `timeZone`. The canonical "zoned time → instant"
+// algorithm: guess by treating the wall clock as UTC, correct by the zone's
+// offset, then re-check once for a DST transition straddle. Used to label each
+// `today` bucket's `bucketStart` with the correct local hour even across a
+// spring-forward / fall-back boundary.
+export function zonedInstant(ymd: string, msSinceMidnight: number, timeZone: string): number {
+  const year = Number(ymd.slice(0, 4));
+  const month = Number(ymd.slice(4, 6));
+  const day = Number(ymd.slice(6, 8));
+  const wallAsUtc = Date.UTC(year, month - 1, day) + msSinceMidnight;
+  const off1 = tzOffsetMs(wallAsUtc, timeZone);
+  let instant = wallAsUtc - off1;
+  const off2 = tzOffsetMs(instant, timeZone);
+  if (off2 !== off1) instant = wallAsUtc - off2;
+  return instant;
 }
