@@ -1,3 +1,5 @@
+// macOS runtime placement now lives in macos_popout.rs (ADR-0084).
+// The physical-coordinate machinery below is used by Windows.
 // Tray-popout positioning (ADR-0050; map #168 M2 — ported wholesale from the
 // hub, apps/hub-desktop/src-tauri/src/popout.rs, whose tray popout is the
 // proven template). Pure math, unit-tested; the runtime glue in lib.rs feeds

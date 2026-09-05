@@ -7,6 +7,8 @@ use parking_lot::Mutex;
 
 #[cfg(windows)]
 mod job_object;
+#[cfg(any(target_os = "macos", test))]
+mod macos_popout;
 mod popout;
 mod sidecar_log;
 use tauri::tray::{MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -1101,14 +1103,65 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
         popout::TrayClick::Show => {}
     }
 
+    // Snapshot the clicked screen before settings IO, never from the hidden
+    // popout's previous monitor. The macOS adapter owns the coordinate units.
+    #[cfg(target_os = "macos")]
+    let anchor = macos_popout::capture(rect);
+    let logical = popout_logical_size(app.config());
+    if let Some(logical) = logical {
+        #[cfg(target_os = "macos")]
+        {
+            let placed = anchor.as_ref().and_then(|a| a.placement(logical));
+            if let Some(p) = placed {
+                if let Err(error) = macos_popout::apply(&window, p) {
+                    eprintln!("[popout] positioning failed: {error}");
+                }
+            } else {
+                // No placement: keep the last position (ADR-0084 — never
+                // guess a display) but still apply the configured size, which
+                // the pre-adapter path wrote unconditionally. tao's queued
+                // setter is fine here: nothing changes display, so the
+                // activation ordering apply() exists for is moot.
+                match &anchor {
+                    Some(a) => eprintln!(
+                        "[popout] no screen for the click — showing at last position: {a:?} size={logical:?}"
+                    ),
+                    None => eprintln!(
+                        "[popout] no native screen snapshot (off main thread) — showing at last position"
+                    ),
+                }
+                let _ = window.set_size(tauri::LogicalSize::new(logical.0, logical.1));
+            }
+        }
+        if !cfg!(target_os = "macos") {
+            place_popout_physical(app, &window, rect, logical);
+        }
+    }
+    // Strictly show THEN focus: tao no-ops set_focus on an invisible window
+    // (macOS), and an unfocused show can't blur-dismiss (#7884) — while on
+    // Windows a re-shown-without-focus window stops firing blur entirely
+    // (#13633). The focus is what makes focus-loss dismissal work at all.
+    //
+    // show() is the one call on this path with no fallback: if it fails the
+    // tray click did nothing at all and the user has no way to find out, so it
+    // gets a log. size/position/focus stay best-effort — each degrades into a
+    // popout that is merely mispositioned or unfocused, not absent.
+    if let Err(e) = window.show() {
+        eprintln!("[hub] popout show failed: {e}");
+    }
+    let _ = window.set_focus();
+}
+
+// Windows retains physical pixels and the two passes required by WM_DPICHANGED.
+fn place_popout_physical(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    rect: &tauri::Rect,
+    logical: (f64, f64),
+) {
     let tray = tray_rect_px(rect);
-    // Which monitor the tray icon is on, decided HERE rather than by the
-    // runtime's `monitor_from_point`: that call is implemented per platform
-    // against whatever the platform's own API wants, and the two units do not
-    // agree (`popout::monitor_containing` carries the measurement). Everything
-    // else on this path — the tray rect, the monitor bounds, the work area,
-    // `set_position` — is physical, so the containment is done in physical too
-    // and the whole routine stays in one coordinate space.
+    // On Windows the tray, monitor bounds, work area, and setter all use
+    // the same global physical-pixel coordinates.
     let monitors = app.available_monitors().unwrap_or_default();
     let bounds: Vec<popout::Px> = monitors
         .iter()
@@ -1140,100 +1193,67 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
             wa.size.width as f64,
             wa.size.height as f64,
         );
-        // The popout's geometry is ours at show time — size as well as
-        // position, and both re-asserted from scratch on every open rather
-        // than inherited from the window. `popout_physical_size` carries the
-        // why: tao rescales this window behind our backs on any DPI event and
-        // can strand it at the wrong physical size for the rest of the
-        // process's life (the CSS viewport then collapses — clipped action
-        // row, ellipsized state column — which no amount of hiding and
-        // showing repairs). Deriving from the configured logical size and the
-        // target monitor's LIVE scale factor also retires the old
-        // outer_size()/scale_factor() rescale, whose whole job was to carry a
-        // size across a mixed-DPI move (tauri #7139/#7890).
-        //
-        // The UNIT is the platform's, not ours (popout::InnerSize): Windows is
-        // held to physical because its per-window scale factor is the value
-        // that goes stale; macOS is held to points because its MONITOR scale
-        // factor is the value that goes wrong — tao answers 1.0 when its
-        // NSScreen lookup misses, and the physical path then hands AppKit a
-        // size it halves.
-        if let Some(logical) = popout_logical_size(app.config()) {
-            let scale = monitor.scale_factor();
-            let place = || {
-                match popout::popout_inner_size(logical, scale, cfg!(target_os = "macos")) {
-                    Some(popout::InnerSize::Logical(w, h)) => {
-                        let _ = window.set_size(tauri::LogicalSize::new(w, h));
-                    }
-                    Some(popout::InnerSize::Physical(w, h)) => {
-                        let _ = window
-                            .set_size(tauri::PhysicalSize::new(w.round() as u32, h.round() as u32));
-                    }
-                    // Nothing describable to assert — leave the window at
-                    // whatever it already measures and still place it.
-                    None => {}
+
+        let scale = monitor.scale_factor();
+        let place = || {
+            match popout::popout_inner_size(logical, scale, false) {
+                Some(popout::InnerSize::Logical(w, h)) => {
+                    let _ = window.set_size(tauri::LogicalSize::new(w, h));
                 }
-                // Position speaks the OUTER box (set_position moves the outer
-                // rect, and an undecorated Win11 window still carries an
-                // invisible resize frame — 22x13px at 150%). Read it back AFTER
-                // the correction so that frame delta is measured on a
-                // right-sized window. It also speaks PHYSICAL on every
-                // platform, so the fallback is still derived — config x the
-                // target monitor's scale — with the configured logical size as
-                // the last resort.
-                let anchor = popout::popout_physical_size(logical, scale);
-                let Some(pop) = window
-                    .outer_size()
-                    .map(|s| (s.width as f64, s.height as f64))
-                    .ok()
-                    .or(anchor)
-                else {
-                    // No physical size from either source. Placing off the
-                    // LOGICAL pair instead would silently mix units (half the
-                    // real box on a 2x display), so leave the popout where it
-                    // is — it still shows, which is the standing trade here.
-                    return;
-                };
-                let (x, y) =
-                    popout::popout_position(tray, mon, work, pop, cfg!(target_os = "macos"));
-                let _ = window.set_position(tauri::PhysicalPosition::new(
-                    x.round() as i32,
-                    y.round() as i32,
-                ));
+                Some(popout::InnerSize::Physical(w, h)) => {
+                    let _ = window
+                        .set_size(tauri::PhysicalSize::new(w.round() as u32, h.round() as u32));
+                }
+                // Nothing describable to assert — leave the window at
+                // whatever it already measures and still place it.
+                None => {}
+            }
+            // Position speaks the OUTER box (set_position moves the outer
+            // rect, and an undecorated Win11 window still carries an
+            // invisible resize frame — 22x13px at 150%). Read it back AFTER
+            // the correction so that frame delta is measured on a
+            // right-sized window. It also speaks PHYSICAL on every
+            // platform, so the fallback is still derived — config x the
+            // target monitor's scale — with the configured logical size as
+            // the last resort.
+            let anchor = popout::popout_physical_size(logical, scale);
+            let Some(pop) = window
+                .outer_size()
+                .map(|s| (s.width as f64, s.height as f64))
+                .ok()
+                .or(anchor)
+            else {
+                // No physical size from either source. Placing off the
+                // LOGICAL pair instead would silently mix units (half the
+                // real box on a 2x display), so leave the popout where it
+                // is — it still shows, which is the standing trade here.
+                return;
             };
-            // TWICE, on purpose. Moving the popout to a monitor whose scale
-            // differs from the one it was last parked on makes Windows deliver
-            // WM_DPICHANGED *synchronously inside our own set_position*, and
-            // tao's handler answers it by rescaling the window itself
-            // (old physical → old logical → new physical) and SetWindowPos-ing
-            // to Windows' suggested rect. So the first pass's work is undone as
-            // it lands: a 224px popout re-sized 224/1.5 = 149px — the exact
-            // collapse ADR-0050 exists to kill — and moved somewhere we did not
-            // choose. The second pass runs after that rescale, re-asserting the
-            // size AND re-reading `outer_size` so the invisible-frame delta is
-            // finally measured at the DESTINATION monitor's DPI.
-            //
-            // Not gated on a scale comparison: `window.scale_factor()` is the
-            // cached per-window value this whole routine distrusts. With no DPI
-            // event the second pass is an idempotent no-op, and the window is
-            // still hidden either way (`show()` is below), so nothing flickers.
-            place();
-            place();
-        }
+            let (x, y) = popout::popout_position(tray, mon, work, pop, false);
+            let _ = window.set_position(tauri::PhysicalPosition::new(
+                x.round() as i32,
+                y.round() as i32,
+            ));
+        };
+        // TWICE, on purpose. Moving the popout to a monitor whose scale
+        // differs from the one it was last parked on makes Windows deliver
+        // WM_DPICHANGED *synchronously inside our own set_position*, and
+        // tao's handler answers it by rescaling the window itself
+        // (old physical → old logical → new physical) and SetWindowPos-ing
+        // to Windows' suggested rect. So the first pass's work is undone as
+        // it lands: a 224px popout re-sized 224/1.5 = 149px — the exact
+        // collapse ADR-0050 exists to kill — and moved somewhere we did not
+        // choose. The second pass runs after that rescale, re-asserting the
+        // size AND re-reading `outer_size` so the invisible-frame delta is
+        // finally measured at the DESTINATION monitor's DPI.
+        //
+        // Not gated on a scale comparison: `window.scale_factor()` is the
+        // cached per-window value this whole routine distrusts. With no DPI
+        // event the second pass is an idempotent no-op, and the window is
+        // still hidden either way (`show()` is below), so nothing flickers.
+        place();
+        place();
     }
-    // Strictly show THEN focus: tao no-ops set_focus on an invisible window
-    // (macOS), and an unfocused show can't blur-dismiss (#7884) — while on
-    // Windows a re-shown-without-focus window stops firing blur entirely
-    // (#13633). The focus is what makes focus-loss dismissal work at all.
-    //
-    // show() is the one call on this path with no fallback: if it fails the
-    // tray click did nothing at all and the user has no way to find out, so it
-    // gets a log. size/position/focus stay best-effort — each degrades into a
-    // popout that is merely mispositioned or unfocused, not absent.
-    if let Err(e) = window.show() {
-        eprintln!("[hub] popout show failed: {e}");
-    }
-    let _ = window.set_focus();
 }
 
 fn create_tray(app: &AppHandle) -> tauri::Result<()> {

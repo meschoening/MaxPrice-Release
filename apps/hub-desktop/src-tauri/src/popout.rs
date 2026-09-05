@@ -1,3 +1,5 @@
+// macOS runtime placement now lives in macos_popout.rs (ADR-0084).
+// The physical-coordinate machinery below is used by Windows.
 // Tray-popout positioning (ADR-0050, map #89 T2). Pure math, unit-tested;
 // the runtime glue in lib.rs feeds it physical pixels from the tray Click's
 // rect + `available_monitors`/`work_area` and hands the result straight to
