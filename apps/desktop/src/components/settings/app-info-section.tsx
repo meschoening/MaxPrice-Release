@@ -1,21 +1,18 @@
 import {
   engineCell,
-  pricingCell,
   sidecarCell,
   versionCell,
   type AppInfoCell,
   type NotePart,
 } from "@/lib/app-info";
 import { useLiveStatus } from "@/state/use-live-status";
-import { useNowTick } from "@/state/use-now-tick";
-import { useSettings } from "@/state/use-settings";
 import { cn } from "@/lib/utils";
 
-// Settings › App info — four read-only rows (Version / Engine / Pricing data /
-// Sidecar) in the `pairs` grammar resolved by T3 (map #100): a label column and
+// Settings › App info — three read-only rows (Version / Engine / Sidecar) in
+// the `pairs` grammar resolved by T3 (map #100): a label column and
 // a value column, one section rather than four, so read-once facts don't take
-// on the heading weight of the two actions beside them. NOTES §"Settings › App
-// info — Glass" is the visual contract; every string comes from `lib/app-info`.
+// on the heading weight of the two actions beside them. The shipped section is
+// its own visual contract (ADR-0088); every string comes from `lib/app-info`.
 //
 // The first three facts used to live in the chrome — the sidebar identity row's
 // version chip and two lines in the sidebar foot — which this section replaced.
@@ -24,6 +21,10 @@ import { cn } from "@/lib/utils";
 // glance at and act on, and the SSE connection is already on every page in the
 // topbar refresh pill. The three static rows keep `dot: null` and render
 // exactly as before.
+//
+// The Pricing data row lived here from 2026-07-29 until ADR-0085 (2026-09-05)
+// moved it to its own Settings › Pricing section beside the manual refresh
+// chip; `pricingCell` still derives its strings there.
 
 function Note({ parts, tone }: { parts: NotePart[]; tone: "" | "warn" }): React.ReactElement {
   return (
@@ -61,10 +62,6 @@ export function AppInfoSection(): React.ReactElement {
   const engineVersion = useLiveStatus((s) => s.engineVersion);
   const pricing = useLiveStatus((s) => s.pricing);
   const connectionState = useLiveStatus((s) => s.connectionState);
-  const { data: settings } = useSettings();
-  // Coarse tick — the pricing row's relative times only need minute-grained
-  // freshness (the same tick the sidebar foot uses for its usage tooltip).
-  const now = useNowTick(60_000);
 
   return (
     <dl className="ai-pairs">
@@ -73,7 +70,6 @@ export function AppInfoSection(): React.ReactElement {
           carrying no `pricing` proves a pre-ADR-0053 binary whatever the two
           version numbers say. Both fields land in one store `set()`. */}
       <Row label="Engine" cell={engineCell(engineVersion, __APP_VERSION__, pricing !== null)} />
-      <Row label="Pricing data" cell={pricingCell(pricing, now, settings?.timezone)} />
       {/* Last, after the static facts: the section's only live row, and the
           only one whose value can change while you are looking at it. */}
       <Row label="Sidecar" cell={sidecarCell(connectionState)} />

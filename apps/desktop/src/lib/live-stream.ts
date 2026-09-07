@@ -297,14 +297,29 @@ export function handleBlockTick(client: QueryClient): void {
   });
 }
 
-// `status:changed` — watched paths / pricing freshness / engine version.
-// Receiving a status frame is also proof the channel is live, so confirm the
-// connection (idempotent — the EventSource `open` handler sets it too).
-export function handleStatusEvent(dataText: string): void {
+// `status:changed` — the sidecar's status snapshot. Feeds the live-status store
+// and marks the channel connected (a frame is proof the channel is live).
+//
+// ONE refetch trigger lives here, and it is gated on a VALUE change (#108): the
+// active price snapshot's `capturedAt`. Cost is priced per event at query time
+// from the sidecar's active snapshot, so when a pricing refresh swaps it, every
+// cached report row is silently priced by the OLD snapshot until something else
+// refetches. `patchStatus` fires for block ticks, usage samples, and hub state
+// too, so a blanket invalidation here would refetch every report constantly —
+// hence the compare. A failed attempt patches `lastAttempt` and leaves
+// `capturedAt` alone, so it never triggers. The first frame carrying pricing
+// (store still `null`) never triggers either: nothing has been priced by a
+// previous snapshot yet.
+export function handleStatusEvent(client: QueryClient, dataText: string): void {
   const snapshot = parseEvent(statusSnapshotSchema, dataText);
   if (snapshot === null) return;
+  const previous = useLiveStatus.getState().pricing;
   useLiveStatus.getState().applyStatusSnapshot(snapshot);
   useLiveStatus.getState().setConnectionState("connected");
+  const next = snapshot.pricing ?? null;
+  if (previous !== null && next !== null && previous.capturedAt !== next.capturedAt) {
+    requestInvalidationRound(client, { sweepSessionRoot: true });
+  }
 }
 
 // A valid null is an authoritative "no window in flight" result, so this
@@ -316,7 +331,7 @@ export function handleUsageSampleEvent(client: QueryClient, dataText: string): v
     // A null sample must not drop the last-known weekly reset (ADR-0083).
     client.setQueryData<UsageCurrent>(usageCurrentQueryKey(), (prev) => ({
       sample: parsed.data,
-      weeklyResetAt: parsed.data?.weekly.resetAt ?? prev?.weeklyResetAt ?? null,
+      weeklyResetAt: parsed.data?.weekly?.resetAt ?? prev?.weeklyResetAt ?? null,
     }));
   } catch {
     // Malformed SSE payloads leave the prior cache untouched.
@@ -459,7 +474,7 @@ async function openConnection(): Promise<void> {
     handleBlockTick(queryClient);
   });
   es.addEventListener(SSE_EVENT.statusChanged, (e) => {
-    handleStatusEvent((e as MessageEvent).data);
+    handleStatusEvent(queryClient, (e as MessageEvent).data);
   });
   es.addEventListener(SSE_EVENT.usageSample, (e) => {
     handleUsageSampleEvent(queryClient, (e as MessageEvent).data);

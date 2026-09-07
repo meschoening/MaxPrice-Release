@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { open, type FileHandle } from "node:fs/promises";
 import { dirname } from "node:path";
+import { setImmediate as yieldToLoop } from "node:timers/promises";
 import { z } from "zod";
 import {
   fleetDedupKey,
@@ -59,8 +60,10 @@ import {
 // left byte-identical for the next boot. That propagation is HUB-ONLY: in
 // REPLICA mode a still-unreadable cache WIPES instead, because `load()` must
 // never reject there — it gates the client's `engineReady`, so a rejection would
-// 500 every report for the process lifetime over a disposable file. Durable SMALL writes — the fresh
-// header, both tmp files — go through `writeDurable`, never the append handle:
+// 500 every report for the process lifetime over a disposable file. Durable writes
+// use a separate handle: `writeDurable` for the header/repair/hub rewrite,
+// `writeCompactSnapshot` for the replica's batched asynchronous rewrite.
+// They never use the append handle:
 // the handle is opened lazily by the first push, so no `sync()` is ever issued
 // against one that has not been written to.
 
@@ -69,9 +72,8 @@ const epochHeaderSchema = z.object({ epoch: z.string() }).passthrough();
 
 // The on-disk byte layout, defined ONCE. `rewrite` writes the archive with
 // these; `reclaimableBytes` measures the post-compact size with them; the
-// running live-row-bytes accumulator measures each row through `fleetRowBytes`
-// (which serializes through `serializeLine`) so its total matches the bytes a
-// compact would write byte-for-byte.
+// lazy live-row-bytes accumulator uses these same canonical lines, NEVER the
+// source line lengths (escaping, whitespace and numeric spellings can differ).
 function serializeHeader(epoch: string): string {
   return `${JSON.stringify({ epoch })}\n`;
 }
@@ -107,6 +109,47 @@ function writeDurable(target: string, contents: string): void {
     fsyncSync(fd);
   } finally {
     closeSync(fd);
+  }
+}
+
+type CompactFile = Pick<FileHandle, "writeFile" | "sync" | "close">;
+
+// Bound both serialization work and temporary strings. One oversized row is
+// indivisible; otherwise a batch is at most 256 rows / ~256 KiB. writeFile
+// handles short writes, sync preserves the durability-before-rename barrier,
+// and the explicit macrotask yield also lets timers run on fast/cached IO.
+async function writeCompactSnapshot(
+  target: string,
+  epoch: string,
+  rows: readonly FleetEvent[],
+  openFile: (path: string) => Promise<CompactFile>,
+  serializeRow: (row: FleetEvent) => string,
+): Promise<number> {
+  const file = await openFile(target);
+  let bytes = 0;
+  try {
+    let lines = [serializeHeader(epoch)];
+    let batchBytes = Buffer.byteLength(lines[0]!);
+    for (let i = 0; i < rows.length; i += 1) {
+      const line = serializeRow(rows[i]!);
+      lines.push(line);
+      batchBytes += Buffer.byteLength(line);
+      if (lines.length >= 256 || batchBytes >= 256 * 1024) {
+        await file.writeFile(lines.join(""));
+        bytes += batchBytes;
+        lines = [];
+        batchBytes = 0;
+        await yieldToLoop();
+      }
+    }
+    if (lines.length > 0) {
+      await file.writeFile(lines.join(""));
+      bytes += batchBytes;
+    }
+    await file.sync();
+    return bytes;
+  } finally {
+    await file.close();
   }
 }
 
@@ -172,6 +215,8 @@ export type FleetEventStore = {
   cursor: () => number; // the derived pull cursor — max seq SEEN
   get: (messageId: string, requestId: string | undefined) => FleetEvent | undefined;
   all: () => readonly FleetEvent[]; // seq-ascending internal refs — NEVER mutate
+  // Retains row references. Callers must not mutate them (including nested
+  // unknown fields); replacements arrive as new objects in a later page.
   applyPage: (rows: FleetEvent[], epoch: string) => "applied" | "epoch-mismatch";
   unlink: () => Promise<void>;
   // Replica-mode only: drop the superseded + torn lines from the cache file,
@@ -199,12 +244,16 @@ export function createFleetEventStore(opts: {
   // the real thing. Throw a `NodeJS.ErrnoException`-shaped error to simulate.
   readFileImpl?: (path: string) => string;
   retryDelayMs?: number; // the load-read retry pause, seam-injected beside readFileImpl so the failure tests don't sleep 250 ms of real time
+  // Real async IO by default; tests hold/fail write + fsync to prove the
+  // compact's swap barrier and races without sleeping or mocking node:fs.
+  openCompactFileImpl?: (path: string) => Promise<CompactFile>;
 }): FleetEventStore {
   const path = opts.path;
   const writer = opts.writer ?? createFleetLogWriter(path);
   const readFile = opts.readFileImpl ?? ((p: string) => readFileSync(p, "utf8"));
   const retryDelayMs = opts.retryDelayMs ?? LOAD_READ_RETRY_MS;
   const isReplica = opts.mode === "replica";
+  const openCompactFile = opts.openCompactFileImpl ?? ((p: string) => open(p, "w"));
 
   const byKey = new Map<string, FleetEvent>();
   // Ascending-seq mirror for page(). Replacement splices the old seq out —
@@ -222,11 +271,18 @@ export function createFleetEventStore(opts: {
   let cursorSeq = 0;
   let validLinesOnDisk = 0; // incl. superseded — garbage = this − live keys
   let unreadable = 0;
-  // Running sum of the on-disk bytes of every LIVE row currently in bySeqAsc,
-  // each serialized exactly as written to disk (serializeLine). Maintained at
-  // every bySeqAsc mutation site so reclaimableBytes is O(1): the post-compact
-  // size = header bytes + this sum, without re-serializing the whole log.
-  let liveRowBytes = 0;
+  // Replay needs membership and cursors, not storage hygiene (ADR-0094).
+  // null means unmeasured: the FIRST reclaimableBytes call sums only surviving
+  // rows. Thereafter every mutation maintains the sum and queries are O(1).
+  // Cache costs by immutable row identity, including displaced incumbents held
+  // for push rollback. Weak keys let dead rows go; nothing touches the wire.
+  let liveRowBytes: number | null = null;
+  let rowByteCosts = new WeakMap<FleetEvent, number>();
+  let replicaGeneration = 0; // changes on wipe, even if the same epoch is re-adopted
+  // Cumulative successful compact removals within a generation. A later
+  // snapshot subtracts what earlier queued compacts have already removed.
+  let compactedLines = 0;
+  let compactedUnreadable = 0;
   // First append after loading a file with no trailing newline must start a
   // fresh line, or the torn tail would concatenate with the new row forever.
   let needsLeadingNewline = false;
@@ -257,30 +313,58 @@ export function createFleetEventStore(opts: {
     return lo;
   }
 
+  function rowBytes(row: FleetEvent): number {
+    const cached = rowByteCosts.get(row);
+    if (cached !== undefined) return cached;
+    const bytes = fleetRowBytes(row);
+    rowByteCosts.set(row, bytes);
+    return bytes;
+  }
+
+  // Appends and rewrites already need a canonical line. Retain its byte cost
+  // so accounting never serializes the same row separately from that write.
+  function serializeAccountedLine(row: FleetEvent): string {
+    const line = serializeLine(row);
+    rowByteCosts.set(row, Buffer.byteLength(line));
+    return line;
+  }
+
+  function measuredLiveRowBytes(): number {
+    if (liveRowBytes === null) {
+      let bytes = 0;
+      for (const row of bySeqAsc) bytes += rowBytes(row);
+      liveRowBytes = bytes;
+    }
+    return liveRowBytes;
+  }
+
   // Apply one already-stamped row to RAM (load replay + push apply share it).
+  // Runtime writers collect winning lines here, after the shared merge check;
+  // replay passes no collector and does no serialization while unmeasured.
   // Returns "new" | "replaced" | "lost".
-  function applyRow(candidate: FleetEvent): "new" | "replaced" | "lost" {
+  function applyRow(candidate: FleetEvent, appendLines?: string[]): "new" | "replaced" | "lost" {
     const key = fleetEventKey(candidate.messageId, candidate.requestId);
     const incumbent = byKey.get(key);
     if (incumbent !== undefined && fleetTokenTotal(incumbent) >= fleetTokenTotal(candidate))
       return "lost";
+    if (appendLines !== undefined) appendLines.push(serializeAccountedLine(candidate));
     byKey.set(key, candidate);
     if (incumbent !== undefined) {
       const idx = firstIndexAbove(incumbent.seq) - 1;
       // idx points at incumbent.seq exactly (it is present by construction).
       bySeqAsc.splice(idx, 1);
-      liveRowBytes -= fleetRowBytes(incumbent);
+      if (liveRowBytes !== null) liveRowBytes -= rowBytes(incumbent);
     }
     bySeqAsc.push(candidate); // seqs only ever grow — tail push keeps order
-    liveRowBytes += fleetRowBytes(candidate);
+    if (liveRowBytes !== null) liveRowBytes += rowBytes(candidate);
     return incumbent === undefined ? "new" : "replaced";
   }
 
   // Drop the on-disk file AND all RAM state in one act, leaving the store empty
   // and immediately reusable (the next applyPage adopts a fresh epoch and the
   // writer lazily reopens the file). Replica-mode only: load calls it on
-  // corruption (cache repair, not archive rescue), unlink calls it after
-  // draining the write chain. Silent by design — a `force` rmSync never throws
+  // corruption (cache repair, not archive rescue), unlink queues it on the
+  // write chain. Silent by design — a `force` rmSync never throws
   // on a present/absent file, so the catch fires only on a real IO fault.
   async function wipeAndReset(): Promise<void> {
     await writer.close();
@@ -292,6 +376,10 @@ export function createFleetEventStore(opts: {
     byKey.clear();
     bySeqAsc.length = 0;
     liveRowBytes = 0;
+    rowByteCosts = new WeakMap();
+    replicaGeneration += 1;
+    compactedLines = 0;
+    compactedUnreadable = 0;
     epochId = "";
     nextSeq = 1;
     durable = 0;
@@ -498,10 +586,9 @@ export function createFleetEventStore(opts: {
       // displaces — applyRow spliced it out of bySeqAsc and overwrote byKey. It
       // is undefined for a new key. Batches are key-unique (the engine store
       // feeds deduped rows), so each key appears once in `applied`.
-      applyRow(fleetRow);
+      applyRow(fleetRow, lines);
       applied.push({ key, row: fleetRow, incumbent });
       validLinesOnDisk += 1;
-      lines.push(`${JSON.stringify(fleetRow)}\n`);
       added += 1;
       stamps.push(
         row.requestId === undefined
@@ -551,7 +638,7 @@ export function createFleetEventStore(opts: {
           const idx = firstIndexAbove(r.seq) - 1;
           if (idx >= 0 && bySeqAsc[idx] === r) {
             bySeqAsc.splice(idx, 1);
-            liveRowBytes -= fleetRowBytes(r);
+            if (liveRowBytes !== null) liveRowBytes -= rowBytes(r);
           }
           if (incumbent !== undefined) {
             // Our winner REPLACED a durable incumbent whose line is still
@@ -560,7 +647,7 @@ export function createFleetEventStore(opts: {
             // until a restart reloads it — a real convergence gap. Restore it.
             byKey.set(key, incumbent);
             bySeqAsc.splice(firstIndexAbove(incumbent.seq), 0, incumbent);
-            liveRowBytes += fleetRowBytes(incumbent);
+            if (liveRowBytes !== null) liveRowBytes += rowBytes(incumbent);
           } else {
             byKey.delete(key); // brand-new key — nothing durable to restore
           }
@@ -597,9 +684,8 @@ export function createFleetEventStore(opts: {
       if (row.seq > cursorSeq) cursorSeq = row.seq;
       if (row.seq > durable) durable = row.seq;
       if (row.seq >= nextSeq) nextSeq = row.seq + 1;
-      if (applyRow(row) === "lost") continue;
+      if (applyRow(row, lines) === "lost") continue;
       validLinesOnDisk += 1;
-      lines.push(`${JSON.stringify(row)}\n`);
     }
     if (lines.length > 0) {
       // Fire-and-forget (NO visibility barrier — the replica is a cache): the
@@ -623,8 +709,13 @@ export function createFleetEventStore(opts: {
   // the caller reseeds on an epoch flip. Replica-mode only.
   async function unlink(): Promise<void> {
     if (!isReplica) throw new Error("unlink is replica-mode only");
-    await writeChain;
-    await wipeAndReset();
+    // Reserve the whole wipe on the chain, including close's await. Otherwise
+    // a later compact could close the same handle and rename after the wipe.
+    const link = writeChain.then(wipeAndReset);
+    writeChain = link.catch((err) => {
+      console.warn("[usage-core] fleet replica unlink failed:", err);
+    });
+    await link;
   }
 
   // Drop the superseded + torn lines from the replica cache, keeping every live
@@ -641,81 +732,63 @@ export function createFleetEventStore(opts: {
   // out of the problem too: a compact keeps every live row by definition, so
   // there is nothing to swap — only the file changes.
   //
-  // CONCURRENCY — why the snapshot is taken HERE and the counters move
-  // RELATIVELY. `applyPage` is the replica's only other writer and it is
-  // SYNCHRONOUS, so unlike `push` it cannot park on a gate; the compact has to
-  // be correct against a page landing at any moment instead. Two rules do it:
+  // CONCURRENCY (ADR-0093): snapshot membership and enqueue are synchronous;
+  // serialization is not. Rows are whole-object replacements, never mutated
+  // in place, so copying the references freezes this point in the write chain.
+  // Earlier appends land on the old file and are covered by the snapshot;
+  // later pages cannot enter it and append exactly once after the rename.
   //
-  //   (1) `contents` is serialized in this synchronous prologue, NOT inside the
-  //       chained body. A page applied after this line is not in the file we
-  //       write, and its own append is queued BEHIND ours, so it lands on the
-  //       new file exactly once. Snapshotting inside the body would put such a
-  //       row in both — written by us and appended again — for a duplicate line
-  //       nobody asked for. (Rows whose append is still pending when we snapshot
-  //       are already in RAM, so they ARE in `contents`; their appends run ahead
-  //       of ours on the old file, which we then replace. Neither lost nor
-  //       doubled.)
-  //   (2) the counters are DECREMENTED after the rename rather than assigned.
-  //       A page applied in the meantime has already incremented
-  //       `validLinesOnDisk` for a line that really will be on disk, and
-  //       `validLinesOnDisk = byKey.size` — rewrite's move, correct there
-  //       precisely because pushes are parked — would swallow it, leaving
-  //       `garbageLines()` under-reporting until the next boot.
+  // Counters move relatively: later pages have already incremented them in
+  // RAM. Cumulative removals additionally stop overlapping compacts from
+  // subtracting the same garbage twice. Failed/cancelled writes remove nothing.
   async function compact(): Promise<{ droppedLines: number; freedBytes: number }> {
     if (!isReplica) throw new Error("compact is replica-mode only");
-    // A replica that has never applied a page has no epoch and no file. A
-    // compact would CREATE one carrying the empty epoch — a header no page can
-    // ever match, so the next boot would load a replica permanently mismatched
-    // against its own hub.
     if (epochId === "") return { droppedLines: 0, freedBytes: 0 };
-    // The snapshot (see rule 1). `unreadable` is in the arithmetic for
-    // completeness, not because it fires: a replica load wipes on a mid-file
-    // corrupt line and skips a torn TAIL uncounted, so it is always 0 here. The
-    // torn tail's BYTES are still reclaimed — they are simply not a line.
-    const contents = serializeHeader(epochId) + bySeqAsc.map(serializeLine).join("");
-    const droppedLines = validLinesOnDisk - byKey.size + unreadable;
-    const droppedUnreadable = unreadable;
+    const rows = bySeqAsc.slice();
     const snapshotEpoch = epochId;
+    const generation = replicaGeneration;
+    const removalTarget = compactedLines + validLinesOnDisk - rows.length + unreadable;
+    const unreadableTarget = compactedUnreadable + unreadable;
+    const isCurrent = () => generation === replicaGeneration && epochId === snapshotEpoch;
     const link = writeChain.then(async () => {
-      // Resurrection backstop. A wipe that began before us does NOT await our
-      // link — `unlink` captured `writeChain` ahead of it — so if it finished
-      // first we would write the file back, restoring a stale epoch header the
-      // next boot would faithfully adopt and then have to reseed out of. Today
-      // that cannot happen from either side: a wipe that has COMPLETED leaves
-      // `epochId` empty, which the early return above catches, and a wipe still
-      // in flight has not reached its `rmSync` yet, because `wipeAndReset`
-      // deletes the file and clears the epoch in one synchronous block. This
-      // line is what keeps that true if an await is ever introduced between
-      // those two — `epochId` is emptied by `wipeAndReset` and by nothing else
-      // once non-empty, so it is the exact signal. (The other order is already
-      // safe: `unlink` awaits the chain, so a compact that got there first
-      // completes before the wipe.)
-      if (epochId !== snapshotEpoch) return { droppedLines: 0, freedBytes: 0 };
-      // Read on the drained chain, so it counts every append that preceded us.
+      // A preceding queued unlink invalidates this snapshot, including a
+      // reseed that happens to adopt the same epoch (the ABA case).
+      if (!isCurrent()) return { droppedLines: 0, freedBytes: 0 };
       let sizeBefore: number;
       try {
         sizeBefore = statSync(path).size;
       } catch {
         sizeBefore = 0;
       }
-      // Close the writer BEFORE the rename: it may hold an append handle on the
-      // old inode (Windows blocks the rename). It reopens lazily on the next
-      // applyPage append. rewrite's ordering, for rewrite's reason.
+      // Windows cannot replace an open append handle. Later appends are on
+      // this chain, and reopen lazily against the replacement after we settle.
       await writer.close();
       const tmpPath = `${path}.tmp`;
-      writeDurable(tmpPath, contents);
-      renameSync(tmpPath, path);
-      validLinesOnDisk -= droppedLines;
-      unreadable -= droppedUnreadable;
-      // The file we just wrote ends in a newline, so a queued append needs no
-      // leading one — including the case where a FAILED append had set this.
-      needsLeadingNewline = false;
-      // Exactly `reclaimableBytes()`'s definition, evaluated against the file we
-      // actually wrote: `contents` is the header plus every live row serialized,
-      // which is the post-compact size that accessor computes from `liveRowBytes`.
-      // That is what makes the Clean preview and the Clean act agree by
-      // construction rather than by two derivations happening to match.
-      return { droppedLines, freedBytes: Math.max(0, sizeBefore - Buffer.byteLength(contents)) };
+      try {
+        if (!isCurrent()) return { droppedLines: 0, freedBytes: 0 };
+        const writtenBytes = await writeCompactSnapshot(
+          tmpPath,
+          snapshotEpoch,
+          rows,
+          openCompactFile,
+          serializeAccountedLine,
+        );
+        // Final resurrection backstop after EVERY yielding operation. The
+        // guard, rename and counter update form one synchronous commit.
+        if (!isCurrent()) return { droppedLines: 0, freedBytes: 0 };
+        renameSync(tmpPath, path);
+        const droppedLines = removalTarget - compactedLines;
+        validLinesOnDisk -= droppedLines;
+        unreadable -= unreadableTarget - compactedUnreadable;
+        compactedLines = removalTarget;
+        compactedUnreadable = unreadableTarget;
+        needsLeadingNewline = false;
+        return { droppedLines, freedBytes: Math.max(0, sizeBefore - writtenBytes) };
+      } finally {
+        // On failure/cancellation the original archive and counters survive.
+        // The next queued append still runs; no partial tmp should linger.
+        rmSync(tmpPath, { force: true });
+      }
     });
     writeChain = link.then(
       () => {},
@@ -758,7 +831,8 @@ export function createFleetEventStore(opts: {
         await writer.close();
         const tmpPath = `${path}.tmp`;
         // Durable before the rename, the loadInner pattern (writeDurable).
-        writeDurable(tmpPath, serializeHeader(nextEpoch) + survivors.map(serializeLine).join(""));
+        const rowLines = survivors.map(serializeAccountedLine).join("");
+        writeDurable(tmpPath, serializeHeader(nextEpoch) + rowLines);
         renameSync(tmpPath, path);
         // Swap RAM atomically with the file. Surviving seqs verbatim; the
         // counter re-derives from the surviving max (safe under newEpoch:false
@@ -766,11 +840,10 @@ export function createFleetEventStore(opts: {
         // before any ack/poke).
         byKey.clear();
         bySeqAsc.length = 0;
-        liveRowBytes = 0;
+        liveRowBytes = Buffer.byteLength(rowLines);
         for (const r of survivors) {
           byKey.set(fleetEventKey(r.messageId, r.requestId), r);
           bySeqAsc.push(r);
-          liveRowBytes += fleetRowBytes(r);
         }
         epochId = nextEpoch;
         durable = survivors.length > 0 ? survivors[survivors.length - 1]!.seq : 0;
@@ -822,11 +895,11 @@ export function createFleetEventStore(opts: {
     // header + every live row re-serialized (see `rewrite`, newEpoch:false), so
     // the post-compact size is computable in RAM from the same state rewrite
     // draws on — no whole-archive intermediate string. The post-compact size
-    // comes from the O(1) running sum `liveRowBytes` (maintained at every
-    // bySeqAsc mutation site, each row serialized through serializeLine exactly
-    // as written to disk) plus the header bytes — not a per-call loop over the
-    // whole log. The residual (current − post-compact) is the superseded lines
-    // plus any unreadable/torn bytes a compact also clears; clamped ≥ 0.
+    // comes from a lazy running sum: the first query measures surviving rows
+    // using cached write costs or canonical serialization, then every mutation
+    // maintains it. Subsequent queries are O(1). Replay never measures source
+    // lines or superseded rows. The residual (current − post-compact) includes
+    // superseded lines and unreadable/torn bytes a compact clears; clamped ≥ 0.
     //
     // Best-effort, like fileBytes: it reads statSync(path).size (disk) against
     // the in-RAM live-row sum without synchronizing with the write chain, so
@@ -839,7 +912,7 @@ export function createFleetEventStore(opts: {
       } catch {
         return 0;
       }
-      const postCompact = Buffer.byteLength(serializeHeader(epochId)) + liveRowBytes;
+      const postCompact = Buffer.byteLength(serializeHeader(epochId)) + measuredLiveRowBytes();
       return Math.max(0, current - postCompact);
     },
     lastAppendAt: () => lastAppend,

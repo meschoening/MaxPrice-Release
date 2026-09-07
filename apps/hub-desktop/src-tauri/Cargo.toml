@@ -1,6 +1,6 @@
 [package]
 name = "maxprice-hub-desktop"
-version = "0.6.2"
+version = "0.6.4"
 description = "MaxPrice Hub"
 authors = ["Max Schoening"]
 license = "MIT"
@@ -57,4 +57,4 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSEvent", "NSScreen", "NSWindow"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSEvent", "NSScreen", "NSRunningApplication", "NSWindow"] }

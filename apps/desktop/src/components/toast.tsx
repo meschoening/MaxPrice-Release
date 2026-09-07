@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils";
 // lands on it (the Settings reset confirmation) — callers use
 // `showToast` from @/lib/toast.
 
-const DWELL_MS = 2200;
+const DWELL_MS = 2200; // the Glass notes said ~1.9s; 2.2s shipped and is the contract (ADR-0088)
 
 // The pill stays in the tree (opacity 0, no pointer events) so the 250ms
 // fade/lift transition runs both ways.

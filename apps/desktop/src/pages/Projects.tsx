@@ -30,6 +30,7 @@ import { MachineChip } from "@/components/machine-chip";
 import { StripPage } from "@/components/strip-page";
 import { DetailStrip, StripIdentity, StripSection, StripStat } from "@/components/detail-strip";
 import { ModelBadges } from "@/components/model-badges";
+import { UnpricedChip } from "@/components/unpriced-chip";
 import { ModelSplitBar } from "@/components/model-split-bar";
 import { CostChart } from "@/components/cost-chart";
 import { composeSeries } from "@/lib/composed-series";
@@ -613,7 +614,10 @@ function ProjectDetailStrip({
 
         {/* Range-scoped, like every other number on this page — and the same
             shape as the Sessions strip, which restates its row's own cost. */}
-        <StripStat label="cost">{formatCost(project.costRange)}</StripStat>
+        <StripStat label="cost">
+          {formatCost(project.costRange)}
+          <UnpricedChip models={project.modelBreakdowns.map((b) => b.modelName)} />
+        </StripStat>
         <StripStat label="sessions">{abbreviate(project.sessions)}</StripStat>
         <StripStat label="first seen">{project.firstActivity || "—"}</StripStat>
         <StripStat label="last seen">{project.lastActivity || "—"}</StripStat>
@@ -701,7 +705,10 @@ function ProjectsAggregateStrip({
           </span>
         </StripIdentity>
 
-        <StripStat label="cost">{formatCost(aggregate.costRange)}</StripStat>
+        <StripStat label="cost">
+          {formatCost(aggregate.costRange)}
+          <UnpricedChip models={aggregate.breakdowns.map((b) => b.modelName)} />
+        </StripStat>
         <StripStat label="sessions">{abbreviate(aggregate.sessions)}</StripStat>
 
         {/* Wider basis than the default section: 30 daily bars need the room. */}

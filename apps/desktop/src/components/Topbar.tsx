@@ -20,7 +20,7 @@ const TITLES: Record<string, string> = {
   "/settings": "Settings",
 };
 
-// The floating pill topbar (glass.html): page title + streaming badge +
+// The floating pill topbar (Glass, ADR-0043): page title + streaming badge +
 // subtitle on the left; refresh chip (with the connection-dot slot) and the
 // theme chip on the right. The old topbar's separate reconnecting indicator
 // is absorbed by the badge and the refresh chip's dot (the mock's

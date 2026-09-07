@@ -25,7 +25,7 @@ const NAV = [
   { to: "/settings", label: "Settings", icon: Settings, showDot: false },
 ] as const;
 
-// The detached frosted sidebar (glass.html): identity, pill nav (Settings
+// The detached frosted sidebar (Glass, ADR-0043): identity, pill nav (Settings
 // in-list, pulse dot on Live), then the absorbed filter rail. The old
 // StatusBar's diagnostics live at the foot — relocation only, behaviors
 // frozen (M2; the mock world has no status bar surface).

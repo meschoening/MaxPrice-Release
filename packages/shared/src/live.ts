@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { usageConnectionSchema, usageSampleSchema } from "./usage-limits";
+import { usageConnectionSchema, usageReadingSchema } from "./usage-limits";
 import { hubConnectionSchema } from "./hub";
 
 // Wire contract for the Part 3 live data pipeline — the SSE channel the
@@ -49,7 +49,7 @@ export const blockTickEventSchema = z.object({
 // `usage:sample` — emitted once per successful 1/min usage poll (ADR-0023/0024).
 // Carries the authoritative live value so the renderer's rings update without
 // polling the sidecar. null means a successful poll found no window in flight.
-export const usageSampleEventSchema = usageSampleSchema.nullable();
+export const usageSampleEventSchema = usageReadingSchema.nullable();
 
 // How a pricing refresh attempt failed (ADR-0053). Classified inside
 // `refreshPricing` at the seam that failed, so the renderer can say something
@@ -88,11 +88,21 @@ export const pricingStatusSchema = z.object({
   // renderer has no snapshot, so it cannot derive this. Counted off the ACTIVE
   // snapshot, so it includes the ADR-0027 override gap-fill.
   modelCount: z.number().int().nonnegative(),
+  // The raw model strings present in the engine's event store that the
+  // ACTIVE snapshot cannot price (#110, ADR-0087). Each of these costs $0 in
+  // every report, so a non-empty list means every cost on screen is a lower
+  // bound. Sorted + deduped by `unresolvedModels`. Required, like every
+  // interior field: the sidecar always knows the answer (an empty store is an
+  // empty list). Global rather than per row: the set is a property of the
+  // (store, snapshot) pair, and every report row already carries its raw
+  // model names, so the renderer joins against this list instead of four
+  // report schemas each duplicating one fact.
+  unpricedModels: z.array(z.string()),
   // The most recent refresh ATTEMPT, success or failure. `null` = none has
-  // settled yet (boot, before the startup refresh resolves). Ticks the ~24h
-  // loop drops on its `inFlight` guard are NOT attempts — no fetch is issued,
-  // and recording one would make a single hung fetch look like healthy
-  // repeated activity.
+  // settled yet (boot, before the startup refresh resolves). A tick or
+  // manual request that joins an in-flight attempt is NOT a new attempt — no
+  // fetch is issued, and recording one would make a single hung fetch look
+  // like healthy repeated activity.
   lastAttempt: z
     .object({
       at: z.string(),

@@ -79,7 +79,7 @@ function resolveTotal(
 //   - `calculate` → always `tokens × unit prices`, ignoring any stored cost.
 //   - `auto`      → the stored cost when present, else the computed cost.
 //
-// An unresolved model never crashes — it yields `0`.
+// An unresolved model's computed cost is 0; auto/display still honor stored costs.
 export function computeCost(
   model: string,
   tokenCounts: CostTokenCounts,

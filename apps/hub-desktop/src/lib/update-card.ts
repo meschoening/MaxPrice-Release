@@ -5,8 +5,9 @@ import { formatRelativeTime } from "@maxprice/shared";
 // Every user-visible string the card can show lives in this one module, and the
 // mapping from state to strings is a pure function — so the seven states are
 // pinnable by a test in a repo with no component-test rig, and a review argues
-// about words in one place. Transcribed from `UPDATE_STATES` in
-// `plans/mocks/redesign/hub-glass.html`, which is the reviewed original.
+// about words in one place. Transcribed from the reviewed `UPDATE_STATES`
+// table of the Hub console mock (history; ADR-0088) — this module is the
+// original now.
 //
 // Two rules from T2 are load-bearing here and are why this is two fields rather
 // than one:

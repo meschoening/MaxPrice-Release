@@ -1,3 +1,4 @@
+import { activePricingSnapshot } from "@maxprice/shared";
 import type {
   CostMode,
   DailyByMachineResponse,
@@ -121,6 +122,23 @@ import { defaultTimeZone } from "./timezone";
 // full-snapshot pre-stamp makes subscription timing irrelevant — anything
 // already in the store is stamped by the walk, anything later is stamped by
 // the feed.
+//
+// THE PRICING RULE. Cost is priced AT FOLD TIME from mutable module state —
+// `computeCostBreakdown` reads `activePricingSnapshot()` — so every memoized
+// acc bakes in whichever snapshot was active when its bucket folded, and a
+// clean bucket is never re-priced. The pricing refresh (ADR-0085) swaps that
+// snapshot in-session, and `setActivePricingSnapshot` installs a NEW object
+// identity per swap — so the same `rebind()` that follows store identity
+// follows pricing identity too: `getPricing()` (default `activePricingSnapshot`;
+// injectable so the wiring is explicit at the call site) is compared to
+// `boundPricing`, and a change clears ALL family entries — the corpus is the
+// same, but every fold of it is priced wrong — while the store subscription
+// and the seq stamps stay (neither depends on prices). No pricing generation
+// rides the entry key: a keyed generation would keep the old-price entries
+// alive under the LRU until evicted, for zero reuse. Accepted residual: a
+// query whose refold straddles a swap serves mixed prices at most once — the
+// next query's rebind sees the new identity and drops the entry — the same
+// "stale at most once" caveat as an evicted or orphaned entry.
 //
 // THE SINGLE-FLIGHT WORK CHAIN. Each entry serializes its cold build, refolds,
 // and assembly on `entry.work` — a promise chain every query appends to — so
@@ -409,10 +427,15 @@ export function createReportCache(opts: {
   // Yield to the event loop after this many events folded (default 8192).
   // Injectable so tests can force yielding on small corpora.
   chunkSize?: number;
+  // The active pricing snapshot's identity (THE PRICING RULE). Only compared,
+  // never read: a new identity means every cached fold is priced stale.
+  getPricing?: () => unknown;
 }): ReportCache {
   const chunkSize = opts.chunkSize ?? 8192;
+  const getPricing = opts.getPricing ?? activePricingSnapshot;
 
   let boundStore: EventStore | null = null;
+  let boundPricing: unknown = null;
   let unsubscribe: (() => void) | null = null;
 
   // The seq stamps (see THE SEQ-STAMPING RULE). WeakMap keyed on the exact
@@ -567,9 +590,18 @@ export function createReportCache(opts: {
     dailyByMachineFamily,
   ];
 
-  // --- rebind (THE REBIND RULE) --------------------------------------------
+  // --- rebind (THE REBIND RULE, THE PRICING RULE) --------------------------
 
   function rebind(): void {
+    // Pricing first: a swapped snapshot drops every entry but keeps the store
+    // binding — the feed subscription and the seq stamps are price-agnostic.
+    // (Checked before the store early-return, or a swap that lands with the
+    // store unchanged would never be seen.)
+    const pricing = getPricing();
+    if (pricing !== boundPricing) {
+      for (const family of families) family.entries.clear();
+      boundPricing = pricing;
+    }
     const store = opts.getStore();
     if (store === boundStore) return;
     unsubscribe?.();

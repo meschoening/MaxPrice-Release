@@ -3,10 +3,10 @@
 
    One source of truth for both apps: tokens (both color modes), the
    ambient wash, the material recipes, and the T1 form primitives.
-   Visual contract: plans/mocks/redesign/NOTES.md §Option C (+ the
-   Hub console / Lists / Session detail / Settings sections) and the
-   mock files it names. Page-level layout stays per-app — this file
-   is the system, not the pages.
+   This file IS the design system's source of truth: the Glass mocks
+   and the NOTES.md that once served as the visual contract are
+   retired to history (ADR-0088). Page-level layout stays per-app —
+   this file is the system, not the pages.
 
    Theming: each app's public/theme-boot.js stamps a RESOLVED
    `data-theme="light"|"dark"` on <html> before first paint and
@@ -558,7 +558,7 @@ kbd {
 
 /* ================= in-app identity ================= */
 /* The lens orb — the app mark (desktop sidebar identity, hub console header
-   pill per NOTES §Hub console), and since ADR-0045 also the source of the
+   pill), and since ADR-0045 also the source of the
    OS-level icons: each app wears a discriminating glyph (`.dollar` = client,
    `.rack` = hub) and the taskbar/dock/tray icons are the same orb + glyph
    baked at the deep light-theme gradient (scripts/gen-icon-sources.ts).

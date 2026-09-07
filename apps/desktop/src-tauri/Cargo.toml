@@ -1,6 +1,6 @@
 [package]
 name = "maxprice-desktop"
-version = "0.6.2"
+version = "0.6.4"
 description = "MaxPrice desktop"
 authors = ["Max Schoening"]
 license = "MIT"
@@ -64,6 +64,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSColor",
   "NSEvent",
   "NSScreen",
+  "NSRunningApplication",
   "NSView",
   "NSWindow",
   "objc2-quartz-core",

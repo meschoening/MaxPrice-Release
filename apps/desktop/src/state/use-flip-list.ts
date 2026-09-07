@@ -1,6 +1,6 @@
 import { useCallback, useLayoutEffect, useRef } from "react";
 
-// FLIP glide (INTERACTIONS.md): rail rows overtaking each other slide to
+// FLIP glide (motion contract, ADR-0088): rail rows overtaking each other slide to
 // their new slot — 350ms on the glass curve, reused (keyed) nodes only.
 // Before paint, compare each keyed element's offsetTop to its previous one
 // and play the inverted delta via WAAPI. WAAPI ignores the global CSS

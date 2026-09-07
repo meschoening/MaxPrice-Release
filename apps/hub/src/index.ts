@@ -5,6 +5,8 @@ import {
   type HubStatus,
   type UsageCredential,
   type UsageSample,
+  type UsageReading,
+  completeUsageSample,
 } from "@maxprice/shared";
 import {
   createDeferredShutdown,
@@ -69,9 +71,10 @@ export function createMergeSamples(
 export function createEmitUsageSample(
   store: Pick<SampleStore, "all">,
   fanout: Pick<HubFanout, "emitSample" | "patchStatus">,
-): (sample: UsageSample | null) => void {
+): (sample: UsageReading | null) => void {
   return (sample) => {
-    if (sample !== null) fanout.emitSample(sample);
+    const historical = completeUsageSample(sample);
+    if (historical !== null) fanout.emitSample(historical);
     fanout.patchStatus({ sampleCount: store.all().length, usageCurrentSample: sample });
   };
 }

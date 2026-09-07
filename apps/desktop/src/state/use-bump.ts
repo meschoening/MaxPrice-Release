@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-// Tile value bump (INTERACTIONS.md): when the rendered value changes, the
+// Tile value bump (motion contract, ADR-0088): when the rendered value changes, the
 // number scales 1 → 1.035 → 1 over 350ms, origin left — the caller adds the
 // `bump` class while this returns true. The initial mount never bumps; only
 // a real value change does. Reduced motion is handled in CSS (the global

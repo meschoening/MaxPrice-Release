@@ -39,7 +39,11 @@ export const NARROW_MAX_QUERY = 799.98;
     boundary (T2 #153): the sum of the three tiles' measured max-content floors
     plus gaps. It rides this module only so the test can tell a deliberate
     component literal apart from a boundary that has drifted. */
-export const TILES_3UP_MIN_CONTENT = 1021;
+export const TILES_3UP_MIN_CONTENT = 1155;
+/** Active block without an unpriced cost chip needs no extra chip reserve. */
+export const TILES_PRICED_3UP_MIN_CONTENT = 1075;
+/** The same row with an idle Active block tile (no live window). */
+export const TILES_IDLE_3UP_MIN_CONTENT = 845;
 
 /** The sidebar collapse, the narrow boundary expressed in FRAME space:
     `frame < 1072` = 800 content + 252 sidebar + 20 gap. Placed there so medium

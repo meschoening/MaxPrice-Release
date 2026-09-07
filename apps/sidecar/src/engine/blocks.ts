@@ -49,6 +49,7 @@ import {
   resolveWindows,
   type ResolvedBlockSpan,
   type ResolvedWindow,
+  type SampleView,
   type WindowSpan,
 } from "./block-windows";
 import { localDate } from "./local-date";
@@ -182,12 +183,14 @@ const HOUR_MS = 60 * 60 * 1000;
 // A block under construction/formed: its window bounds, provenance, and the
 // timestamp-sorted events folded into it. Heuristic blocks have
 // endMs = startMs + 5h; observed blocks carry the real [reset−5h, reset).
-type PendingBlock = {
+export type PendingBlock = {
   startMs: number;
   endMs: number;
   source: BlockRow["windowSource"];
   events: StoredEvent[];
 };
+
+export type BlockFormation = { formed: PendingBlock[]; windows: ResolvedWindow[] };
 
 // Floor an epoch-ms instant to the start of its UTC hour. Pure epoch
 // arithmetic — NOT a local-calendar operation (see SPIKE / WINDOW-START
@@ -196,11 +199,27 @@ function floorToHour(ms: number): number {
   return Math.floor(ms / HOUR_MS) * HOUR_MS;
 }
 
-// One event's epoch-ms timestamp. An unparseable timestamp yields `NaN`;
-// callers must drop such events before block formation (see `aggregateBlocks`).
-function eventMs(event: StoredEvent): number {
-  return new Date(event.timestamp).getTime();
+// Events with a parseable timestamp, in input order. Returns the INPUT ARRAY
+// ITSELF when every row parses (the overwhelmingly common case), so a clean
+// corpus costs one scan and zero allocation; only a real `NaN` forces the copy.
+// Same check-then-copy idiom as `byTimestamp` (`./model-rollup`), and for the
+// same reason: this runs over the whole corpus on every fold.
+function dropUnparsable(events: StoredEvent[]): StoredEvent[] {
+  for (let i = 0; i < events.length; i += 1) {
+    const event = events[i];
+    if (event !== undefined && Number.isNaN(event.ms)) {
+      return events.filter((e) => !Number.isNaN(e.ms));
+    }
+  }
+  return events;
 }
+
+// An event's epoch-ms timestamp is `event.ms` — derived once at `upsert` and
+// carried on the row (ADR-0089). There is no `eventMs` helper and no per-fold
+// side-table: this module used to build a `Map<StoredEvent, number>` over the
+// whole corpus on every call, which measured 43% of `/api/blocks`. An
+// unparseable timestamp still yields `NaN`; `formPendingBlocks` drops those
+// rows before formation, exactly as it did when it parsed them itself.
 
 // ---------------------------------------------------------------------------
 // Token-count helpers
@@ -228,13 +247,12 @@ function computeBurnRate(
   events: StoredEvent[],
   counts: TokenCounts,
   costUSD: number,
-  msOf: (event: StoredEvent) => number,
 ): BurnRate | null {
   if (events.length === 0) return null;
   const first = events[0];
   const last = events[events.length - 1];
   if (first === undefined || last === undefined) return null;
-  const durationMinutes = (msOf(last) - msOf(first)) / (1000 * 60);
+  const durationMinutes = (last.ms - first.ms) / (1000 * 60);
   if (durationMinutes <= 0) return null;
   return {
     tokensPerMinute: totalOf(counts) / durationMinutes,
@@ -272,53 +290,30 @@ function matchesMachineFilter(machineId: string, machines: string[]): boolean {
 // Row flushing
 // ---------------------------------------------------------------------------
 
-// Flush a finished `PendingBlock` into a wire `BlockRow`. `mode` selects the
-// cost basis; `now` drives active-block detection and the projection;
-// `loweredModels` is the ADR-0017 filter, its needles ALREADY lowered by
-// `lowerModelNeedles` at the `aggregateBlocks` options site (hoisted out of the
-// per-event loop). It never reaches the wire: the row's `models` come from
-// `modelNames`, a Set of real event model strings.
-//
-// TWO AGGREGATIONS, ONE EVENT WALK. The block's QUOTA-level figures —
-// `isActive`, `burnRate`, `projection` — are computed over ALL events (the
-// real 5h window). The block's WIRE sums — `costUSD`, `tokenCounts`,
-// `totalTokens`, `models`, `entries` — are computed over only the events
-// matching the model filter. `computeCost` runs exactly once per event.
-//
-// A heuristic block is active when there is recent activity (`now -
-// lastEventMs < 5h`) AND `now` is still inside the 5h window (`now < endMs`)
-// — the `Zn` rule (see SPIKE); observed blocks key off the real window alone (ADR-0028,
-// see below). Active-block detection is itself all-model (the 5h quota window
-// counts every model).
-function flushBlock(
+// Test-only work counter: events priced by the block totals fold.
+export const blockFoldCounter = { count: 0 };
+
+// Totals are independent of time, samples, boundaries and the date window.
+// Fold each event in its original order: combining partial sums would change
+// floating-point artifacts and first-seen model/machine order (ADR-0092).
+export type BlockTotals = {
+  allCounts: TokenCounts;
+  allCost: number;
+  counts: TokenCounts;
+  costUSD: number;
+  entries: number;
+  models: string[];
+  machines: string[];
+};
+
+export function foldBlockTotals(
   block: PendingBlock,
   mode: CostMode,
-  now: number,
   loweredModels: string[],
   machines: string[],
-  resolvedActiveExists: boolean,
-  msOf: (event: StoredEvent) => number,
-): BlockRow {
-  const { startMs, endMs, events, source } = block;
-  const last = events[events.length - 1];
-  // `actualEndTime` is the last in-block event's raw timestamp. A block always
-  // has >= 1 event (it is only created when an event opens it), so `last` is
-  // defined; the fallback keeps the type total.
-  const actualEndTime = last !== undefined ? last.timestamp : new Date(startMs).toISOString();
-  const lastMs = last !== undefined ? msOf(last) : startMs;
-
-  // Observed/annulled blocks are active iff their real window hasn't ended
-  // (their events are ≤5h old by construction, so the recent-activity
-  // condition is implied; an annulled window's end is its successor's start,
-  // so it can never be active beside a live successor — ADR-0029). Heuristic
-  // blocks keep the dual condition — but are demoted when a resolved
-  // block is live: disjoint real windows mean a residual event's unobserved
-  // window provably ended by the live window's start (ADR-0028).
-  const isActive =
-    source === "heuristic"
-      ? !resolvedActiveExists && now - lastMs < FIVE_HOURS_MS && now < endMs
-      : now < endMs;
-
+): BlockTotals {
+  const { events } = block;
+  blockFoldCounter.count += events.length;
   // Quota-level accumulators (all events) + filtered wire accumulators.
   const allCounts: TokenCounts = {
     inputTokens: 0,
@@ -376,8 +371,56 @@ function flushBlock(
     }
   }
 
+  return {
+    allCounts,
+    allCost,
+    counts,
+    costUSD,
+    entries,
+    models: Array.from(modelNames),
+    machines: Array.from(machineNames),
+  };
+}
+
+// The serving path may provide memoized totals and a validated sample view.
+// Pure aggregateBlocks omits this context and remains the uncached oracle.
+export type BlockFlushContext = {
+  totals: (block: PendingBlock) => BlockTotals;
+  sampleView: SampleView | null;
+};
+
+// Wire rows are always fresh: activity, burn, projection, gaps, limits and
+// date selection are evaluated for the current request even on a totals hit.
+function flushBlock(
+  block: PendingBlock,
+  totals: BlockTotals,
+  now: number,
+  resolvedActiveExists: boolean,
+): BlockRow {
+  const { startMs, endMs, events, source } = block;
+  const last = events[events.length - 1];
+  // `actualEndTime` is the last in-block event's raw timestamp. A block always
+  // has >= 1 event (it is only created when an event opens it), so `last` is
+  // defined; the fallback keeps the type total.
+  const actualEndTime = last !== undefined ? last.timestamp : new Date(startMs).toISOString();
+  const lastMs = last !== undefined ? last.ms : startMs;
+
+  // Observed/annulled blocks are active iff their real window hasn't ended
+  // (their events are ≤5h old by construction, so the recent-activity
+  // condition is implied; an annulled window's end is its successor's start,
+  // so it can never be active beside a live successor — ADR-0029). Heuristic
+  // blocks keep the dual condition — but are demoted when a resolved
+  // block is live: disjoint real windows mean a residual event's unobserved
+  // window provably ended by the live window's start (ADR-0028).
+  const isActive =
+    source === "heuristic"
+      ? !resolvedActiveExists && now - lastMs < FIVE_HOURS_MS && now < endMs
+      : now < endMs;
+
+  const { allCounts, allCost, counts, costUSD, entries } = totals;
+
   // burnRate / projection are quota-level (all events) — ADR-0017.
-  const burnRate = isActive ? computeBurnRate(events, allCounts, allCost, msOf) : null;
+  const burnRate = isActive ? computeBurnRate(events, allCounts, allCost) : null;
   const projection = isActive ? computeProjection(endMs, now, allCounts, allCost, burnRate) : null;
 
   return {
@@ -388,11 +431,11 @@ function flushBlock(
     isActive,
     isGap: false,
     entries,
-    tokenCounts: counts,
+    tokenCounts: { ...counts },
     totalTokens: totalOf(counts),
     costUSD,
-    models: Array.from(modelNames),
-    machines: Array.from(machineNames),
+    models: [...totals.models],
+    machines: [...totals.machines],
     burnRate,
     projection,
     // Placeholder — the limit pass inside `aggregateBlocks` (ADR-0028) fills
@@ -502,26 +545,18 @@ function applyWindow(
 // chronological merge. Extracted so the block-span window resolver and the
 // blocks aggregator share ONE implementation — the /api/intraday block frame
 // must be the same window /api/blocks reports active, by construction.
-function formPendingBlocks(
-  events: StoredEvent[],
-  samples: UsageSample[],
-): { formed: PendingBlock[]; windows: ResolvedWindow[]; msOf: (event: StoredEvent) => number } {
-  // Parse each event's timestamp exactly once and reuse it everywhere below
-  // (the window partition walk, the heuristic walk, the gap check, and
-  // flushBlock/computeBurnRate). Events whose timestamp doesn't parse are
-  // dropped here — an unparseable timestamp never reaches the wire (it would
-  // throw in `new Date(NaN).toISOString()` downstream). `byTimestamp`
-  // (`./model-rollup`) returns the same object references, so the identity map
-  // stays valid after sorting.
-  const msByEvent = new Map<StoredEvent, number>();
-  const parsed: StoredEvent[] = [];
-  for (const event of events) {
-    const t = eventMs(event);
-    if (Number.isNaN(t)) continue;
-    msByEvent.set(event, t);
-    parsed.push(event);
-  }
-  const msOf = (event: StoredEvent): number => msByEvent.get(event) as number;
+export function formPendingBlocks(events: StoredEvent[], samples: UsageSample[]): BlockFormation {
+  // Every epoch-ms below — the window partition walk, the heuristic walk, the
+  // gap check, flushBlock/computeBurnRate — reads `event.ms`, derived once at
+  // `upsert` (ADR-0089). Events whose timestamp doesn't parse are dropped here:
+  // an unparseable timestamp never reaches the wire (it would throw in
+  // `new Date(NaN).toISOString()` downstream).
+  //
+  // The drop scan follows `byTimestamp`'s idiom — check first, allocate only
+  // on a hit — because an unparseable timestamp is vanishingly rare and the
+  // common case should not copy the corpus to prove nothing was wrong. When
+  // nothing is dropped, `events` itself flows through untouched.
+  const parsed = dropUnparsable(events);
   const sorted = byTimestamp(parsed);
 
   // ADR-0028/0029 — resolved windows partition formation: the util>0 windows
@@ -531,7 +566,7 @@ function formPendingBlocks(
   // construction (see resolveWindows).
   const windows: ResolvedWindow[] = resolveWindows(
     samples,
-    sorted.map((e) => msOf(e)),
+    sorted.map((e) => e.ms),
   );
 
   // Partition each event into the window containing it (unique — windows are
@@ -542,7 +577,7 @@ function formPendingBlocks(
   const residual: StoredEvent[] = [];
   let wi = 0;
   for (const event of sorted) {
-    const t = msOf(event);
+    const t = event.ms;
     while (wi < windows.length && (windows[wi] as ResolvedWindow).end <= t) wi++;
     const w = windows[wi];
     if (w !== undefined && w.start <= t) {
@@ -570,14 +605,14 @@ function formPendingBlocks(
     }
   };
   for (const event of residual) {
-    const ms = msOf(event);
+    const ms = event.ms;
     if (pending === null) {
       pending = { startMs: floorToHour(ms), events: [event] };
       continue;
     }
     const prevEvent = pending.events[pending.events.length - 1];
     if (prevEvent === undefined) continue;
-    const prevMs = msOf(prevEvent);
+    const prevMs = prevEvent.ms;
     if (ms - pending.startMs > FIVE_HOURS_MS || ms - prevMs > FIVE_HOURS_MS) {
       flushPending();
       pending = { startMs: floorToHour(ms), events: [event] };
@@ -600,7 +635,7 @@ function formPendingBlocks(
     ...heuristic,
   ].sort((a, b) => a.startMs - b.startMs);
 
-  return { formed, windows, msOf };
+  return { formed, windows };
 }
 
 // `WindowSpan` / `ResolvedBlockSpan` live in `./block-windows` (the lower-level
@@ -622,8 +657,14 @@ export function resolveBlockSpanWindow(
   samples: UsageSample[],
   now: number,
 ): ResolvedBlockSpan | null {
-  const { formed, windows, msOf } = formPendingBlocks(events, samples);
+  return resolveFormedBlockSpan(formPendingBlocks(events, samples), now);
+}
 
+// Formation may be reused; the active winner and ghost frame are always fresh.
+export function resolveFormedBlockSpan(
+  { formed, windows }: BlockFormation,
+  now: number,
+): ResolvedBlockSpan | null {
   // The active gate walks FORMED blocks — not resolved windows — deliberately:
   // a live util>0 window with NO local events emits no PendingBlock, so it
   // neither frames the span nor demotes a heuristic block. This mirrors
@@ -643,7 +684,7 @@ export function resolveBlockSpanWindow(
       if (block.source !== "heuristic") continue;
       const last = block.events[block.events.length - 1];
       if (last === undefined) continue;
-      if (now - msOf(last) < FIVE_HOURS_MS && now < block.endMs) {
+      if (now - last.ms < FIVE_HOURS_MS && now < block.endMs) {
         if (active === null || block.endMs > active.endMs) active = block;
       }
     }
@@ -749,7 +790,21 @@ export function aggregateBlocks(
   options: AggregateBlocksOptions = {},
 ): BlocksResponse {
   const now = options.now ?? Date.now();
-  // Lower the model needles ONCE here, not once per event inside `flushBlock`'s
+  return aggregateFormedBlocks(formPendingBlocks(events, options.samples ?? []), mode, {
+    ...options,
+    now,
+  });
+}
+
+// The formation cache stores event membership only, never priced or timed rows.
+export function aggregateFormedBlocks(
+  { formed }: BlockFormation,
+  mode: CostMode,
+  options: AggregateBlocksOptions = {},
+  context?: BlockFlushContext,
+): BlocksResponse {
+  const now = options.now ?? Date.now();
+  // Lower the model needles ONCE here, not once per event inside the totals
   // walk (`lowerModelNeedles` — byte-identical, `toLowerCase` is
   // locale-independent). These lowered needles are a MATCHING input only: the
   // wire `models` on each row come from the events themselves (`modelNames`),
@@ -758,7 +813,6 @@ export function aggregateBlocks(
   const machines = options.machines ?? [];
 
   const samples = options.samples ?? [];
-  const { formed, msOf } = formPendingBlocks(events, samples);
 
   // At most one active block (ADR-0028/0029): when a resolved window is live,
   // every heuristic block is demoted in flushBlock. Disjointness means only
@@ -776,15 +830,16 @@ export function aggregateBlocks(
       const prevLast = prev.events[prev.events.length - 1];
       const first = block.events[0];
       if (prevLast !== undefined && first !== undefined) {
-        const prevMs = msOf(prevLast);
-        const nextMs = msOf(first);
+        const prevMs = prevLast.ms;
+        const nextMs = first.ms;
         if (nextMs - prevMs > FIVE_HOURS_MS) {
           const gap = makeGapRow(prevMs, nextMs);
           if (gap !== null) rows.push(gap);
         }
       }
     }
-    rows.push(flushBlock(block, mode, now, models, machines, resolvedActive, msOf));
+    const totals = context?.totals(block) ?? foldBlockTotals(block, mode, models, machines);
+    rows.push(flushBlock(block, totals, now, resolvedActive));
     prev = block;
   }
 
@@ -815,7 +870,12 @@ export function aggregateBlocks(
   // leak the neighboring window's samples into a peak query (the retired
   // ADR-0028 corollary), and an ACTIVE heuristic row only exists when the
   // history is stale — so the "live" latest util describes a dead window.
-  const view = samples.length > 0 ? precomputeSamples(samples) : null;
+  const view =
+    context !== undefined
+      ? context.sampleView
+      : samples.length > 0
+        ? precomputeSamples(samples)
+        : null;
   const withLimits =
     view === null
       ? rows

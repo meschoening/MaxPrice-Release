@@ -1,271 +1,56 @@
-// Pricing refresh — the startup fetch, the ~24h loop, and the one site that
-// wires both into the live status.
+// Runtime pricing lifecycle (ADR-0085, ADR-0096). Load a newer cached fetch
+// after the LISTENING handshake, then refresh in the background. Successful
+// fetches swap active prices and persist the raw snapshot; failures retain
+// active prices. Disk and network work never gate the handshake or reports.
 //
-// The vendored LiteLLM price snapshot (`packages/shared/src/pricing/`) is the
-// offline floor — it ships in the binary and is always available. But a
-// long-lived install would drift on stale prices, so on sidecar startup we kick
-// a *best-effort* fetch of the live upstream LiteLLM price JSON; on success we
-// swap in the fresher snapshot via `setActivePricingSnapshot`.
-//
-// What lives here:
-//   - `refreshPricing` — one best-effort fetch + swap. Never rejects.
-//   - `schedulePricingRefresh` — the ~24h re-fetch loop (ADR-0041 T14).
-//   - `wirePricingRefresh` — the SINGLE wiring site. `main()` calls it once and
-//     gets the loop handle back; the startup arm and the loop arm used to be two
-//     hand-written blocks in `index.ts` patching identical status, with a
-//     comment asking a future editor to keep them (and the test's
-//     reconstruction of them) in sync.
-//   - `buildPricingStatus` — the single CONSTRUCTION site for the wire's
-//     `pricing` object (ADR-0053), so `source` / `capturedAt` / `modelCount` can
-//     never disagree with each other or with the snapshot actually pricing.
-//
-// Load-bearing constraints:
-//   - Cadence: once at startup (after the LISTENING handshake), then every ~24h.
-//     The startup attempt deliberately does NOT participate in the loop's
-//     `inFlight` guard — it is kicked before any tick can exist.
-//   - Best-effort. ANY failure — offline, non-200, timeout, parse error, an
-//     upstream shape change — falls back to the vendored snapshot. SILENT in the
-//     sense that matters: nothing throws, nothing is gated, `refreshPricing`
-//     never rejects, and the vendored snapshot stands. But no longer INVISIBLE —
-//     every settled attempt is reported on the wire as `pricing.lastAttempt`
-//     (ADR-0053), which is what lets a never-reached-upstream install be told
-//     apart from a successful fetch of the same age.
-//   - A COMPLETENESS FLOOR guards the swap: a transformed snapshot carrying
-//     under half the vendored model count is refused. `transformUpstreamPricing`
-//     rejects only the ZERO-model case, so an upstream restructure that renamed
-//     most keys past its `/claude/i` filter would otherwise swap a handful of
-//     models in over the vendored floor — every missing model then resolving
-//     `null` and pricing at $0 across every report, silently, while the App info
-//     row reads a perfectly healthy `fetched just now`.
-//   - The body is read through a byte-counting reader with a hard ceiling rather
-//     than `response.json()`. A `Content-Length` check is NOT a substitute:
-//     upstream serves this file gzip-encoded and the runtime decompresses it
-//     transparently, so `Content-Length` bounds only the COMPRESSED size (a
-//     decompression bomb sails straight past it), and a chunked response carries
-//     no `Content-Length` at all.
-//   - The fetch uses an `AbortSignal` timeout so a hung request can't leak.
-//   - It must never gate the `LISTENING` handshake, the engine scan, or any
-//     endpoint — `main()` calls `wirePricingRefresh` after the handshake and the
-//     startup attempt is `void`ed inside it.
+// Startup, daily, manual and unknown-model discovery share one in-flight
+// attempt and ten-second cooldown. Unknown-model retries back off from one
+// minute to one hour. All activations publish through the existing status /
+// report-cache invalidation path. The shared fetch module owns payload limits,
+// timeouts, transform validation and the bundled completeness floor.
 
 import {
-  transformUpstreamPricing,
   setActivePricingSnapshot,
   activePricingSnapshot,
   pricingSnapshot,
-  UPSTREAM_PRICING_URL,
-  type PricingFailureKind,
+  unresolvedModels,
+  type PricingRefreshResponse,
   type PricingStatus,
+  fetchPricingSnapshot,
+  type RefreshPricingResult,
+  type RefreshPricingOptions,
 } from "@maxprice/shared";
 
-// The fetch signature we depend on — a structural subset of the global
-// `fetch`. Injected in tests so they stay deterministic and offline.
-export type FetchLike = (url: string, init?: { signal?: AbortSignal }) => Promise<Response>;
+import type { EventStore, StoreChange } from "./engine/store";
 
-export type RefreshPricingOptions = {
-  // Injected for tests; defaults to the global `fetch`.
-  fetchImpl?: FetchLike;
-  // Abort the fetch after this many ms. Defaults to 10s — generous for a
-  // ~1.4 MB JSON file, tight enough that a hung connection can't linger.
-  timeoutMs?: number;
-};
+export { type RefreshPricingResult } from "@maxprice/shared";
+import { loadPricingCache, savePricingCache } from "./pricing-cache";
 
-// The outcome of a refresh attempt. Either the fetch time of a successful swap,
-// or a CLASSIFIED failure (ADR-0053) — the failure arm used to be an opaque
-// `reason` string that every call site discarded; now it reaches the live status
-// so the App info row can say something true about why prices are stale.
-export type RefreshPricingResult =
-  | { ok: true; fetchedAt: string }
-  | { ok: false; kind: PricingFailureKind; detail: string };
+export const DEFAULT_REFRESH_COOLDOWN_MS = 10_000;
 
-const DEFAULT_TIMEOUT_MS = 10_000;
-
-// Hard ceiling on the upstream body, in bytes — enforced by counting DECODED
-// bytes as they arrive (see `readCappedBody`). The real file is ~1.4 MB, so
-// 32 MB is ~23x headroom: legitimate upstream growth can never trip it, while a
-// hostile or corrupt response can't buffer the sidecar out of memory.
-const MAX_BODY_BYTES = 32 * 1024 * 1024;
-
-// The minimum share of the VENDORED model count a fetched snapshot must carry
-// before it is allowed to replace it.
-//
-// 50% is a CATASTROPHIC-RESTRUCTURE bar, not a quality bar. It fires only when
-// upstream has lost most of its Claude keys at once — a rename or restructure
-// slipping past `transformUpstreamPricing`'s `/claude/i` filter — and stays
-// quiet through any plausible legitimate pruning of retired models. A stricter
-// bar would eventually pin the app to an ever-staler vendored floor as upstream
-// genuinely drops old Claude keys, which is the failure this check exists to
-// prevent, only slower.
-//
-// Compared against the VENDORED count, never `activePricingSnapshot()`: the
-// active one ratchets upward with each successful fetch, so using it would turn
-// the floor into a monotonic high-water mark that refuses legitimate prunings.
-const MIN_MODEL_RATIO = 0.5;
-
-// Best-effort fetch + swap of the upstream LiteLLM pricing. Resolves to a
-// result describing the outcome — it never rejects.
-//
-// The nested try/catch structure exists so each `PricingFailureKind` is
-// reachable at the seam that actually failed: a flat single `try` can only
-// report "something threw", which is how the old opaque `reason` came about.
 export async function refreshPricing(
-  opts: RefreshPricingOptions = {},
+  opts: RefreshPricingOptions & { cachePath?: string } = {},
 ): Promise<RefreshPricingResult> {
-  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-
-  try {
-    // Constructed OUTSIDE the fetch's own try on purpose: a `timeoutMs` the
-    // platform rejects is a programmer error, and reporting it as `offline`
-    // would blame the network for our own bad argument. It falls to the
-    // backstop below instead.
-    const signal = AbortSignal.timeout(timeoutMs);
-
-    let response: Response;
-    try {
-      response = await fetchImpl(UPSTREAM_PRICING_URL, { signal });
-    } catch (err) {
-      return fail(classify(err, "offline"), detailOf(err));
-    }
-
-    if (!response.ok) {
-      // Nothing reads an error body, and an undrained, uncancelled one holds
-      // its connection open until GC gets round to it. The `.catch` is
-      // mandatory rather than cosmetic: `index.ts` handles `unhandledRejection`
-      // by shutting the sidecar down, so a bare `void`ed rejecting cancel would
-      // turn a 404 from upstream into a dead sidecar.
-      response.body?.cancel().catch(() => {});
-      return fail("http", `HTTP ${response.status}`);
-    }
-
-    let fetchedAt: string;
-    let snapshot: ReturnType<typeof transformUpstreamPricing>;
-    try {
-      // NOT `response.json()` — the body goes through a counting reader so an
-      // oversized payload is refused rather than buffered (see MAX_BODY_BYTES).
-      const body = await readCappedBody(response, MAX_BODY_BYTES);
-      const upstream: unknown = JSON.parse(body);
-      // The fetch time IS the snapshot's capture time — a runtime refresh is, by
-      // definition, captured now.
-      fetchedAt = new Date().toISOString();
-      snapshot = transformUpstreamPricing(upstream, fetchedAt);
-    } catch (err) {
-      // Deliberately no `body.cancel()` on this arm: every path that reaches it
-      // has already locked (and usually consumed) the stream, and `cancel()` on
-      // a locked stream returns a REJECTED promise which this `catch` — already
-      // unwinding — would not catch. It would reach `unhandledRejection`, i.e.
-      // sidecar shutdown, which is strictly worse than the socket it saves.
-      return fail(classify(err, "payload"), detailOf(err));
-    }
-
-    // The completeness floor — the last gate before the swap. See
-    // MIN_MODEL_RATIO for why the bar is where it is, and why it is measured
-    // against the vendored snapshot rather than the active one. It lives here
-    // and not in `transformUpstreamPricing` because that function is shared with
-    // `packages/shared/scripts/refresh-pricing.ts`, which regenerates the very
-    // floor it would be compared against.
-    const fetchedModels = Object.keys(snapshot.models).length;
-    const vendoredModels = Object.keys(pricingSnapshot.models).length;
-    if (fetchedModels < vendoredModels * MIN_MODEL_RATIO) {
-      return fail(
-        "payload",
-        `fetched snapshot carries ${fetchedModels} of the vendored ${vendoredModels} models — ` +
-          `under the ${Math.ceil(vendoredModels * MIN_MODEL_RATIO)}-model completeness floor`,
-      );
-    }
-
-    setActivePricingSnapshot(snapshot);
-    return { ok: true, fetchedAt };
-  } catch (err) {
-    // The backstop. Reachable via `setActivePricingSnapshot` (the swap itself)
-    // and `AbortSignal.timeout` — folding those into `offline` would report a
-    // swap failure as a network problem, so `unknown` keeps the catch-all
-    // honest while preserving the never-throws contract belt-and-braces.
-    return fail(classify(err, "unknown"), detailOf(err));
+  const result = await fetchPricingSnapshot(opts);
+  if (!result.ok) {
+    console.warn(
+      `[sidecar] pricing refresh skipped (${result.kind}: ${result.detail}); retaining active prices`,
+    );
+    return result;
   }
+  setActivePricingSnapshot(result.snapshot);
+  if (opts.cachePath) await savePricingCache(opts.cachePath, result.snapshot);
+  return { ok: true, fetchedAt: result.fetchedAt };
 }
 
-// Read a response body to text through a running byte counter, refusing to
-// buffer past `maxBytes`. Throws on an oversized body — the caller classifies
-// that as `payload` — and propagates a mid-read abort untouched so `classify`
-// can call it the `timeout` it actually is.
-async function readCappedBody(response: Response, maxBytes: number): Promise<string> {
-  const body = response.body;
-  // A 200 carrying no body at all is unparseable: the payload's fault, not the
-  // network's. `undefined` as well as `null`, because a non-standard Response
-  // may simply not carry the property.
-  if (body === null || body === undefined) {
-    throw new Error("upstream pricing response had no body");
-  }
-
-  const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value === undefined) continue;
-    total += value.byteLength;
-    if (total > maxBytes) {
-      // Stop pulling and drop the connection rather than draining the rest of
-      // an unbounded body. `.catch` for the same reason the non-2xx arm has
-      // one — a rejecting cancel must never reach `unhandledRejection`.
-      void reader.cancel().catch(() => {});
-      throw new Error(`upstream pricing payload exceeded the ${maxBytes}-byte ceiling`);
-    }
-    chunks.push(value);
-  }
-
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(merged);
-}
-
-// An abort ALWAYS means our own timeout fired. `refreshPricing` passes exactly
-// one signal — `AbortSignal.timeout(timeoutMs)` — so there is no other abort
-// source to confuse it with. Both DOMException names denote that same
-// condition: `AbortSignal.timeout()` fires `TimeoutError` in production, and
-// `AbortError` is how a hand-driven abort of the same signal presents (which is
-// what the timeout test injects). Checked at every seam rather than only the
-// fetch one, because a body read can abort mid-flight too — reporting that as
-// `payload` would blame the data for a stalled network.
-function classify(err: unknown, otherwise: PricingFailureKind): PricingFailureKind {
-  const aborted =
-    err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
-  return aborted ? "timeout" : otherwise;
-}
-
-function detailOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-// Silent failure — log at warn level (visible in the sidecar's stderr, not a
-// crash) and report the classified outcome to the caller, which now records it
-// on the live status rather than discarding it.
-//
-// `warn`, not `info`/`debug`: a refresh failure is not nothing — it means the
-// install is running on the vendored snapshot's prices, which only drift
-// further from upstream the longer the failure persists. A one-off offline
-// boot is harmless, but a *persistently* failing refresh is a real
-// staleness exposure, and `warn` is the level an operator scanning stderr
-// would actually notice.
-function fail(kind: PricingFailureKind, detail: string): RefreshPricingResult {
-  console.warn(`[sidecar] pricing refresh skipped (${kind}: ${detail}); using vendored snapshot`);
-  return { ok: false, kind, detail };
-}
-
-// The ONE construction site for the wire's pricing status (ADR-0053). Both
-// `main()` call sites — the boot seed and every settled refresh — patch through
-// this, so `source` / `capturedAt` / `modelCount` can never disagree with each
-// other or with the snapshot actually pricing reports.
+// The ONE construction site for the wire's pricing status (ADR-0053). Every
+// settled attempt patches through this — as does the boot seed — so `source` /
+// `capturedAt` / `modelCount` can never disagree with each other or with the
+// snapshot actually pricing reports.
 //
 // `result === null` means no attempt has settled yet: that is the boot seed,
-// where the active snapshot is still the vendored floor and `lastAttempt` is
-// honestly unknown.
+// where prices may come from the bundled floor or a persisted fetch and
+// this process has not attempted a network refresh yet.
 //
 // `source` needs no branch on the result. `withPricingOverrides` is documented
 // as identity-preserving precisely so this identity check holds (overrides.ts),
@@ -276,6 +61,7 @@ function fail(kind: PricingFailureKind, detail: string): RefreshPricingResult {
 // are still active.
 export function buildPricingStatus(
   result: RefreshPricingResult | null,
+  models: Iterable<string>,
   nowImpl: () => string = () => new Date().toISOString(),
 ): PricingStatus {
   const active = activePricingSnapshot();
@@ -285,6 +71,7 @@ export function buildPricingStatus(
     // Off the ACTIVE snapshot, so the count includes the ADR-0027 override
     // gap-fill — the honest answer to "how many models can this app price".
     modelCount: Object.keys(active.models).length,
+    unpricedModels: unresolvedModels(models),
     lastAttempt:
       result === null
         ? null
@@ -302,105 +89,230 @@ export type PricingRefreshLoop = { stop: () => void };
 
 // ADR-0041 (T14): the ~24h BEST-EFFORT pricing re-fetch. Startup-only refresh
 // left always-on machines frozen at boot-day prices, making cross-machine cost
-// convergence hollow — so the same refreshPricing re-runs on a daily interval.
-// Never throws, never gates anything; a failure leaves the active snapshot
-// untouched and the loop ticking. Injectable + disabled in tests (tests never
-// call schedulePricingRefresh with real timers).
+// convergence hollow — so the same attempt re-runs on a daily interval.
 //
-// `onResult` fires for EVERY settled attempt, success or failure (ADR-0053) —
-// it used to be an `onSuccess` that only saw the happy path, which meant a
-// machine that had never once reached upstream could only ever report
-// `lastAttempt: null`, indistinguishable from one still awaiting its first
-// attempt. One callback rather than `onSuccess` + `onFailure`: two would each
-// have to rebuild the status object independently, defeating
-// `buildPricingStatus`'s single-construction-site guarantee.
+// A PLAIN TICKER since ADR-0085: it calls `attempt` and nothing else. The
+// overlap guard that used to live here (`inFlight`) moved into the single-flight
+// attempt `wirePricingRefresh` builds, because a manual `refreshNow` needed the
+// same guard and two copies of it would have raced each other. A tick landing
+// during an in-flight attempt JOINS it — no fetch is issued, so `lastAttempt`
+// is not advanced and a single hung fetch still cannot look like healthy
+// repeated activity. Never throws, never gates anything.
 export function schedulePricingRefresh(opts: {
-  onResult: (result: RefreshPricingResult) => void;
+  attempt: () => Promise<unknown>;
   intervalMs?: number;
-  refreshImpl?: () => Promise<RefreshPricingResult>;
   setIntervalImpl?: (cb: () => void, ms: number) => unknown;
   clearIntervalImpl?: (handle: unknown) => void;
 }): PricingRefreshLoop {
   const intervalMs = opts.intervalMs ?? 24 * 60 * 60 * 1000;
-  const refreshImpl = opts.refreshImpl ?? refreshPricing;
   const setIntervalImpl = opts.setIntervalImpl ?? ((cb, ms) => setInterval(cb, ms));
   const clearIntervalImpl =
     opts.clearIntervalImpl ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
-  // A slow refresh (a hung fetch inside the AbortSignal timeout) must not let
-  // the next tick stack a second concurrent attempt — the guard drops when the
-  // in-flight one settles. A tick dropped here is NOT an attempt: no fetch is
-  // issued, so reporting one would advance `lastAttempt.at` and make a single
-  // hung fetch look like healthy repeated activity.
-  let inFlight = false;
   const handle = setIntervalImpl(() => {
-    if (inFlight) return;
-    inFlight = true;
-    // Two-argument `.then` rather than a trailing `.catch`, so the rejection
-    // handler covers `refreshImpl()` ONLY. The two failure modes are genuinely
-    // different — a refresh that couldn't run vs. a status update that threw —
-    // and a trailing `.catch` (where `onResult` used to sit, inside the `.then`)
-    // labelled both as the former, blaming the fetch for a wiring bug.
-    void refreshImpl()
-      .then(
-        (result) => {
-          try {
-            opts.onResult(result);
-          } catch (err: unknown) {
-            console.warn("[sidecar] pricing refresh status update failed:", err);
-          }
-        },
-        // A REJECTING refreshImpl is not a result — `refreshPricing` never
-        // rejects by contract, so this stays a defensive warn rather than a
-        // synthesized `unknown` failure the refresh never actually returned.
-        (err: unknown) => {
-          console.warn("[sidecar] periodic pricing refresh failed:", err);
-        },
-      )
-      .finally(() => {
-        inFlight = false;
-      });
+    // `refreshPricing` never rejects by contract; the attempt rejects only if
+    // the status patch throws. Either way a timer callback must not surface it
+    // — `index.ts` turns an unhandled rejection into a sidecar shutdown.
+    void opts.attempt().catch((err: unknown) => {
+      console.warn("[sidecar] periodic pricing refresh failed:", err);
+    });
   }, intervalMs);
   return { stop: () => clearIntervalImpl(handle) };
 }
 
+// The handle `main()` keeps: `stop()` cancels both timers; `refreshNow()`
+// is what POST /api/pricing/refresh calls (ADR-0085).
+export type PricingRefresher = PricingRefreshLoop & {
+  refreshNow: () => Promise<PricingRefreshResponse>;
+  republish: () => void;
+};
+
 // The SINGLE wiring site: `main()` calls this once, after the LISTENING
-// handshake, and keeps the returned handle so shutdown can `stop()` the timer.
+// handshake, and keeps the returned handle.
 //
-// Both arms patch the same `{ pricing: buildPricingStatus(result) }`. They used
-// to be two hand-written blocks in `index.ts` — plus a third reconstruction of
-// them in `pricing-refresh.test.ts`, since `main()` is not exported — held
-// together by a comment asking a future editor to keep all three in sync.
+// Startup, daily, manual and model-discovery callers share ONE attempt
+// (ADR-0085, ADR-0096). `attempt()` is single-flight —
+// a caller arriving while one is in flight gets the SAME promise, so there is
+// never more than one upstream fetch or more than one status patch per
+// attempt, and every caller is told the same truth. This is what lets the
+// manual button never fail for a reason the user cannot see: pressing it during
+// the boot fetch simply waits for that fetch's answer.
 //
-// The two arms are NOT interchangeable, and both differences are deliberate:
-//   - The startup arm carries its own `.catch`. `refreshPricing` never rejects,
-//     but `patch` could in principle throw, and a `void`ed rejection would reach
-//     `unhandledRejection` — which `index.ts` handles by exiting the process.
-//   - The startup arm does NOT participate in the loop's `inFlight` guard. It is
-//     kicked before any tick can fire, and folding it in would be a semantic
-//     change ADR-0053 didn't sanction.
+// This reverses ADR-0053's note that the startup arm did NOT participate in the
+// loop's guard. It had to: a manual request racing the boot fetch would
+// otherwise have stacked a second fetch and a second swap.
+//
+// `newModels` is measured across the attempt from the ACTIVE snapshot's key
+// set — before the fetch and after the swap — so it counts exactly what this
+// attempt made priceable. It is 0 on failure by construction (no swap).
+//
+// Behind the single-flight guard sits a COOLDOWN (DEFAULT_REFRESH_COOLDOWN_MS):
+// a call arriving within the window after the last attempt settled is answered
+// with that attempt's `pricing` and `newModels: 0` — not the previous count,
+// which was already reported once, by the attempt that earned it. Like a joined
+// caller, a cooled caller is not an attempt: no fetch, no status patch,
+// `lastAttempt` does not advance. The window opens only on a SETTLED response;
+// an attempt whose patch threw never produced one, so it cools nothing and the
+// next call retries for real.
 export function wirePricingRefresh(opts: {
   patch: (partial: { pricing: PricingStatus }) => void;
+  models: () => Iterable<string>;
   refreshImpl?: () => Promise<RefreshPricingResult>;
+  cachePath?: string;
+  retryBaseMs?: number;
+  retryMaxMs?: number;
+  setTimeoutImpl?: (cb: () => void, ms: number) => unknown;
+  clearTimeoutImpl?: (handle: unknown) => void;
   intervalMs?: number;
   setIntervalImpl?: (cb: () => void, ms: number) => unknown;
   clearIntervalImpl?: (handle: unknown) => void;
-}): PricingRefreshLoop {
-  const refreshImpl = opts.refreshImpl ?? refreshPricing;
-  const patchResult = (result: RefreshPricingResult): void => {
-    opts.patch({ pricing: buildPricingStatus(result) });
+  // The cooldown window and the clock it is measured on. Injected for tests,
+  // mirroring `buildPricingStatus`'s clock.
+  cooldownMs?: number;
+  nowImpl?: () => number;
+}): PricingRefresher {
+  const refreshImpl = opts.refreshImpl ?? (() => refreshPricing({ cachePath: opts.cachePath }));
+  const retryBaseMs = opts.retryBaseMs ?? 60_000;
+  const retryMaxMs = opts.retryMaxMs ?? 60 * 60_000;
+  const setTimeoutImpl =
+    opts.setTimeoutImpl ??
+    ((cb, ms) => {
+      const timer = setTimeout(cb, ms);
+      timer.unref();
+      return timer;
+    });
+  const clearTimeoutImpl =
+    opts.clearTimeoutImpl ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+  let retryTimer: unknown = null;
+  let retryDelay = retryBaseMs;
+  let nextAutomaticAt = 0;
+  let stopped = false;
+  let cacheLoaded = !opts.cachePath;
+  const cooldownMs = opts.cooldownMs ?? DEFAULT_REFRESH_COOLDOWN_MS;
+  const nowImpl = opts.nowImpl ?? Date.now;
+
+  // A model-only publication preserves the settled attempt's timestamp and
+  // failure. It must also update cooldown responses, so a manual response can
+  // never overwrite newer model discovery with a stale unpriced list.
+  let publishedPricing = buildPricingStatus(null, []);
+  let inFlight: Promise<PricingRefreshResponse> | null = null;
+  let lastSettled: { at: number; response: PricingRefreshResponse } | null = null;
+  const attempt = (): Promise<PricingRefreshResponse> => {
+    if (inFlight !== null) return inFlight;
+    if (lastSettled !== null && nowImpl() - lastSettled.at < cooldownMs) {
+      return Promise.resolve({ pricing: publishedPricing, newModels: 0 });
+    }
+    let before = new Set(Object.keys(activePricingSnapshot().models));
+    const run = async (): Promise<RefreshPricingResult> => {
+      if (!cacheLoaded && opts.cachePath) {
+        cacheLoaded = true;
+        await loadPricingCache(opts.cachePath);
+        before = new Set(Object.keys(activePricingSnapshot().models));
+        publishedPricing = buildPricingStatus(null, opts.models());
+        opts.patch({ pricing: publishedPricing });
+      }
+      return refreshImpl();
+    };
+    inFlight = run()
+      .then((result) => {
+        const after = Object.keys(activePricingSnapshot().models);
+        const newModels = result.ok ? after.filter((key) => !before.has(key)).length : 0;
+        const pricing = buildPricingStatus(result, opts.models());
+        // The ONE patch per attempt. If it throws, the promise rejects — the
+        // startup arm and the ticker warn, the route answers 500.
+        opts.patch({ pricing });
+        publishedPricing = pricing;
+        const response = { pricing, newModels };
+        lastSettled = { at: nowImpl(), response };
+        const needsRetry = !result.ok || pricing.unpricedModels.length > 0;
+        nextAutomaticAt = nowImpl() + (needsRetry ? retryDelay : cooldownMs);
+        retryDelay = needsRetry ? Math.min(retryDelay * 2, retryMaxMs) : retryBaseMs;
+        return response;
+      })
+      .catch((err: unknown) => {
+        nextAutomaticAt = nowImpl() + retryDelay;
+        retryDelay = Math.min(retryDelay * 2, retryMaxMs);
+        throw err;
+      })
+      .finally(() => {
+        inFlight = null;
+        scheduleUnknownRefresh();
+      });
+    return inFlight;
   };
 
-  void refreshImpl()
-    .then(patchResult)
-    .catch((err: unknown) => {
-      console.warn("[sidecar] pricing refresh status update failed:", err);
-    });
+  // Discovery and retries share the same attempt as startup, manual and daily refresh.
+  // Failed or still-unpriced attempts back off globally, including when more models arrive.
+  function scheduleUnknownRefresh(): void {
+    if (retryTimer !== null) clearTimeoutImpl(retryTimer);
+    retryTimer = null;
+    if (stopped || inFlight !== null || unresolvedModels(opts.models()).length === 0) return;
+    const cooldownUntil = lastSettled === null ? 0 : lastSettled.at + cooldownMs;
+    const delay = Math.max(0, nextAutomaticAt - nowImpl(), cooldownUntil - nowImpl());
+    retryTimer = setTimeoutImpl(() => {
+      retryTimer = null;
+      if (stopped) return;
+      void attempt().catch((err: unknown) => {
+        console.warn("[sidecar] automatic pricing refresh failed:", err);
+      });
+    }, delay);
+  }
 
-  return schedulePricingRefresh({
-    onResult: patchResult,
-    refreshImpl,
+  // The startup arm. `void`ed so it never gates the handshake / scan / any
+  // endpoint; its own `.catch` keeps a throwing `patch` away from
+  // `unhandledRejection`, which `index.ts` handles by exiting the process.
+  void attempt().catch((err: unknown) => {
+    console.warn("[sidecar] pricing refresh status update failed:", err);
+  });
+
+  const loop = schedulePricingRefresh({
+    attempt,
     intervalMs: opts.intervalMs,
     setIntervalImpl: opts.setIntervalImpl,
     clearIntervalImpl: opts.clearIntervalImpl,
+  });
+  return {
+    stop: () => {
+      stopped = true;
+      loop.stop();
+      if (retryTimer !== null) clearTimeoutImpl(retryTimer);
+      retryTimer = null;
+    },
+    refreshNow: attempt,
+    republish: () => {
+      const next = unresolvedModels(opts.models());
+      if (sameList(publishedPricing.unpricedModels, next)) return;
+      const pricing = { ...publishedPricing, unpricedModels: next };
+      opts.patch({ pricing });
+      publishedPricing = pricing;
+      scheduleUnknownRefresh();
+    },
+  };
+}
+
+function sameList(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// Subscribe to a store's change feed and call `republish` the first time any
+// raw model string appears in a batch (#110). Cheap by construction: one Set
+// lookup per changed row, and `republish` itself only broadcasts when the
+// unpriced list actually moved. Returns the unsubscribe; `main()` re-attaches
+// on the fleet's store swap, the way the local archive does.
+export function watchNewModels(
+  store: Pick<EventStore, "onChanged">,
+  republish: () => void,
+): () => void {
+  const seen = new Set<string>();
+  return store.onChanged((changes: readonly StoreChange[]) => {
+    let fresh = false;
+    for (const c of changes) {
+      if (!seen.has(c.event.model)) {
+        seen.add(c.event.model);
+        fresh = true;
+      }
+    }
+    if (fresh) republish();
   });
 }

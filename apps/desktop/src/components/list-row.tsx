@@ -19,7 +19,7 @@ export type ListRowProps = {
   flipRef?: (el: HTMLElement | null) => void;
 };
 
-// One rail row (glass.html): title + 800-weight cost on the first line,
+// One rail row (Glass, ADR-0043): title + 800-weight cost on the first line,
 // meta + model split bar on the second; hairline dividers between rows.
 export function ListRow({
   breakdowns,

@@ -17,6 +17,7 @@ export * from "./settings";
 export * from "./storage";
 export * from "./error";
 export * from "./rescan";
+export * from "./pricing-refresh";
 export * from "./query-keys";
 export * from "./readout";
 export * from "./models";

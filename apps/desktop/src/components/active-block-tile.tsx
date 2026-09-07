@@ -6,6 +6,7 @@ import {
   type ActiveBlockTileState,
 } from "@/lib/active-block-tile-state";
 import { UsageExpiredHint } from "@/components/usage-expired-hint";
+import { UnpricedChip } from "@/components/unpriced-chip";
 import { useLiveStatus } from "@/state/use-live-status";
 import { useNowTick } from "@/state/use-now-tick";
 import { useTimeDisplay } from "@/state/use-settings";
@@ -20,7 +21,7 @@ export type ActiveBlockTileProps = {
   typicalBlockTokens: number;
 };
 
-// The Active Block tile (glass.html): the 100px elapsed ring and the 5-hour
+// The Active Block tile (Glass, ADR-0043): the 100px elapsed ring and the 5-hour
 // limit meter wear the Aurora --accent-a → --accent-b gradient — the glass
 // system's glow, earned by a live reset window (the This-week tile's weekly
 // meter wears it too; settled blocks' meters stay flat). The ring's arc tracks
@@ -56,10 +57,10 @@ export function ActiveBlockTile({
   // distinguish idle from unavailable, so retain the explicit empty inset.
   // A connected account with no local block keeps the tile shell: a future
   // reset shows the provisional account window, while an expired or absent
-  // reading renders known zeroes below.
+  // reading renders the idle ring below.
   if (tileState.kind === "empty-inset") {
     return (
-      <div className="tile panel">
+      <div className="tile panel" data-block-state="idle">
         <span className="eyebrow">Active block</span>
         <div className="inset dashed my-auto">
           <p>No active block — start a Claude Code session to open one.</p>
@@ -77,6 +78,7 @@ export function ActiveBlockTile({
       display={display}
       bumping={bumping}
       usageExpired={usageConnection === "expired"}
+      models={block?.models ?? []}
     />
   );
 }
@@ -90,6 +92,9 @@ export type ActiveBlockTileContentProps = {
   display: TimeDisplay;
   bumping: boolean;
   usageExpired: boolean;
+  // The active block's raw model names (`BlockRow.models`) — the unpriced
+  // chip's join input (#110). Empty for an account-window-only tile.
+  models: readonly string[];
 };
 
 // Pure rendering seam for the two sources of active-block presentation: a
@@ -103,6 +108,7 @@ export function ActiveBlockTileContent({
   display,
   bumping,
   usageExpired,
+  models,
 }: ActiveBlockTileContentProps): React.ReactElement {
   const { accountWindow, active, limitPct, ringCenterLabel, ringFrac } = state;
   const valueText = tileValueText(state);
@@ -111,7 +117,10 @@ export function ActiveBlockTileContent({
   const tileEndMs = active?.endMs ?? accountWindow?.endMs ?? null;
 
   return (
-    <div className="tile panel block-tile">
+    <div
+      className="tile panel block-tile"
+      data-block-state={active === null && accountWindow === null ? "idle" : "active"}
+    >
       <div className="ring-wrap">
         <svg
           viewBox="0 0 96 96"
@@ -160,7 +169,10 @@ export function ActiveBlockTileContent({
           ) : null}
         </div>
         <div className="block-value-row">
-          <span className={cn("value num", bumping && "bump")}>{valueText}</span>
+          <span className={cn("value num", bumping && "bump")}>
+            {valueText}
+            <UnpricedChip models={models} />
+          </span>
           {tileStartMs !== null && tileEndMs !== null ? (
             <span className="block-meta num">
               {formatElapsed(now - tileStartMs)} elapsed · resets{" "}

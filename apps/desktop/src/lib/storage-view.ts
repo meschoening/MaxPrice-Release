@@ -8,9 +8,9 @@ import type { HubMachine, StorageReport, StorageSegment, StorageSegmentId } from
 // hold the markup; the arithmetic, the copy table, and the two rules the
 // section exists to keep honest live here, where they are testable.
 //
-// The visual contract is `plans/mocks/redesign/storage-glass.html` (variant C,
-// `framed`) + NOTES.md §"Settings › Storage — Glass". The copy below is the
-// mock's frozen `COPY` table.
+// Ported from the Storage mock's variant C (`framed`) and its written notes;
+// the mocks are history (ADR-0088) and the copy below IS the frozen `COPY`
+// table now.
 
 export type MeasuredSegment = Extract<StorageSegment, { state: "measured" }>;
 export type UnavailableSegment = Extract<StorageSegment, { state: "unavailable" }>;
@@ -77,7 +77,7 @@ export function corpusRatio(report: StorageReport): string | null {
 //
 // The legend's seven notes are ~9 lines of prose under a 26px bar, so they left
 // the resting list and come back on a dwell (chosen 2026-08-04 from the four
-// `?notes=` variants in `plans/mocks/redesign/storage-glass.html`: dwell / a
+// `?notes=` variants of the Storage mock, history per ADR-0088: dwell / a
 // per-row `?` / one section switch / a reserved strip).
 //
 // The two timings are what make the gesture survivable, and they are a pair:

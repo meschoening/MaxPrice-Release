@@ -91,7 +91,7 @@ impl Px {
 }
 
 /// The popout's corner radius in POINTS (logical px) — the mock's radius-14
-/// geometry, NOTES.md §"Client tray popout — Glass (T3)".
+/// geometry (ADR-0050).
 ///
 /// macOS only, and it is the reason the number lives in Rust at all: Win11's
 /// DWM rounds the undecorated window itself at its own radius (ADR-0050), so

@@ -61,7 +61,8 @@ import type { StoredEvent } from "./store";
 // rightmost bucket end exactly at `now`, which is what the live chart wants.
 //
 // BUCKET ASSIGNMENT. An event's timestamp is parsed to epoch-ms with
-// `Date.parse`. An unparseable timestamp yields `NaN` and the event is
+// `event.ms` (derived once at `upsert`, ADR-0089). An unparseable timestamp
+// yields `NaN` and the event is
 // *dropped* — mirroring `daily.ts`'s `localDate === null` skip, so a malformed
 // timestamp can never reach the wire. A parseable event is assigned to bucket
 // `floor((t - windowStart)/ms)` of whichever window it falls in; an event
@@ -539,7 +540,7 @@ export function aggregateIntraday(
   // event is past `now` every later one is too → `stop`; before `windowStart` →
   // `skip` (f12).
   const classify = (event: StoredEvent): EventClass => {
-    const t = Date.parse(event.timestamp);
+    const t = event.ms;
     // Unparseable timestamp → NaN → dropped (mirrors daily.ts's localDate skip).
     if (Number.isNaN(t)) return { kind: "skip" };
     if (t > now) return { kind: "stop" };
@@ -664,7 +665,7 @@ function aggregateToday(
   // calendar date, not by a monotone right edge, so a later event might still be
   // a yesterday-window match.
   const classify = (event: StoredEvent): EventClass => {
-    const t = Date.parse(event.timestamp);
+    const t = event.ms;
     // Unparseable, or before the lower bound → dropped without an `Intl` call.
     if (Number.isNaN(t) || t < lowerBound) return { kind: "skip" };
     const clock = localClock(event.timestamp, tz);
@@ -759,7 +760,7 @@ function aggregateBlockSpan(
       : Array.from({ length: count }, (_, k) => new Date(prevWin.startMs + k * ms).toISOString());
 
   const classify = (event: StoredEvent): EventClass => {
-    const t = Date.parse(event.timestamp);
+    const t = event.ms;
     if (Number.isNaN(t)) return { kind: "skip" };
     // Ascending input: past the block's real end nothing later can land in
     // either frame (the previous block is earlier still). The half-open right
@@ -876,7 +877,7 @@ function aggregateWeekSpan(
   // its ghost is wanted, else the anchor. Everything earlier is `skip`ped.
   const lowerBound = includePrevious ? prevStart : startMs;
   const classify = (event: StoredEvent): EventClass => {
-    const t = Date.parse(event.timestamp);
+    const t = event.ms;
     if (Number.isNaN(t) || t < lowerBound) return { kind: "skip" };
     if (t >= startMs) {
       // In the current week (including a future-dated event — fold into the

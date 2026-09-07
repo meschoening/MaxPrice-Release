@@ -2,7 +2,7 @@ import { cn } from "@/lib/utils";
 
 // The glass switch (@maxprice/glass .toggle) — label + pill track. Disabled
 // switches stay rendered but dimmed with an explanatory tooltip
-// (INTERACTIONS.md: the Log scale toggle is disabled, not hidden, when no
+// (ADR-0088: the Log scale toggle is disabled, not hidden, when no
 // model/token-type axis is selected).
 export function GlassToggle({
   label,

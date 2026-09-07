@@ -60,7 +60,7 @@ export function Layout() {
         /* sidecar may not be up yet at boot; hub stays off until pushed */
       });
   }, [settings]);
-  // The glass frame (glass.html .app): panels float on the body's wash with
+  // The glass frame (ADR-0043): panels float on the body's wash with
   // ≥16px gaps. The sidebar is a detached frosted column; the main column is
   // the pill topbar over the routed page. Unlike the mock (whose whole page
   // scrolls), <main> stays the definite-height scroll container — the

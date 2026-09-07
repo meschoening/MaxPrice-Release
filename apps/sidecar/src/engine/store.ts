@@ -47,7 +47,39 @@ export type StoredEvent = UsageRecord & {
   // with the machine's own id (loadOrCreateMachineId's value) at append;
   // replica-fed rows carry the hub-minted id. No "undefined = self" sentinel.
   machineId: string;
+  // ADR-0089: `Date.parse(timestamp)`, computed ONCE at `upsert` and carried
+  // for the row's lifetime. `NaN` when the timestamp is unparseable — the
+  // store keeps such rows (dropping them would be a semantic change) and every
+  // consumer already fails them safe.
+  //
+  // THE INVARIANT: `ms === Date.parse(timestamp)`, always. It holds by
+  // construction because `upsert` is the ONE place a `StoredEvent` becomes
+  // stored, and it derives `ms` there rather than trusting a caller. Never
+  // build a `StoredEvent` literal outside the store and never patch
+  // `timestamp` without re-deriving `ms` — a desynced pair is invisible
+  // (the wire still shows the right timestamp) and silently rebuckets the
+  // event in blocks, intraday, and every instant-bounded query.
+  //
+  // This is a RAM-only field: `storedEventToWire` does not carry it, and the
+  // fleet wire shape (`FleetEvent`) has no such member.
+  ms: number;
 };
+
+// A `StoredEvent` as a FEEDER builds it — every field but the derived `ms`.
+// Both feeders (local scan/watcher and the fleet replica) hand this to
+// `upsert`, which derives `ms` and is the only producer of a real
+// `StoredEvent`.
+export type StoredEventInput = Omit<StoredEvent, "ms">;
+
+// THE derivation of `ms`, and the only one. `upsert` calls it on the ingest
+// path; the engine suites' `ev()` fixtures call it so a test that overrides
+// `timestamp` cannot leave a stale `ms` behind it — a desync no assertion
+// would catch, because every wire field would still look right. Any `ms`
+// already on `input` is overwritten, deliberately: the timestamp is the truth
+// and this field is a cache of it.
+export function withEventMs<T extends { timestamp: string }>(input: T): T & { ms: number } {
+  return { ...input, ms: Date.parse(input.timestamp) };
+}
 
 // ---------------------------------------------------------------------------
 // StoreChange — the change feed's unit (consumed by the report cache, #113)
@@ -292,6 +324,13 @@ export type EventStore = {
   stampInsertionOrder: (visit: (e: StoredEvent) => void) => void;
   // Total deduped event count — for tests and `/api/status`.
   size: () => number;
+  // Every distinct raw `model` string this store has ever upserted (#110,
+  // ADR-0087). The sidecar resolves this set against the active pricing
+  // snapshot to publish `pricing.unpricedModels`; it is a store scan rather
+  // than a resolver side effect precisely so the answer does not depend on
+  // which reports have run. Insertion-ordered, never pruned: a model that
+  // once appeared stays in the corpus, so it stays here.
+  models: () => ReadonlySet<string>;
 };
 
 // How many files the initial scan reads+parses concurrently. Parse work is
@@ -318,6 +357,9 @@ export function createEventStore(opts: {
   // keyed upsert — a duplicate key is resolved by `upsert`'s
   // largest-token-total rule, never blindly re-added.
   const events = new Map<string, StoredEvent>();
+
+  // Distinct raw model strings seen by `upsert` — see `EventStore.models`.
+  const modelsSeen = new Set<string>();
 
   // Lazily-built timestamp-sorted snapshot of every event, memoized so a burst
   // of back-to-back queries (`/api/daily` + `/api/daily-by-project` share a
@@ -372,11 +414,19 @@ export function createEventStore(opts: {
   // byte-identical content-block lines) keep first-seen, and a streamed
   // message's final row replaces the `output_tokens: 1` partial regardless of
   // which the scan reads first.
-  function upsert(event: StoredEvent, changes: StoreChange[]): boolean {
-    const key = dedupKey(event.messageId, event.requestId);
+  function upsert(input: StoredEventInput, changes: StoreChange[]): boolean {
+    const key = dedupKey(input.messageId, input.requestId);
     const existing = events.get(key);
-    if (existing !== undefined && tokenTotal(existing) >= tokenTotal(event)) return false;
+    if (existing !== undefined && tokenTotal(existing) >= tokenTotal(input)) return false;
+    // Derive `ms` HERE and nowhere else (ADR-0089) — this is the single funnel
+    // both feeders converge on, so the `ms === Date.parse(timestamp)` invariant
+    // cannot be violated by a caller. Deliberately AFTER the dedup rejection:
+    // a re-scan or a scan/watcher overlap re-presents rows that are already
+    // stored, and parsing a timestamp only to discard the row is the exact
+    // waste this change exists to remove.
+    const event: StoredEvent = withEventMs(input);
     events.set(key, event);
+    modelsSeen.add(event.model);
     // A new or replacing event invalidates the memoized sorted snapshot.
     sorted = null;
     // The displaced row rides along so a subscriber can un-count it without
@@ -422,7 +472,7 @@ export function createEventStore(opts: {
     const changes: StoreChange[] = [];
     let changed = 0;
     for (const row of rows) {
-      const stored: StoredEvent = {
+      const stored: StoredEventInput = {
         timestamp: row.timestamp,
         messageId: row.messageId,
         requestId: row.requestId,
@@ -582,8 +632,9 @@ export function createEventStore(opts: {
     for (const event of sortedEvents()) {
       if (since !== undefined || until !== undefined) {
         if (instantBounds) {
-          // Half-open `[since, until)` window on the event's own timestamp.
-          const t = Date.parse(event.timestamp);
+          // Half-open `[since, until)` window on the event's own timestamp,
+          // read off the row's derived `ms` (ADR-0089) rather than re-parsed.
+          const t = event.ms;
           // An unparseable timestamp fails the filter safe, as on the ymd path.
           if (Number.isNaN(t)) continue;
           if (sinceMs !== undefined && t < sinceMs) continue;
@@ -631,5 +682,6 @@ export function createEventStore(opts: {
       for (const e of events.values()) visit(e);
     },
     size: () => events.size,
+    models: () => modelsSeen,
   };
 }

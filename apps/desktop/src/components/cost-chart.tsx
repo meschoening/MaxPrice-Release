@@ -199,7 +199,7 @@ export function CostChart(props: CostChartProps): React.ReactElement {
   );
 }
 
-// The legend row under the chart — glass chips (glass.html .legend-row).
+// The legend row under the chart — glass chips (ADR-0043).
 // Lives here so the visual contract (swatch color + label) ships with the
 // chart. The compose step emits one legend group per selected axis
 // (ADR-0033): the hue axis shows its own palette, the ramp axis dark→light

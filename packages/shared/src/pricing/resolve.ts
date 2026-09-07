@@ -79,14 +79,16 @@ const DATED_SUFFIX = /-\d{8}$/;
 // dated variant of an undated key (`claude-opus-4-5` → `claude-opus-4-5-…`) —
 // is never attempted: there is no date to invent, so an undated raw string
 // only ever matches an undated snapshot key.
-// Returns the resolved snapshot key, or `null` if nothing matches.
-export function resolveModelKey(rawModel: string): string | null {
+// Returns the resolved snapshot key, or `null` if nothing matches. An explicit
+// snapshot supports release coverage checks without changing active prices or
+// consulting/populating their resolution cache.
+export function resolveModelKey(rawModel: string, snapshot?: PricingSnapshot): string | null {
   if (typeof rawModel !== "string" || rawModel.length === 0) return null;
 
   // `Map.get` returns `undefined` for an absent key but the stored value `null`
   // for a previously-resolved unresolvable model, so `!== undefined` reads a
   // cached `null` as a hit rather than recomputing it.
-  const cached = resolveCache.get(rawModel);
+  const cached = snapshot === undefined ? resolveCache.get(rawModel) : undefined;
   if (cached !== undefined) return cached;
 
   // The ordered candidate list: each transform is additive over the previous.
@@ -106,11 +108,37 @@ export function resolveModelKey(rawModel: string): string | null {
 
   let resolved: string | null = null;
   for (const candidate of candidates) {
-    if (snapshotKeys.has(candidate)) {
+    if (
+      snapshot === undefined
+        ? snapshotKeys.has(candidate)
+        : Object.hasOwn(snapshot.models, candidate)
+    ) {
       resolved = candidate;
       break;
     }
   }
-  resolveCache.set(rawModel, resolved);
+  if (snapshot === undefined) resolveCache.set(rawModel, resolved);
   return resolved;
+}
+
+// The subset of `rawModels` the ACTIVE snapshot cannot price — every raw
+// string `resolveModelKey` maps to `null`, deduped and sorted so two callers
+// over the same set produce byte-identical lists (the status wire compares
+// them to decide whether to re-broadcast). Pure: this is the whole reason the
+// sidecar's unpriced set is a store scan rather than a resolver side effect
+// (ADR-0087) — the resolver's memo is cleared on every swap and only ever
+// knows the models some report happened to price, whereas this answers for
+// exactly the set it is handed, whenever it is asked. The release gate reuses
+// the same resolution rules against the bundled offline floor; the app may
+// instead have a newer fetched snapshot.
+export function unresolvedModels(
+  rawModels: Iterable<string>,
+  snapshot?: PricingSnapshot,
+): string[] {
+  const out = new Set<string>();
+  for (const raw of rawModels) {
+    if (typeof raw !== "string" || raw.length === 0) continue;
+    if (resolveModelKey(raw, snapshot) === null) out.add(raw);
+  }
+  return Array.from(out).sort();
 }

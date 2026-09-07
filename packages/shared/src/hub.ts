@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { usageConnectionSchema, usageSampleSchema } from "./usage-limits";
+import { usageConnectionSchema, usageReadingSchema, usageSampleSchema } from "./usage-limits";
 
 // Hub wire protocol (ADR-0035): the contract between the standalone always-on
 // hub (apps/hub) and each sidecar's hub-client. Crosses MACHINE boundaries —
@@ -8,7 +8,7 @@ import { usageConnectionSchema, usageSampleSchema } from "./usage-limits";
 // HUB_PROTOCOL_VERSION match (no shims; the failure mode is a clear "mismatch"
 // connection state, never quiet misbehavior). Bump the version on ANY breaking
 // change to the shapes below.
-export const HUB_PROTOCOL_VERSION = 2;
+export const HUB_PROTOCOL_VERSION = 3;
 
 // The hub's fixed default port. Unlike the sidecar (ADR-0002's dynamic port +
 // stdout handshake — only possible with a parent process), remote clients must
@@ -62,9 +62,9 @@ export const hubStatusSchema = z.object({
   protocolVersion: z.number().int(),
   usageConnection: usageConnectionSchema,
   usageLastSampleAt: z.string().nullable(),
-  // Protocol v2: authoritative live value, separate from append-only history.
+  // Protocol v3: each live window is nullable independently of the others.
   // null means a successful poll found no account window in flight.
-  usageCurrentSample: usageSampleSchema.nullable(),
+  usageCurrentSample: usageReadingSchema.nullable(),
   sampleCount: z.number().int().nonnegative(),
   credentialPresent: z.boolean(),
   // Provenance + display fields (ADR-0036). All .optional() — additive; protocol

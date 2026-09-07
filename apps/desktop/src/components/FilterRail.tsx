@@ -26,7 +26,7 @@ function presetLabel(p: DateRangePreset): string {
 }
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-// The sidebar's filter fields (glass.html): date presets as a seg pill +
+// The sidebar's filter fields (Glass, ADR-0043): date presets as a seg pill +
 // resolved readout, then Project / Model / Machine select chips whose menus
 // are floating glass leaves. Filter semantics are frozen — the rail drives
 // the same store the old rail drove.
@@ -191,7 +191,7 @@ type MultiSelectLeafProps = {
 
 // A select chip whose menu is a floating glass leaf (.menu/.opt) — Radix
 // Popover supplies the float/outside-click/one-at-a-time semantics; option
-// clicks keep the menu open (multi-select, INTERACTIONS.md). The focus
+// clicks keep the menu open (multi-select; ADR-0088). The focus
 // pattern: empty = "All X"; picking from All narrows to that one; toggling
 // members after; selecting everything resets to All.
 function MultiSelectLeaf({

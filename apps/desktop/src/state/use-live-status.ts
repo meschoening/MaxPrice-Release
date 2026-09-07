@@ -148,3 +148,20 @@ export const useLiveStatus = create<LiveStatusState>((set) => ({
     })),
   markEvent: (at) => set({ lastEventAt: at }),
 }));
+
+// The sidecar's unpriced model set as a Set (#110). Memoized on the wire
+// array's identity: `pricing` is replaced whole per frame, and the sidecar
+// only re-broadcasts when the list changed, so consumers see a stable Set
+// between changes and a new one exactly when the answer moved.
+const EMPTY_UNPRICED: ReadonlySet<string> = new Set();
+let unpricedSource: readonly string[] | null = null;
+let unpricedSet: ReadonlySet<string> = EMPTY_UNPRICED;
+export function useUnpricedModels(): ReadonlySet<string> {
+  const list = useLiveStatus((s) => s.pricing?.unpricedModels ?? null);
+  if (list === null) return EMPTY_UNPRICED;
+  if (list !== unpricedSource) {
+    unpricedSource = list;
+    unpricedSet = list.length === 0 ? EMPTY_UNPRICED : new Set(list);
+  }
+  return unpricedSet;
+}

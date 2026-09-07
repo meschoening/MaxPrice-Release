@@ -1,6 +1,6 @@
 {
   "name": "maxprice",
-  "version": "0.6.2",
+  "version": "0.6.4",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -19,7 +19,7 @@
     "typecheck": "bun --filter '*' typecheck && bun run typecheck:scripts",
     "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json",
     "test": "bun --filter '*' test && bun run test:scripts",
-    "test:scripts": "bun test scripts/release-tooling.test.ts scripts/public-sync.test.ts scripts/updater-manifest.test.ts",
+    "test:scripts": "bun test scripts/release-tooling.test.ts scripts/public-sync.test.ts scripts/updater-manifest.test.ts scripts/check-unpriced-models.test.ts scripts/prepare-release.test.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

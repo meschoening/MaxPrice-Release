@@ -1,7 +1,7 @@
 import type { BootProgress } from "@maxprice/shared";
 
-// The boot splash's progress model (ADR-0067, amending ADR-0047 and the NOTES
-// §Boot splash contract that forbade progress numbers).
+// The boot splash's progress model (ADR-0067, amending ADR-0047 and the
+// original boot-splash contract that forbade progress numbers).
 //
 // The splash reports four steps. Only ONE of them is measured by the sidecar —
 // the corpus scan, whose file counts ride `bootProgress` on the status frame.

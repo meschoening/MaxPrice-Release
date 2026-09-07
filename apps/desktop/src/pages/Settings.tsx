@@ -7,6 +7,8 @@ import { TimeFormatControl } from "@/components/settings/TimeFormatControl";
 import { WeekControl } from "@/components/settings/WeekControl";
 import { CostModeControl } from "@/components/settings/CostModeControl";
 import { UpdatesSection } from "@/components/settings/UpdatesSection";
+import { PricingSection } from "@/components/settings/pricing-section";
+import { PRICING_SECTION_DESCRIPTION } from "@/lib/pricing-section";
 import { BackgroundSection } from "@/components/settings/background-section";
 import { backgroundResidencySupported } from "@/lib/background-residency";
 import { isMacOS } from "@/lib/platform";
@@ -23,7 +25,7 @@ import { STORAGE_COPY } from "@/lib/storage-view";
 import { disconnectHub } from "@/lib/hub-config";
 
 // Settings page (`/settings`, ADR-0014) — the single-column editor for the
-// durable `settings.json`, wearing Glass per settings-glass.html (M6, the T7
+// durable `settings.json`, wearing Glass (M6, the T7
 // `clusters` variant): three grouped panels — Data / Connections /
 // Application — sections hairlined inside, the wash breathing between groups.
 // The page title/subtitle live in the pill topbar (the T5/T6 rule). Reads via
@@ -215,6 +217,12 @@ export function SettingsPage(): React.ReactElement {
           <UpdatesSection />
         </Section>
 
+        {/* Directly after Updates: the two "ask upstream" actions share a
+            grammar and a job, so they read as a pair (ADR-0085). */}
+        <Section title="Pricing" description={PRICING_SECTION_DESCRIPTION}>
+          <PricingSection />
+        </Section>
+
         {IS_MAC ? (
           <Section
             title="Reduce transparency"
@@ -228,14 +236,12 @@ export function SettingsPage(): React.ReactElement {
           <ResetSection onReset={reset} />
         </Section>
 
-        {/* Last in the cluster, after the two actions — facts, not things to
-            do (T3's placement, map #100). Mostly read-once ones; the Sidecar
+        {/* Last in the cluster, after the actions — facts, not things to do
+            (T3's placement, map #100). The Pricing data row moved out to
+            Settings › Pricing (ADR-0085). Mostly read-once ones; the Sidecar
             row added on 2026-08-01 is the exception, and the description says
             so rather than letting a live row hide under "versions". */}
-        <Section
-          title="App info"
-          description="Versions, where model prices come from, and whether the sidecar is running."
-        >
+        <Section title="App info" description="Versions and whether the sidecar is running.">
           <AppInfoSection />
         </Section>
       </div>

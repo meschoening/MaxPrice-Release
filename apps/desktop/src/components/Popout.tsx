@@ -9,7 +9,7 @@ import { useNowTick } from "../state/use-now-tick";
 import { useSettings, useTimeDisplay } from "../state/use-settings";
 
 // The tray popout mini-dashboard (map #168 M3; the T3-approved "leaf" variant,
-// NOTES.md §"Client tray popout — Glass (T3)"): a 54px-ring live header, quiet
+// ADR-0050): a 54px-ring live header, quiet
 // 5-hour-limit / Weekly-limit / <Model>-limit (wire- AND setting-gated) /
 // Today (cost · tokens) rows, a pending-only accent update row, and
 // Open / Quit as kmenu items. Every quantity is a popout-owned sidecar fetch

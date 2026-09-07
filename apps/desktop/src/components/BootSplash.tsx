@@ -17,8 +17,8 @@ import {
   shouldReveal,
 } from "@/lib/boot-splash";
 
-// The full-window boot splash gate (map #75 T4; visual contract NOTES §Boot
-// splash — the resolved `still` variant; signal contract ADR-0047). From
+// The full-window boot splash gate (map #75 T4; visual contract ADR-0047/0067
+// — the resolved `still` variant; signal contract ADR-0047). From
 // first paint until the engine's `ready` lands on the status stream, every
 // route is gated: BootGate renders the splash INSTEAD of the app frame — no
 // sidebar, no topbar — over the body's own wash, so the reveal never jumps

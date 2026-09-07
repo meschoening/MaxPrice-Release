@@ -1137,8 +1137,8 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
             place_popout_physical(app, &window, rect, logical);
         }
     }
-    // Strictly show THEN focus: tao no-ops set_focus on an invisible window
-    // (macOS), and an unfocused show can't blur-dismiss (#7884) — while on
+    // Strictly show THEN focus: an unfocused show cannot blur-dismiss
+    // (#7884). macOS activation uses the native adapter (ADR-0097); on
     // Windows a re-shown-without-focus window stops firing blur entirely
     // (#13633). The focus is what makes focus-loss dismissal work at all.
     //
@@ -1149,6 +1149,11 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
     if let Err(e) = window.show() {
         eprintln!("[hub] popout show failed: {e}");
     }
+    #[cfg(target_os = "macos")]
+    if let Err(error) = macos_popout::focus(&window) {
+        eprintln!("[popout] focus failed: {error}");
+    }
+    #[cfg(not(target_os = "macos"))]
     let _ = window.set_focus();
 }
 

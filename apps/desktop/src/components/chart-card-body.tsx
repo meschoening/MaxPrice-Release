@@ -120,7 +120,7 @@ export function ChartCardBody({
 // regardless of span kind / group-by. The legend renders for EVERY selection
 // (ADR-0034), the ghost pill with it; Log scale is disabled — dimmed, tooltip
 // explains — unless a model/token-type axis is selected (ADR-0040,
-// INTERACTIONS.md). The summary computes over `composed.totals` — exactly
+// ADR-0088). The summary computes over `composed.totals` — exactly
 // what is drawn.
 function ChartFoot({
   composed,

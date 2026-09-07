@@ -8,6 +8,7 @@ import { useUsageCurrent } from "@/state/use-usage-current";
 import { useBump } from "@/state/use-bump";
 import { UsageExpiredHint } from "@/components/usage-expired-hint";
 import { DeltaChip } from "./delta-chip";
+import { UnpricedChip } from "./unpriced-chip";
 import { weekEyebrowTag, weekRefLabel, weekTag } from "@/lib/week-copy";
 import { cn } from "@/lib/utils";
 
@@ -23,11 +24,11 @@ export type ThisWeekTileProps = {
   display: TimeDisplay;
 };
 
-// The This-week tile (glass.html): eyebrow, 800-weight value, the week
+// The This-week tile (Glass, ADR-0043): eyebrow, 800-weight value, the week
 // window tag ("Mon Jul 13 → now"), and the delta chip vs last week. The
 // weekly usage limit — the old weekly ring — relocated to a meter row
 // wearing the same Aurora gradient + glow as the 5-hour tracker: both are
-// live polled-limit readings (NOTES §Option C).
+// live polled-limit readings (Glass, ADR-0043).
 export function ThisWeekTile({
   rows,
   prevRows,
@@ -41,6 +42,7 @@ export function ThisWeekTile({
   const pct = prevTotal === 0 ? null : (delta / prevTotal) * 100;
   const valueText = `$${total.toFixed(2)}`;
   const bumping = useBump(valueText);
+  const weekModels = useMemo(() => rows.flatMap((r) => r.modelsUsed), [rows]);
 
   const now = useNowTick(60_000);
   const { data: usage } = useUsageCurrent();
@@ -51,7 +53,9 @@ export function ThisWeekTile({
     formatRemainingLong,
   );
   const weeklyPct =
-    ring.kind === "limit" && usage?.sample ? Math.round(usage.sample.weekly.utilizationPct) : null;
+    ring.kind === "limit" && usage?.sample?.weekly
+      ? Math.round(usage.sample.weekly.utilizationPct)
+      : null;
 
   const eyebrowTag = weekEyebrowTag(week);
 
@@ -61,7 +65,10 @@ export function ThisWeekTile({
         This week
         {eyebrowTag !== null ? <span className="eyebrow-tag"> · {eyebrowTag}</span> : null}
       </span>
-      <span className={cn("value num", bumping && "bump")}>{valueText}</span>
+      <span className={cn("value num", bumping && "bump")}>
+        {valueText}
+        <UnpricedChip models={weekModels} />
+      </span>
       <span className="tile-sub num">{weekTag(week, rollingStart, display)}</span>
       {week.kind === "rolling" && week.fallback ? (
         <span className="inline-flex items-center gap-1 text-[11px] text-warn">

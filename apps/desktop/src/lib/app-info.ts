@@ -1,9 +1,10 @@
 import { formatRelativeTime, type PricingFailureKind, type PricingStatus } from "@maxprice/shared";
 import type { ConnectionState } from "@/state/use-live-status";
 import type { DotVariant } from "./dot-variant";
+import { UNPRICED_COST_NOTE } from "./unpriced";
 
 // Settings › App info — the four rows' derivations (map #100, T5; the grammar
-// and the frozen copy are NOTES §"Settings › App info — Glass").
+// and the frozen copy live here; the mock is history, ADR-0088).
 // Every user-visible string in the section is produced here rather than inline
 // in JSX, for two reasons: the Engine row's drift comparison is the section's
 // one piece of real logic, and the Pricing row has six states whose tone rules
@@ -26,7 +27,7 @@ export type NotePart = { text: string } | { code: string };
 // The glass `.dot` triad variant a row's value wears, plus whether it breathes
 // on the shared pulse. `null` on every static row — the three original facts
 // are label/value pairs, not status vocabulary, and only the live Sidecar row
-// earns a dot (NOTES §"Settings › App info", amended 2026-08-01).
+// earns a dot (amended 2026-08-01).
 export type AppInfoDot = { variant: DotVariant; pulse: boolean };
 
 export type AppInfoCell = {
@@ -52,7 +53,7 @@ const BARE = { meta: null, note: null, noteTone: "", title: null, dot: null } as
 
 // One written clause per failure kind (ADR-0053's enum). Exhaustive by type:
 // a new kind fails to compile until it has copy.
-const FAILURE_CLAUSE: Record<PricingFailureKind, string> = {
+export const FAILURE_CLAUSE: Record<PricingFailureKind, string> = {
   offline: "no network connection",
   timeout: "LiteLLM didn’t respond in time",
   http: "LiteLLM returned an error",
@@ -134,6 +135,14 @@ function capturedDate(iso: string, tz: string | undefined): string {
   });
 }
 
+// This exposure persists while a manual refresh runs and until the active
+// snapshot can price every observed model (ADR-0087).
+export function unpricedPricingNote(pricing: PricingStatus | null): string | null {
+  const models = pricing?.unpricedModels ?? [];
+  if (models.length === 0) return null;
+  return `${models.length} ${models.length === 1 ? "model" : "models"} unpriced: ${models.join(", ")}. ${UNPRICED_COST_NOTE} Refresh prices; if still unpriced, a MaxPrice update is needed.`;
+}
+
 export function pricingCell(pricing: PricingStatus | null, now: number, tz?: string): AppInfoCell {
   // Absent on the wire (a stale sidecar binary) and never-yet-received (no
   // frame) render identically: both mean "we don't know", and the Engine row
@@ -148,6 +157,17 @@ export function pricingCell(pricing: PricingStatus | null, now: number, tz?: str
   }
 
   const meta = `LiteLLM · ${pricing.modelCount} models`;
+  // #110 — the row is pricing's home, so it names the models the active
+  // snapshot cannot price. Always amber, always FIRST: it is the one line
+  // here that means a number on screen is wrong, not merely old. The value's
+  // own tone is untouched — live prices are still live for every other model.
+  const warning = unpricedPricingNote(pricing);
+  const unpricedNote: NotePart | null = warning === null ? null : { text: warning };
+  // Prepends the unpriced sentence; a single space joins it to whatever
+  // followed, and nothing trails when it stands alone.
+  const withUnpriced = (note: NotePart[] | null): NotePart[] | null =>
+    unpricedNote ? [unpricedNote, ...(note ? [{ text: " " }, ...note] : [])] : note;
+  const warnIf = (tone: "" | "warn"): "" | "warn" => (unpricedNote ? "warn" : tone);
   const attempt = pricing.lastAttempt;
   const failure = attempt?.failure ?? null;
   // A sentence FRAGMENT with a load-bearing trailing space, not a boolean: both
@@ -170,8 +190,8 @@ export function pricingCell(pricing: PricingStatus | null, now: number, tz?: str
       tone: "",
       dot: null,
       meta,
-      note: failure ? [{ text: `${failurePrefix}Retrying automatically.` }] : null,
-      noteTone: failure ? "warn" : "",
+      note: withUnpriced(failure ? [{ text: `${failurePrefix}Retrying automatically.` }] : null),
+      noteTone: warnIf(failure ? "warn" : ""),
       title: failure?.detail ?? null,
     };
   }
@@ -191,20 +211,20 @@ export function pricingCell(pricing: PricingStatus | null, now: number, tz?: str
       value,
       tone: "soft",
       meta,
-      note: [{ text: "Checking LiteLLM for newer prices…" }],
+      note: withUnpriced([{ text: "Checking LiteLLM for newer prices…" }]),
+      noteTone: warnIf(""),
     };
   }
-  // Now the value itself is degraded, so it goes amber too. Per T2 (#102) the
-  // copy can never read as permanent: it names the automatic retry AND the
-  // relaunch remedy, which restarts the sidecar and re-attempts at once.
+  // Now the value itself is degraded, so it goes amber too. The remedy is the
+  // Settings › Pricing chip beside this data (ADR-0085), so the note names only
+  // the automatic retry — the old relaunch clause was a workaround for the
+  // button's absence.
   return {
     value,
     tone: "warn",
     dot: null,
     meta,
-    note: [
-      { text: `${failurePrefix}Retrying automatically; relaunching MaxPrice retries right away.` },
-    ],
+    note: withUnpriced([{ text: `${failurePrefix}Retrying automatically.` }]),
     noteTone: "warn",
     title: failure.detail,
   };

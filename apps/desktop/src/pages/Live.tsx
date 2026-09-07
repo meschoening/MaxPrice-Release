@@ -105,7 +105,7 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
   const effAxes = machineAxis.effectiveAxes(groupByAxes);
   const visibleAxes = GROUP_BY_AXES.filter((axis) => axis !== "machine" || machineAxis.enabled);
 
-  // FLIP glides (INTERACTIONS.md): keyed rail rows slide to their new slot
+  // FLIP glides (motion contract, ADR-0088): keyed rail rows slide to their new slot
   // when the cost order changes; the dep is the order itself.
   const sessionFlip = useFlipList(data.topSessions.map((s) => s.sessionId).join("|"));
   const projectFlip = useFlipList(data.topProjects.map((p) => p.slug).join("|"));

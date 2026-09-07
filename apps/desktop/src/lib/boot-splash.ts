@@ -1,7 +1,7 @@
 import type { ConnectionState } from "@/state/use-live-status";
 
 // Boot splash timing + failure semantics (map #75 T4, consuming ADR-0047's
-// `ready` signal; visual contract: plans/mocks/redesign/NOTES.md §Boot splash).
+// `ready` signal; visual contract: ADR-0047/0067).
 // The splash renders at first paint above the whole frame; these helpers are
 // the testable core of its state machine — the component owns only timers and
 // render.

@@ -34,6 +34,9 @@ export default defineConfig({
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {
+    // Local WebView assets have no network transfer cost. Keep a 1 MB warning
+    // for unexpected growth in both renderers (ADR-0095, issue #190).
+    chunkSizeWarningLimit: 1000,
     target: "es2022",
     minify: !process.env.TAURI_DEBUG,
     sourcemap: !!process.env.TAURI_DEBUG,

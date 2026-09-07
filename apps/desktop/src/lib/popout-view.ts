@@ -11,7 +11,7 @@ import { usageRingState } from "@/lib/usage-ring";
 import { corpusIsEmpty } from "@/state/use-corpus-empty";
 
 // Pure view-state for the tray popout mini-dashboard (map #168 M3; the T3
-// "leaf" contract, NOTES.md §"Client tray popout — Glass (T3)"). Extracted
+// "leaf" contract, ADR-0050). Extracted
 // from the component so the state ladder — sidecar down / first launch / the
 // dash with its head + rows — and every formatted string are pinnable without
 // a DOM. The quantities deliberately reuse the Live page's own derivations

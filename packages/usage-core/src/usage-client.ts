@@ -1,9 +1,9 @@
 import { z } from "zod";
-import type { UsageSample } from "@maxprice/shared";
+import type { UsageReading } from "@maxprice/shared";
 
 // Outbound client for Anthropic's undocumented subscription-usage endpoint
 // (ADR-0023). Best-effort, mirrors pricing-refresh.ts: injected fetch, timeout,
-// never throws. Maps the upstream JSON onto the normalized UsageSample.
+// never throws. Maps the upstream JSON onto the normalized UsageReading.
 
 export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -57,7 +57,7 @@ const upstreamUsageSchema = z
 // the Model-scoped weekly limit. Exported for its tests.
 export function modelScopedWindow(
   limits: z.infer<typeof upstreamUsageSchema>["limits"],
-): UsageSample["weeklyModel"] {
+): UsageReading["weeklyModel"] {
   for (const limit of limits ?? []) {
     if (limit === null || limit.kind !== "weekly_scoped") continue;
     const model = limit.scope?.model?.display_name;
@@ -81,11 +81,9 @@ const upstreamOrgsSchema = z.array(
 );
 
 export type UsageFailKind = "expired" | "error";
-// `sample: null` is the successful-but-no-sample case (ADR-0029): a window
-// reported `resets_at: null`, so there is nothing to persist — but auth is
-// healthy and the connection stays "connected".
+// Each window survives independently; null means none has a reset in flight.
 export type FetchUsageResult =
-  | { ok: true; sample: UsageSample | null }
+  | { ok: true; sample: UsageReading | null }
   | { ok: false; kind: UsageFailKind };
 
 export type FetchUsageOptions = {
@@ -142,23 +140,29 @@ export async function fetchUsage(opts: FetchUsageOptions): Promise<FetchUsageRes
       return { ok: false, kind: "error" };
     }
     const u = parsed.data;
-    // Conscious trade-off (ADR-0029): a partially-null payload appends no sample
-    // even if `five_hour` alone is valid with util>0 — keeping `UsageSample`'s
-    // required-string `weekly.resetAt` shape rather than widening it. Never yet
-    // observed; revisit only if a real five_hour-valid / seven_day-null payload
-    // ever shows up.
-    if (u.five_hour.resets_at === null || u.seven_day.resets_at === null) {
-      console.warn("[usage-core] usage poll: a window has no reset in flight — sample skipped");
-      return { ok: true, sample: null };
-    }
-    const sample: UsageSample = {
+    const sample: UsageReading = {
       capturedAt: nowIso(),
-      fiveHour: { utilizationPct: u.five_hour.utilization, resetAt: u.five_hour.resets_at },
-      weekly: { utilizationPct: u.seven_day.utilization, resetAt: u.seven_day.resets_at },
+      fiveHour:
+        u.five_hour.resets_at === null
+          ? null
+          : {
+              utilizationPct: u.five_hour.utilization,
+              resetAt: u.five_hour.resets_at,
+            },
+      weekly:
+        u.seven_day.resets_at === null
+          ? null
+          : {
+              utilizationPct: u.seven_day.utilization,
+              resetAt: u.seven_day.resets_at,
+            },
     };
     const weeklyModel = modelScopedWindow(u.limits);
     if (weeklyModel !== undefined) sample.weeklyModel = weeklyModel;
-    return { ok: true, sample };
+    return {
+      ok: true,
+      sample: sample.fiveHour === null && sample.weekly === null && !weeklyModel ? null : sample,
+    };
   } catch (err) {
     console.warn(
       "[usage-core] usage fetch failed:",

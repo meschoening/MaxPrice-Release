@@ -211,6 +211,8 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
   // `allowedOrigins`. GET/HEAD/OPTIONS are never guarded — OPTIONS is the CORS
   // preflight (already handled above) and reads carry no side effect. Runs
   // before auth so a cross-origin attempt is a clean 403 whatever the gate.
+  // The sidecar carries the same guard (#72, the ADR-0077 copy precedent);
+  // ADR-0086 records the layering both servers rely on.
   const STATE_CHANGING = new Set(["POST", "PUT", "DELETE", "PATCH"]);
   app.use("/api/*", async (c, next) => {
     const origin = c.req.header("origin");

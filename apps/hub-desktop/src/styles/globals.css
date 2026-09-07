@@ -100,8 +100,8 @@ html {
 }
 
 /* ============================================================
-   Hub console (M7) — page-level layout per NOTES.md §Hub console and
-   hub-glass.html (?shell=pill, the T1 resolution). The system recipes
+   Hub console (M7) — page-level layout per the Hub console mock
+   (?shell=pill, the T1 resolution; history per ADR-0088). The system recipes
    (panel/chip/inset/input/kmenu/dot/toast) come from @maxprice/glass;
    what lives here is the tray-window scale and the console's own
    structure. The wash is the glass body rule (fields-only — the dot
@@ -373,8 +373,7 @@ button:disabled {
 }
 
 /* ============================================================
-   Tray popout (ADR-0050) — T1 variant A "leaf", per NOTES.md §Tray popout
-   and tray-popout-glass.html. The popout floats over the user's DESKTOP,
+   Tray popout (ADR-0050) — T1 variant A "leaf" (ADR-0050). The popout floats over the user's DESKTOP,
    which backdrop-filter cannot blur through, so it wears the opaque T4
    reduce-transparency composite with its own miniature internal wash —
    never the translucent panel recipe. The WINDOW is opaque (T2: transparent

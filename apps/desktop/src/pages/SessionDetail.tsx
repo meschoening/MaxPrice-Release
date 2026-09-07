@@ -17,6 +17,7 @@ import { useMachineAxis, type MachineAxis } from "@/state/use-machine-axis";
 import { foldMachineIdList } from "@/lib/machines";
 import { MachineChip } from "@/components/machine-chip";
 import { ModelSplitBar } from "@/components/model-split-bar";
+import { UnpricedChip } from "@/components/unpriced-chip";
 import { SessionTimeline } from "@/components/session-timeline";
 import { StripIdentity, StripStat } from "@/components/detail-strip";
 import { formatCost } from "@/lib/list-format";
@@ -24,7 +25,7 @@ import { abbreviate } from "@/lib/active-block";
 import { cn } from "@/lib/utils";
 
 // M5 — the standalone /sessions/:id page wearing Glass (T6 `lens`,
-// session-detail-glass.html + NOTES §Session detail). The back navigation
+// ADR-0043). The back navigation
 // lives in the topbar's back chip (Topbar's SessionHeading); the old
 // SessionHeader + KeyValueGrid + split Card fuse into ONE summary strip
 // panel; the timeline is the lens panel in `session-timeline.tsx`. The data
@@ -311,7 +312,14 @@ function SummaryStrip({
         </StripStat>
       ) : null}
       <StripStat label="total cost">
-        {summary ? <span className="num">{formatCost(summary.totalCost)}</span> : <Dash />}
+        {summary ? (
+          <span className="num">
+            {formatCost(summary.totalCost)}
+            <UnpricedChip models={summary.modelBreakdowns.map((b) => b.modelName)} />
+          </span>
+        ) : (
+          <Dash />
+        )}
       </StripStat>
       <StripStat label="total tokens">
         {summary ? <span className="num">{abbreviate(summary.totalTokens)}</span> : <Dash />}

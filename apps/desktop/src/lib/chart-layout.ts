@@ -6,11 +6,11 @@ import type { ChartModel } from "@/lib/chart-model";
 // verbatim — every number a renderer draws is computed (and tested) here.
 //
 // Provenance: x-geometry (cluster/bar/ghost widths and placement) generalizes
-// the approved prototype renderer (plans/mocks/redesign/prototype/chart.js) —
-// the mock hand-rounds its cluster positions, so its x values are NOT the
-// contract. y-geometry follows the mock's authored rects
-// (plans/mocks/redesign/glass.html chart section), which diverge from the
-// prototype in two places:
+// the approved prototype renderer from the retired Glass mocks (history;
+// ADR-0088) — the mock hand-rounded its cluster positions, so its x values
+// were never the contract. y-geometry follows the Live mock's authored rects,
+// which diverged from the prototype in two places (chart-layout.test.ts pins
+// the resulting pixels; those tests are the contract now):
 // - the 2px carve between stacked segments comes out of each segment's own
 //   TOP (topmost surviving segment kept full, so the stack cap sits exactly
 //   at y(total) under the rounded clip); the prototype carved each segment's

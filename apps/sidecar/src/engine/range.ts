@@ -25,13 +25,18 @@ export function parseRangeBound(s: string): RangeBound | null {
   return null;
 }
 
-// The ONE predicate every windowing site uses. Each side is lazy for the
-// other's sake: `localYmd` is computed only when the bound is a ymd, so the
-// instant path never formats a date, and `timestampMs` may be a thunk that is
-// called only when the bound is an instant, so the ymd path never parses a
-// timestamp — the projects fold runs this per EVENT with the local date already
-// in hand, where an eager `Date.parse` measured ~340 ns/event of pure waste
-// on the golden ymd branch. (Row-scale callers pass a plain number.)
+// The ONE predicate every windowing site uses. `localYmd` stays lazy — it is
+// computed only when the bound is a ymd, so the instant path never formats a
+// date.
+//
+// `timestampMs` used to accept a thunk as well, so the ymd branch could skip an
+// eager `Date.parse` worth a measured ~340 ns/event in the projects fold. That
+// seam is gone (ADR-0089): every event carries its own `ms`, derived once at
+// `upsert`, so the per-event caller passes a plain field read and the closure
+// it used to allocate per event goes with it. Row-scale callers already passed
+// a number. If a future caller genuinely cannot produce the epoch-ms cheaply,
+// bring the thunk back rather than parsing at the call site.
+//
 // Semantics: ymd bounds are inclusive on the local date; instant bounds are
 // `since <= t` and `t < until` on the epoch-ms. Both bounds share a kind (the
 // HTTP layer rejects mixed forms), so one instant bound decides the branch.
@@ -39,7 +44,7 @@ export function parseRangeBound(s: string): RangeBound | null {
 // cheap even per event; the store's per-event loop pre-parses its bounds
 // instead only because it can hoist them.
 export function inRange(
-  timestampMs: number | (() => number),
+  timestampMs: number,
   localYmd: () => string | null,
   since: string | undefined,
   until: string | undefined,
@@ -49,7 +54,7 @@ export function inRange(
     (since !== undefined && isInstantBound(since)) ||
     (until !== undefined && isInstantBound(until));
   if (instant) {
-    const t = typeof timestampMs === "function" ? timestampMs() : timestampMs;
+    const t = timestampMs;
     if (since !== undefined && t < Date.parse(since)) return false;
     if (until !== undefined && t >= Date.parse(until)) return false;
     return true;

@@ -29,7 +29,7 @@ export function isOptionSelected(o: MultiSelectOption, selected: readonly string
 // representative slug) only.
 //
 // Checking every box (or clearing the last one) reads as "All" — reset to the
-// empty selection (INTERACTIONS.md focus pattern; the wire treats both
+// empty selection (the Glass focus pattern, ADR-0088; the wire treats both
 // identically). The reset counts CHECKED OPTIONS, not stored values: a group's
 // stored selection can hold several member slugs while being one checked box.
 export function toggleOption(

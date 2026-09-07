@@ -25,7 +25,8 @@ import { modelBreakdownSchema } from "./models";
 // daily's old post-aggregation quirk; intraday always filtered cleanly.)
 
 // ---------------------------------------------------------------------------
-// Span definitions — FIXED by the UI mock (`plans/mocks/index.html`'s `SPANS`)
+// Span definitions — originally fixed by the pre-redesign UI mock's `SPANS`
+// (history; ADR-0088)
 // ---------------------------------------------------------------------------
 
 // The intraday span identifiers — the spans whose BARS are served by

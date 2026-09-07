@@ -13,7 +13,7 @@ export const usageWindowSchema = z.object({
 export type UsageWindow = z.infer<typeof usageWindowSchema>;
 
 // One timestamped reading — persisted per line of usage-history.jsonl (ADR-0024)
-// and served as "current". `capturedAt` is when WE polled, not an upstream field.
+// with both windows in flight. `capturedAt` is when WE polled, not an upstream field.
 //
 // FORWARD-COMPAT (review f8): usage-history.jsonl is the app's first cross-upgrade
 // persistent artifact — it outlives any single app version. `loadHistory` silently
@@ -39,6 +39,20 @@ export const usageSampleSchema = z.object({
 export type ModelScopedWindow = NonNullable<UsageSample["weeklyModel"]>;
 export type UsageSample = z.infer<typeof usageSampleSchema>;
 
+// Live windows are independent: an idle five-hour window must not erase a
+// valid weekly reading. History keeps its complete-sample contract above.
+export const usageReadingSchema = usageSampleSchema.extend({
+  fiveHour: usageWindowSchema.nullable(),
+  weekly: usageWindowSchema.nullable(),
+});
+export type UsageReading = z.infer<typeof usageReadingSchema>;
+
+/** Only complete readings enter the block-reconstruction history. */
+export function completeUsageSample(reading: UsageReading | null): UsageSample | null {
+  if (reading?.fiveHour == null || reading.weekly === null) return null;
+  return { ...reading, fiveHour: reading.fiveHour, weekly: reading.weekly };
+}
+
 // Connection lifecycle for the subtle status indicator (ADR-0023).
 export const usageConnectionSchema = z.enum([
   "disconnected", // no credential configured
@@ -53,9 +67,9 @@ export type UsageConnection = z.infer<typeof usageConnectionSchema>;
 // state is carried separately by the status snapshot (zustand), so it is NOT
 // duplicated here (review f10).
 export const usageCurrentSchema = z.object({
-  sample: usageSampleSchema.nullable(),
+  sample: usageReadingSchema.nullable(),
   // ADR-0083: the last-known weekly reset, independent of `sample` (which is
-  // null whenever no 5h window is in flight).
+  // null whenever no windows are in flight).
   weeklyResetAt: z.string().nullable(),
 });
 export type UsageCurrent = z.infer<typeof usageCurrentSchema>;

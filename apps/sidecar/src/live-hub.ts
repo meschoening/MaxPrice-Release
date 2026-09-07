@@ -4,7 +4,7 @@ import {
   type EmittedStatusSnapshot,
   type StatusSnapshot,
   type UsageEvent,
-  type UsageSample,
+  type UsageReading,
 } from "@maxprice/shared";
 
 // Transport-agnostic messages the hub fans out. The SSE route translates each
@@ -15,7 +15,7 @@ export type LiveMessage =
   | { type: typeof SSE_EVENT.usageNew; data: UsageEvent }
   | { type: typeof SSE_EVENT.blockTick; data: BlockTickEvent }
   | { type: typeof SSE_EVENT.statusChanged; data: StatusSnapshot }
-  | { type: typeof SSE_EVENT.usageSample; data: UsageSample | null }
+  | { type: typeof SSE_EVENT.usageSample; data: UsageReading | null }
   // Fleet machine-directory poke (ADR-0041 M5) — empty data, a pure refetch
   // signal for GET /api/machines. Broadcast on every hub:machines poke and on
   // this machine's own directory-cache refresh.
@@ -34,7 +34,7 @@ export type LiveHub = {
   // unsubscribe function.
   subscribe: (subscriber: LiveSubscriber) => () => void;
   emitUsage: (event: UsageEvent) => void;
-  emitUsageSample: (sample: UsageSample | null) => void;
+  emitUsageSample: (sample: UsageReading | null) => void;
   // Broadcast a machines:changed poke (empty payload) so subscribers refetch
   // GET /api/machines (ADR-0041 M5).
   emitMachinesChanged: () => void;
@@ -92,7 +92,7 @@ export function createLiveHub(opts: CreateLiveHubOptions): LiveHub {
   let status: StatusSnapshot = opts.initialStatus;
   // undefined until the first authoritative poll. Afterwards retain sample OR
   // null so a reconnect cannot miss a reset between first paint and SSE.
-  let usageCurrent: UsageSample | null | undefined;
+  let usageCurrent: UsageReading | null | undefined;
   let blockTickTimer: unknown = null;
   let heartbeatTimer: unknown = null;
 

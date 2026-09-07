@@ -5,6 +5,8 @@ import {
   type ModelBreakdown,
   type ModelFamily,
 } from "@maxprice/shared";
+import { unpricedFamilies, unpricedTitle } from "@/lib/unpriced";
+import { useUnpricedModels } from "@/state/use-live-status";
 import { cn } from "@/lib/utils";
 
 // Whether the bar's segment widths are proportional to cost or to token
@@ -60,14 +62,29 @@ const HEIGHT: Record<ModelSplitBarProps["size"], number> = {
   lg: 8,
 };
 
-export function ModelSplitBar({
+export function ModelSplitBar(props: ModelSplitBarProps): React.ReactElement {
+  const unpriced = useUnpricedModels();
+  return <ModelSplitBarContent {...props} unpriced={unpriced} />;
+}
+
+// Pure composition, matching badges/chips so static rendering can cover the
+// unpriced state without replacing the live-status hook.
+export function ModelSplitBarContent({
   breakdowns,
   size,
   showLegend = false,
   metric = "cost",
   className,
-}: ModelSplitBarProps): React.ReactElement {
+  unpriced,
+}: ModelSplitBarProps & { unpriced: ReadonlySet<string> }): React.ReactElement {
   const segments = summarize(breakdowns, metric);
+  // #110 — a legend entry whose family has an unpriced raw member carries the
+  // amber mark. When no stored cost contributes, its cost segment is absent
+  // from the bar, and the legend is where the fact lands.
+  const marked = unpricedFamilies(
+    breakdowns.map((b) => b.modelName),
+    unpriced,
+  );
 
   return (
     <div className={cn("flex flex-col gap-1.5 min-w-0", className)}>
@@ -85,16 +102,33 @@ export function ModelSplitBar({
           />
         ))}
       </div>
-      {showLegend && segments.length > 0 ? (
+      {showLegend && (segments.length > 0 || marked.size > 0) ? (
         // .split-legend wraps: in a narrow strip section the legend folds to a
         // second line instead of overflowing the section's right edge.
         <div className="split-legend">
-          {segments.map((seg) => (
-            <span key={seg.family}>
-              <i className="sw" style={{ background: MODEL_COLORS[seg.family] }} aria-hidden />
-              {seg.family} <b>{Math.round(seg.pct)}%</b>
-            </span>
-          ))}
+          {segments.map((seg) => {
+            const raw = marked.get(seg.family);
+            return (
+              <span key={seg.family} title={raw ? unpricedTitle(raw) : undefined}>
+                <i className="sw" style={{ background: MODEL_COLORS[seg.family] }} aria-hidden />
+                {seg.family} <b>{Math.round(seg.pct)}%</b>
+                {raw ? <span className="unpriced-mark">unpriced</span> : null}
+              </span>
+            );
+          })}
+          {/* An unpriced family usually has NO segment under the cost metric
+              (its cost is $0, so `summarize` drops it) — the legend still
+              names it, at 0%, or the mark would only ever show under
+              `tokens`. */}
+          {Array.from(marked.entries())
+            .filter(([family]) => !segments.some((seg) => seg.family === family))
+            .map(([family, raw]) => (
+              <span key={family} title={unpricedTitle(raw)}>
+                <i className="sw" style={{ background: MODEL_COLORS[family] }} aria-hidden />
+                {family} <b>0%</b>
+                <span className="unpriced-mark">unpriced</span>
+              </span>
+            ))}
         </div>
       ) : null}
     </div>

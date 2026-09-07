@@ -168,6 +168,37 @@ pub fn apply(window: &tauri::WebviewWindow, p: Placement) -> Result<(), String> 
     Ok(())
 }
 
+/// Focus the shown popout even when the main window is on another display.
+/// Placement must already be complete (ADR-0084); activation is a separate
+/// native boundary (ADR-0097), not another geometry correction.
+#[cfg(target_os = "macos")]
+pub fn focus(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWindow};
+
+    let _mtm = MainThreadMarker::new().ok_or("popout focus requires the main thread")?;
+    let ptr = window.ns_window().map_err(|e| e.to_string())?;
+    // SAFETY: Tauri owns this live NSWindow; borrow only on the main thread.
+    let native = unsafe { &*(ptr as *const NSWindow) };
+    if !native.isVisible() || native.isMiniaturized() {
+        return Ok(());
+    }
+    native.makeKeyAndOrderFront(None);
+    // tao's set_focus activates with only IgnoreOtherApps. With the main
+    // window on the laptop, AirPlay activation then leaves the popout visible
+    // but non-key and greys its menu bar; macOS consumes the next tray click.
+    // AllWindows is needed in addition to the existing user-click activation
+    // policy. It raises ordered windows, but does not order a hidden main
+    // window back in. Verified with real tray clicks in both visibility states.
+    #[allow(deprecated)] // Preserve user-click activation on supported pre-14 macOS too.
+    let options = NSApplicationActivationOptions::ActivateAllWindows
+        | NSApplicationActivationOptions::ActivateIgnoringOtherApps;
+    if !NSRunningApplication::currentApplication().activateWithOptions(options) {
+        return Err("macOS declined popout activation".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

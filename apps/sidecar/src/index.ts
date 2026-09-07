@@ -18,6 +18,8 @@ import {
   SPAN_WINDOW_MS,
   WEEK_BUCKET_MS,
   SSE_EVENT,
+  activePricingSnapshot,
+  PRICING_REFRESH_PATH,
   RESCAN_PATH,
   STORAGE_CLEAN_PATH,
   STORAGE_FORGET_PATH,
@@ -30,6 +32,7 @@ import {
   type ErrorResponse,
   type ForgetSessionRef,
   type IntradayResponse,
+  type PricingRefreshResponse,
   type ProjectMergeMutationRequest,
   type ProjectMergeMutationResponse,
   type ReadoutResponse,
@@ -45,7 +48,12 @@ import {
 } from "@maxprice/shared";
 import { aggregateSessionEvents, type SessionEventsAggregate } from "./engine/session-events";
 import { createBootTrace } from "./boot-trace";
-import { buildPricingStatus, wirePricingRefresh } from "./pricing-refresh";
+import {
+  buildPricingStatus,
+  watchNewModels,
+  wirePricingRefresh,
+  type PricingRefresher,
+} from "./pricing-refresh";
 import { createLiveHub, type LiveHub } from "./live-hub";
 import { createWatcher, type CreateWatcherOptions, type Watcher } from "./watcher";
 import { resolveWatchRoots } from "./watch-roots";
@@ -86,7 +94,7 @@ import { isInstantBound, parseRangeBound } from "./engine/range";
 import { aggregateDaily, aggregateDailyByMachine, aggregateDailyByProject } from "./engine/daily";
 import { aggregateIntraday } from "./engine/intraday";
 import { createReportCache } from "./engine/report-cache";
-import { aggregateBlocks, resolveBlockSpanWindow } from "./engine/blocks";
+import { createBlockReports } from "./engine/block-formation-cache";
 import pkg from "../package.json";
 
 export type BuildAppDeps = {
@@ -168,6 +176,15 @@ export type BuildAppDeps = {
   fleetSync: {
     notifyLocalChange: () => void;
     kickPull: () => void;
+  };
+  // The manual pricing refresh (ADR-0085): POST /api/pricing/refresh runs (or
+  // joins) one attempt of the same best-effort upstream fetch the startup arm
+  // and the ~24h ticker use, and answers with the rebuilt `pricing` status plus
+  // the count of models the attempt made priceable. Wired in `main()` to the
+  // `wirePricingRefresh` handle; a thunk because that handle is created AFTER
+  // the LISTENING handshake, and `buildApp` before it.
+  pricing: {
+    refreshNow: () => Promise<PricingRefreshResponse>;
   };
   // Fired (fire-and-forget) once POST /api/rescan's walk has landed — the
   // Identity directory's re-probe trigger (ADR-0062). Optional and deliberately
@@ -532,7 +549,16 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // at the first query's rebind, and that rebind pre-stamps the store's FULL
   // snapshot in sort order, so events that landed before it subscribed are
   // stamped anyway. That is exactly what makes construction at build time safe.
-  const reportCache = createReportCache({ getStore: deps.store });
+  //
+  // `getPricing` is the cache's second rebind trigger (THE PRICING RULE in
+  // report-cache.ts): every acc is priced at fold time from the active
+  // snapshot, so the ADR-0085 swap must drop them. Passed explicitly — it is
+  // the module default too — so the dependency is visible where it is wired.
+  const reportCache = createReportCache({
+    getStore: deps.store,
+    getPricing: activePricingSnapshot,
+  });
+  const blockReports = createBlockReports({ getStore: deps.store, getSamples: deps.samples });
 
   // Host-header allowlist. The renderer always reaches us via the loopback
   // address it discovered through get_sidecar_url, so any other Host means
@@ -553,6 +579,37 @@ export function buildApp(deps: BuildAppDeps): Hono {
       origin: (origin) => (deps.allowedOrigins.includes(origin) ? origin : null),
     }),
   );
+
+  // CSRF Origin guard (#72). Every state-changing route below ALSO calls
+  // `usageAuthGuard`, whose `x-maxprice-auth` header is non-simple and so
+  // preflight-shields those routes incidentally — but only while a token
+  // exists: `deps.authToken === null` (standalone dev, the test rigs) makes
+  // that guard a no-op, and a future route that forgets the call has nothing at
+  // all. The host allowlist above is no help here: a browser sets `Host`
+  // correctly when POSTing to the loopback URL. So reject any STATE-CHANGING
+  // request carrying a browser `Origin` outside the allowlist — once, for every
+  // current and future route. Mirrors the hub daemon's guard
+  // (`apps/hub/src/server.ts`); ADR-0086 records why both layers stay.
+  //
+  // A request with NO Origin passes: CSRF is a browser threat and a browser
+  // always sets Origin on a POST, so a missing one means a non-browser caller
+  // (curl against a dev sidecar, a test rig) that already has loopback access.
+  // GET/HEAD/OPTIONS are never guarded — OPTIONS is the CORS preflight handled
+  // above, and reads carry no side effect. Mounted on `/api/*` so `/healthz`
+  // stays reachable from anywhere.
+  const STATE_CHANGING = new Set(["POST", "PUT", "DELETE", "PATCH"]);
+  app.use("/api/*", async (c, next) => {
+    const origin = c.req.header("origin");
+    if (
+      origin !== undefined &&
+      STATE_CHANGING.has(c.req.method) &&
+      !deps.allowedOrigins.includes(origin)
+    ) {
+      const body: ErrorResponse = { error: "cross-origin request rejected" };
+      return c.json(body, 403);
+    }
+    return next();
+  });
 
   app.onError((err, c) => {
     console.error("[sidecar] route error:", err);
@@ -841,7 +898,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         // next `block:tick` refetch (which re-frames both to the new block or
         // the empty state).
         const now = deps.now();
-        const resolved = resolveBlockSpanWindow(deps.store().query(), deps.samples(), now);
+        const resolved = blockReports.span(now);
         if (resolved === null) {
           const body: IntradayResponse = {
             buckets: [],
@@ -975,19 +1032,17 @@ export function buildApp(deps: BuildAppDeps): Hono {
       const q = parseCommonQuery(c);
       if (q instanceof Response) return q;
       await deps.engineReady();
-      const events = deps.store().query();
       // One pass (ADR-0028): observed reset windows from the usage history
       // partition block formation; the heuristic survives only in history
       // holes; fiveHourLimitPct fills from the same samples. With an empty
       // history this is the pure heuristic port.
       return c.json(
-        aggregateBlocks(events, q.mode, {
+        blockReports.blocks(q.mode, {
           since: q.since,
           until: q.until,
           timeZone: q.tz,
           models: q.models,
           machines: q.machines,
-          samples: deps.samples(),
           now: deps.now(),
         }),
       );
@@ -1165,7 +1220,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
 
       const now = deps.now();
       const sample = deps.usage.getCurrent().sample;
-      const resetMs = sample === null ? Number.NaN : Date.parse(sample.fiveHour.resetAt);
+      const resetMs = sample?.fiveHour == null ? Number.NaN : Date.parse(sample.fiveHour.resetAt);
       const blockLive = !Number.isNaN(resetMs) && resetMs > now;
 
       // `localDateUncached`, not `localDate`: `now` is a wall-clock reading, so
@@ -1187,7 +1242,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
 
       const body: ReadoutResponse = {
         blockLive,
-        utilizationPct: blockLive && sample !== null ? sample.fiveHour.utilizationPct : null,
+        utilizationPct: blockLive ? (sample?.fiveHour?.utilizationPct ?? null) : null,
         todayCost,
         hasData: deps.liveHub.getStatus().hasData,
         hasModelWindow: sample?.weeklyModel !== undefined,
@@ -1197,9 +1252,9 @@ export function buildApp(deps: BuildAppDeps): Hono {
   );
 
   // Bearer-token guard for EVERY POST endpoint (f22) — the two usage endpoints,
-  // /api/hub/config, and POST /api/rescan. Enforced ONLY when `deps.authToken`
-  // is set (the Tauri shell passes MAXPRICE_AUTH_TOKEN); null (standalone dev /
-  // tests) means no auth. Returns a 401 Response carrying the pinned error
+  // /api/hub/config, POST /api/rescan, and POST /api/pricing/refresh. Enforced
+  // ONLY when `deps.authToken` is set (the Tauri shell passes
+  // MAXPRICE_AUTH_TOKEN); null (standalone dev / tests) means no auth. Returns a 401 Response carrying the pinned error
   // envelope on a missing/mismatched `x-maxprice-auth` header, else null so the
   // caller proceeds.
   const usageAuthGuard = (c: Context): Response | null => {
@@ -1432,6 +1487,32 @@ export function buildApp(deps: BuildAppDeps): Hono {
         return c.json(body);
       },
       "rescan failed",
+    ),
+  );
+
+  // --- POST /api/pricing/refresh -------------------------------------------
+  //
+  // The sidecar's second action endpoint (ADR-0085; the first is /api/rescan,
+  // ADR-0019). Always available — a newly announced model needs its prices
+  // before the ~24h tick would fetch them — and never a way to stack fetches:
+  // the refresher is single-flight, so a click during the boot fetch or a tick
+  // joins that attempt and shares its answer. The status snapshot's `pricing`
+  // is rebuilt and broadcast on every settled attempt whatever the caller, so
+  // the renderer's provenance line updates over SSE; this response exists for
+  // the gesture's own feedback ("Refreshed · N new models").
+  app.post(
+    PRICING_REFRESH_PATH,
+    withEngineErrors(
+      PRICING_REFRESH_PATH,
+      async (c) => {
+        // Same guard as every other POST (f22). Cheap to serve, but it reaches
+        // the network on the user's behalf, and the rule is simpler as "every
+        // POST" than as a list of exceptions.
+        const unauthorized = usageAuthGuard(c);
+        if (unauthorized) return unauthorized;
+        return c.json(await deps.pricing.refreshNow());
+      },
+      "pricing refresh failed",
     ),
   );
 
@@ -1697,7 +1778,7 @@ async function main(): Promise<void> {
       // the boot seed cannot drift from the refresh patches; the active snapshot
       // is still the vendored one here (the refresh is kicked after the
       // handshake), so this reads `source: "vendored"`.
-      pricing: buildPricingStatus(null),
+      pricing: buildPricingStatus(null, []),
       // The app's own version — Settings › App info's Engine row surfaces it,
       // compared against the renderer's baked `__APP_VERSION__` so a mismatch
       // names a stale `bun run build:binaries` (the sidebar foot's `engine v…`
@@ -1782,6 +1863,11 @@ async function main(): Promise<void> {
   // scan + engineReady, which run on the original store.
   let engineStore = eventStore;
   const getEngineStore = (): EventStore => engineStore;
+  // The pricing loop and its unpriced-model watch (#110) are assigned after the
+  // handshake, but the fleet's `swapStore` (declared next) must re-attach the
+  // watch — hence `let`s declared ahead of both.
+  let pricingRefresher: PricingRefresher | null = null;
+  let detachModelWatch: (() => void) | null = null;
 
   // The Local archive (#140, ADR-0069): this machine's own events, durable,
   // always on. Constructed before the fleet so rebuildEngine can seed from it.
@@ -1817,6 +1903,13 @@ async function main(): Promise<void> {
       // Re-subscribe the archive's change feed onto the store that is now live
       // — the boot subscription points at a store nothing writes to any more.
       localArchive.attachStore(next);
+      // Same for the unpriced-model watch (#110): re-attach, then republish
+      // once against the new corpus (its model set is not the old one's).
+      detachModelWatch?.();
+      if (pricingRefresher) {
+        detachModelWatch = watchNewModels(next, pricingRefresher.republish);
+        pricingRefresher.republish();
+      }
     },
     seedLocalArchive: (store) => localArchive.seedInto(store),
     forgetLocalArchive: (sessions) => localArchive.forgetSessions(sessions),
@@ -1919,6 +2012,12 @@ async function main(): Promise<void> {
 
   // Bind first so we know the port, then wire up host validation against it.
   const allowedHosts = new Set<string>();
+  // Assigned after the handshake (see the wirePricingRefresh call below); the
+  // route reaches it through a thunk. A request cannot precede the assignment
+  // in practice — the Rust shell only learns the port from LISTENING, and the
+  // refresher is wired synchronously right after that line — but the guard
+  // keeps the failure a 500 rather than a TDZ ReferenceError if that order
+  // ever changes.
   const app = buildApp({
     allowedOrigins,
     isAllowedHost: (host) => host !== undefined && allowedHosts.has(host),
@@ -1975,6 +2074,13 @@ async function main(): Promise<void> {
     fleetSync: {
       notifyLocalChange: () => fleet.notifyLocalChange(),
       kickPull: () => fleet.kickPull(),
+    },
+    // The manual pricing refresh (ADR-0085), through the thunk described above.
+    pricing: {
+      refreshNow: () => {
+        if (pricingRefresher === null) throw new Error("pricing refresher not wired yet");
+        return pricingRefresher.refreshNow();
+      },
     },
     // The rescan's identity side channel (ADR-0062): a re-probe of every
     // locally-resolvable project, so a repo cloned/moved/re-pointed since boot
@@ -2116,9 +2222,15 @@ async function main(): Promise<void> {
 
   // Once the initial scan settles, reflect whether it found any usage data in
   // the status snapshot — a first-launch corpus stays `hasData: false`.
-  void eventStore.ready.then(markHasData).catch((err: unknown) => {
-    console.error("[sidecar] markHasData failed:", err);
-  });
+  void eventStore.ready
+    .then(() => {
+      markHasData();
+      // The scan's full model set is now in the store (#110).
+      pricingRefresher?.republish();
+    })
+    .catch((err: unknown) => {
+      console.error("[sidecar] markHasData failed:", err);
+    });
 
   // E11 + ADR-0041 (T14) — the best-effort pricing refresh: one fetch kicked
   // here, after the handshake, then a ~24h re-fetch loop. Both arms live inside
@@ -2137,8 +2249,21 @@ async function main(): Promise<void> {
   // reason a never-reached-upstream install can now be told apart from a
   // successful fetch of the same age.
   //
-  // `pricingLoop.stop()` in shutdown cancels the daily timer.
-  const pricingLoop = wirePricingRefresh({ patch: liveHub.patchStatus });
+  // The same handle serves the manual endpoint; all triggers share one
+  // attempt and cooldown (ADR-0085). ADR-0096 also loads/saves the pricing cache
+  // here and retries unpriced model discovery; shutdown cancels both timers.
+  pricingRefresher = wirePricingRefresh({
+    cachePath: join(appDataDir, "pricing-cache.json"),
+    patch: liveHub.patchStatus,
+    models: () => getEngineStore().models(),
+  });
+  // Republish `pricing.unpricedModels` the first time any raw model lands
+  // (#110). The boot scan may already have emitted batches before this
+  // subscription existed, so republish once now and once more when the scan
+  // settles (above, beside markHasData); `swapStore` re-attaches on a fleet
+  // rebuild.
+  detachModelWatch = watchNewModels(eventStore, pricingRefresher.republish);
+  pricingRefresher.republish();
 
   // Start the 1/min usage poll. Idles until the renderer pushes a credential
   // (POST /api/usage/credential). Standalone interval (not SSE-ref-counted) so
@@ -2186,7 +2311,8 @@ async function main(): Promise<void> {
         // it stops the event-sync loops and closes the replica store.
         await fleet.stop();
         // Cancel the daily pricing-refresh timer so no tick fires post-teardown.
-        pricingLoop.stop();
+        pricingRefresher?.stop();
+        detachModelWatch?.();
         // Cancel the saturation sample timer + any saturated heartbeat.
         saturationReporting.stop();
         // Drain the poller (await its in-flight poll), THEN flush the sample

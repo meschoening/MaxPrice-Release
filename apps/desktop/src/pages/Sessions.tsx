@@ -23,6 +23,7 @@ import { MachineChip } from "@/components/machine-chip";
 import { StripPage } from "@/components/strip-page";
 import { DetailStrip, StripIdentity, StripSection, StripStat } from "@/components/detail-strip";
 import { ModelBadges } from "@/components/model-badges";
+import { UnpricedChip } from "@/components/unpriced-chip";
 import { ModelSplitBar } from "@/components/model-split-bar";
 import { useArrangement } from "@/state/use-arrangement";
 import { costBarColumn } from "@/components/cost-bar";
@@ -318,7 +319,10 @@ function SessionDetailStrip({ session }: { session: SessionRow }): React.ReactEl
         <span className="sub num">{deriveProjectPath(session.path)}</span>
       </StripIdentity>
 
-      <StripStat label="cost">{formatCost(session.totalCost)}</StripStat>
+      <StripStat label="cost">
+        {formatCost(session.totalCost)}
+        <UnpricedChip models={session.modelsUsed} />
+      </StripStat>
       <StripStat label="tokens">{abbreviate(session.totalTokens)}</StripStat>
       <StripStat label="cache hit">{cacheHitPct(session).toFixed(0)}%</StripStat>
       <StripStat label="last event">{session.lastActivity}</StripStat>
@@ -353,7 +357,10 @@ function SessionsAggregateStrip({
         </span>
       </StripIdentity>
 
-      <StripStat label="total cost">{formatCost(aggregate.totalCost)}</StripStat>
+      <StripStat label="total cost">
+        {formatCost(aggregate.totalCost)}
+        <UnpricedChip models={aggregate.breakdowns.map((b) => b.modelName)} />
+      </StripStat>
       <StripStat label="total tokens">{abbreviate(aggregate.totalTokens)}</StripStat>
       <StripStat label="avg / session">{formatCost(aggregate.avgCost)}</StripStat>
       <StripStat label="cache hit">{aggregate.cacheHitPct.toFixed(0)}%</StripStat>

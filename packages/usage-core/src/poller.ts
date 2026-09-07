@@ -1,4 +1,9 @@
-import type { UsageConnection, UsageCredential, UsageSample } from "@maxprice/shared";
+import {
+  completeUsageSample,
+  type UsageConnection,
+  type UsageCredential,
+  type UsageReading,
+} from "@maxprice/shared";
 import { fetchUsage, type FetchUsageResult } from "./usage-client";
 import type { SampleStore } from "./sample-store";
 
@@ -12,7 +17,7 @@ export type PollerHub = {
   // A successful poll can authoritatively report that no account window is in
   // flight. Broadcast that null just like a sample so live consumers can clear
   // stale current state without touching the append-only history.
-  emitUsageSample: (sample: UsageSample | null) => void;
+  emitUsageSample: (sample: UsageReading | null) => void;
   patchStatus: (partial: {
     usageConnection: UsageConnection;
     usageLastSampleAt: string | null;
@@ -25,11 +30,10 @@ export type PollerHub = {
 // the poller's internal state, not the narrowed /api/usage/current response.
 export type UsagePollerCurrent = {
   connection: UsageConnection;
-  sample: UsageSample | null;
+  sample: UsageReading | null;
   lastSampleAt: string | null;
   // The last-known weekly reset, INDEPENDENT of `sample` (ADR-0083): a
-  // successful poll with no 5h window in flight reports `sample: null`, but
-  // the weekly window is still known from the latest stored sample.
+  // successful poll with no weekly window still leaves its cadence known.
   weeklyResetAt: string | null;
 };
 
@@ -43,7 +47,7 @@ export type UsagePoller = {
   getCurrent: () => UsagePollerCurrent;
   // While a remote Hub owns polling, mirror its authoritative current value
   // into the loopback /api/usage/current endpoint. This never mutates history.
-  setCurrentSample: (sample: UsageSample | null) => void;
+  setCurrentSample: (sample: UsageReading | null) => void;
   start: (intervalMs?: number) => void;
   stop: () => Promise<void>;
 };
@@ -80,7 +84,12 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
   // undefined means no poll (local or Hub-owned) has established live state in
   // this process yet, so first paint may fall back to persisted history. Once a
   // successful poll says sample OR null, that authoritative value wins.
-  let currentSample: UsageSample | null | undefined;
+  let currentSample: UsageReading | null | undefined;
+  let lastWeeklyResetAt: string | null = null;
+  function setCurrentSample(sample: UsageReading | null): void {
+    currentSample = sample;
+    lastWeeklyResetAt = sample?.weekly?.resetAt ?? lastWeeklyResetAt;
+  }
   let timer: ReturnType<typeof setInterval> | null = null;
   // Monotonic credential epoch: bumped on EVERY setCredential() call (set or clear).
   // runPoll() captures it before the await and bails after, so a Disconnect or a
@@ -132,10 +141,9 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
       // `sample: null` = successful poll, no window in flight (ADR-0029).
       // Preserve history, but replace and broadcast the separate live-current
       // state so a prior reset cannot survive as a phantom active window.
-      currentSample = result.sample;
-      if (result.sample !== null) {
-        opts.store.append(result.sample);
-      }
+      setCurrentSample(result.sample);
+      const historical = completeUsageSample(result.sample);
+      if (historical !== null) opts.store.append(historical);
       opts.liveHub.emitUsageSample(result.sample);
       setStatus("connected");
     } else {
@@ -178,9 +186,7 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
     },
     getCredential: () => credential,
     pollOnce,
-    setCurrentSample: (sample) => {
-      currentSample = sample;
-    },
+    setCurrentSample,
     getCurrent: () => {
       const latest = opts.store.latest();
       const sample = currentSample === undefined ? latest : currentSample;
@@ -188,7 +194,8 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
         connection,
         sample,
         lastSampleAt: latest?.capturedAt ?? null,
-        weeklyResetAt: sample?.weekly.resetAt ?? latest?.weekly.resetAt ?? null,
+        weeklyResetAt:
+          sample?.weekly?.resetAt ?? lastWeeklyResetAt ?? latest?.weekly.resetAt ?? null,
       };
     },
     start: (intervalMs = 60_000) => {

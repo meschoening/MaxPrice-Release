@@ -19,7 +19,7 @@ export function App(): React.ReactElement {
   // always-alive like this window, and exactly one writer keeps the string
   // coherent. Popout.tsx carries the effect and its logging discipline.
 
-  // The pill-header shell (NOTES §Hub console, T1): the lens orb + wordmark,
+  // The pill-header shell (Hub console, T1; ADR-0043): the lens orb + wordmark,
   // sticky at a 10px inset so cards slide beneath the frost. No bg on the tree
   // — the body paints the glass wash (ADR-0043).
   //

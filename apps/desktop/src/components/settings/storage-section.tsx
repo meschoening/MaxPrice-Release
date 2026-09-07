@@ -21,8 +21,8 @@ import {
 import { cn } from "@/lib/utils";
 
 // Settings › Storage › Disk usage — the facts half (map #124, ticket #133).
-// `plans/mocks/redesign/storage-glass.html` variant C (`framed`) is the visual
-// contract; NOTES.md §"Settings › Storage — Glass" is the written one. Every
+// Ported from the Storage mock's variant C (`framed`); the mocks are history
+// (ADR-0088) and the shipped section is its own contract. Every
 // label and sentence is renderer-side (the wire carries ids and bytes only) and
 // lives in `lib/storage-view`, which also owns the arithmetic.
 //

@@ -248,17 +248,13 @@ export function foldProjectEvent(
     bucket.firstActivity = date.dashed;
   }
 
-  // In-window partition through the one shared predicate (ADR-0083). Both
-  // arguments are lazy: the ymd branch reads the already-computed `date` (f13
-  // — nothing recomputes `localDate`; `inRange`'s null branch is dead here,
-  // the fold already returned on it) and never parses the timestamp; the
-  // instant branch parses it and never asks for the date.
-  const within = inRange(
-    () => Date.parse(event.timestamp),
-    () => date.ymd,
-    since,
-    until,
-  );
+  // In-window partition through the one shared predicate (ADR-0083). The ymd
+  // argument stays lazy — it reads the already-computed `date` (f13 — nothing
+  // recomputes `localDate`; `inRange`'s null branch is dead here, the fold
+  // already returned on it) and the instant branch never asks for it. The
+  // epoch-ms side needs no laziness any more: `event.ms` is a field read
+  // (ADR-0089), so the ymd branch pays nothing for it.
+  const within = inRange(event.ms, () => date.ymd, since, until);
   if (within) {
     // Pricing moved inside the partition with ADR-0068: with the all-time
     // rollup gone, an out-of-window event has nothing left to price.

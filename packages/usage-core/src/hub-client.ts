@@ -12,7 +12,7 @@ import {
   type SseFrame,
   type UsageConnection,
   type UsageCredential,
-  type UsageSample,
+  type UsageReading,
 } from "@maxprice/shared";
 import type { SampleStore } from "./sample-store";
 
@@ -72,7 +72,7 @@ const PUSH_UP_BATCH_SIZE = 5000;
 export type HubClientDeps = {
   store: SampleStore;
   liveHub: {
-    emitUsageSample: (sample: UsageSample | null) => void;
+    emitUsageSample: (sample: UsageReading | null) => void;
     patchStatus: (
       partial: Partial<{
         hubConnection: HubConnection;
@@ -87,7 +87,7 @@ export type HubClientDeps = {
     start: () => void;
     stop: () => Promise<void>;
     pollOnce: () => Promise<void>;
-    setCurrentSample: (sample: UsageSample | null) => void;
+    setCurrentSample: (sample: UsageReading | null) => void;
   };
   machineId: string;
   // Friendly per-machine label for the hub roster (ADR-0036). Emitted as
@@ -283,7 +283,7 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
     if (state !== "connecting") stateBeforeConnecting = state;
     setState("connecting");
     let hubUsageConnection: UsageConnection;
-    let hubCurrentSample: UsageSample | null = null;
+    let hubCurrentSample: UsageReading | null = null;
     // The hub's event-sync watermark, captured near the status parse (below) so
     // it survives the block-scoped `status` const out to the connected block
     // where onConnected fires — the ADR-0041 seam ([[HubFleetHooks]]). null ⇒ a

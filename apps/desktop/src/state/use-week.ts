@@ -16,8 +16,8 @@ export function useWeekWindow(): WeekWindow {
   const now = useNowTick(60_000);
   const week = settings?.week ?? DEFAULT_WEEK;
   const tz = settings?.timezone;
-  // `weeklyResetAt`, not `sample.weekly.resetAt`: a poll with no 5h window
-  // in flight reports `sample: null` while the weekly window stays known.
+  // `weeklyResetAt` retains the last-known cadence even when the current
+  // reading has no weekly window (ADR-0083/0090).
   const resetAt = usage?.weeklyResetAt ?? null;
   return useMemo(
     () =>
