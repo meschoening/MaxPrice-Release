@@ -138,7 +138,7 @@ body {
      medium   800px <= content < 1520px
      wide     content >= 1520px         (unbounded — see below)
 
-   Three containers, each existing for a reason the others cannot
+   Two containers, each existing for a reason the other cannot
    serve:
 
      frame     the app frame, viewport - 32. Queried ONLY by the
@@ -154,15 +154,6 @@ body {
                would measure ~11px narrower on Windows only, and
                could oscillate across a boundary as the scrollbar
                appears and leaves.
-     tile      `.tiles`, the ROW — deliberately NOT `.tile`. T1
-               declared it on the tile itself and T6 (#158) measured
-               that this cannot work: a container query styles its
-               container's DESCENDANTS, never the container, and the
-               tiles' large state IS the tile's own flex-direction
-               (a 613px tile still computed `column`). So each tile
-               queries its row. The one COMPONENT container so far;
-               others earn one by proving a state exists — a
-               container with no @container rule is dead weight.
 
    The sidebar collapse is the FIRST BOUNDARY expressed in frame
    space: it collapses to an icon rail below `frame: 1072px`
@@ -180,8 +171,8 @@ body {
    Three COMPONENT thresholds exist beside the two boundaries:
 
      845      idle `.tiles` can draw 3-up (no active-window rows).
-     1075     active `.tiles` without an unpriced block cost chip.
-     1155     `.tiles` breaks from 3-up to `duo` below this content
+     1013     active `.tiles` without an unpriced block cost chip.
+     1093     `.tiles` breaks from 3-up to `duo` below this content
               width. It is the SUM OF THE THREE TILES' MEASURED
               FLOORS plus the gaps plus margin (T2 #153) — see the
               derivation at `.tiles` itself. It is a component's
@@ -867,16 +858,19 @@ a.sb-footrow:hover .sb-label {
    fault, not the tile's.
 
    The Active block's cost and elapsed/reset text must share one line.
-   Reserve 500px for that tile, including its ring, gap and card padding;
-   an actual unpriced chip needs another 80px (580px total).
-   The old 446px floor wrapped even $175.38 beside an AM/PM reset time.
+   Reserve 446px for that tile, including its ring, gap and card padding;
+   an actual unpriced chip needs another 80px (526px total).
+   This restores 54f7efe's realistic $999.99 bound while retaining PR #199's
+   no-wrap value row. Measured with the current font and a full AM/PM reset:
+   288.14px value row + 90.625px visible ring + 25px gap + 42px chrome
+   = 445.765px. The projection foot may wrap independently.
    The other floors remain 236px (Today) and 285px (This week).
 
-   236 + 500 + 285 + two 18px gaps = 1057px. The 1075px content
-   threshold adds 10px for the main scrollbar and 8px of margin. A block
-   cost chip raises it to 1155px; absent chips consume no reserve. Below
-   it the Active block spans the duo layout instead of squeezing its
-   value row. The projection foot may still wrap independently.
+   236 + 446 + 285 + two 18px gaps = 1003px. The 1013px content
+   threshold adds 10px for the main scrollbar; the old 8px cushion bought
+   no content room beyond these floors. A block cost chip raises it to
+   1093px; absent chips consume no reserve. Below it the Active block
+   spans the duo layout instead of squeezing its value row.
 
    NOT taken, on purpose: `.tile`'s 20px side padding. Trimming it to 14
    would buy another 36px of threshold, but 20 is the shared card padding
@@ -894,20 +888,14 @@ a.sb-footrow:hover .sb-label {
   display: grid;
   /* duo. `minmax(0, 1fr)` rather than a bare `1fr` (= minmax(auto, 1fr)):
      the auto floor is the tile's min-content, and the tile is no longer a
-     query container (below), so nothing contains that contribution away
-     any more. Writing the floor down is what keeps a too-narrow window
+     query container, so nothing contains that contribution away. Writing
+     the floor down is what keeps a too-narrow window
      overflowing INSIDE a tile instead of blowing the row out. */
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   grid-template-areas:
     "today week"
     "block block";
   gap: 18px;
-  /* The one component container (see "responsive thresholds" above). It is
-     the ROW, not the tile: a container query styles its container's
-     descendants, never the container itself, so a tile cannot query its
-     own width to flip its own flex-direction (T6 #158, measured). */
-  container-type: inline-size;
-  container-name: tile;
 }
 /* Placed by position, which is the same authority the areas below rely on.
    NOT `.block-tile`: the Active block drops that class in its empty-inset
@@ -921,20 +909,20 @@ a.sb-footrow:hover .sb-label {
 .tiles > :nth-child(3) {
   grid-area: week;
 }
-/* 3-up. See "responsive thresholds" and the derivation above for 1155. */
-@container content (min-width: 1155px) {
+/* 3-up. See "responsive thresholds" and the derivation above for 1093. */
+@container content (min-width: 1093px) {
   .tiles {
-    grid-template-columns: minmax(236px, 1fr) minmax(580px, 1.62fr) minmax(285px, 1fr);
+    grid-template-columns: minmax(236px, 1fr) minmax(526px, 1.62fr) minmax(285px, 1fr);
     grid-template-areas: "today block week";
   }
 }
-/* Restore PR #199's floor when the block cost has no unpriced chip.
+/* Use the measured priced floor when the block cost has no unpriced chip.
    Chips in Today/This week do not enlarge the block. Keep this selector's
    specificity at `.tiles` so the idle composition below still wins.
    The DOM is the authority: a pricing refresh can remove a chip in place. */
-@container content (min-width: 1075px) {
+@container content (min-width: 1013px) {
   .tiles:where(:not(:has(> .block-tile .unpriced-chip))) {
-    grid-template-columns: minmax(236px, 1fr) minmax(500px, 1.62fr) minmax(285px, 1fr);
+    grid-template-columns: minmax(236px, 1fr) minmax(446px, 1.62fr) minmax(285px, 1fr);
     grid-template-areas: "today block week";
   }
 }
@@ -1023,67 +1011,9 @@ a.sb-footrow:hover .sb-label {
   margin-bottom: 10px;
 }
 
-/* --- the stat tiles' LARGE state (map #151 / T6 #158, ADR-0073) ---
-
-   At content 2256 a 3-up stat tile is 613px holding ~160px of ink; at
-   1616 it is ~390px, still wider than the stack needs. So at wide the
-   column becomes one line and the void inside the tile fills with ink —
-   "data takes the space", which at this end means "wide adds ink".
-
-   The threshold is wide's own boundary (1520) read in ROW space, and
-   that is not laziness: a tile-space number is not available, because
-   the tile-space reading is INVERTED. A duo tile is (row - 18)/2, which
-   at the top of duo is ~514px — wider than a 3-up tile at 1616. Any
-   threshold on the tile's own width would therefore flip the tall duo
-   tiles horizontal before it ever reached the wide 3-up ones it exists
-   for. So the honest statement is that this state belongs to the wide
-   ARRANGEMENT, and the row is where an arrangement is legible.
-
-   The row is 0-10px narrower than `content` (the scrollbar, see the
-   thresholds block), so the flip can trail content: 1520 by up to 10px —
-   three px of tile width, deliberately not corrected with a second
-   literal.
-
-   The Active block is EXCLUDED: T2 locked it to one state, and it is
-   already a row. */
-@container tile (min-width: 1520px) {
-  .tiles > :nth-child(1),
-  .tiles > :nth-child(3) {
-    flex-direction: row;
-    align-items: baseline;
-    gap: 26px;
-    /* `flex-wrap` is not about wrapping — it is what makes `align-content`
-       apply, and align-content is the only way to centre a single flex LINE
-       while keeping `align-items: baseline` inside it. Without it the line
-       pins to the top of a 134px box (the Active block's ring sets the row
-       height) and the horizontal void is simply traded for a vertical one. */
-    flex-wrap: wrap;
-    align-content: center;
-  }
-  .tiles > :nth-child(1) > .value,
-  .tiles > :nth-child(3) > .value {
-    margin: 0;
-  }
-  /* Undo the shared-baseline pair above: in a row-direction line an auto top
-     margin bottom-aligns the item and breaks the baseline it was written to
-     protect, and the sibling's 10px is a gap below the line. */
-  .tiles > :nth-child(1) > *:has(+ .delta),
-  .tiles > :nth-child(3) > *:has(+ .delta) {
-    margin-bottom: 0;
-  }
-  .tiles > :nth-child(1) > .delta,
-  .tiles > :nth-child(3) > .delta {
-    align-self: center;
-    margin-top: 0;
-    margin-left: auto;
-  }
-  .tiles > :nth-child(1) > .limit-row,
-  .tiles > :nth-child(3) > .limit-row {
-    flex: 1;
-    margin-top: 0;
-    margin-left: auto;
-  }
-}
+/* Stat tiles keep their normal vertical reading order at every width.
+   The cards expand; their contents do not switch to horizontal wrapping.
+   See ADR-0073's stable tile lines amendment. */
 
 /* active block tile — ONE state at every width (map #151 / T2 #153):
    the ring is attached to the left of the text and the pair centres as
