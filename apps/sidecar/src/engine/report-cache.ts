@@ -630,7 +630,7 @@ export function createReportCache(opts: {
     // keeps the original position, so the tie rank is inherited).
     for (const { event, replaced } of changes) {
       const inherited = replaced === null ? undefined : seq.get(replaced);
-      seq.set(event, inherited ?? nextSeq++);
+      if (event !== null) seq.set(event, inherited ?? nextSeq++);
     }
     // HARDENING, not a bug fix: no throw can reach here today — `rebind`
     // pre-stamps the full snapshot synchronously (so `seqOf` cannot miss), and
@@ -703,7 +703,7 @@ export function createReportCache(opts: {
           }
         }
       }
-      if (entryMatches(entry, event)) {
+      if (event !== null && entryMatches(entry, event)) {
         const key = family.bucketOf(event, entry.q);
         if (key !== null) {
           let bucket = entry.buckets.get(key);

@@ -128,6 +128,13 @@ export const settingsSchema = z
     // `keepRunningInBackground` precedent) — absent/non-bool → false; keep the
     // two in lockstep. Popout only: the Live page and the readout ignore it.
     showModelLimit: z.boolean().default(false).catch(false),
+    // The Home organization (CONTEXT.md, ADR-0098): the ONE organization whose
+    // usage the app shows. `null` = not chosen yet — the sidecar then uses the
+    // login it observed at boot, and the renderer persists that value on first
+    // launch so a later `/login` elsewhere can never silently move the home.
+    // Consumed by the sidecar via the settings watch (in-session engine
+    // rebuild, no relaunch). An empty string is not an organization.
+    homeOrganization: z.string().min(1).nullable().default(null).catch(null),
   })
   .passthrough();
 

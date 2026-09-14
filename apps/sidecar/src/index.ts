@@ -11,6 +11,7 @@ import {
   hubConfigSchema,
   MAX_INTRADAY_BUCKETS,
   nativeBucketMs,
+  ORGANIZATIONS_PATH,
   PROJECT_IDENTITY_PATH,
   PROJECT_MERGE_PATH,
   projectMergeMutationRequestSchema,
@@ -32,6 +33,7 @@ import {
   type ErrorResponse,
   type ForgetSessionRef,
   type IntradayResponse,
+  type OrganizationsResponse,
   type PricingRefreshResponse,
   type ProjectMergeMutationRequest,
   type ProjectMergeMutationResponse,
@@ -67,6 +69,9 @@ import {
 } from "./storage";
 import { createIdentityProber } from "./identity-probe";
 import { createLocalArchive } from "./local-archive";
+import { createOrganizationRegistry, listOrganizations, readCurrentLogin } from "./organizations";
+import { gateOrganizationWatcher, prepareOrganizationStore } from "./organization-boot";
+import { createOrganizationRepair } from "./organization-repair";
 import { createSettingsWatch, type SettingsWatch } from "./settings-watch";
 import { mintRescanWalkKey, scanGate } from "./scan-gate";
 import { createScanCache, type ScanCache } from "./engine/scan-cache";
@@ -220,6 +225,8 @@ export type BuildAppDeps = {
     clean: () => Promise<StorageCleanResponse>;
     forget: (sessions: readonly ForgetSessionRef[]) => Promise<FleetForgetResult>;
   };
+  // ADR-0098: Settings' Home organization select.
+  organizations: { list: () => Promise<OrganizationsResponse> };
   // Live Loop-lag summary (issue #116 / F4). GET /api/status composes this
   // over the hub-held snapshot: verdict-edge frames + the saturated heartbeat
   // keep the hub's copy only flip-fresh, but one status read must answer "is
@@ -1199,6 +1206,11 @@ export function buildApp(deps: BuildAppDeps): Hono {
     return c.json({ sample: cur.sample, weeklyResetAt: cur.weeklyResetAt });
   });
 
+  // --- /api/organizations ---  (ADR-0098) the organizations this machine knows
+  // about, for Settings' Home organization select. Labels and ids only — no
+  // count of what is hidden ever rides here.
+  app.get(ORGANIZATIONS_PATH, async (c) => c.json(await deps.organizations.list()));
+
   // --- /api/readout ---  (map #168 T5/M3; ADR-0076) the tray readout's one
   // wire: the desktop shell's Rust ambient writer polls this ~1/min and renders
   // the Windows tray tooltip / macOS menu-bar title from it. Composed here, not
@@ -1753,6 +1765,32 @@ async function main(): Promise<void> {
   const bootHubConfigured =
     Boolean(process.env.MAXPRICE_HUB_URL) || (bootSettings?.hubUrl ?? "") !== "";
 
+  // The Home organization (CONTEXT.md, ADR-0098): the persisted choice. A first
+  // launch has none, and its boot walk runs with NO home — nothing excluded — so
+  // the corpus itself can say which organization this machine works under
+  // (`prepareOrganizationStore`, before public readiness). The boot login is
+  // only the seed's tie-break and fallback. Label reads may refresh live; they
+  // never select the home, since the login file flips whenever the
+  // user signs in elsewhere. `currentHome` is what every store this process
+  // builds is given; its only writers are the seed and the settings watch.
+  const bootLogin = await readCurrentLogin(watchRoots);
+  let currentHome: string | null = bootSettings?.homeOrganization ?? null;
+  // What a null setting falls back to once the seed has run. Null until then,
+  // so a settings edit that beats the walk is never overridden.
+  let seededHome: string | null = null;
+  // Settles once the seed has been decided — at once when a home was persisted
+  // — so /api/organizations never reports a home the walk is about to change.
+  let settleHome: (() => void) | undefined;
+  const homeSettled: Promise<void> =
+    currentHome !== null
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => {
+          settleHome = resolve;
+        });
+  // Whether a hub is configured right now — the repair skips the hub half when
+  // there is none. Boot value from settings; POST /api/hub/config updates it.
+  let hubTargetNow: string | null = process.env.MAXPRICE_HUB_URL ?? (bootSettings?.hubUrl || null);
+
   // The boot progress channel (ADR-0067). Created before the hub so its seed
   // can go straight into the status literal; its `patch` sink is the hub's, so
   // it is installed a few statements below alongside the saturation sampler's.
@@ -1850,19 +1888,38 @@ async function main(): Promise<void> {
     path: join(appDataDir, STORAGE_FILE.scanCache),
   });
 
-  // The Part 4.5 usage engine's in-memory event store (E4). Created here, but
-  // its initial scan is kicked off *after* the LISTENING handshake (below) so
-  // a large filesystem walk can't blow the Rust shell's 5s timeout. Every
-  // `/api/*` data handler queries it (E9 cutover).
-  const eventStore = createEventStore({ selfMachineId: machineId, scanCache });
+  // ADR-0098: plan words per organization, so a label survives logging out.
+  const organizationRegistry = createOrganizationRegistry({
+    path: join(appDataDir, STORAGE_FILE.organizations),
+  });
+  // Serialized, never fire-and-forget: `remember()` persists through one fixed
+  // `${path}.tmp` with no write queue, so it must not overlap itself or `load()`
+  // — every later writer (the /api/organizations handler) awaits this first.
+  const registryReady: Promise<void> = organizationRegistry
+    .load()
+    .then(() =>
+      bootLogin === null
+        ? undefined
+        : organizationRegistry.remember(bootLogin.organizationUuid, bootLogin.organizationType),
+    )
+    .catch((err: unknown) => console.error("[sidecar] organization registry load failed:", err));
 
-  // The engine store, as a mutable ref (ADR-0041): the fleet resync path
-  // rebuilds it in-session (fresh store → local rescan + replica reseed → swap),
-  // so everything that reads or feeds the engine goes through `getEngineStore()`,
-  // never the captured `eventStore`. The `eventStore` name stays for the boot
-  // scan + engineReady, which run on the original store.
-  let engineStore = eventStore;
+  // An empty placeholder while the private selection walk runs. No source
+  // feeds this store; prepareOrganizationStore installs the first live corpus
+  // after LISTENING, before localReady opens any outward feeder.
+  let engineStore = createEventStore({
+    selfMachineId: machineId,
+    scanCache,
+    homeOrganization: currentHome,
+  });
   const getEngineStore = (): EventStore => engineStore;
+  let resolveLocalReady!: () => void;
+  let rejectLocalReady!: (error: unknown) => void;
+  const localReady = new Promise<void>((resolve, reject) => {
+    resolveLocalReady = resolve;
+    rejectLocalReady = reject;
+  });
+  let detachForeignEvidence: (() => void) | null = null;
   // The pricing loop and its unpriced-model watch (#110) are assigned after the
   // handshake, but the fleet's `swapStore` (declared next) must re-attach the
   // watch — hence `let`s declared ahead of both.
@@ -1881,9 +1938,21 @@ async function main(): Promise<void> {
       }
     },
   });
-  // The change-feed subscription on the boot store; every later swap re-attaches
-  // (see swapStore below).
-  localArchive.attachStore(eventStore);
+  // Install only the home-filtered corpus. The first selection walk has no
+  // archive subscription, fleet source, report readers, or watcher writes.
+  function installStore(next: EventStore): void {
+    engineStore = next;
+    localArchive.attachStore(next);
+    detachForeignEvidence?.();
+    detachForeignEvidence = next.onForeignEvidence((sessions) => {
+      void engineReady.then(() => organizationRepair.invalidate(sessions));
+    });
+    detachModelWatch?.();
+    if (pricingRefresher) {
+      detachModelWatch = watchNewModels(next, pricingRefresher.republish);
+      pricingRefresher.republish();
+    }
+  }
 
   // Fleet event sync (ADR-0041). Toggles + the hub-configured gate come from
   // settings.json at boot (read above, beside the boot progress reporter that
@@ -1898,22 +1967,14 @@ async function main(): Promise<void> {
     identityDirectoryPath: join(dirname(usageHistoryPath), "identity-directory.json"),
     liveHub,
     getStore: getEngineStore,
-    swapStore: (next) => {
-      engineStore = next;
-      // Re-subscribe the archive's change feed onto the store that is now live
-      // — the boot subscription points at a store nothing writes to any more.
-      localArchive.attachStore(next);
-      // Same for the unpriced-model watch (#110): re-attach, then republish
-      // once against the new corpus (its model set is not the old one's).
-      detachModelWatch?.();
-      if (pricingRefresher) {
-        detachModelWatch = watchNewModels(next, pricingRefresher.republish);
-        pricingRefresher.republish();
-      }
-    },
+    ingestionReady: localReady,
+    swapStore: installStore,
     seedLocalArchive: (store) => localArchive.seedInto(store),
     forgetLocalArchive: (sessions) => localArchive.forgetSessions(sessions),
-    createStore: () => createEventStore({ selfMachineId: machineId, scanCache }),
+    // ADR-0098: a rebuild re-derives under whatever home is current — the
+    // settings watch's home change is exactly a rebuild.
+    createStore: () =>
+      createEventStore({ selfMachineId: machineId, scanCache, homeOrganization: currentHome }),
     getRoots: () => watchRoots,
     emitMachinesChanged: () => liveHub.emitMachinesChanged(),
     emitIdentityChanged: () => liveHub.emitIdentityChanged(),
@@ -1922,6 +1983,19 @@ async function main(): Promise<void> {
       fleetReplica: bootFleetReplica,
       hubConfigured: bootHubConfigured,
     },
+  });
+
+  // ADR-0098: the one-shot repair of synced history. Runs after the boot gate
+  // (below), after a Home organization change, and on its own retry timer while
+  // a configured hub is unreachable.
+  const organizationRepair = createOrganizationRepair({
+    markerPath: join(appDataDir, STORAGE_FILE.organizationRepair),
+    homeOrganization: () => currentHome,
+    foreignSessions: () => getEngineStore().foreignSessions(),
+    hubTarget: () => hubTargetNow,
+    forgetOnHub: (sessions, target) => fleet.repairOrganizations(sessions, target),
+    forgetLocalArchive: (sessions) => localArchive.forgetSessions(sessions),
+    rebuild: () => fleet.rebuildEngine(),
   });
 
   // The Repo identity prober (ADR-0062 §2) — the ONE producer of this
@@ -1978,7 +2052,7 @@ async function main(): Promise<void> {
   // pull is background). Both are kicked AFTER the LISTENING handshake (below);
   // until then this holds the scan's own `ready` so a request in the boot window
   // still waits on the scan, exactly as the pre-fleet app did.
-  let engineReady: Promise<void> = eventStore.ready;
+  let engineReady: Promise<void> = localReady;
 
   // Usage-limits (ADR-0023/0024). Construction is synchronous and reads no file
   // — the on-disk history is loaded by `sampleStore.loadHistory()` *after* the
@@ -2007,7 +2081,13 @@ async function main(): Promise<void> {
     getLocalCredential: () => usagePoller.getCredential(),
     // The ADR-0041 event-sync seam: hub-client owns connection custody and
     // fires these hooks; fleet.ts drives the event-sync from them.
-    fleet: fleet.hooks,
+    fleet: {
+      ...fleet.hooks,
+      onConnected: (context) => {
+        fleet.hooks.onConnected(context);
+        void engineReady.then(() => organizationRepair.run());
+      },
+    },
   });
 
   // Bind first so we know the port, then wire up host validation against it.
@@ -2043,6 +2123,30 @@ async function main(): Promise<void> {
       clean: () => storageReporter.clean(),
       forget: (sessions) => fleet.forget(sessions),
     },
+    // ADR-0098: Settings' Home organization select.
+    organizations: {
+      list: async () => {
+        // A first launch answers only once the walk has chosen the home, so the
+        // renderer's seed never persists a null or a value about to change.
+        await homeSettled;
+        // The live login is display-only here ("(current login)" in the select);
+        // the home itself never follows it.
+        const login = await readCurrentLogin(watchRoots);
+        // After the boot load+remember, never beside it: the registry persists
+        // through one fixed tmp path with no write queue.
+        await registryReady;
+        if (login !== null) {
+          await organizationRegistry.remember(login.organizationUuid, login.organizationType);
+        }
+        return listOrganizations({
+          home: currentHome,
+          currentLogin: login,
+          trackedLimits: usagePoller.getCredential()?.orgId ?? null,
+          seen: getEngineStore().organizationsSeen(),
+          registry: organizationRegistry,
+        });
+      },
+    },
     // Live accessor, not a snapshot: `watchRoots` is reassigned on a settings
     // `claudePaths` edit (below), and POST /api/rescan must scan whatever is
     // watched now (ADR-0019).
@@ -2066,7 +2170,10 @@ async function main(): Promise<void> {
       // reconciles live. `c === null` ⇒ hub off.
       configure: (c) => {
         hubClient.configure(c);
+        // ADR-0098: the repair skips its hub half when no hub is configured.
+        hubTargetNow = c?.url ?? null;
         fleet.onHubConfigured(c !== null);
+        void engineReady.then(() => organizationRepair.run());
       },
     },
     // The rescan handler's push trigger — same poke the watcher's onRecords
@@ -2119,46 +2226,51 @@ async function main(): Promise<void> {
   // it happened. Constructed HERE so `+0ms` means the handshake.
   const bootTrace = createBootTrace();
 
-  // The event store's initial full scan and the watcher both come up after the
-  // handshake so a large initial filesystem walk can't delay the LISTENING
-  // line past the Rust shell's 5s timeout. The scan runs concurrently with the
-  // watcher — the store's `(messageId, requestId)` dedup makes a scan/watcher
-  // overlap safe. `void`: nothing awaits the scan here; the endpoints await
-  // `eventStore.ready`. Through `scanAndPoke` because the watcher runs
-  // `ignoreInitial: true` — the boot corpus never replays through `onRecords`,
-  // so without this poke, work done while the app was closed would sit unpushed
-  // until the 5-min sweep on an otherwise-idle machine.
-  void scanAndPoke(eventStore, fleet, watchRoots, "boot", (p) => {
-    // Piggybacks the splash's existing per-file callback: the tick line gets
-    // to say WHERE in the corpus the walk was when the loop stopped, which is
-    // the difference between "the scan blocked" and "the scan blocked at file
-    // 412 of 1253".
-    bootTrace.detail("scan", `${p.filesParsed}/${p.filesTotal} files`);
-    bootProgress.onScanProgress(p);
-  });
+  // First-launch selection stays private, including on repeated launches
+  // where no settings writer has persisted the seed. Publish only after the
+  // selected home's walk has established its exclusion keys.
+  void prepareOrganizationStore({
+    home: currentHome,
+    loginOrganization: bootLogin?.organizationUuid ?? null,
+    roots: watchRoots,
+    createStore: (homeOrganization) =>
+      createEventStore({ selfMachineId: machineId, scanCache, homeOrganization }),
+    onProgress: (p) => {
+      bootTrace.detail("scan", `${p.filesParsed}/${p.filesTotal} files`);
+      bootProgress.onScanProgress(p);
+    },
+  }).then(({ home, store }) => {
+    if (currentHome === null) seededHome = home;
+    currentHome = home;
+    installStore(store);
+    settleHome?.();
+    resolveLocalReady();
+  }, rejectLocalReady);
 
-  // Kick the replica load beside the scan (ADR-0041) and gate the data handlers
-  // on BOTH: engineReady resolves once the local scan AND the replica file load
-  // finish. Deferred to here so the replica's disk read can't delay the LISTENING
-  // line either; NEVER the network (the hub pull is background). A hub-less
-  // client's loadReplicaAtBoot resolves immediately, so this is just the scan.
+  // Gate data handlers on the installed home corpus and its disk feeders.
+  // Replica/archive seeding waits for localReady; network never gates reports.
   engineReady = bootTrace.track(
     "engine",
     Promise.all([
-      bootTrace.track("scan", eventStore.ready),
+      bootTrace.track("scan", localReady),
       bootTrace.track("replica", fleet.loadReplicaAtBoot()),
       // The archive's disk load (never rejects — a failure degrades instead,
       // ADR-0069 §3). Local disk only, like the replica: never the network.
-      bootTrace.track("archive", localArchive.loadAtBoot()),
-    ]).then(() => undefined),
+      bootTrace.track(
+        "archive",
+        localReady.then(() => localArchive.loadAtBoot()),
+      ),
+    ]).then(() => {
+      fleet.notifyLocalChange();
+    }),
   );
 
   // The corpus walk's end (ADR-0067): announce the `merging` phase to anyone
-  // still on the splash. Off `eventStore.ready` rather than `engineReady`,
+  // still on the splash. Off `localReady` rather than `engineReady`,
   // because the whole point is the window BETWEEN them — the one a hub client's
   // replica load occupies and a hub-less client's does not (the reporter drops
   // this frame entirely in the latter case).
-  void eventStore.ready.then(() => bootProgress.scanFinished());
+  void localReady.then(() => bootProgress.scanFinished());
 
   // The boot readiness signal (ADR-0047): flip `ready: true` — broadcast as a
   // status:changed frame — when the SAME local gate the data handlers await
@@ -2207,6 +2319,18 @@ async function main(): Promise<void> {
       }),
   );
 
+  // ADR-0098: the private seed has settled before the boot gate. Repair the
+  // archive/hub after local sources have loaded; network never gates reports.
+  void bootTrace.track(
+    "organization-repair",
+    engineReady
+      .catch(() => {
+        // The walk still ran; the seed and the repair read its verdicts.
+      })
+      .then(() => new Promise<void>((resolve) => setTimeout(resolve, 0)))
+      .then(() => organizationRepair.run()),
+  );
+
   // Load the persisted usage history after the handshake, for the same reason
   // the event-store scan is deferred — a large read mustn't gate the LISTENING
   // line. The poller (started below) reads `latest()` lazily, so an in-flight
@@ -2222,7 +2346,7 @@ async function main(): Promise<void> {
 
   // Once the initial scan settles, reflect whether it found any usage data in
   // the status snapshot — a first-launch corpus stays `hasData: false`.
-  void eventStore.ready
+  void localReady
     .then(() => {
       markHasData();
       // The scan's full model set is now in the store (#110).
@@ -2262,7 +2386,7 @@ async function main(): Promise<void> {
   // subscription existed, so republish once now and once more when the scan
   // settles (above, beside markHasData); `swapStore` re-attaches on a fleet
   // rebuild.
-  detachModelWatch = watchNewModels(eventStore, pricingRefresher.republish);
+  detachModelWatch = watchNewModels(getEngineStore(), pricingRefresher.republish);
   pricingRefresher.republish();
 
   // Start the 1/min usage poll. Idles until the renderer pushes a credential
@@ -2324,6 +2448,11 @@ async function main(): Promise<void> {
         liveHub.close();
         if (settingsWatch) await settingsWatch.close();
         if (watcher) await watcher.close();
+        // ADR-0098: cancel the repair's hub retry timer so no tick fires
+        // post-teardown — and, since a tick reaches the archive, before the
+        // archive is closed below.
+        organizationRepair.stop();
+        detachForeignEvidence?.();
         // The Local archive (ADR-0069) after the watcher, so no flush can
         // enqueue an append behind the barrier: `stop()` cancels the sweep
         // interval, drops the change-feed subscription, drains the write chain,
@@ -2424,23 +2553,25 @@ async function main(): Promise<void> {
   void bootTrace
     .track(
       "watcher",
-      createWatcher(jsonlWatcherOptions(watchRoots)).then((w) => {
-        watcher = w;
-        if (w.readyTimedOut) {
-          bootTrace.detail("watcher", "ready timed out");
-          liveHub.patchStatus({ watcherDegraded: true });
-        }
-        // The settings watch is built HERE, inside the watcher's `.then`, and
-        // not concurrently: `onRootsChanged` is the sole writer of
-        // `watcher`/`watchRoots`, and racing it against this assignment could
-        // clobber a newer watcher with the boot one — leaving `watcher` on the
-        // old roots while `watchRoots` claims the new ones, exactly the
-        // invariant `settings-watch.ts` is built around. The delay it costs is
-        // bounded by WATCHER_READY_TIMEOUT_MS and covers nothing that worked
-        // before: the settings watcher runs `ignoreInitial: true`, so an edit
-        // predating its creation was never seen anyway.
-        wireSettingsWatch();
-      }),
+      createWatcher(gateOrganizationWatcher(jsonlWatcherOptions(watchRoots), localReady)).then(
+        (w) => {
+          watcher = w;
+          if (w.readyTimedOut) {
+            bootTrace.detail("watcher", "ready timed out");
+            liveHub.patchStatus({ watcherDegraded: true });
+          }
+          // The settings watch is built HERE, inside the watcher's `.then`, and
+          // not concurrently: `onRootsChanged` is the sole writer of
+          // `watcher`/`watchRoots`, and racing it against this assignment could
+          // clobber a newer watcher with the boot one — leaving `watcher` on the
+          // old roots while `watchRoots` claims the new ones, exactly the
+          // invariant `settings-watch.ts` is built around. The delay it costs is
+          // bounded by WATCHER_READY_TIMEOUT_MS and covers nothing that worked
+          // before: the settings watcher runs `ignoreInitial: true`, so an edit
+          // predating its creation was never seen anyway.
+          void engineReady.then(() => wireSettingsWatch());
+        },
+      ),
     )
     .catch((err: unknown) => {
       // A rejecting createWatcher leaves the sidecar serving reports from a
@@ -2448,7 +2579,7 @@ async function main(): Promise<void> {
       // the same thing rather than dying.
       console.error("[sidecar] watcher creation failed:", err);
       liveHub.patchStatus({ watcherDegraded: true });
-      wireSettingsWatch();
+      void engineReady.then(() => wireSettingsWatch());
     });
 
   // Every phase is registered — including the watcher above; start the
@@ -2504,11 +2635,25 @@ async function main(): Promise<void> {
         // relaunch. `settingsPath` is narrowed to string inside this block.
         onSettingsChanged: () => {
           const s = readSettingsFile(settingsPath);
-          if (s !== null)
+          if (s !== null) {
             fleet.applySettings({
               hubShareEvents: s.hubShareEvents,
               hubFleetReplica: s.hubFleetReplica,
             });
+            // ADR-0098: a Home organization change rebuilds the engine under the
+            // new verdicts, then repairs synced history against them. A null
+            // setting falls back to the SEEDED organization, never the login file.
+            const nextHome = s.homeOrganization ?? seededHome;
+            if (nextHome !== currentHome) {
+              currentHome = nextHome;
+              void fleet
+                .rebuildEngine()
+                .then(() => organizationRepair.run())
+                .catch((err: unknown) =>
+                  console.error("[sidecar] home organization change failed:", err),
+                );
+            }
+          }
         },
         // A restart that failed leaves the PREVIOUS watcher installed on the
         // PREVIOUS roots — file watching no longer matches the configured

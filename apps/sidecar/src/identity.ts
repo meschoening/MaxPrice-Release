@@ -1,4 +1,4 @@
-import { basename, isAbsolute, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, sep } from "node:path";
 
 // Map a JSONL file path to the `(projectSlug, sessionId)` pair the event store
 // tags every event with. Claude Code lays sessions out two ways:
@@ -42,4 +42,15 @@ export function identityFromPath(
 
 function stripJsonl(name: string): string {
   return name.replace(/\.jsonl$/, "");
+}
+
+// The flat transcript a subagent transcript belongs to, or null for any other
+// path: `<root>/<slug>/<session>/subagents/agent-x.jsonl` → `<root>/<slug>/<session>.jsonl`.
+// A subagent transcript carries no Owner record of its own; the watcher flushes
+// the parent FIRST so the store learns the session's owner before the
+// subagent's events arrive (ADR-0098). Pure path arithmetic — never a stat.
+export function parentSessionPath(path: string): string | null {
+  const dir = dirname(path);
+  if (basename(dir) !== "subagents") return null;
+  return `${dirname(dir)}.jsonl`;
 }

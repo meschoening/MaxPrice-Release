@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-09-06T22:41:31.190Z",
+  "capturedAt": "2026-09-14T10:35:28.436Z",
   "models": {
     "anthropic.claude-3-5-haiku-20241022-v1:0": {
       "input_cost_per_token": 8e-7,
@@ -397,6 +397,13 @@
       "cache_creation_input_token_cost": 3.75e-7,
       "cache_read_input_token_cost": 3e-8
     },
+    "bedrock/us-gov-east-1/anthropic.claude-fable-5-1": {
+      "input_cost_per_token": 0.000012,
+      "output_cost_per_token": 0.00006,
+      "cache_creation_input_token_cost": 0.000015,
+      "cache_read_input_token_cost": 3e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000024
+    },
     "bedrock/us-gov-east-1/anthropic.claude-haiku-4-5-20251001-v1:0": {
       "input_cost_per_token": 0.0000012,
       "output_cost_per_token": 0.000006,
@@ -405,6 +412,13 @@
       "cache_creation_input_token_cost_above_1hr": 0.0000024
     },
     "bedrock/us-gov-east-1/anthropic.claude-opus-4-8": {
+      "input_cost_per_token": 0.000006,
+      "output_cost_per_token": 0.00003,
+      "cache_creation_input_token_cost": 0.0000075,
+      "cache_read_input_token_cost": 6e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000012
+    },
+    "bedrock/us-gov-east-1/anthropic.claude-opus-5": {
       "input_cost_per_token": 0.000006,
       "output_cost_per_token": 0.00003,
       "cache_creation_input_token_cost": 0.0000075,
@@ -450,6 +464,13 @@
       "cache_creation_input_token_cost": 3.75e-7,
       "cache_read_input_token_cost": 3e-8
     },
+    "bedrock/us-gov-west-1/anthropic.claude-fable-5-1": {
+      "input_cost_per_token": 0.000012,
+      "output_cost_per_token": 0.00006,
+      "cache_creation_input_token_cost": 0.000015,
+      "cache_read_input_token_cost": 3e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000024
+    },
     "bedrock/us-gov-west-1/anthropic.claude-haiku-4-5-20251001-v1:0": {
       "input_cost_per_token": 0.0000012,
       "output_cost_per_token": 0.000006,
@@ -458,6 +479,13 @@
       "cache_creation_input_token_cost_above_1hr": 0.0000024
     },
     "bedrock/us-gov-west-1/anthropic.claude-opus-4-8": {
+      "input_cost_per_token": 0.000006,
+      "output_cost_per_token": 0.00003,
+      "cache_creation_input_token_cost": 0.0000075,
+      "cache_read_input_token_cost": 6e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000012
+    },
+    "bedrock/us-gov-west-1/anthropic.claude-opus-5": {
       "input_cost_per_token": 0.000006,
       "output_cost_per_token": 0.00003,
       "cache_creation_input_token_cost": 0.0000075,
@@ -842,10 +870,10 @@
       "output_cost_per_token": 0.00001
     },
     "eu.anthropic.claude-3-5-haiku-20241022-v1:0": {
-      "input_cost_per_token": 2.5e-7,
-      "output_cost_per_token": 0.00000125,
-      "cache_creation_input_token_cost": 3.125e-7,
-      "cache_read_input_token_cost": 2.5e-8
+      "input_cost_per_token": 8e-7,
+      "output_cost_per_token": 0.000004,
+      "cache_creation_input_token_cost": 0.000001,
+      "cache_read_input_token_cost": 8e-8
     },
     "eu.anthropic.claude-3-5-sonnet-20240620-v1:0": {
       "input_cost_per_token": 0.000003,
@@ -1346,7 +1374,27 @@
       "output_cost_per_token": 0.000015,
       "cache_read_input_token_cost": 3e-7
     },
+    "us-gov.anthropic.claude-3-haiku-20240307-v1:0": {
+      "input_cost_per_token": 3e-7,
+      "output_cost_per_token": 0.0000015,
+      "cache_creation_input_token_cost": 3.75e-7,
+      "cache_read_input_token_cost": 3e-8
+    },
+    "us-gov.anthropic.claude-fable-5-1": {
+      "input_cost_per_token": 0.000012,
+      "output_cost_per_token": 0.00006,
+      "cache_creation_input_token_cost": 0.000015,
+      "cache_read_input_token_cost": 3e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000024
+    },
     "us-gov.anthropic.claude-opus-4-8": {
+      "input_cost_per_token": 0.000006,
+      "output_cost_per_token": 0.00003,
+      "cache_creation_input_token_cost": 0.0000075,
+      "cache_read_input_token_cost": 6e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000012
+    },
+    "us-gov.anthropic.claude-opus-5": {
       "input_cost_per_token": 0.000006,
       "output_cost_per_token": 0.00003,
       "cache_creation_input_token_cost": 0.0000075,

@@ -90,6 +90,8 @@ export type FleetSyncDeps = {
   identityDirectoryPath: string; // <app-data>/identity-directory.json (ADR-0062)
   liveHub: Pick<LiveHub, "patchStatus" | "emitUsage" | "getStatus">;
   getStore: () => EventStore;
+  // The private first-launch selection must settle before any outward feeder.
+  ingestionReady?: Promise<void>;
   swapStore: (next: EventStore) => void; // main()'s storeRef assignment
   createStore: () => EventStore; // () => createEventStore({ selfMachineId: machineId })
   // The Local archive's engine feeder (ADR-0069): rebuildEngine seeds every
@@ -128,7 +130,13 @@ export type FleetSyncDeps = {
 // caller wants done.
 export type FleetForgetResult =
   | { ok: true; sessionsRequested: number; sessionsMatched: number; rowsRemoved: number }
-  | { ok: false; reason: "unavailable" | "failed" | "busy"; detail: string; landed: boolean };
+  | {
+      ok: false;
+      reason: "unavailable" | "failed" | "busy";
+      detail: string;
+      landed: boolean;
+      retryable?: boolean;
+    };
 
 export type FleetSync = {
   hooks: HubFleetHooks; // hand to createHubClient({ fleet: ... })
@@ -158,6 +166,16 @@ export type FleetSync = {
   // connection context, the replica, and the resync ORDER this module exists to
   // own. The caller (the route) owns only the guards.
   forget: (sessions: readonly ForgetSessionRef[]) => Promise<FleetForgetResult>;
+  repairOrganizations: (
+    sessions: readonly ForgetSessionRef[],
+    target: string,
+  ) => Promise<FleetForgetResult>;
+  // ADR-0098: a full engine rebuild (fresh store → walk → archive + replica
+  // seed → swap) WITHOUT unlinking the replica — for a Home organization change
+  // and the repair, where the replica is still valid but the engine's verdicts
+  // are not. Serialized through the reconcile chain like everything that swaps
+  // the store; resolves once the swap has happened.
+  rebuildEngine: () => Promise<void>;
   // Test-observability seam (ADR-0041, Task 12 convergence suite): the live
   // replica store, or null when detached (replica off / hub unconfigured). The
   // fleet fixed-point asserter reads `.all()` off it to compare the client's
@@ -172,6 +190,12 @@ function seedEqual(a: HubSeed, b: HubSeed): boolean {
 }
 
 export function createFleetSync(deps: FleetSyncDeps): FleetSync {
+  let ingestible = deps.ingestionReady === undefined;
+  void deps.ingestionReady
+    ?.then(() => {
+      ingestible = true;
+    })
+    .catch(() => {});
   const fetchImpl = deps.fetchImpl ?? fetch;
   const debounceMs = deps.debounceMs ?? 500;
   const pokeMaxWaitMs = deps.pokeMaxWaitMs ?? 2_000;
@@ -252,9 +276,14 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     // replica-sourced rows in the engine are stamped by construction — the
     // replica holds each at exact token fullness, so the stamp predicate
     // filters them out of every push.
-    localEvents: () => deps.getStore().query(),
+    localEvents: () => (ingestible ? deps.getStore().query() : []),
     toWire: storedEventToWire,
-    applyFleetRows: (rows) => deps.getStore().appendFleet(rows),
+    applyFleetRows: async (rows) => {
+      // ADR-0098: seed after the walk — see loadReplicaAtBoot.
+      await deps.ingestionReady;
+      await deps.getStore().ready;
+      return deps.getStore().appendFleet(rows);
+    },
     replica: () => replica,
     onPagesApplied: (changed) => onPagesApplied(changed),
     onSeedProgress: (seed) => onSeedProgress(seed),
@@ -390,6 +419,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   let reconciling = false;
   let pendingReconcile = false;
   let pendingResync = false;
+  let pendingRebuild = false;
 
   function scheduleReconcile(): void {
     if (reconciling) {
@@ -414,6 +444,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   }
 
   async function reconcileOnce(): Promise<void> {
+    await deps.ingestionReady;
     // 1. Replica lifecycle: bring the actual replica into line with the desired
     //    state (re-read fresh — last toggle state wins).
     const want = replicaWanted();
@@ -428,6 +459,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // a same-epoch hub already at the replica's cursor serves a caught-up short
       // page that applies nothing — without this feed those on-disk rows would
       // never reach the engine (silent under-counting until restart).
+      // ADR-0098: seed after the walk — see loadReplicaAtBoot.
+      await deps.getStore().ready;
       deps.getStore().appendFleet([...attached.all()]);
       eventSync.kickPull();
     } else if (!want && replica !== null) {
@@ -442,27 +475,21 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       deps.liveHub.patchStatus({ hubSeed: null });
     }
 
-    // 2. Epoch resync: unlink drops the cursor + stamps in one act, rebuild
-    //    reseeds the engine, resync() drops the ack set and re-runs push +
-    //    pull. When a concurrent replica-off / hub-unconfigure won the race,
-    //    step 1 above already unlinked + rebuilt — skip only THAT half. But
-    //    once pendingResync is consumed, resync() MUST run unconditionally:
-    //    it is the ONLY thing that clears event-sync's mismatch suspension
-    //    (connect/disconnect never touch suspendedForResync/mismatchSignaled),
-    //    so dropping it would leave every push/pull trigger gated forever —
-    //    contribute-only push silently dead and a later replica-on kickPull()
-    //    inert until process restart. A resync with no replica is safe: it
-    //    re-kicks the appropriately-gated loops (push resumes contribute-only;
-    //    pull no-ops without a replica). And onEpochMismatch only fires with a
-    //    replica attached at signal time, so a detached replica here means
-    //    step 1's teardown already did the unlink + rebuild this resync needs.
+    // 2. Epoch resync: drop the replica if present, rebuild from local
+    // transcripts and the pruned archive, then reset push acknowledgements.
+    // A contribute-only organization repair still needs BOTH the rebuild and
+    // the acknowledgement reset to restore a mixed session's home rows.
+    // resync also clears event-sync's mismatch suspension even when a toggle
+    // detached the replica while this operation was queued.
     if (pendingResync) {
       pendingResync = false;
-      if (replica !== null) {
-        await replica.unlink();
-        await rebuildEngine();
-      }
+      pendingRebuild = false; // a resync rebuilds anyway
+      if (replica !== null) await replica.unlink();
+      await rebuildEngine();
       eventSync.resync();
+    } else if (pendingRebuild) {
+      pendingRebuild = false;
+      await rebuildEngine();
     }
   }
 
@@ -496,6 +523,12 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     await reconcileChain;
   }
 
+  async function requestRebuild(): Promise<void> {
+    pendingRebuild = true;
+    scheduleReconcile();
+    await reconcileChain;
+  }
+
   // Once the hub accepted a forget, the local resync is mandatory even if the
   // Local archive could not make the same deletion durable. Preserve that
   // ordering while returning the archive failure to the route instead of
@@ -525,7 +558,10 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // caller, or a future non-modal entry point.
   let forgetInflight: Promise<FleetForgetResult> | null = null;
 
-  async function forget(sessions: readonly ForgetSessionRef[]): Promise<FleetForgetResult> {
+  async function forget(
+    sessions: readonly ForgetSessionRef[],
+    target?: string,
+  ): Promise<FleetForgetResult> {
     if (forgetInflight !== null) {
       return {
         ok: false,
@@ -534,7 +570,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
         landed: false,
       };
     }
-    forgetInflight = forgetInner(sessions);
+    forgetInflight = forgetInner(sessions, target);
     try {
       return await forgetInflight;
     } finally {
@@ -542,15 +578,28 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     }
   }
 
-  async function forgetInner(sessions: readonly ForgetSessionRef[]): Promise<FleetForgetResult> {
+  async function forgetInner(
+    sessions: readonly ForgetSessionRef[],
+    target: string | undefined,
+  ): Promise<FleetForgetResult> {
+    await deps.ingestionReady;
     if (sessions.length === 0) {
       return { ok: true, sessionsRequested: 0, sessionsMatched: 0, rowsRemoved: 0 };
     }
-    if (conn === null || replica === null) {
+    if (
+      conn === null ||
+      (target === undefined && replica === null) ||
+      (target !== undefined && conn.url.replace(/\/+$/, "") !== target.replace(/\/+$/, ""))
+    ) {
       return {
         ok: false,
         reason: "unavailable",
-        detail: conn === null ? "not connected to a hub" : "the fleet replica is not attached",
+        detail:
+          conn === null
+            ? "not connected to a hub"
+            : target !== undefined
+              ? "not connected to the configured hub"
+              : "the fleet replica is not attached",
         landed: false,
       };
     }
@@ -594,6 +643,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
               ? "the hub connection dropped mid-forget"
               : `the hub connection dropped mid-forget; ${archiveFailure}`,
           landed,
+          retryable: true,
         };
       }
       // Projected onto the declared pair, not passed through: the classifier's
@@ -608,6 +658,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // reasoning, and the deadline catches a black-holed hub per-request).
       const deadline = requestDeadline();
       let failure: string | null = null;
+      let retryable = true;
       try {
         const res = await fetchImpl(`${c.url}/api/events/forget`, {
           method: "POST",
@@ -619,8 +670,10 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
           // A hub that predates ADR-0063. Named rather than folded into the
           // generic rejection: it is the one failure with an action attached,
           // and it is permanent until the operator updates the hub.
+          retryable = false;
           failure = "this hub is too old to forget rows — update the MaxPrice Hub app";
         } else if (!res.ok) {
+          retryable = res.status >= 500 || res.status === 408 || res.status === 429;
           failure = `the hub rejected the request (${res.status})`;
         } else {
           // Marked landed the MOMENT the 2xx is observed, before a single byte of
@@ -664,6 +717,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
           reason: "failed",
           detail: archiveFailure === null ? failure : `${failure}; ${archiveFailure}`,
           landed,
+          retryable,
         };
       }
     }
@@ -678,7 +732,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     //
     const archiveFailure = await forgetLocalArchiveThenResync(landedSessions);
     if (archiveFailure !== null) {
-      return { ok: false, reason: "failed", detail: archiveFailure, landed: true };
+      return { ok: false, reason: "failed", detail: archiveFailure, landed: true, retryable: true };
     }
     return { ok: true, sessionsRequested: sessions.length, sessionsMatched, rowsRemoved };
   }
@@ -1004,13 +1058,19 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // ── FleetSync surface ──
 
   async function loadReplicaAtBoot(): Promise<void> {
+    await deps.ingestionReady;
     // Local disk only — part of engineReady, NEVER network. Not attached (the
     // toggle off OR the hub unconfigured) resolves immediately, so a hub-less
     // client is bit-for-bit the pre-hub app.
     if (!replicaWanted()) return;
     const attached = attachReplica();
     await attached.load(); // self-heals corruption (Task 4)
-    // The engine's SECOND local feeder: seed it from the replica's holdings.
+    // Seed AFTER the boot walk (ADR-0098): the walk records which dedup keys the
+    // Home organization rule excluded, and `appendFleet` refuses exactly those;
+    // a replica row landing first would be presumed home. `rebuildEngine`
+    // already walks before it seeds — this makes boot match it. `ready`
+    // resolves even on a partially failed walk, so this cannot hang.
+    await deps.getStore().ready;
     deps.getStore().appendFleet([...attached.all()]);
   }
 
@@ -1187,6 +1247,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       return { assertion };
     },
     forget,
+    repairOrganizations: (sessions, target) => forget(sessions, target),
+    rebuildEngine: requestRebuild,
     getReplica: () => replica,
     stop: async () => {
       clearPokeTimer();

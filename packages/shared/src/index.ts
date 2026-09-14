@@ -14,6 +14,7 @@ export * from "./blocks";
 export * from "./fleet-dedup";
 export * from "./cost-mode";
 export * from "./settings";
+export * from "./organizations";
 export * from "./storage";
 export * from "./error";
 export * from "./rescan";

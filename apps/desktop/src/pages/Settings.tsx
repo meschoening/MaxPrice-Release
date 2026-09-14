@@ -176,8 +176,8 @@ export function SettingsPage(): React.ReactElement {
         <span className="cluster-head eyebrow">Connections</span>
 
         <Section
-          title="Claude account (usage limits)"
-          description="Connect a claude.ai session key to show real 5-hour and weekly subscription limits."
+          title="Claude account"
+          description="Which organization's usage MaxPrice shows, and the claude.ai session key for real 5-hour and weekly limits."
         >
           <UsageConnectionSection />
         </Section>

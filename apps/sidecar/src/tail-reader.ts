@@ -61,6 +61,9 @@ function extractTimestamp(line: string): string | null {
 }
 
 export type TailResult = {
+  // True when this read starts at byte zero, including a truncation to empty
+  // or an incomplete first line. Stateful parsers must discard their cursor.
+  fromStart: boolean;
   count: number;
   // The complete newly-appended lines, in file order. The watcher's `flush`
   // feeds these through the E2 parser into the event store before emitting the
@@ -97,20 +100,20 @@ export function createTailReader(): TailReader {
       size = (await stat(path)).size;
     } catch {
       // File vanished between the watch event and this read — nothing to do.
-      return { count: 0, lines: [], latestTimestamp: null };
+      return { count: 0, lines: [], latestTimestamp: null, fromStart: false };
     }
 
     let prevOffset = offsets.get(path) ?? 0;
     if (size < prevOffset) prevOffset = 0; // truncated / rotated
     if (size <= prevOffset) {
       offsets.set(path, size);
-      return { count: 0, lines: [], latestTimestamp: null };
+      return { count: 0, lines: [], latestTimestamp: null, fromStart: prevOffset === 0 };
     }
 
     const chunk = new Uint8Array(await Bun.file(path).slice(prevOffset).arrayBuffer());
     const { count, lines, latestTimestamp, consumedBytes } = parseTailChunk(chunk);
     offsets.set(path, prevOffset + consumedBytes);
-    return { count, lines, latestTimestamp };
+    return { count, lines, latestTimestamp, fromStart: prevOffset === 0 };
   }
 
   // Serialize reads per path: a read for a path already being read waits for

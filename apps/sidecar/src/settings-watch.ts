@@ -155,6 +155,9 @@ export function createSettingsWatch(opts: CreateSettingsWatchOptions): SettingsW
       .catch(() => {});
   }
 
+  // Re-read once the file watch is attached: settings may have changed since
+  // main's boot snapshot, while its private corpus selection was running.
+  fsWatcher.on("ready", scheduleRestart);
   fsWatcher.on("add", scheduleRestart);
   fsWatcher.on("change", scheduleRestart);
   fsWatcher.on("error", (err) => console.error("[sidecar] settings watcher error:", err));

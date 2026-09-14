@@ -45,6 +45,10 @@ export const STORAGE_FILE = {
   localArchive: "local-archive.jsonl",
   scanCache: "scan-cache.json",
   usageHistory: "usage-history.jsonl",
+  // ADR-0098 — both land in the storage report's `other` catch-all on purpose:
+  // a few hundred bytes each, and naming them would put a segment on the bar.
+  organizations: "organizations.json",
+  organizationRepair: "organization-repair.json",
 } as const;
 
 // The durable log directory (ADR-0056) — the Rust shell owns the file, we only

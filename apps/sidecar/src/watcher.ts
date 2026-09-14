@@ -2,7 +2,7 @@ import { type FSWatcher, watch } from "chokidar";
 import type { UsageEvent } from "@maxprice/shared";
 import { parseLines } from "./engine/jsonl";
 import type { UsageRecord } from "./engine/types";
-import { identityFromPath } from "./identity";
+import { identityFromPath, parentSessionPath } from "./identity";
 import { createTailReader, type TailReader } from "./tail-reader";
 
 export type CreateWatcherOptions = {
@@ -106,6 +106,12 @@ export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher
     );
   }
 
+  // The owner in effect at the end of each path's last read (ADR-0098). The
+  // FIRST read of any path starts at byte 0 (createTailReader), so it carries
+  // the file's own owner records; later reads carry only the delta, and this
+  // map is what lets `parseLines` resume where the previous read stopped.
+  const ownerAtEnd = new Map<string, string | undefined>();
+
   // Per-path flush ordering is best-effort: a flush already past its
   // `setTimeout` (awaiting `tailReader.read`) can still be running when this
   // path's next timer fires and starts a second flush. Event *correctness*
@@ -114,20 +120,37 @@ export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher
   // store dedups — only the relative ordering of two `onEvent` signals for the
   // same path is unguaranteed (a cosmetic refresh-pill staleness at worst).
   async function flush(path: string): Promise<void> {
-    const { count, lines, latestTimestamp } = await tailReader.read(path);
+    // A subagent transcript carries no owner record: its events resolve against
+    // the parent session's owner points in the store. Read the parent FIRST so
+    // those points exist before the subagent's records arrive — a busy parent's
+    // debounce keeps resetting and can trail the subagent's (ADR-0098). The
+    // parent's own pending timer later reads an empty delta, which is harmless.
+    const parent = parentSessionPath(path);
+    if (parent !== null) await flushOne(parent, false);
+    await flushOne(path, true);
+  }
+
+  async function flushOne(path: string, emitWhenEmpty: boolean): Promise<void> {
+    const { count, lines, latestTimestamp, fromStart } = await tailReader.read(path);
     const { projectSlug, sessionId } = identityFromPath(path, opts.roots);
 
     // Append-before-emit (Part 4.5 correctness invariant): the freshly-parsed
     // usage records land in the event store *before* the opaque SSE
     // `UsageEvent` fires. The renderer's post-invalidation refetch must never
-    // observe a store missing the very events that triggered it. So: parse the
-    // newly-appended lines, append, *then* emit. `parseLines` applies the E2
-    // parser's whole-file skip rules; the store dedups, so a truncation
-    // re-read replaying old lines is safe.
+    // observe a store missing the very events that triggered it. `parseLines`
+    // applies the E2 parser's whole-file skip rules; the store dedups, so a
+    // truncation re-read replaying old lines is safe.
     if (opts.onRecords) {
-      opts.onRecords(parseLines(lines), projectSlug, sessionId);
+      // A truncation need not emit unlink. Restart positional attribution
+      // whenever the reader restarts, even if this chunk has no complete lines.
+      const parsed = parseLines(lines, fromStart ? undefined : ownerAtEnd.get(path));
+      ownerAtEnd.set(path, parsed.owner);
+      opts.onRecords(parsed.records, projectSlug, sessionId);
     }
 
+    // A parent pre-read that found nothing new is not a change worth a poke;
+    // the path's own flush always emits (a deletion legitimately reports 0).
+    if (!emitWhenEmpty && lines.length === 0) return;
     opts.onEvent({
       project: projectSlug,
       sessionId,
@@ -142,6 +165,8 @@ export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher
   fsWatcher.on("change", schedule);
   fsWatcher.on("unlink", (path) => {
     tailReader.forget(path);
+    // A recreated file re-reads from byte 0 with a fresh owner.
+    ownerAtEnd.delete(path);
     schedule(path);
   });
   fsWatcher.on("error", (err) => opts.onError?.(err));

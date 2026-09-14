@@ -102,6 +102,20 @@ export const assistantRecordSchema = z
   })
   .passthrough();
 
+// The Owner record (CONTEXT.md): the line Claude Code writes when a session is
+// attached to Remote Control or the desktop app, naming the Organization that
+// owns the session from that line on. It is attribution evidence, never a
+// usage event, and it is NOT a member of `jsonlRecordSchema` — the scan reads
+// it ahead of the pre-filter (jsonl.ts) and it never reaches the union. Older
+// records omit the owner fields; those are no evidence, not a reset.
+export const ownerRecordSchema = z
+  .object({
+    type: z.literal("bridge-session"),
+    ownerOrganizationUuid: z.string().min(1).optional(),
+  })
+  .passthrough();
+export type OwnerRecord = z.infer<typeof ownerRecordSchema>;
+
 // Every non-assistant record kind. The engine reads none of their innards, so
 // each is modelled as `{ type: <literal> }` open — enough to discriminate, no
 // more. `type` values observed across the E1 fixture corpus: `user`, `system`,
@@ -167,6 +181,7 @@ export type JsonlRecord = z.infer<typeof jsonlRecordSchema>;
 //   - `cacheCreation`   — `message.usage.cache_creation` 5m/1h split, when present
 //   - `costUSD`         — top-level `costUSD`, when present (never `null`)
 //   - `cwd`             — top-level `cwd`, the session's working directory
+//   - `organizationUuid` — the nearest preceding owner record's `ownerOrganizationUuid`
 export type UsageRecord = {
   timestamp: string;
   messageId: string;
@@ -186,6 +201,11 @@ export type UsageRecord = {
     | undefined;
   costUSD: number | undefined;
   cwd: string | undefined;
+  // The Organization (CONTEXT.md, ADR-0098) named by the most recent Owner
+  // record ABOVE this line in the same file; `undefined` when none precedes it
+  // — a session that was never attached, or a subagent transcript (those
+  // inherit their parent session's owner inside the store).
+  organizationUuid: string | undefined;
 };
 
 // The on-disk parse cache's whole-cache version (ADR-0048). The cache stores
@@ -198,7 +218,8 @@ export type UsageRecord = {
 // A version mismatch discards the whole cache — one slow boot, never a wrong
 // number. Lives beside `UsageRecord` so the shape and its cache version are
 // reviewed together.
-export const SCAN_CACHE_VERSION = 1;
+// History: 1 — the original shape; 2 — ADR-0098 added `organizationUuid`.
+export const SCAN_CACHE_VERSION = 2;
 
 // ---------------------------------------------------------------------------
 // parseLine result

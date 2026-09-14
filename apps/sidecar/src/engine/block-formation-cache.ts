@@ -114,7 +114,7 @@ export function createBlockReports(deps: {
         for (const { event, replaced } of changes) {
           // Whole-row replacement can change any field and inherit an earlier
           // map tie rank. Refuse it even when its new timestamp looks recent.
-          if (replaced !== null) {
+          if (replaced !== null || event === null) {
             dirty = true;
             additions = [];
             return;

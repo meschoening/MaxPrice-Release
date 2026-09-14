@@ -56,7 +56,9 @@ export type EventSyncDeps<Row extends StampableRow = StoredEventWire> = {
   // The engine feed + push source (fleet.ts wires these to the live EventStore):
   localEvents: () => Row[]; // EVERY engine event as RAW store rows; the stamp predicate filters, toWire projects the survivors
   toWire: (row: Row) => StoredEventWire; // project a surviving row onto the push wire shape
-  applyFleetRows: (rows: FleetEvent[]) => number; // engine RAM upsert; returns changed count
+  // Engine RAM upsert; returns the changed count. May resolve LATER: fleet.ts
+  // parks it on the engine's `ready` during the boot walk (ADR-0098).
+  applyFleetRows: (rows: FleetEvent[]) => number | Promise<number>;
   // The replica — null ⇒ contribute-only (replica off / not attached):
   replica: () => FleetEventStore | null;
   // Wiring callbacks (fleet.ts debounces/orchestrates):
@@ -467,7 +469,10 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
         suspendForResync();
         return "abandon";
       }
-      deps.onPagesApplied(deps.applyFleetRows(rows));
+      // The replica cursor is already advanced above, so an abandon after this
+      // await loses nothing — the next trigger re-derives it.
+      deps.onPagesApplied(await deps.applyFleetRows(rows));
+      if (gen !== myGen) return "abandon";
     }
     if (seeding) {
       // target only grows; the renderer clamps (min(cursor/target, 1)) — the

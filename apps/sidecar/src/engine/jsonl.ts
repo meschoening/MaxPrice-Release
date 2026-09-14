@@ -1,5 +1,6 @@
 import {
   jsonlRecordSchema,
+  ownerRecordSchema,
   type AssistantRecord,
   type ParseLineResult,
   type UsageRecord,
@@ -72,7 +73,10 @@ const SYNTHETIC_MODEL = "<synthetic>";
 //   - `message.model === "<synthetic>"` — a synthetic message
 // These are the golden oracle's loader skip rules; exact parity is verified
 // later by the aggregator golden tests (E5–E8).
-export function toUsageRecord(record: AssistantRecord): UsageRecord | null {
+export function toUsageRecord(
+  record: AssistantRecord,
+  organizationUuid: string | undefined,
+): UsageRecord | null {
   if (record.isApiErrorMessage === true) return null;
   if (record.message.model === SYNTHETIC_MODEL) return null;
 
@@ -101,6 +105,7 @@ export function toUsageRecord(record: AssistantRecord): UsageRecord | null {
           },
     costUSD: record.costUSD,
     cwd: record.cwd,
+    organizationUuid,
   };
 }
 
@@ -130,6 +135,34 @@ const ASSISTANT_MARKER = /"type"\s*:\s*"assistant"/;
 // `}`, which no writer we know of produces (pinned in jsonl.test.ts).
 export function preFilterSkips(line: string): boolean {
   return line.endsWith("}") && !ASSISTANT_MARKER.test(line);
+}
+
+// ---------------------------------------------------------------------------
+// Owner records (ADR-0098)
+// ---------------------------------------------------------------------------
+
+const OWNER_MARKER = /"type"\s*:\s*"bridge-session"/;
+
+// The owner in effect while a file is read: the organization the most recent
+// owner record named, or `undefined` before the first one. One per file for
+// the whole-file reader; the watcher keeps one per path across tail reads.
+export type OwnerCursor = { organizationUuid: string | undefined };
+
+// Parse one line as an Owner record. Returns the organization it names, or
+// `undefined` when the line is not an owner record, is malformed, or is the
+// old owner-less shape — none of which change the owner in effect. Checked
+// BEFORE `preFilterSkips`, which would otherwise discard the line: it ends in
+// `}` and carries no assistant marker.
+export function parseOwnerLine(line: string): string | undefined {
+  if (!OWNER_MARKER.test(line)) return undefined;
+  let json: unknown;
+  try {
+    json = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  const parsed = ownerRecordSchema.safeParse(json);
+  return parsed.success ? parsed.data.ownerOrganizationUuid : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,8 +198,9 @@ export async function collectUsageRecords(path: string): Promise<UsageRecord[]> 
   // file captured mid-write leaves a real unterminated final line instead.
   const lineCount = lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
   const records: UsageRecord[] = [];
+  const owner: OwnerCursor = { organizationUuid: undefined };
   for (let i = 0; i < lineCount; i++) {
-    const record = handleLine(path, stripCarriageReturn(lines[i] as string), i + 1);
+    const record = handleLine(path, stripCarriageReturn(lines[i] as string), i + 1, owner);
     if (record !== null) records.push(record);
   }
   return records;
@@ -211,7 +245,18 @@ function warrantsWarning(
 // extracted `UsageRecord`. Returns `null` for everything else; warns (once,
 // with file + line context) on a failure that `warrantsWarning` deems
 // significant.
-function handleLine(path: string, line: string, lineNumber: number): UsageRecord | null {
+function handleLine(
+  path: string,
+  line: string,
+  lineNumber: number,
+  owner: OwnerCursor,
+): UsageRecord | null {
+  // An owner record moves the cursor and is never a usage event (ADR-0098).
+  const named = parseOwnerLine(line);
+  if (named !== undefined) {
+    owner.organizationUuid = named;
+    return null;
+  }
   // The pre-filter: a line that provably cannot be an assistant record skips
   // JSON.parse + Zod (and, per the predicate's contract, warrants no warning).
   if (preFilterSkips(line)) return null;
@@ -227,7 +272,7 @@ function handleLine(path: string, line: string, lineNumber: number): UsageRecord
   // `assistantRecordSchema`; `type === "assistant"` narrows `JsonlRecord` to
   // `AssistantRecord` for free, with no second parse.
   if (result.record.type !== "assistant") return null;
-  return toUsageRecord(result.record);
+  return toUsageRecord(result.record, owner.organizationUuid);
 }
 
 // Parse an in-memory batch of JSONL lines into `UsageRecord`s, applying the
@@ -237,13 +282,25 @@ function handleLine(path: string, line: string, lineNumber: number): UsageRecord
 // parse failure — the watcher's incremental tail-read has no file:line context
 // to warn with, and a truncation re-read replaying old lines is expected. The
 // store dedups, so a replayed line is harmless.
-export function parseLines(lines: string[]): UsageRecord[] {
+export type ParsedLines = { records: UsageRecord[]; owner: string | undefined };
+
+// `initialOwner` is the owner in effect at the end of the previous read of the
+// same file (the watcher's per-path memory); the returned `owner` is what the
+// next read must start from. A first read starts at byte 0 (tail-reader), so
+// it sees the file's own owner records.
+export function parseLines(lines: string[], initialOwner: string | undefined): ParsedLines {
+  const owner: OwnerCursor = { organizationUuid: initialOwner };
   const records: UsageRecord[] = [];
   for (const line of lines) {
+    const named = parseOwnerLine(line);
+    if (named !== undefined) {
+      owner.organizationUuid = named;
+      continue;
+    }
     const result = parseLine(line);
     if (!result.ok || result.record.type !== "assistant") continue;
-    const record = toUsageRecord(result.record);
+    const record = toUsageRecord(result.record, owner.organizationUuid);
     if (record !== null) records.push(record);
   }
-  return records;
+  return { records, owner: owner.organizationUuid };
 }

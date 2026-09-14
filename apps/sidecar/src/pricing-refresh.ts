@@ -308,7 +308,11 @@ export function watchNewModels(
   return store.onChanged((changes: readonly StoreChange[]) => {
     let fresh = false;
     for (const c of changes) {
-      if (!seen.has(c.event.model)) {
+      if (c.event === null) {
+        seen.delete(c.replaced.model);
+        fresh = true;
+      }
+      if (c.event !== null && !seen.has(c.event.model)) {
         seen.add(c.event.model);
         fresh = true;
       }

@@ -1,7 +1,9 @@
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useLiveStatus } from "@/state/use-live-status";
 import {
   discoverOrgsViaSidecar,
+  readCredential,
   writeCredential,
   pushCredentialToSidecar,
 } from "@/lib/usage-credential";
@@ -13,7 +15,9 @@ import {
   type TimeDisplay,
 } from "@maxprice/shared";
 import { useSettings, useTimeDisplay, useUpdateSettings } from "@/state/use-settings";
+import { organizationsQueryKey, useOrganizations } from "@/state/use-organizations";
 import { useUsageCurrent } from "@/state/use-usage-current";
+import { HomeOrganizationSelect } from "./home-organization-select";
 import { isStale, STALE_USAGE_LINE } from "@/lib/stale-status";
 import { cn } from "@/lib/utils";
 import { dotVariant } from "@/lib/dot-variant";
@@ -29,9 +33,12 @@ import { dotVariant } from "@/lib/dot-variant";
 // red text); inputs/buttons are the T1 glass pieces; validation errors stay
 // bare `--bad` text lines under their control.
 
-// Capabilities that mark a subscription org (vs an API-only org). We pick the
-// first org that has any of these; a multi-subscription-org picker is a
-// follow-up.
+// Capabilities that mark a subscription org (vs an API-only org). A FIRST
+// connect picks the first org that has any of these; a RECONNECT keeps the org
+// already tracked when discovery still lists it (ADR-0098), so a second
+// subscription org appearing on the same login — the #228 shape — can never
+// silently move the rings and the observed block windows. The full picker is
+// the multi-organization follow-up.
 const SUBSCRIPTION_CAPS = ["claude_max", "claude_pro", "chat"];
 
 // Format an ISO 8601 capturedAt as a clock time for the status line ("last
@@ -67,6 +74,14 @@ export function UsageConnectionSection(): React.ReactElement {
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const qc = useQueryClient();
+  const organizations = useOrganizations().data;
+  const tracked = organizations?.trackedLimits ?? null;
+  const trackedLabel =
+    tracked === null
+      ? null
+      : (organizations?.organizations.find((o) => o.uuid === tracked)?.label ??
+        `Organization ${tracked.slice(0, 8)}`);
 
   async function connect(): Promise<void> {
     setBusy(true);
@@ -81,13 +96,18 @@ export function UsageConnectionSection(): React.ReactElement {
         );
         return;
       }
+      const existing = await readCredential().catch(() => null);
+      const kept = existing === null ? undefined : orgs.find((o) => o.id === existing.orgId);
       // orgs.length > 0 is proven by the guard above; orgs[0]! is safe.
       const pick =
-        orgs.find((o) => o.capabilities.some((c) => SUBSCRIPTION_CAPS.includes(c))) ?? orgs[0]!;
+        kept ??
+        orgs.find((o) => o.capabilities.some((c) => SUBSCRIPTION_CAPS.includes(c))) ??
+        orgs[0]!;
       const cred = { sessionKey: key.trim(), orgId: pick.id };
       await writeCredential(cred);
       await pushCredentialToSidecar(cred);
       setKey("");
+      void qc.invalidateQueries({ queryKey: organizationsQueryKey() });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -101,6 +121,7 @@ export function UsageConnectionSection(): React.ReactElement {
     try {
       await writeCredential(null);
       await pushCredentialToSidecar(null);
+      void qc.invalidateQueries({ queryKey: organizationsQueryKey() });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -130,6 +151,8 @@ export function UsageConnectionSection(): React.ReactElement {
 
   return (
     <>
+      <HomeOrganizationSelect />
+
       <div className="status-line">
         <span className={cn("dot", line.variant)} aria-hidden />
         <span className={line.textClass}>{line.label}</span>
@@ -140,6 +163,7 @@ export function UsageConnectionSection(): React.ReactElement {
         {lastSampleAt !== null ? (
           <span className="when">— last reading {formatSampleTime(lastSampleAt, display)}</span>
         ) : null}
+        {trackedLabel !== null ? <span className="when">— {trackedLabel}</span> : null}
       </div>
 
       <div className="row-line">

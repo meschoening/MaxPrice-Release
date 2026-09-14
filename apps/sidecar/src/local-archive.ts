@@ -216,7 +216,10 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
   function onChanges(changes: readonly StoreChange[]): void {
     const own = changes
       .map((c) => c.event)
-      .filter((e) => e.machineId === deps.machineId && !forgotten(e) && !stamped(e));
+      .filter(
+        (e): e is StoredEvent =>
+          e !== null && e.machineId === deps.machineId && !forgotten(e) && !stamped(e),
+      );
     enqueueAppend(own);
   }
 
@@ -245,6 +248,8 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     // pending set intact, so the next sweep retries the pair together.
     await applyPendingForgets(store);
     archive = store;
+    // ADR-0098: seed after the engine's walk — see fleet.ts loadReplicaAtBoot.
+    await deps.getStore().ready;
     deps.getStore().appendFleet([...store.all()]);
   }
 
@@ -318,7 +323,10 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     const own = deps
       .getStore()
       .query()
-      .filter((e) => e.machineId === deps.machineId && !forgotten(e) && !stamped(e));
+      .filter(
+        (e): e is StoredEvent =>
+          e !== null && e.machineId === deps.machineId && !forgotten(e) && !stamped(e),
+      );
     enqueueAppend(own);
     await chain;
   }

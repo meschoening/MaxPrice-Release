@@ -3,6 +3,7 @@ import { Outlet } from "react-router-dom";
 import { useLiveStream } from "@/lib/live-stream";
 import { useMainWindowVisibility } from "@/lib/window-visibility";
 import { useManualRefreshHotkey } from "@/state/use-manual-refresh-hotkey";
+import { useSeedHomeOrganization } from "@/state/use-organizations";
 import { readCredential, pushCredentialToSidecar } from "@/lib/usage-credential";
 import { readHubPassword, pushHubConfigToSidecar } from "@/lib/hub-config";
 import { useSettings } from "@/state/use-settings";
@@ -22,6 +23,8 @@ export function Layout() {
   // drives that module's invalidation pause and shares its lifetime.
   useMainWindowVisibility();
   useManualRefreshHotkey();
+  // ADR-0098: persist the boot login as the Home organization on first launch.
+  useSeedHomeOrganization();
   const { data: settings } = useSettings();
 
   // Push the stored credential to the sidecar once on mount so the usage

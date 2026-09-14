@@ -5,6 +5,7 @@ import {
   fleetDedupTokenTotal,
   worktreeSlugPrefix,
   type FleetEvent,
+  type ForgetSessionRef,
 } from "@maxprice/shared";
 import { identityFromPath } from "../identity";
 import { collectUsageRecords } from "./jsonl";
@@ -39,6 +40,14 @@ import type { UsageRecord } from "./types";
 //
 // The `cwd` for a real project path (ADR-0009) lives on the embedded
 // `UsageRecord` — `StoredEvent` does not duplicate it.
+//
+// `organizationUuid` on a stored row is the RESOLVED Organization (ADR-0098):
+// the record's own tag when the parser set one, otherwise the owner the
+// session's owner points name at its timestamp (inherited, for a subagent
+// record, which carries no owner record of its own). A row whose resolved
+// organization is not the Home organization never becomes a `StoredEvent` at
+// all — `appendInternal` drops it at the feeder. RAM-only: `storedEventToWire`
+// does not carry it.
 export type StoredEvent = UsageRecord & {
   projectSlug: string;
   sessionId: string;
@@ -89,7 +98,9 @@ export function withEventMs<T extends { timestamp: string }>(input: T): T & { ms
 // event now stored, and the exact event object it displaced (`null` for a new
 // key). A replacement may differ from `replaced` in ANY field — including
 // sessionId/projectSlug/timestamp — the merge rule is whole-row.
-export type StoreChange = { event: StoredEvent; replaced: StoredEvent | null };
+export type StoreChange =
+  | { event: StoredEvent; replaced: StoredEvent | null }
+  | { event: null; replaced: StoredEvent }; // newly proven foreign: remove the incumbent
 
 // ---------------------------------------------------------------------------
 // ScanProgress — the walk's own counters (consumed by the boot reporter, #77)
@@ -328,9 +339,27 @@ export type EventStore = {
   // ADR-0087). The sidecar resolves this set against the active pricing
   // snapshot to publish `pricing.unpricedModels`; it is a store scan rather
   // than a resolver side effect precisely so the answer does not depend on
-  // which reports have run. Insertion-ordered, never pruned: a model that
-  // once appeared stays in the corpus, so it stays here.
+  // which reports have run. Re-derived when foreign evidence removes rows.
   models: () => ReadonlySet<string>;
+  // ADR-0098: every session that held at least one record the Home organization
+  // rule excluded, as the forget unit (ADR-0063) — the repair's input. Sorted by
+  // (projectSlug, sessionId) so a marker diff is stable.
+  foreignSessions: () => ForgetSessionRef[];
+  onForeignEvidence: (listener: (sessions: readonly ForgetSessionRef[]) => void) => () => void;
+  // ADR-0098: every Organization any record named, kept OR excluded. Settings'
+  // select is built from this — it is the only place a foreign organization's
+  // existence is allowed to surface, as a label with no count.
+  organizationsSeen: () => ReadonlySet<string>;
+  // ADR-0098: how many sessions each Organization owned when they ended — the
+  // organization of every session's LAST owner point. Sessions, not events, and
+  // counted whether or not the Home organization rule excluded them, so a store
+  // built with NO home (a first launch) can say which organization this machine
+  // mostly works under. Internal to the sidecar's first-launch seed; it never
+  // leaves the process — the app shows no count of anything it hides.
+  organizationSessionCounts: () => ReadonlyMap<string, number>;
+  // ADR-0098: the Home organization this store was built with; null = none,
+  // nothing excluded (the golden corpus runs this way).
+  homeOrganization: () => string | null;
 };
 
 // How many files the initial scan reads+parses concurrently. Parse work is
@@ -346,6 +375,10 @@ export function createEventStore(opts: {
   // otherwise — instead of always parsing. The store never saves the cache;
   // that is main()'s one post-ready write (`wireScanCachePersist`).
   scanCache?: ScanCache;
+  // The Home organization (CONTEXT.md, ADR-0098). A record whose resolved
+  // organization differs is dropped at the feeder and never becomes a
+  // StoredEvent. `null`/omitted = nothing is excluded.
+  homeOrganization?: string | null;
 }): EventStore {
   // The machine id every locally-scanned/watched row is tagged with (ADR-0041).
   // The fleet feeder carries each replica row's own hub-minted id instead.
@@ -360,6 +393,57 @@ export function createEventStore(opts: {
 
   // Distinct raw model strings seen by `upsert` — see `EventStore.models`.
   const modelsSeen = new Set<string>();
+
+  const homeOrganization = opts.homeOrganization ?? null;
+
+  // ADR-0098 state. `ownerPoints`: per session, the (ms, organization) of every
+  // TAGGED record its transcripts carried, ascending — a subagent record, which
+  // carries no owner record of its own, resolves against these by timestamp.
+  // Filled from every record BEFORE the exclusion below, so a foreign parent
+  // still teaches the store who owns its subagents. `foreignSessions`: the
+  // repair's forget list. `foreignKeys`: the dedup key of every excluded
+  // record — `appendFleet` refuses them, so an UNTAGGED copy of a foreign event
+  // (the local archive, the replica, the hub before the repair lands) cannot
+  // re-enter through the side door. `organizationsSeen`: Settings' list.
+  const ownerPoints = new Map<string, Array<{ ms: number; organizationUuid: string }>>();
+  const foreignSessions = new Map<string, ForgetSessionRef>();
+  const foreignKeys = new Set<string>();
+  const foreignListeners = new Set<(sessions: readonly ForgetSessionRef[]) => void>();
+  const organizationsSeen = new Set<string>();
+
+  function sessionKey(projectSlug: string, sessionId: string): string {
+    return `${projectSlug}\u0000${sessionId}`;
+  }
+
+  function addOwnerPoint(key: string, ms: number, organizationUuid: string): void {
+    if (Number.isNaN(ms)) return;
+    let points = ownerPoints.get(key);
+    if (points === undefined) {
+      points = [];
+      ownerPoints.set(key, points);
+    }
+    // Sorted insert; an identical point is a re-presented record (rescan,
+    // scan/watcher overlap) and is not duplicated.
+    let i = points.length;
+    while (i > 0 && (points[i - 1] as { ms: number }).ms > ms) i -= 1;
+    const prev = points[i - 1];
+    if (prev !== undefined && prev.ms === ms && prev.organizationUuid === organizationUuid) return;
+    points.splice(i, 0, { ms, organizationUuid });
+  }
+
+  // The owner in effect at `ms` for a session: the last point at or before it,
+  // or the earliest known owner for a record that precedes every point (a
+  // subagent line stamped a moment before its parent's first assistant line).
+  function resolveOwner(key: string, ms: number): string | undefined {
+    const points = ownerPoints.get(key);
+    if (points === undefined || points.length === 0 || Number.isNaN(ms)) return undefined;
+    let owner = (points[0] as { organizationUuid: string }).organizationUuid;
+    for (const p of points) {
+      if (p.ms <= ms) owner = p.organizationUuid;
+      else break;
+    }
+    return owner;
+  }
 
   // Lazily-built timestamp-sorted snapshot of every event, memoized so a burst
   // of back-to-back queries (`/api/daily` + `/api/daily-by-project` share a
@@ -448,13 +532,69 @@ export function createEventStore(opts: {
     sessionId: string,
   ): number {
     const changes: StoreChange[] = [];
+    let newForeignEvidence = false;
     let changed = 0;
-    for (const record of records) {
-      if (upsert({ ...record, projectSlug, sessionId, machineId: selfMachineId }, changes)) {
+    const key = sessionKey(projectSlug, sessionId);
+    const batch = Array.isArray(records) ? (records as UsageRecord[]) : [...records];
+    // Pass 1 — learn the session's owner points from every tagged record, so a
+    // later record in the same batch can own an earlier subagent record.
+    // ADR-0098's ONE sanctioned Date.parse on ingest: this is the RAW record's
+    // timestamp, classified before `upsert` derives `ms` (ADR-0089 governs
+    // stored events, which these are not yet).
+    for (const record of batch) {
+      if (record.organizationUuid !== undefined) {
+        organizationsSeen.add(record.organizationUuid);
+        addOwnerPoint(key, Date.parse(record.timestamp), record.organizationUuid);
+      }
+    }
+    // Pass 2 — resolve, exclude, upsert.
+    for (const record of batch) {
+      const organizationUuid =
+        record.organizationUuid ??
+        (ownerPoints.has(key) ? resolveOwner(key, Date.parse(record.timestamp)) : undefined);
+      if (
+        homeOrganization !== null &&
+        organizationUuid !== undefined &&
+        organizationUuid !== homeOrganization
+      ) {
+        foreignSessions.set(key, { projectSlug, sessionId });
+        const excludedKey = dedupKey(record.messageId, record.requestId);
+        if (!foreignKeys.has(excludedKey)) newForeignEvidence = true;
+        foreignKeys.add(excludedKey);
+        const incumbent = events.get(excludedKey);
+        if (incumbent !== undefined) {
+          events.delete(excludedKey);
+          sorted = null;
+          changes.push({ event: null, replaced: incumbent });
+          changed += 1;
+        }
+        continue;
+      }
+      if (
+        upsert(
+          { ...record, organizationUuid, projectSlug, sessionId, machineId: selfMachineId },
+          changes,
+        )
+      ) {
         changed += 1;
       }
     }
+    if (changes.some((change) => change.event === null)) {
+      // Exclusion is the only removal path. Rebuild once per batch so models
+      // belonging only to removed events cannot linger in pricing discovery.
+      modelsSeen.clear();
+      for (const event of events.values()) modelsSeen.add(event.model);
+    }
     emitChanges(changes);
+    if (newForeignEvidence) {
+      for (const listener of foreignListeners) {
+        try {
+          listener([{ projectSlug, sessionId }]);
+        } catch (err) {
+          console.error("[store] foreign evidence listener threw:", err);
+        }
+      }
+    }
     return changed;
   }
 
@@ -472,6 +612,9 @@ export function createEventStore(opts: {
     const changes: StoreChange[] = [];
     let changed = 0;
     for (const row of rows) {
+      // ADR-0098: an untagged copy of a record the walk excluded (archive,
+      // replica, hub) never re-enters.
+      if (foreignKeys.has(dedupKey(row.messageId, row.requestId))) continue;
       const stored: StoredEventInput = {
         timestamp: row.timestamp,
         messageId: row.messageId,
@@ -484,6 +627,7 @@ export function createEventStore(opts: {
         cacheCreation: row.cacheCreation,
         costUSD: row.costUSD,
         cwd: row.cwd,
+        organizationUuid: undefined,
         projectSlug: row.projectSlug,
         sessionId: row.sessionId,
         machineId: row.machineId,
@@ -683,5 +827,34 @@ export function createEventStore(opts: {
     },
     size: () => events.size,
     models: () => modelsSeen,
+    foreignSessions: () =>
+      [...foreignSessions.values()].sort((a, b) =>
+        a.projectSlug === b.projectSlug
+          ? a.sessionId < b.sessionId
+            ? -1
+            : a.sessionId > b.sessionId
+              ? 1
+              : 0
+          : a.projectSlug < b.projectSlug
+            ? -1
+            : 1,
+      ),
+    organizationsSeen: () => organizationsSeen,
+    organizationSessionCounts: () => {
+      const counts = new Map<string, number>();
+      for (const points of ownerPoints.values()) {
+        const last = points[points.length - 1];
+        if (last === undefined) continue;
+        counts.set(last.organizationUuid, (counts.get(last.organizationUuid) ?? 0) + 1);
+      }
+      return counts;
+    },
+    onForeignEvidence: (listener) => {
+      foreignListeners.add(listener);
+      return () => {
+        foreignListeners.delete(listener);
+      };
+    },
+    homeOrganization: () => homeOrganization,
   };
 }
