@@ -29,7 +29,7 @@ import type { ZodType } from "zod";
 import { createMachineDirectoryCache } from "./machine-directory-cache";
 import { scanGate } from "./scan-gate";
 import { storedEventToWire } from "./stored-event-wire";
-import type { EventStore } from "./engine/store";
+import type { EventStore, LocalAppend } from "./engine/store";
 import type { LiveHub } from "./live-hub";
 
 // ADR-0041 (M5) — the sidecar's fleet-event WIRING module. This is the ONE place
@@ -140,6 +140,9 @@ export type FleetForgetResult =
 
 export type FleetSync = {
   hooks: HubFleetHooks; // hand to createHubClient({ fleet: ... })
+  // During an automatic epoch reseed, reports keep their populated view while
+  // ingestion and push acknowledgements use the rebuilding engine.
+  reportStore: () => EventStore;
   loadReplicaAtBoot: () => Promise<void>; // local disk only — part of engineReady, never network
   applySettings: (s: { hubShareEvents: boolean; hubFleetReplica: boolean }) => void;
   onHubConfigured: (configured: boolean) => void;
@@ -257,6 +260,24 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   let hubConfigured = deps.initial.hubConfigured;
 
   const replicaWanted = (): boolean => fleetReplica && hubConfigured;
+  let retainedReportStore: EventStore | null = null;
+  let detachReportRelay: (() => void) | null = null;
+
+  function releaseReportStore(): void {
+    detachReportRelay?.();
+    detachReportRelay = null;
+    retainedReportStore = null;
+  }
+
+  function relayLocalReports(store: EventStore): void {
+    detachReportRelay?.();
+    detachReportRelay = null;
+    const retained = retainedReportStore;
+    if (retained === null || retained === store) return;
+    detachReportRelay = store.onLocalAppend(({ records, projectSlug, sessionId }) => {
+      retained.append(records, projectSlug, sessionId);
+    });
+  }
   // Creates the replica store, records it as the live one, AND returns the same
   // ref — callers operate on the returned ref across their awaits so a
   // concurrent detach (which nulls + wipes it) degrades to an empty `all()`
@@ -278,11 +299,16 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     // filters them out of every push.
     localEvents: () => (ingestible ? deps.getStore().query() : []),
     toWire: storedEventToWire,
-    applyFleetRows: async (rows) => {
+    applyFleetRows: async (rows, mayApply) => {
       // ADR-0098: seed after the walk — see loadReplicaAtBoot.
       await deps.ingestionReady;
       await deps.getStore().ready;
-      return deps.getStore().appendFleet(rows);
+      if (!mayApply()) return 0;
+      const changed = deps.getStore().appendFleet(rows);
+      // New remote usage remains live too; old rows disappear only when the
+      // replacement has proved complete. This view NEVER feeds a push.
+      retainedReportStore?.appendFleet(rows);
+      return changed;
     },
     replica: () => replica,
     onPagesApplied: (changed) => onPagesApplied(changed),
@@ -364,6 +390,11 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     armDebounce();
   }
   function onSeedProgress(seed: HubSeed): void {
+    if (seed === null && retainedReportStore !== null) {
+      releaseReportStore();
+      // Even an empty replacement must remove the old rows from every report.
+      pokeNow();
+    }
     // Leading edge (M7): the FIRST progress frame of a seed flushes
     // immediately — on a fast drain the trailing debounce re-arms per pull
     // page and only the completion null would ever flush, so the percent
@@ -391,22 +422,39 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // ── In-session engine rebuild ──
   // Fresh store → local rescan (+ replica reseed rows when attached) → swap →
   // wholesale invalidation. Shared by the replica-off toggle and the epoch
-  // resync. ACCEPTED RACE: a watcher flush landing on the OLD store between its
-  // scan-read and the swap is lost until the next flush/rescan — the same class
-  // as the existing scan/watcher overlap, self-healing.
+  // resync. Capture local batches across the walk, including duplicates and
+  // foreign evidence, so the swap cannot lose a watcher flush after scan-read.
   async function rebuildEngine(): Promise<void> {
     const fresh = deps.createStore();
+    const appended: LocalAppend[] = [];
+    const detach = deps.getStore().onLocalAppend((batch) => appended.push(batch));
     // Through the shared corpus-walk gate (ADR-0059). This walk is on a FRESH
     // store, so nothing scoped to a store instance could serialize it against
     // the boot / roots-change / rescan walks — yet it costs the single JS
     // thread exactly as much as they do.
-    await scanGate.run(() => fresh.scan(deps.getRoots()));
-    // The Local archive seeds BEFORE the replica (ADR-0069 §6): same rows either
-    // way (the one merge rule dedups), but archive-first keeps the first-seen
-    // tie order stable between a boot and a rebuild.
-    deps.seedLocalArchive?.(fresh);
-    if (replica !== null) fresh.appendFleet([...replica.all()]);
-    deps.swapStore(fresh);
+    try {
+      await scanGate.run(() => fresh.scan(deps.getRoots()));
+      for (const { records, projectSlug, sessionId } of appended) {
+        fresh.append(records, projectSlug, sessionId);
+      }
+      // The Local archive seeds BEFORE the replica (ADR-0069 §6): same rows either
+      // way (the one merge rule dedups), but archive-first keeps the first-seen
+      // tie order stable between a boot and a rebuild.
+      deps.seedLocalArchive?.(fresh);
+      if (replica !== null) fresh.appendFleet([...replica.all()]);
+      deps.swapStore(fresh);
+      relayLocalReports(fresh);
+      // A known forget prunes its session from the retained view immediately;
+      // restore any home rows still backed by local transcripts/archive, just
+      // as the ordinary rebuild does (mixed-organization sessions included).
+      retainedReportStore?.appendFleet(
+        fresh
+          .query()
+          .map((row) => ({ ...storedEventToWire(row), machineId: row.machineId, seq: 0 })),
+      );
+    } finally {
+      detach();
+    }
     pokeNow();
   }
 
@@ -468,6 +516,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // rest the seed status at null immediately.
       const detached = replica;
       replica = null;
+      releaseReportStore();
       await detached.unlink();
       seedPending = false;
       pendingSeed = null;
@@ -482,13 +531,22 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     // resync also clears event-sync's mismatch suspension even when a toggle
     // detached the replica while this operation was queued.
     if (pendingResync) {
+      eventSync.suspend();
       pendingResync = false;
+      // A Home organization rebuild cannot retain the preceding home's view.
+      // A known forget already pruned its sessions; keep all unrelated reports.
+      if (replica !== null && !pendingRebuild) {
+        retainedReportStore ??= deps.getStore();
+      } else {
+        releaseReportStore();
+      }
       pendingRebuild = false; // a resync rebuilds anyway
       if (replica !== null) await replica.unlink();
       await rebuildEngine();
       eventSync.resync();
     } else if (pendingRebuild) {
       pendingRebuild = false;
+      releaseReportStore();
       await rebuildEngine();
     }
   }
@@ -518,12 +576,15 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // do/while rather than a new link — so the chain in hand covers our resync
   // either way.
   async function awaitResync(): Promise<void> {
+    eventSync.suspend();
     pendingResync = true;
     scheduleReconcile();
     await reconcileChain;
   }
 
   async function requestRebuild(): Promise<void> {
+    // A changed Home organization must never retain the preceding home's view.
+    releaseReportStore();
     pendingRebuild = true;
     scheduleReconcile();
     await reconcileChain;
@@ -541,6 +602,10 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       await deps.forgetLocalArchive?.(sessions);
     } catch (err) {
       failure = `the local archive forget could not be made durable (${String(err)})`;
+    }
+    if (replica !== null) {
+      retainedReportStore ??= deps.getStore();
+      retainedReportStore.removeMachineSessions(deps.machineId, sessions);
     }
     await awaitResync();
     return failure;
@@ -1246,11 +1311,13 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       void pushIdentity();
       return { assertion };
     },
+    reportStore: () => retainedReportStore ?? deps.getStore(),
     forget,
     repairOrganizations: (sessions, target) => forget(sessions, target),
     rebuildEngine: requestRebuild,
     getReplica: () => replica,
     stop: async () => {
+      releaseReportStore();
       clearPokeTimer();
       pendingSince = null;
       clearDirectorySweep();

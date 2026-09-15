@@ -58,7 +58,9 @@ export type EventSyncDeps<Row extends StampableRow = StoredEventWire> = {
   toWire: (row: Row) => StoredEventWire; // project a surviving row onto the push wire shape
   // Engine RAM upsert; returns the changed count. May resolve LATER: fleet.ts
   // parks it on the engine's `ready` during the boot walk (ADR-0098).
-  applyFleetRows: (rows: FleetEvent[]) => number | Promise<number>;
+  // Check mayApply after any await: an accepted page may finish on disconnect,
+  // but must never enter a replacement engine after a replica reset/detach.
+  applyFleetRows: (rows: FleetEvent[], mayApply: () => boolean) => number | Promise<number>;
   // The replica — null ⇒ contribute-only (replica off / not attached):
   replica: () => FleetEventStore | null;
   // Wiring callbacks (fleet.ts debounces/orchestrates):
@@ -85,6 +87,7 @@ export type EventSync = {
   notifyLocalChange: () => void; // trigger: watcher flush — push
   setShareEnabled: (on: boolean) => void; // hubShareEvents — gates every push trigger
   kickPull: () => void; // replica re-attach (toggle on) — ordinary reseed
+  suspend: () => void; // before unlink/rebuild: invalidate outstanding responses and gate both loops
   resync: () => void; // post-unlink: drops the ack set, re-push + re-pull
   idle: () => Promise<void>; // test seam — resolves when no loop is in flight or pending
   // `caughtUpSeq` — the seq PROVEN drained (ADR-0055); 0 until a drain ends on
@@ -113,9 +116,12 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
     ((handle: unknown): void => clearInterval(handle as ReturnType<typeof setInterval>));
 
   // Connection generation (the hub-client epoch-guard house pattern): connect /
-  // disconnect / stop bump it; every await re-checks it, so a stale loop can
+  // disconnect / stop / reset suspension bump it; every await re-checks it, so a stale loop can
   // never apply its results.
   let gen = 0;
+  // Accepted rows waiting for the engine survive a network disconnect (their
+  // replica cursor already advanced), but never a reset or replica detachment.
+  let resetGeneration = 0;
   let ctx: EventSyncConnection | null = null;
   let connected = false;
   // Sharing defaults ON; fleet.ts drives it from the hubShareEvents setting via
@@ -204,10 +210,21 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
     }
   }
 
-  // Suspend every loop until resync() and signal fleet.ts ONCE (it unlinks +
-  // rebuilds the replica, then calls resync()).
-  function suspendForResync(): void {
+  // Fence outstanding responses BEFORE fleet.ts starts any asynchronous wipe.
+  // New loops own fresh flags; an old loop's finally cannot clear them.
+  function suspend(): void {
+    if (suspendedForResync) return;
+    gen += 1;
     suspendedForResync = true;
+    resetGeneration += 1;
+    pushing = false;
+    pendingPush = false;
+    pulling = false;
+    pendingPull = false;
+  }
+
+  function suspendForResync(): void {
+    suspend();
     if (!mismatchSignaled) {
       mismatchSignaled = true;
       deps.onEpochMismatch();
@@ -394,6 +411,8 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
     let res: Response;
     try {
       res = await fetchImpl(`${conn.url}/api/events?since=${cursor}&limit=${pullLimit}`, {
+        // Bun fetch negotiates and decodes gzip by default. Keep that native
+        // path; the real-socket fleet compression test pins it on our runtime.
         headers: conn.headers,
       });
     } catch (err) {
@@ -438,8 +457,7 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
     // append racing its own close (an EBADF warn) — and (b) inject rows into the
     // engine that a now-local-only view must not show. Abandon; the next trigger
     // re-derives the cursor from the CURRENT replica (an off→on kickPull reseeds
-    // it from 0). Identity-compare only: a resync unlinks IN PLACE (same object),
-    // which correctly keeps applying against hub-mode's re-minted epoch.
+    // it from 0). In-place resets are fenced separately by the generation.
     if (deps.replica() !== r) return "abandon";
     // Lenient per-row parse: malformed rows skip-and-COUNT (one warn per page)
     // and never brick the loop. A bad row at a full page's tail re-serves on
@@ -458,21 +476,23 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
         `[usage-core] event pull skipped ${skippedThisPage} malformed row(s) in one page`,
       );
     }
+    // Empty pages also reconcile/adopt the header, including a purge to zero.
+    const applied = r.applyPage(rows, envelope.epoch);
+    if (applied === "reset-pending") return "abandon";
+    if (applied === "epoch-mismatch") {
+      suspendForResync();
+      return "abandon";
+    }
     if (rows.length > 0) {
-      // Replica first (the pull loop is its ONLY writer), then the engine. An
-      // empty parsed page applies nothing — a stale replica epoch surfaces on
-      // the first page that actually carries rows.
-      if (r.applyPage(rows, envelope.epoch) === "epoch-mismatch") {
-        // The replica mirrors a different hub log than this envelope: the same
-        // suspend path as a foreign ack epoch (a mismatching replica is
-        // non-empty by construction — it has adopted an epoch header).
-        suspendForResync();
-        return "abandon";
-      }
       // The replica cursor is already advanced above, so an abandon after this
       // await loses nothing — the next trigger re-derives it.
-      deps.onPagesApplied(await deps.applyFleetRows(rows));
+      const acceptedReset = resetGeneration;
+      const changed = await deps.applyFleetRows(
+        rows,
+        () => resetGeneration === acceptedReset && deps.replica() === r,
+      );
       if (gen !== myGen) return "abandon";
+      deps.onPagesApplied(changed);
     }
     if (seeding) {
       // target only grows; the renderer clamps (min(cursor/target, 1)) — the
@@ -616,6 +636,7 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
   return {
     connect,
     disconnect,
+    suspend,
     onEventsPoke: (seq) => {
       if (seq > hubWatermark) hubWatermark = seq;
       runPullLoop(gen);
@@ -623,7 +644,7 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
     onStatusEvents: (events) => {
       // null: a pre-event hub echoing status mid-stream — IGNORE; the connect
       // gate already handled capability (and a fresh connect re-probes).
-      if (events === null) return;
+      if (events === null || suspendedForResync) return;
       if (events.seq > hubWatermark) hubWatermark = events.seq;
       // Same epoch: RECONCILE (ADR-0055, amending ADR-0041's "pokes drive
       // pulls"). The hub re-broadcasts its whole status — watermark included —
@@ -652,6 +673,8 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
       runPullLoop(gen);
     },
     resync: () => {
+      // Also fences callers that request a reset without an epoch signal.
+      suspend();
       // Post-unlink (fleet.ts rebuilt the replica): drop every stamp + the epoch,
       // clear the suspension + its one-shot signal, and re-run both loops. Reset
       // the seed watermark too: after an archive-SHRINKING purge the client

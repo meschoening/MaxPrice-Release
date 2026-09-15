@@ -217,7 +217,9 @@ export type FleetEventStore = {
   all: () => readonly FleetEvent[]; // seq-ascending internal refs — NEVER mutate
   // Retains row references. Callers must not mutate them (including nested
   // unknown fields); replacements arrive as new objects in a later page.
-  applyPage: (rows: FleetEvent[], epoch: string) => "applied" | "epoch-mismatch";
+  // During unlink, returns reset-pending without touching RAM or queuing IO.
+  // Callers must fence pre-reset responses and await unlink before reseeding.
+  applyPage: (rows: FleetEvent[], epoch: string) => "applied" | "epoch-mismatch" | "reset-pending";
   unlink: () => Promise<void>;
   // Replica-mode only: drop the superseded + torn lines from the cache file,
   // keeping every live row and the epoch. See `compact` below for why this is
@@ -279,6 +281,7 @@ export function createFleetEventStore(opts: {
   let liveRowBytes: number | null = null;
   let rowByteCosts = new WeakMap<FleetEvent, number>();
   let replicaGeneration = 0; // changes on wipe, even if the same epoch is re-adopted
+  let pendingWipes = 0; // closes admission synchronously, through the final queued wipe
   // Cumulative successful compact removals within a generation. A later
   // snapshot subtracts what earlier queued compacts have already removed.
   let compactedLines = 0;
@@ -665,8 +668,12 @@ export function createFleetEventStore(opts: {
   }
 
   // Apply one pulled page to the replica cache. The replica's ONLY writer.
-  function applyPage(rows: FleetEvent[], epoch: string): "applied" | "epoch-mismatch" {
+  function applyPage(
+    rows: FleetEvent[],
+    epoch: string,
+  ): "applied" | "epoch-mismatch" | "reset-pending" {
     if (!isReplica) throw new Error("applyPage is replica-mode only");
+    if (pendingWipes > 0) return "reset-pending";
     if (epochId !== "" && epoch !== epochId) return "epoch-mismatch";
     const lines: string[] = [];
     if (epochId === "") {
@@ -691,7 +698,9 @@ export function createFleetEventStore(opts: {
       // Fire-and-forget (NO visibility barrier — the replica is a cache): the
       // write chain serializes appends and consumes the leading-newline guard
       // at write time exactly like the hub path, but nothing awaits the sync.
+      const generation = replicaGeneration;
       writeChain = writeChain.then(async () => {
+        if (generation !== replicaGeneration) return;
         const prefix = needsLeadingNewline ? "\n" : "";
         try {
           await writer.append(`${prefix}${lines.join("")}`);
@@ -709,13 +718,22 @@ export function createFleetEventStore(opts: {
   // the caller reseeds on an epoch flip. Replica-mode only.
   async function unlink(): Promise<void> {
     if (!isReplica) throw new Error("unlink is replica-mode only");
+    // Admission closes NOW, not after writer.close resolves. A counter keeps
+    // overlapping resets closed until the last wipe settles; queued appends
+    // and compacts from an earlier lifecycle are invalidated at this boundary.
+    pendingWipes += 1;
+    replicaGeneration += 1;
     // Reserve the whole wipe on the chain, including close's await. Otherwise
     // a later compact could close the same handle and rename after the wipe.
     const link = writeChain.then(wipeAndReset);
     writeChain = link.catch((err) => {
       console.warn("[usage-core] fleet replica unlink failed:", err);
     });
-    await link;
+    try {
+      await link;
+    } finally {
+      pendingWipes -= 1;
+    }
   }
 
   // Drop the superseded + torn lines from the replica cache, keeping every live

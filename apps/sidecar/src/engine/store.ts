@@ -102,6 +102,12 @@ export type StoreChange =
   | { event: StoredEvent; replaced: StoredEvent | null }
   | { event: null; replaced: StoredEvent }; // newly proven foreign: remove the incumbent
 
+export type LocalAppend = {
+  records: UsageRecord[];
+  projectSlug: string;
+  sessionId: string;
+};
+
 // ---------------------------------------------------------------------------
 // ScanProgress — the walk's own counters (consumed by the boot reporter, #77)
 // ---------------------------------------------------------------------------
@@ -297,6 +303,13 @@ export type EventStore = {
   // Incremental-append path — the watcher's `flush` calls this with freshly
   // parsed records and the project/session they belong to. Deduped.
   append: (records: UsageRecord[], projectSlug: string, sessionId: string) => void;
+  // Local ingest only, including duplicate and excluded records: rebuilds must
+  // replay owner evidence as well as changed rows. Batches are read-only to
+  // subscribers. Fleet pages never emit here.
+  onLocalAppend: (listener: (batch: LocalAppend) => void) => () => void;
+  // Remove a known hub deletion from a retained report view immediately.
+  // No tombstone: a later local transcript may legitimately restore a row.
+  removeMachineSessions: (machineId: string, sessions: readonly ForgetSessionRef[]) => void;
   // The fleet replica feeder (ADR-0041 M5, see fleet.ts) — projects hub-minted
   // wire rows onto `StoredEvent` and upserts each through the SAME merge rule
   // the local path uses. Returns how many rows changed RAM (new + replaced),
@@ -469,6 +482,7 @@ export function createEventStore(opts: {
   // A Set so an unsubscribe is O(1) and a double-subscribe of the same function
   // is idempotent; iteration order is registration order.
   const changeListeners = new Set<(changes: readonly StoreChange[]) => void>();
+  const localAppendListeners = new Set<(batch: LocalAppend) => void>();
 
   // Deliver one fully-applied batch. Called AFTER the whole batch has landed in
   // `events`, so a listener that queries the store sees the post-batch RAM, not
@@ -593,6 +607,13 @@ export function createEventStore(opts: {
         } catch (err) {
           console.error("[store] foreign evidence listener threw:", err);
         }
+      }
+    }
+    for (const listener of localAppendListeners) {
+      try {
+        listener({ records: batch, projectSlug, sessionId });
+      } catch (err) {
+        console.error("[store] onLocalAppend listener threw:", err);
       }
     }
     return changed;
@@ -816,6 +837,28 @@ export function createEventStore(opts: {
     ready,
     scan,
     append,
+    onLocalAppend: (listener) => {
+      localAppendListeners.add(listener);
+      return () => localAppendListeners.delete(listener);
+    },
+    removeMachineSessions: (machineId, sessions) => {
+      const keys = new Set(sessions.map((s) => sessionKey(s.projectSlug, s.sessionId)));
+      const changes: StoreChange[] = [];
+      for (const [key, event] of events) {
+        if (
+          event.machineId !== machineId ||
+          !keys.has(sessionKey(event.projectSlug, event.sessionId))
+        )
+          continue;
+        events.delete(key);
+        changes.push({ event: null, replaced: event });
+      }
+      if (changes.length === 0) return;
+      sorted = null;
+      modelsSeen.clear();
+      for (const event of events.values()) modelsSeen.add(event.model);
+      emitChanges(changes);
+    },
     appendFleet,
     query,
     onChanged: (listener) => {

@@ -114,6 +114,9 @@ export type BuildAppDeps = {
   // BOTH local sources — the initial scan AND the replica file load — never
   // the network (the hub pull is background).
   store: () => EventStore;
+  // A populated report view held through an automatic fleet reseed. Mutating
+  // actions (rescan) always use `store`, never this temporary view.
+  reportStore?: () => EventStore;
   engineReady: () => Promise<void>;
   // Loopback machine directory (ADR-0041): the fleet's cached directory + this
   // machine's own id, so the renderer names machines offline. M6 consumes it.
@@ -561,11 +564,12 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // report-cache.ts): every acc is priced at fold time from the active
   // snapshot, so the ADR-0085 swap must drop them. Passed explicitly — it is
   // the module default too — so the dependency is visible where it is wired.
+  const reportStore = deps.reportStore ?? deps.store;
   const reportCache = createReportCache({
-    getStore: deps.store,
+    getStore: reportStore,
     getPricing: activePricingSnapshot,
   });
-  const blockReports = createBlockReports({ getStore: deps.store, getSamples: deps.samples });
+  const blockReports = createBlockReports({ getStore: reportStore, getSamples: deps.samples });
 
   // Host-header allowlist. The renderer always reaches us via the loopback
   // address it discovered through get_sidecar_url, so any other Host means
@@ -657,7 +661,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
       }
       // Bounded queries stay on the direct path: the store's date filter makes
       // them O(window) already, and a moving `until` would churn cache keys.
-      const events = deps.store().query({
+      const events = reportStore().query({
         since: q.since,
         until: q.until,
         timeZone: q.tz,
@@ -703,7 +707,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
       }
       // Bounded queries stay on the direct path: the store's date filter makes
       // them O(window) already, and a moving `until` would churn cache keys.
-      const events = deps.store().query({
+      const events = reportStore().query({
         since: q.since,
         until: q.until,
         timeZone: q.tz,
@@ -746,7 +750,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
       }
       // Bounded queries stay on the direct path: the store's date filter makes
       // them O(window) already, and a moving `until` would churn cache keys.
-      const events = deps.store().query({
+      const events = reportStore().query({
         since: q.since,
         until: q.until,
         timeZone: q.tz,
@@ -916,7 +920,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
           };
           return c.json(body);
         }
-        const events = deps.store().query({ projects, models, machines });
+        const events = reportStore().query({ projects, models, machines });
         return c.json(
           aggregateIntraday(events, mode, {
             span: "block",
@@ -930,7 +934,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         );
       }
 
-      const events = deps.store().query({ projects, models, machines });
+      const events = reportStore().query({ projects, models, machines });
       if (span === "week") {
         if (weekStartMs === undefined) throw new Error("intraday: span week without weekStart");
         return c.json(
@@ -1100,7 +1104,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
     try {
       await deps.engineReady();
       aggregate = aggregateSessionEvents(
-        deps.store().query({ sessions: [id], models, machines }),
+        reportStore().query({ sessions: [id], models, machines }),
         mode,
         id,
       );
@@ -1247,7 +1251,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
       const today = localDateUncached(now, tz);
       let todayCost = 0;
       if (today !== null) {
-        const events = deps.store().query({ since: today.ymd, until: today.ymd, timeZone: tz });
+        const events = reportStore().query({ since: today.ymd, until: today.ymd, timeZone: tz });
         const daily = aggregateDaily(events, mode, { projectFilterCount: 0, timeZone: tz });
         todayCost = daily.daily.find((row) => row.date === today.dashed)?.totalCost ?? 0;
       }
@@ -2105,6 +2109,7 @@ async function main(): Promise<void> {
     // Live engine accessor (ADR-0041): a fleet rebuild swaps the store, so
     // handlers read it per-request rather than capturing one at build time.
     store: getEngineStore,
+    reportStore: fleet.reportStore,
     // Both local sources gate the data handlers — the scan AND the replica load
     // (assigned after the handshake); `() =>` reads the live value.
     engineReady: () => engineReady,

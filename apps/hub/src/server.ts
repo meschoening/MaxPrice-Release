@@ -1,5 +1,6 @@
 // Exported via a package.json subpath solely for the sidecar fleet test rig (apps/sidecar/src/test-hub.ts) — keep signatures stable, a cross-app test contract.
 import { Hono } from "hono";
+import { eventDownloadResponse } from "./event-download";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
@@ -404,7 +405,7 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
         since,
         Math.min(limit, EVENT_PULL_LIMIT_MAX),
       );
-      return c.json(body);
+      return eventDownloadResponse(body, c.req.header("accept-encoding"));
     });
 
     // Client-initiated forgetting (ADR-0063): a machine drops its OWN rows for
