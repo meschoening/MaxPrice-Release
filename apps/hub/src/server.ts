@@ -4,10 +4,12 @@ import { eventDownloadResponse } from "./event-download";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
-import { streamSSEPump } from "@maxprice/usage-core";
+import { FleetRecoveryRequired, FleetUploadConflict, streamSSEPump } from "@maxprice/usage-core";
 import {
   EVENT_PULL_LIMIT_MAX,
   HUB_SSE_EVENT,
+  HUB_PROTOCOL_VERSION,
+  hubPurgeRequestSchema,
   PROJECT_IDENTITY_PATH,
   hubEventsForgetRequestSchema,
   hubEventsPushRequestSchema,
@@ -22,7 +24,6 @@ import {
   type ErrorResponse,
   type HubClientsResponse,
   type HubEventsForgetResponse,
-  type HubEventsPullResponse,
   type HubEventsPushResponse,
   type HubMachinesResponse,
   type HubProjectIdentityResponse,
@@ -72,6 +73,7 @@ export type BuildHubAppDeps = {
   // Optional: omitted/empty ⇒ NO CORS mounted (headless serve, remote sidecars —
   // non-browser, unchanged). index.ts populates it only when embedded.
   allowedOrigins?: string[];
+
   // Boot-readiness gate (F1): a promise that resolves once the hub's on-disk
   // history is loaded, the persisted credential is seeded, and the poller is
   // started. When supplied, EVERY /api/* route awaits it before running, so
@@ -128,11 +130,11 @@ export function fleetEventsStatus(store: FleetEventStore): NonNullable<HubStatus
   return {
     epoch: store.epoch(),
     seq: store.durableSeq(),
+    deletionGeneration: store.deletionGeneration(),
+    changeBytes: store.changeBytes(),
     eventCount: store.size(),
     fileBytes: store.fileBytes(),
-    garbageLines: store.garbageLines(),
     reclaimableBytes: store.reclaimableBytes(),
-    unreadableLines: store.unreadableLines(),
     lastAppendAt: store.lastAppendAt(),
   };
 }
@@ -167,7 +169,8 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
   // Archive health predicate + its pinned 503 envelope (F3). Absent dep ⇒
   // always usable. The copy names the remedy: nothing re-attempts the load, so
   // a restart is the only cure (the same contract as the console's inset).
-  const eventsUsable = deps.eventsUsable ?? (() => true);
+  let actionRecoveryFailed = false;
+  const eventsUsable = () => !actionRecoveryFailed && (deps.eventsUsable?.() ?? true);
   const identityDegraded = deps.identityDegraded ?? (() => false);
   const ARCHIVE_UNAVAILABLE: ErrorResponse = {
     error: "fleet event archive failed to load — restart the hub",
@@ -194,6 +197,7 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
           "Authorization",
           "content-type",
           "x-maxprice-machine",
+          "x-maxprice-protocol",
           "x-maxprice-hostname",
         ],
       }),
@@ -241,6 +245,15 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     return next();
   });
 
+  app.use("/api/*", async (c, next) => {
+    if (
+      !["GET", "HEAD", "OPTIONS"].includes(c.req.method) &&
+      c.req.header("x-maxprice-protocol") !== String(HUB_PROTOCOL_VERSION)
+    )
+      return c.json({ error: "Hub protocol mismatch; update both apps" }, 409);
+    await next();
+  });
+
   // Boot-readiness gate (F1): every authenticated /api/* handler — /api/status
   // included — parks here until the hub has loaded its history and seeded the
   // credential. This is what closes the auto-heal race: the seed's keychain
@@ -255,6 +268,32 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
       return next();
     });
   }
+
+  // Complete interrupted directory work before serving archive mutations. The
+  // receipt identifies the original deletion; newer contributions survive.
+  let recoveredActions = false;
+  app.use("/api/*", async (_c, next) => {
+    if (!recoveredActions && fleetEvents !== undefined && eventsUsable() && !identityDegraded()) {
+      try {
+        for (const operation of fleetEvents.pendingOperations()) {
+          if (!operation.scope.startsWith("machine:")) continue;
+          const id = operation.scope.slice("machine:".length);
+          identityDirectory?.removeMachine(id);
+          if (machineDirectory?.has(id)) machineDirectory.remove(id);
+          fleetEvents.completeOperation(operation.id);
+        }
+        recoveredActions = true;
+      } catch (error) {
+        actionRecoveryFailed = true;
+        deps.fanout.patchStatus({ events: undefined });
+        console.error(
+          "[hub] pending deletion completion failed; archive mutations disabled:",
+          error,
+        );
+      }
+    }
+    return next();
+  });
 
   // Record every AUTHENTICATED /api/* request that identifies its machine (this
   // runs after the auth guard, so only valid clients enter the roster). A
@@ -373,7 +412,13 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
         const body: ErrorResponse = { error: "invalid events payload" };
         return c.json(body, 400);
       }
-      const ack = await fleetEvents.push(parsed.data.events, machineId);
+      let ack;
+      try {
+        ack = await fleetEvents.push(parsed.data.events, machineId, parsed.data);
+      } catch (error) {
+        if (error instanceof FleetUploadConflict) return c.json({ error: error.message }, 409);
+        throw error;
+      }
       // Any successful ack proves this machine is sharing — losers included.
       lastPushByMachine.set(machineId, nowIso());
       if (ack.added > 0) {
@@ -385,27 +430,56 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
 
     // Pull: one cursor-paged loop client-side — seq-ascending rows strictly
     // after `since`, up to the DURABLE watermark only, `limit` clamped.
-    // Caught-up = a short page; the epoch rides every envelope (the resync
+    // Completion names a fixed change boundary; the epoch rides every envelope (the resync
     // sentinel).
     app.get("/api/events", (c) => {
       if (!eventsUsable()) return c.json(ARCHIVE_UNAVAILABLE, 503);
-      const sinceRaw = c.req.query("since");
-      const since = sinceRaw === undefined ? 0 : Number(sinceRaw);
-      if (!Number.isInteger(since) || since < 0) {
-        const body: ErrorResponse = { error: `invalid since (expected seq >= 0): ${sinceRaw}` };
-        return c.json(body, 400);
+      const since = Number(c.req.query("since") ?? 0);
+      const limit = Number(c.req.query("limit") ?? 100);
+      const through = c.req.query("through");
+      if (
+        !Number.isSafeInteger(since) ||
+        since < 0 ||
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        (through !== undefined && (!Number.isSafeInteger(Number(through)) || Number(through) < 0))
+      )
+        return c.json({ error: "invalid change cursor or limit" }, 400);
+      if (c.req.query("epoch") !== fleetEvents.epoch())
+        return c.json({ error: "archive changed" }, 410);
+      try {
+        return eventDownloadResponse(
+          fleetEvents.changes(
+            since,
+            Math.min(limit, 100),
+            through === undefined ? undefined : Number(through),
+          ),
+          c.req.header("accept-encoding"),
+        );
+      } catch (error) {
+        if (error instanceof FleetRecoveryRequired) return c.json({ error: error.message }, 410);
+        throw error;
       }
-      const limitRaw = c.req.query("limit");
-      const limit = limitRaw === undefined ? EVENT_PULL_LIMIT_MAX : Number(limitRaw);
-      if (!Number.isInteger(limit) || limit < 1) {
-        const body: ErrorResponse = { error: `invalid limit (expected int >= 1): ${limitRaw}` };
-        return c.json(body, 400);
+    });
+    app.get("/api/events/snapshot", (c) => {
+      if (!eventsUsable()) return c.json(ARCHIVE_UNAVAILABLE, 503);
+      const offset = Number(c.req.query("offset") ?? 0);
+      const limit = Number(c.req.query("limit") ?? EVENT_PULL_LIMIT_MAX);
+      if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1)
+        return c.json({ error: "invalid snapshot offset or limit" }, 400);
+      try {
+        return eventDownloadResponse(
+          fleetEvents.snapshotPage(
+            c.req.query("snapshot"),
+            offset,
+            Math.min(limit, EVENT_PULL_LIMIT_MAX),
+          ),
+          c.req.header("accept-encoding"),
+        );
+      } catch (error) {
+        if (error instanceof FleetRecoveryRequired) return c.json({ error: error.message }, 410);
+        throw error;
       }
-      const body: HubEventsPullResponse = fleetEvents.page(
-        since,
-        Math.min(limit, EVENT_PULL_LIMIT_MAX),
-      );
-      return eventDownloadResponse(body, c.req.header("accept-encoding"));
     });
 
     // Client-initiated forgetting (ADR-0063): a machine drops its OWN rows for
@@ -439,68 +513,31 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
         const body: ErrorResponse = { error: "invalid forget payload" };
         return c.json(body, 400);
       }
-      // Scope is a BYTE comparison against the id the hub itself minted at push
-      // time — never alias-resolved. M7 merge is metadata-only (no event is ever
-      // rewritten), so a merged-away machine's rows keep their original
-      // machineId forever and are reachable only by the operator purge.
-      // Alias-closure would make delete authority a function of mutable
-      // directory state an operator edits from a console — exactly the
-      // widening this guard exists to prevent.
+      if (parsed.data.epoch !== fleetEvents.epoch())
+        return c.json({ error: "archive changed; renew the deletion action" }, 409);
       const named = new Set(
         parsed.data.sessions.map((s) => sessionPairKey(s.projectSlug, s.sessionId)),
       );
-      // Pre-scan before rewriting: rewrite({ newEpoch: true }) mints a fresh
-      // epoch unconditionally, and an epoch bump forces EVERY client in the
-      // fleet to unlink its replica and reseed from seq 0. A forget that
-      // matches nothing is a NORMAL outcome (ADR-0063's Consequences names
-      // "rows were already gone" as an expected race), so it must cost the
-      // fleet nothing: no rewrite, no epoch, no status patch — the CURRENT
-      // epoch and two zeroes. Costs one extra O(archive) scan on the matching
-      // path, which then rewrites the whole archive anyway.
-      //
-      // The window between this scan and the rewrite is unlocked: a matching
-      // row pushed in between is missed and survives. That is the SAME race
-      // `removed` already reports against — a forget is a point-in-time
-      // statement about rows the caller had already stopped backing — so it
-      // wants this comment rather than a lock. The client re-forgets on its
-      // next pass.
-      const matched = new Set<string>();
-      let matchedRows = 0;
-      for (const row of fleetEvents.all()) {
-        if (row.machineId !== machineId) continue;
-        const key = sessionPairKey(row.projectSlug, row.sessionId);
-        if (!named.has(key)) continue;
-        matched.add(key);
-        matchedRows += 1;
+      const scope = JSON.stringify([machineId, [...named].sort()]);
+      let receipt;
+      try {
+        receipt = await fleetEvents.remove(
+          parsed.data.operationId,
+          scope,
+          (row) =>
+            row.machineId === machineId &&
+            named.has(sessionPairKey(row.projectSlug, row.sessionId)),
+        );
+      } catch (error) {
+        if (error instanceof FleetUploadConflict) return c.json({ error: error.message }, 409);
+        throw error;
       }
-      if (matchedRows === 0) {
-        const body: HubEventsForgetResponse = {
-          epoch: fleetEvents.epoch(),
-          removed: 0,
-          sessionsMatched: 0,
-        };
-        return c.json(body);
+      fleetEvents.completeOperation(parsed.data.operationId);
+      if (receipt.removed > 0) {
+        deps.fanout.patchStatus({ events: fleetEventsStatus(fleetEvents) });
+        deps.fanout.emitEventsPoke(fleetEvents.durableSeq());
       }
-      const { droppedRows } = await fleetEvents.rewrite({
-        keep: (row) => {
-          if (row.machineId !== machineId) return true;
-          return !named.has(sessionPairKey(row.projectSlug, row.sessionId));
-        },
-        newEpoch: true,
-      });
-      // No emitEventsPoke: the poke carries the durable watermark, which a
-      // forget leaves unchanged or LOWERS, and ADR-0055's clients pull only when
-      // the advertised seq is HIGHER — a poke would be a wire event every peer
-      // correctly ignores. Peers converge on the 5-min sweep, exactly as they
-      // already do after a purge. No identity cascade either: forget removes
-      // HISTORY for sessions whose checkout may still exist and still be probed.
-      deps.fanout.patchStatus({ events: fleetEventsStatus(fleetEvents) });
-      const body: HubEventsForgetResponse = {
-        epoch: fleetEvents.epoch(),
-        removed: droppedRows,
-        sessionsMatched: matched.size,
-      };
-      return c.json(body);
+      return c.json(receipt satisfies HubEventsForgetResponse);
     });
   }
 
@@ -711,42 +748,34 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     });
   }
 
-  // Archive operations (ADR-0041 M7): the explicit operator forgetting surface.
-  // Purge = the log rewrite with an epoch bump — every existing invariant then
-  // propagates it for free (mismatch → replica unlink + reseed → stamps clear →
-  // re-push). Compact = the SAME rewrite, epoch-preserving — invisible on the
-  // wire. Mounted only when both the store and the directory exist.
+  // Operator deletion commits exact keys plus a durable action receipt.
+  // Directory cleanup finishes that receipt; compaction preserves replay history.
   if (fleetEvents !== undefined && machineDirectory !== undefined) {
     app.delete("/api/machines/:id", async (c) => {
       // 503 before ANY work (F3): rewrite() writes RAM's survivors over the log,
       // so a purge against a store that failed to load would truncate it.
       if (!eventsUsable()) return c.json(ARCHIVE_UNAVAILABLE, 503);
       const id = c.req.param("id");
-      if (!machineDirectory.has(id)) {
-        const body: ErrorResponse = { error: "unknown machine" };
-        return c.json(body, 404);
+      const parsed = hubPurgeRequestSchema.safeParse(await c.req.json().catch(() => null));
+      if (!parsed.success) return c.json({ error: "invalid purge operation" }, 400);
+      const operationId = parsed.data.operationId;
+      const scope = `machine:${id}`;
+      if (!fleetEvents.hasOperation(operationId) && !machineDirectory.has(id))
+        return c.json({ error: "unknown machine" }, 404);
+      if (identityDegraded())
+        return c.json({ error: "identity directory unavailable; purge is incomplete" }, 503);
+      try {
+        await fleetEvents.remove(operationId, scope, (row) => row.machineId === id);
+      } catch (error) {
+        if (error instanceof FleetUploadConflict) return c.json({ error: error.message }, 409);
+        throw error;
       }
-      // Store first, directory second: if the directory write failed after the
-      // rewrite, a zero-row entry survives (benign, re-purgeable) — the inverse
-      // order could orphan rows under a name that no longer exists.
-      await fleetEvents.rewrite({ keep: (row) => row.machineId !== id, newEpoch: true });
-      machineDirectory.remove(id);
-      // ADR-0062 §4: purge cascades to identity rows; clients drop them on their
-      // next pull. When serve() withheld the store because the identity file did
-      // not load, that cascade cannot happen — and the resulting partial state is
-      // UNREPAIRABLE, because both purge paths look the machine up in the machine
-      // directory first and the lines above have already removed it: once the
-      // file is readable again a re-purge answers 404 "unknown machine" while the
-      // stale rows keep serving and mirroring fleet-wide. Log-only all the same
-      // (the offline CLI's pinned posture): the archive + directory halves DID
-      // succeed, and 503-ing after them would leave a worse partial state.
-      if (identityDirectory !== undefined) {
-        identityDirectory.removeMachine(id);
-      } else if (identityDegraded()) {
-        console.error(
-          `[hub] identity rows for ${id} were NOT purged: identity-directory.json could not be read or was corrupt, so identity sync is disabled this run. They cannot be re-purged either — ${id} is gone from the machine directory both purge paths resolve against. Fix or remove the file, restart the hub, then remove those rows by hand.`,
-        );
+      if (!fleetEvents.operationComplete(operationId)) {
+        identityDirectory?.removeMachine(id);
+        if (machineDirectory.has(id)) machineDirectory.remove(id);
+        fleetEvents.completeOperation(operationId);
       }
+      deps.fanout.emitEventsPoke(fleetEvents.durableSeq());
       deps.fanout.patchStatus({ events: fleetEventsStatus(fleetEvents) });
       deps.fanout.emitMachinesPoke();
       return c.json({ ok: true } satisfies CredentialAck);
@@ -755,9 +784,9 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     app.post("/api/store/compact", async (c) => {
       // Same truncation hazard as the purge above — refuse before rewriting.
       if (!eventsUsable()) return c.json(ARCHIVE_UNAVAILABLE, 503);
-      await fleetEvents.rewrite({ newEpoch: false });
+      const result = await fleetEvents.compact();
       deps.fanout.patchStatus({ events: fleetEventsStatus(fleetEvents) });
-      return c.json({ ok: true } satisfies CredentialAck);
+      return c.json({ freedBytes: result.freedBytes });
     });
   }
 

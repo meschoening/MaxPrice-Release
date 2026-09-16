@@ -1,6 +1,36 @@
 {
-  "capturedAt": "2026-09-14T10:35:28.436Z",
+  "capturedAt": "2026-09-16T22:33:06.642Z",
   "models": {
+    "aihubmix/claude-fable-5": {
+      "input_cost_per_token": 0.000011,
+      "output_cost_per_token": 0.000055,
+      "cache_creation_input_token_cost": 0.00001375,
+      "cache_read_input_token_cost": 0.0000011
+    },
+    "aihubmix/claude-haiku-4-5": {
+      "input_cost_per_token": 0.0000011,
+      "output_cost_per_token": 0.0000055,
+      "cache_creation_input_token_cost": 0.000001375,
+      "cache_read_input_token_cost": 1.1e-7
+    },
+    "aihubmix/claude-opus-4-8-think": {
+      "input_cost_per_token": 0.000005,
+      "output_cost_per_token": 0.000025,
+      "cache_creation_input_token_cost": 0.00000625,
+      "cache_read_input_token_cost": 5e-7
+    },
+    "aihubmix/claude-opus-5": {
+      "input_cost_per_token": 0.000005,
+      "output_cost_per_token": 0.000025,
+      "cache_creation_input_token_cost": 0.00000625,
+      "cache_read_input_token_cost": 5e-7
+    },
+    "aihubmix/claude-sonnet-5": {
+      "input_cost_per_token": 0.000002,
+      "output_cost_per_token": 0.00001,
+      "cache_creation_input_token_cost": 0.0000025,
+      "cache_read_input_token_cost": 2e-7
+    },
     "anthropic.claude-3-5-haiku-20241022-v1:0": {
       "input_cost_per_token": 8e-7,
       "output_cost_per_token": 0.000004,

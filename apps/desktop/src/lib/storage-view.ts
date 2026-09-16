@@ -247,14 +247,19 @@ export const STORAGE_COPY = {
     // The duplicated-rows clause disappears entirely when there are none:
     // "and 0 duplicated history rows (0 B)" makes a working number look
     // broken, and a hub-less client has no replica at all.
-    why: (clean: StorageReport["clean"]): string =>
-      clean.duplicateRows > 0
-        ? `Drops the parse cache (${formatStorageBytes(clean.scanCacheBytes)}) and ` +
-          `${clean.duplicateRows.toLocaleString()} duplicated history rows ` +
-          `(${formatStorageBytes(clean.duplicateBytes)}). ` +
-          "Both are rebuilt from files you already have; the only cost is one slower launch."
-        : "Drops the parse cache. It's rebuilt from session files you already have; the only cost is one slower launch.",
-    whyEmpty: "The parse cache is empty and there are no duplicated rows.",
+    why: (clean: StorageReport["clean"]): string => {
+      const parts = [`parse cache (${formatStorageBytes(clean.scanCacheBytes)})`];
+      if (clean.duplicateRows > 0)
+        parts.push(
+          `${clean.duplicateRows.toLocaleString()} duplicated Local archive rows (${formatStorageBytes(clean.duplicateBytes)})`,
+        );
+      if (clean.databaseBytes > 0)
+        parts.push(
+          `unused fleet database space (about ${formatStorageBytes(clean.databaseBytes)})`,
+        );
+      return `Cleans ${parts.join(" and ")}. Preserves usage history and fleet synchronization history.`;
+    },
+    whyEmpty: "The parse cache is empty and there is no unused archive space.",
     done: (bytes: number): string => `Cleaned ${formatStorageBytes(bytes)}.`,
   },
 

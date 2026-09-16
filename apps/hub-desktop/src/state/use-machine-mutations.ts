@@ -11,9 +11,9 @@ import {
 // Operator mutations (M7). Every success refreshes the Machines card AND the
 // status card (purge/compact change the archive stats; rename/merge change the
 // directory). Errors surface via mutation.error (the pinned envelope message).
-function useInvalidating<TVars>(
-  fn: (vars: TVars) => Promise<void>,
-): UseMutationResult<void, Error, TVars> {
+function useInvalidating<TVars, TResult = void>(
+  fn: (vars: TVars) => Promise<TResult>,
+): UseMutationResult<TResult, Error, TVars> {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: fn,
@@ -40,6 +40,6 @@ export function useMergeMachine(): UseMutationResult<
 export function usePurgeMachine(): UseMutationResult<void, Error, { machineId: string }> {
   return useInvalidating(({ machineId }) => purgeMachine(machineId));
 }
-export function useCompactStore(): UseMutationResult<void, Error, void> {
+export function useCompactStore(): UseMutationResult<{ freedBytes: number }, Error, void> {
   return useInvalidating(() => compactStore());
 }

@@ -401,13 +401,3 @@ export function formatBytes(n: number): string {
   }
   return `${value.toFixed(1)} ${units[unit]}`;
 }
-
-// unreadable lines are ACKED rows lost to corruption — amber, real loss;
-// garbage lines are replaced/duplicate rows replay converges over — panel
-// tint, compactable housekeeping. (ADR-0041 §hub console.)
-export type HygieneState = "clean" | "garbage" | "unreadable";
-export function hygieneState(events: HubStatus["events"]): HygieneState {
-  if ((events?.unreadableLines ?? 0) > 0) return "unreadable";
-  if ((events?.garbageLines ?? 0) > 0) return "garbage";
-  return "clean";
-}

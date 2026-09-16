@@ -8,7 +8,7 @@ import { usageConnectionSchema, usageReadingSchema, usageSampleSchema } from "./
 // HUB_PROTOCOL_VERSION match (no shims; the failure mode is a clear "mismatch"
 // connection state, never quiet misbehavior). Bump the version on ANY breaking
 // change to the shapes below.
-export const HUB_PROTOCOL_VERSION = 3;
+export const HUB_PROTOCOL_VERSION = 4;
 
 // The hub's fixed default port. Unlike the sidecar (ADR-0002's dynamic port +
 // stdout handshake — only possible with a parent process), remote clients must
@@ -116,15 +116,12 @@ export const hubStatusSchema = z.object({
     .object({
       epoch: z.string(),
       seq: z.number().int().nonnegative(),
+      deletionGeneration: z.number().int().nonnegative(),
+      changeBytes: z.number().int().nonnegative().optional(),
       eventCount: z.number().int().nonnegative().optional(),
       fileBytes: z.number().int().nonnegative().optional(),
-      garbageLines: z.number().int().nonnegative().optional(),
-      // Bytes a compact would free = fileBytes − what rewrite would write.
-      // Exact (a compact re-serializes live rows verbatim), so this is the
-      // superseded/unreadable/torn bytes that fall away. Optional like its
-      // console-stat siblings — additive under v1 when introduced.
+      // SQLite unused-page estimate; completed maintenance reports actual bytes.
       reclaimableBytes: z.number().int().nonnegative().optional(),
-      unreadableLines: z.number().int().nonnegative().optional(),
       lastAppendAt: z.string().nullable().optional(),
     })
     .optional(),
@@ -223,6 +220,8 @@ export type FleetEvent = z.infer<typeof fleetEventSchema>;
 
 // POST /api/events — body carries the client's NATIVE shape (no machineId/seq).
 export const hubEventsPushRequestSchema = z.object({
+  epoch: z.string().min(1),
+  deletionGeneration: z.number().int().nonnegative(),
   events: z.array(storedEventWireSchema).max(EVENT_PUSH_BATCH_MAX),
 });
 export type HubEventsPushRequest = z.infer<typeof hubEventsPushRequestSchema>;
@@ -237,35 +236,16 @@ export type HubEventStamp = z.infer<typeof hubEventStampSchema>;
 
 export const hubEventsPushResponseSchema = z.object({
   epoch: z.string(),
+  deletionGeneration: z.number().int().nonnegative(),
   added: z.number().int().nonnegative(),
   stamps: z.array(hubEventStampSchema),
 });
 export type HubEventsPushResponse = z.infer<typeof hubEventsPushResponseSchema>;
 
-// GET /api/events?since=<seq>&limit=<n> — seq-ascending, durable rows only.
-export const hubEventsPullResponseSchema = z.object({
-  epoch: z.string(),
-  seq: z.number().int().nonnegative(), // durable watermark
-  events: z.array(fleetEventSchema),
-});
-export type HubEventsPullResponse = z.infer<typeof hubEventsPullResponseSchema>;
-
 // The hub:events SSE poke payload — the post-fsync durable watermark, never
 // rows (ADR-0041). Passthrough for the usual additive-evolution posture.
 export const hubEventsPokeSchema = z.object({ seq: z.number().int().nonnegative() }).passthrough();
 export type HubEventsPoke = z.infer<typeof hubEventsPokeSchema>;
-
-// The CLIENT'S lenient pull-envelope parse (ADR-0041 M5): rows stay `unknown`
-// so one malformed row can't fail the whole envelope — event-sync safeParses
-// each row against fleetEventSchema and skip-and-COUNTS failures, never
-// bricking the client. The hub-side response type stays the strict
-// hubEventsPullResponseSchema above.
-export const hubEventsPullEnvelopeSchema = z.object({
-  epoch: z.string(),
-  seq: z.number().int().nonnegative(),
-  events: z.array(z.unknown()),
-});
-export type HubEventsPullEnvelope = z.infer<typeof hubEventsPullEnvelopeSchema>;
 
 // ── Client-initiated forgetting (ADR-0063). Additive at v1 like the rest of
 //    event sync: a pre-forget hub 404s POST /api/events/forget, so callers
@@ -294,6 +274,8 @@ export type ForgetSessionRef = z.infer<typeof forgetSessionRefSchema>;
 // POST /api/events/forget body. Attribution comes from x-maxprice-machine — the
 // id the HUB minted at push time — so the body never names a machine.
 export const hubEventsForgetRequestSchema = z.object({
+  operationId: z.string().uuid(),
+  epoch: z.string().min(1),
   sessions: z.array(forgetSessionRefSchema).min(1).max(EVENT_FORGET_SESSIONS_MAX),
 });
 export type HubEventsForgetRequest = z.infer<typeof hubEventsForgetRequestSchema>;
@@ -306,10 +288,48 @@ export type HubEventsForgetRequest = z.infer<typeof hubEventsForgetRequestSchema
 // resync immediately rather than discovering the mismatch on a later pull.
 export const hubEventsForgetResponseSchema = z.object({
   epoch: z.string(),
+  deletionGeneration: z.number().int().nonnegative(),
   removed: z.number().int().nonnegative(),
   sessionsMatched: z.number().int().nonnegative(),
 });
 export type HubEventsForgetResponse = z.infer<typeof hubEventsForgetResponseSchema>;
+
+// ADR-0100: complete transactions, never individual operations, are the unit
+// of replay. Event seq identifies a version; cursor identifies a transaction.
+export const fleetDeletionSchema = z.object({
+  messageId: z.string(),
+  requestId: z.string().optional(),
+  seq: z.number().int().positive(),
+});
+export type FleetDeletion = z.infer<typeof fleetDeletionSchema>;
+export const fleetChangeSchema = z.object({
+  cursor: z.number().int().positive(),
+  deletionGeneration: z.number().int().nonnegative(),
+  upserts: z.array(fleetEventSchema),
+  deletes: z.array(fleetDeletionSchema),
+});
+export type FleetChange = z.infer<typeof fleetChangeSchema>;
+export const fleetChangesPageSchema = z.object({
+  epoch: z.string(),
+  seq: z.number().int().nonnegative(),
+  deletionGeneration: z.number().int().nonnegative(),
+  floor: z.number().int().nonnegative(),
+  changes: z.array(fleetChangeSchema),
+  complete: z.boolean(),
+});
+export type FleetChangesPage = z.infer<typeof fleetChangesPageSchema>;
+export const fleetSnapshotPageSchema = z.object({
+  epoch: z.string(),
+  snapshot: z.string(),
+  seq: z.number().int().nonnegative(),
+  deletionGeneration: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative(),
+  nextOffset: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+  events: z.array(fleetEventSchema),
+  complete: z.boolean(),
+});
+export type FleetSnapshotPage = z.infer<typeof fleetSnapshotPageSchema>;
 
 // Machine directory entry (ADR-0041). Directory fields required; joined stats
 // (roster ∪ store aggregates) are .optional() — M4 serves the directory
@@ -459,3 +479,6 @@ export function normalizeHubUrl(raw: string): string {
   if (url.port === "") url.port = String(HUB_DEFAULT_PORT);
   return url.toString().replace(/\/+$/, "");
 }
+
+export const hubPurgeRequestSchema = z.object({ operationId: z.string().uuid() });
+export const hubCompactResponseSchema = z.object({ freedBytes: z.number().int().nonnegative() });

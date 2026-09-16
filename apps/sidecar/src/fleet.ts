@@ -1,5 +1,8 @@
+import { join, dirname } from "node:path";
+import { createForgetIntent, type FleetForgetIntent } from "./fleet-forget-intent";
 import {
   createEventSync,
+  fleetTokenTotal,
   createFleetEventStore,
   createIdentityDirectory,
   type EventSync,
@@ -12,6 +15,7 @@ import {
   PROJECT_IDENTITY_PATH,
   buildAutomaticProjectIdentity,
   hubEventsForgetResponseSchema,
+  hubStatusSchema,
   hubMachinesResponseSchema,
   hubProjectIdentityResponseSchema,
   projectMergeAssertionKey,
@@ -29,7 +33,7 @@ import type { ZodType } from "zod";
 import { createMachineDirectoryCache } from "./machine-directory-cache";
 import { scanGate } from "./scan-gate";
 import { storedEventToWire } from "./stored-event-wire";
-import type { EventStore, LocalAppend } from "./engine/store";
+import type { EventStore, LocalAppend, StoredEvent } from "./engine/store";
 import type { LiveHub } from "./live-hub";
 
 // ADR-0041 (M5) — the sidecar's fleet-event WIRING module. This is the ONE place
@@ -85,7 +89,7 @@ function requestDeadline(): { signal: AbortSignal; clear: () => void } {
 
 export type FleetSyncDeps = {
   machineId: string;
-  replicaPath: string; // <app-data>/fleet-events.jsonl
+  replicaPath: string; // <app-data>/fleet-events.sqlite
   directoryCachePath: string; // <app-data>/machine-directory.json
   identityDirectoryPath: string; // <app-data>/identity-directory.json (ADR-0062)
   liveHub: Pick<LiveHub, "patchStatus" | "emitUsage" | "getStatus">;
@@ -162,12 +166,8 @@ export type FleetSync = {
   recordProbes: (rows: ProjectIdentityRow[]) => void;
   identity: () => SidecarProjectIdentityResponse; // loopback GET /api/project-identity body
   setProjectMerge: (request: ProjectMergeMutationRequest) => ProjectMergeMutationResponse;
-  // The destructive action's whole mechanic (map #124, ticket #132): tell the
-  // hub to drop this machine's rows for `sessions`, then let the epoch bump's
-  // existing unlink → rebuild → resync path rebuild the replica from the pruned
-  // archive. It lives here because everything it needs already does — the hub
-  // connection context, the replica, and the resync ORDER this module exists to
-  // own. The caller (the route) owns only the guards.
+  // A durable action receipt joins Hub deletion, Local archive pruning, and
+  // replica reconciliation. Retries complete the same action (ADR-0100).
   forget: (sessions: readonly ForgetSessionRef[]) => Promise<FleetForgetResult>;
   repairOrganizations: (
     sessions: readonly ForgetSessionRef[],
@@ -184,6 +184,7 @@ export type FleetSync = {
   // fleet fixed-point asserter reads `.all()` off it to compare the client's
   // verbatim mirror against the hub log. Read-only — callers MUST NOT mutate.
   getReplica: () => FleetEventStore | null;
+  mayArchiveFleet: (row: StoredEvent) => boolean;
   stop: () => Promise<void>;
 };
 
@@ -259,6 +260,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   let fleetReplica = deps.initial.fleetReplica;
   let hubConfigured = deps.initial.hubConfigured;
 
+  const forgetIntent = createForgetIntent(join(dirname(deps.replicaPath), "fleet-forget.json"));
   const replicaWanted = (): boolean => fleetReplica && hubConfigured;
   let retainedReportStore: EventStore | null = null;
   let detachReportRelay: (() => void) | null = null;
@@ -291,13 +293,53 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // The transport-thin event-sync, created ONCE with accessor-based deps so a
   // store swap / replica re-attach is picked up live.
   const eventSync: EventSync = createEventSync({
-    // RAW store rows (no per-push wire projection); event-sync stamp-filters
-    // them and calls toWire only on the survivors it actually batches. Feeding
-    // it the WHOLE store is correct without any provenance tracking because
-    // replica-sourced rows in the engine are stamped by construction — the
-    // replica holds each at exact token fullness, so the stamp predicate
-    // filters them out of every push.
-    localEvents: () => (ingestible ? deps.getStore().query() : []),
+    // Upload only independent sources; neither merged reports nor a stale
+    // replica can establish source eligibility after a deletion (ADR-0100).
+    localEvents: () => {
+      if (!ingestible || forgetIntent.error() !== null) return [];
+      const blocked = new Set(
+        forgetIntent
+          .read()
+          ?.batches.flatMap((batch) =>
+            batch.sessions.map((s) => JSON.stringify([s.projectSlug, s.sessionId])),
+          ) ?? [],
+      );
+      return deps
+        .getStore()
+        .contributions()
+        .filter((row) => !blocked.has(JSON.stringify([row.projectSlug, row.sessionId])));
+    },
+    prepareContributions: async () => {
+      await deps.ingestionReady;
+      const current = deps.getStore();
+      await current.ready;
+      const fresh = deps.createStore();
+      const batches: LocalAppend[] = [];
+      const detach = current.onLocalAppend((batch) => batches.push(batch));
+      try {
+        await scanGate.run(() => fresh.scan(deps.getRoots()));
+        for (const batch of batches)
+          fresh.append(batch.records, batch.projectSlug, batch.sessionId);
+        deps.seedLocalArchive?.(fresh);
+        if (current === deps.getStore()) {
+          current.replaceContributions(fresh.contributions());
+          current.appendFleet(
+            fresh
+              .contributions()
+              .map((row) => ({ ...storedEventToWire(row), machineId: row.machineId, seq: 0 })),
+          );
+        }
+      } finally {
+        detach();
+      }
+    },
+    applyFleetDeletes: async (rows, mayApply) => {
+      await deps.ingestionReady;
+      await deps.getStore().ready;
+      if (!mayApply()) return;
+      deps.getStore().removeFleetKeys(rows);
+      retainedReportStore?.removeFleetKeys(rows);
+    },
     toWire: storedEventToWire,
     applyFleetRows: async (rows, mayApply) => {
       // ADR-0098: seed after the walk — see loadReplicaAtBoot.
@@ -504,7 +546,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // same second-feeder step loadReplicaAtBoot does (symmetry). A no-op on the
       // common empty-file case, but if a stale non-empty replica survived a boot
       // that saw hubConfigured=false (crash-during-clear / manual settings edit),
-      // a same-epoch hub already at the replica's cursor serves a caught-up short
+      // a same-epoch Hub already at the replica's cursor serves a complete change
       // page that applies nothing — without this feed those on-disk rows would
       // never reach the engine (silent under-counting until restart).
       // ADR-0098: seed after the walk — see loadReplicaAtBoot.
@@ -517,7 +559,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       const detached = replica;
       replica = null;
       releaseReportStore();
-      await detached.unlink();
+      await detached.discard();
       seedPending = false;
       pendingSeed = null;
       await rebuildEngine();
@@ -575,13 +617,6 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // a request landing on an in-flight reconcile coalesces into that chain's
   // do/while rather than a new link — so the chain in hand covers our resync
   // either way.
-  async function awaitResync(): Promise<void> {
-    eventSync.suspend();
-    pendingResync = true;
-    scheduleReconcile();
-    await reconcileChain;
-  }
-
   async function requestRebuild(): Promise<void> {
     // A changed Home organization must never retain the preceding home's view.
     releaseReportStore();
@@ -594,33 +629,9 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // Local archive could not make the same deletion durable. Preserve that
   // ordering while returning the archive failure to the route instead of
   // falsely acknowledging success.
-  async function forgetLocalArchiveThenResync(
-    sessions: readonly ForgetSessionRef[],
-  ): Promise<string | null> {
-    let failure: string | null = null;
-    try {
-      await deps.forgetLocalArchive?.(sessions);
-    } catch (err) {
-      failure = `the local archive forget could not be made durable (${String(err)})`;
-    }
-    if (replica !== null) {
-      retainedReportStore ??= deps.getStore();
-      retainedReportStore.removeMachineSessions(deps.machineId, sessions);
-    }
-    await awaitResync();
-    return failure;
-  }
-
   // An in-flight GUARD, deliberately not the self-chaining queue `clean` uses:
-  // a queued second forget has nothing left to do, while running it anyway is
-  // expensive and wrong. `deps.storage()` is single-flight, so two concurrent
-  // requests classify against the SAME session list, and the hub's
-  // `rewrite({ newEpoch: true })` mints a fresh epoch unconditionally — so the
-  // duplicate matches zero rows and still costs the whole fleet a reseed. The
-  // single-renderer path is already covered by the confirm dialog (disabled
-  // while pending, no retry); this is defense-in-depth against a second renderer
-  // instance (a dev Vite beside the packaged app), a direct authenticated
-  // caller, or a future non-modal entry point.
+  // Concurrent actions cannot share a completion receipt. A pending durable
+  // action must settle before a different selection can be accepted.
   let forgetInflight: Promise<FleetForgetResult> | null = null;
 
   async function forget(
@@ -648,158 +659,165 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     target: string | undefined,
   ): Promise<FleetForgetResult> {
     await deps.ingestionReady;
-    if (sessions.length === 0) {
+    if (forgetIntent.error() !== null)
+      return {
+        ok: false,
+        reason: "failed",
+        detail: String(forgetIntent.error()),
+        landed: false,
+        retryable: false,
+      };
+    if (forgetIntent.read() === null && sessions.length === 0)
       return { ok: true, sessionsRequested: 0, sessionsMatched: 0, rowsRemoved: 0 };
-    }
+    const connection = conn;
+    const deletionConnection = connGen;
     if (
-      conn === null ||
-      (target === undefined && replica === null) ||
-      (target !== undefined && conn.url.replace(/\/+$/, "") !== target.replace(/\/+$/, ""))
-    ) {
+      connection === null ||
+      (target !== undefined && connection.url.replace(/\/+$/, "") !== target.replace(/\/+$/, ""))
+    )
       return {
         ok: false,
         reason: "unavailable",
-        detail:
-          conn === null
-            ? "not connected to a hub"
-            : target !== undefined
-              ? "not connected to the configured hub"
-              : "the fleet replica is not attached",
+        detail: "not connected to the configured hub",
         landed: false,
+        retryable: true,
       };
-    }
-
-    // BATCHED, not truncated. The hub caps a body at EVENT_FORGET_SESSIONS_MAX
-    // pairs and 400s anything larger with nothing rewritten, precisely so a
-    // caller's intent is never silently cut short (ADR-0063) — which means
-    // sending only the first N here would commit the exact sin that cap exists
-    // to prevent, and refusing outright would leave a machine that somehow
-    // crossed it permanently unable to clean. The identity push already batches
-    // for the same reason. Each batch is its own rewrite and its own epoch, and
-    // that is fine: a forget is idempotent by construction (the second batch
-    // names sessions the first did not), peers converge on the 5-min sweep
-    // exactly as they do after a purge, and ONE local resync at the end covers
-    // every epoch minted along the way. In practice this loops once — the
-    // measured orphan set is 147 pairs against a 5000 cap.
-    const myGen = connGen;
-    let sessionsMatched = 0;
-    let rowsRemoved = 0;
-    let landed = false;
-    // What the ARCHIVE has to drop (ADR-0069 §8) — the pairs whose batch the hub
-    // actually applied, which on a partial run is a prefix of `sessions` rather
-    // than the whole list. Accumulated at the 2xx, not at the receipt.
-    const landedSessions: ForgetSessionRef[] = [];
-    for (let i = 0; i < sessions.length; i += EVENT_FORGET_SESSIONS_MAX) {
-      // Re-read the connection per batch, the pushIdentity rule: a disconnect
-      // between requests must end the run rather than dial a superseded context.
-      const c = conn;
-      if (c === null || connGen !== myGen) {
-        // Archive first, then the resync — the ordering rule the success path
-        // below spells out (ADR-0069 §8) holds on every partial run too.
-        let archiveFailure: string | null = null;
-        if (landed) {
-          archiveFailure = await forgetLocalArchiveThenResync(landedSessions);
-        }
+    let intent = forgetIntent.read();
+    if (intent !== null && sessions.length > 0) {
+      const scope = (rows: readonly ForgetSessionRef[]) =>
+        JSON.stringify(rows.map((row) => JSON.stringify([row.projectSlug, row.sessionId])).sort());
+      if (scope(sessions) !== scope(intent.batches.flatMap((batch) => batch.sessions)))
         return {
           ok: false,
-          reason: archiveFailure === null ? "unavailable" : "failed",
-          detail:
-            archiveFailure === null
-              ? "the hub connection dropped mid-forget"
-              : `the hub connection dropped mid-forget; ${archiveFailure}`,
-          landed,
-          retryable: true,
+          reason: "busy",
+          detail: "a different deletion is awaiting completion",
+          landed: false,
         };
-      }
-      // Projected onto the declared pair, not passed through: the classifier's
-      // `UnbackedSession` also carries a `rows` count, and `forgetSessionRefSchema`
-      // is `.passthrough()` for forward compatibility rather than as an
-      // invitation to send fields the contract does not name.
-      const batch = sessions
-        .slice(i, i + EVENT_FORGET_SESSIONS_MAX)
-        .map(({ projectSlug, sessionId }) => ({ projectSlug, sessionId }));
-      // A FRESH deadline per request — one budget stretched across N would abort
-      // later batches for the sin of following earlier ones (pushIdentity's
-      // reasoning, and the deadline catches a black-holed hub per-request).
-      const deadline = requestDeadline();
-      let failure: string | null = null;
-      let retryable = true;
-      try {
-        const res = await fetchImpl(`${c.url}/api/events/forget`, {
-          method: "POST",
-          headers: { ...c.headers, "content-type": "application/json" },
-          body: JSON.stringify({ sessions: batch }),
-          signal: deadline.signal,
-        });
-        if (res.status === 404) {
-          // A hub that predates ADR-0063. Named rather than folded into the
-          // generic rejection: it is the one failure with an action attached,
-          // and it is permanent until the operator updates the hub.
-          retryable = false;
-          failure = "this hub is too old to forget rows — update the MaxPrice Hub app";
-        } else if (!res.ok) {
-          retryable = res.status >= 500 || res.status === 408 || res.status === 429;
-          failure = `the hub rejected the request (${res.status})`;
-        } else {
-          // Marked landed the MOMENT the 2xx is observed, before a single byte of
-          // the body is read. The rewrite has already HAPPENED by the time the hub
-          // writes a receipt, so everything from here on is a receipt-read failure,
-          // never a delete failure — including a body that makes `res.json()` throw
-          // (malformed JSON, a socket dying mid-read), which would otherwise land in
-          // the shared `catch` with the flag still false and skip the resync. The
-          // dangerous outcome is a client that keeps serving rows the archive no
-          // longer has.
-          landed = true;
-          // Same moment, same reason (ADR-0069 §8): this batch is gone from the
-          // archive of record, so the local archive owes the same rewrite even
-          // when the receipt read fails a line below.
-          landedSessions.push(...batch);
-          const parsed = hubEventsForgetResponseSchema.safeParse(await res.json());
-          if (!parsed.success) {
-            failure = "the hub's answer could not be read";
-          } else {
-            sessionsMatched += parsed.data.sessionsMatched;
-            rowsRemoved += parsed.data.removed;
+    }
+    if (intent !== null && intent.hub !== connection.url)
+      return {
+        ok: false,
+        reason: "failed",
+        detail: "a deletion is pending on another Hub",
+        landed: false,
+        retryable: false,
+      };
+    if (intent === null && sessions.length === 0)
+      return { ok: true, sessionsRequested: 0, sessionsMatched: 0, rowsRemoved: 0 };
+    let landed = intent?.batches.some((batch) => batch.receipt !== undefined) ?? false;
+    let retryable = true;
+    eventSync.suspend();
+    try {
+      if (intent === null) {
+        const deadline = requestDeadline();
+        const status = await (async () => {
+          try {
+            const response = await fetchImpl(`${connection.url}/api/status`, {
+              headers: connection.headers,
+              signal: deadline.signal,
+            });
+            if (!response.ok) throw new Error(`Cannot read Hub state (${response.status})`);
+            return hubStatusSchema.parse(await response.json());
+          } finally {
+            deadline.clear();
           }
-        }
-      } catch (err) {
-        failure = String(err);
-      } finally {
-        deadline.clear();
+        })();
+        if (status.events === undefined) throw new Error("Hub archive unavailable");
+        intent = {
+          hub: connection.url,
+          epoch: status.events.epoch,
+          batches: [],
+        } satisfies FleetForgetIntent;
+        for (let i = 0; i < sessions.length; i += EVENT_FORGET_SESSIONS_MAX)
+          intent.batches.push({
+            operationId: crypto.randomUUID(),
+            sessions: sessions
+              .slice(i, i + EVENT_FORGET_SESSIONS_MAX)
+              .map(({ projectSlug, sessionId }) => ({ projectSlug, sessionId })),
+          });
+        forgetIntent.write(intent);
       }
-      if (failure !== null) {
-        // Resync anyway when something landed: the hub has already minted a new
-        // epoch, so a client that skipped this would sit on a mismatched replica
-        // until its next pull noticed. Abandoning the remaining batches (rather
-        // than retrying) is event-sync's posture throughout — and the user can
-        // simply press the button again, which re-classifies from scratch.
-        let archiveFailure: string | null = null;
-        if (landed) {
-          archiveFailure = await forgetLocalArchiveThenResync(landedSessions);
+      for (const batch of intent.batches) {
+        if (batch.receipt !== undefined) continue;
+        if (connGen !== deletionConnection || conn !== connection)
+          throw new Error("Connection changed; the pending deletion will resume on reconnect");
+        const deadline = requestDeadline();
+        try {
+          const response = await fetchImpl(`${connection.url}/api/events/forget`, {
+            method: "POST",
+            headers: { ...connection.headers, "content-type": "application/json" },
+            signal: deadline.signal,
+            body: JSON.stringify({
+              epoch: intent.epoch,
+              operationId: batch.operationId,
+              sessions: batch.sessions,
+            }),
+          });
+          if (!response.ok) {
+            retryable =
+              response.status === 408 || response.status === 429 || response.status >= 500;
+            throw new Error(`Hub deletion rejected (${response.status})`);
+          }
+          landed = true;
+          batch.receipt = hubEventsForgetResponseSchema.parse(await response.json());
+          forgetIntent.write(intent);
+        } finally {
+          deadline.clear();
         }
-        return {
-          ok: false,
-          reason: "failed",
-          detail: archiveFailure === null ? failure : `${failure}; ${archiveFailure}`,
-          landed,
-          retryable,
-        };
       }
+      const forgotten = intent.batches.flatMap((batch) => batch.sessions);
+      if (!intent.localComplete) {
+        await deps.forgetLocalArchive?.(forgotten);
+        intent.localComplete = true;
+        forgetIntent.write(intent);
+      }
+      deps.getStore().removeMachineSessions(deps.machineId, forgotten);
+      retainedReportStore?.removeMachineSessions(deps.machineId, forgotten);
+      const result: FleetForgetResult = {
+        ok: true,
+        sessionsRequested: forgotten.length,
+        sessionsMatched: intent.batches.reduce(
+          (sum, batch) => sum + batch.receipt!.sessionsMatched,
+          0,
+        ),
+        rowsRemoved: intent.batches.reduce((sum, batch) => sum + batch.receipt!.removed, 0),
+      };
+      // Keep the durable contribution/archive barrier until the disposable
+      // replica has learned this action. A restart before this point resumes it.
+      eventSync.resync();
+      await eventSync.idle();
+      const requiredGeneration = Math.max(
+        ...intent.batches.map((batch) => batch.receipt!.deletionGeneration),
+      );
+      if (
+        replica !== null &&
+        (replica.epoch() !== intent.epoch || replica.deletionGeneration() < requiredGeneration)
+      ) {
+        throw new Error("Deletion committed; waiting for replica reconciliation");
+      }
+      if (replica !== null) {
+        const pairs = new Set(
+          forgotten.map((row) => JSON.stringify([row.projectSlug, row.sessionId])),
+        );
+        const restored = replica
+          .all()
+          .filter(
+            (row) =>
+              row.machineId === deps.machineId &&
+              pairs.has(JSON.stringify([row.projectSlug, row.sessionId])),
+          );
+        deps.getStore().appendFleet(restored);
+        retainedReportStore?.appendFleet(restored);
+      }
+      forgetIntent.write(null);
+      pokeNow();
+      return result;
+    } catch (error) {
+      patchEventsDegraded(true);
+      return { ok: false, reason: "failed", detail: String(error), landed, retryable };
+    } finally {
+      eventSync.resync();
     }
-
-    // THE RESEED IS THE LOCAL DELETE (map #124). No tombstone file and no
-    // separate local-durability problem: unlink drops the replica, the rebuild
-    // re-reads local disk, and the re-pull refills from the pruned archive.
-    //
-    // And the Local archive must be pruned FIRST (ADR-0069 §8): awaitResync's
-    // rebuildEngine re-seeds the engine from the archive, so a rewrite after it
-    // would resurrect the rows the hub just dropped.
-    //
-    const archiveFailure = await forgetLocalArchiveThenResync(landedSessions);
-    if (archiveFailure !== null) {
-      return { ok: false, reason: "failed", detail: archiveFailure, landed: true, retryable: true };
-    }
-    return { ok: true, sessionsRequested: sessions.length, sessionsMatched, rowsRemoved };
   }
 
   // ── Serialized directory refresh ──
@@ -952,6 +970,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       refreshDirectory();
       refreshIdentity();
       void pushIdentity();
+      if (forgetIntent.read() !== null) void forget([]);
     }, directorySweepMs);
   }
 
@@ -1194,6 +1213,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     onConnected: (ctx) => {
       connGen += 1;
       conn = { url: ctx.url, headers: ctx.headers };
+
       resetRefreshSerializers();
       refreshDirectory();
       armDirectorySweep();
@@ -1208,6 +1228,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // synchronous connect verdict AND any later 404 latch (M7) both land on
       // the loopback status without waiting for a reconnect cycle.
       eventSync.connect({ url: ctx.url, headers: ctx.headers, events: ctx.events });
+      if (forgetIntent.read() !== null) void forget([], ctx.url);
     },
     onDisconnected: () => {
       // Idempotent: the hub-client may fire a leading onDisconnected on configure
@@ -1316,6 +1337,23 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     repairOrganizations: (sessions, target) => forget(sessions, target),
     rebuildEngine: requestRebuild,
     getReplica: () => replica,
+    mayArchiveFleet: (row) => {
+      if (
+        forgetIntent.error() !== null ||
+        forgetIntent.pending() ||
+        conn === null ||
+        replica === null ||
+        !replica.seeded()
+      )
+        return false;
+      if (!eventSync.isCaughtUp()) return false;
+      const held = replica.get(row.messageId, row.requestId);
+      return (
+        held !== undefined &&
+        held.machineId === row.machineId &&
+        fleetTokenTotal(held) === fleetTokenTotal(row)
+      );
+    },
     stop: async () => {
       releaseReportStore();
       clearPokeTimer();

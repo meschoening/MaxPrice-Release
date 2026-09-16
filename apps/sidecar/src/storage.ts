@@ -1,7 +1,7 @@
 import { readdir, stat } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
 import type { StorageCleanResponse, StorageReport, StorageSegment } from "@maxprice/shared";
-import type { FleetEventStore } from "@maxprice/usage-core";
+import type { FleetEventStore, LocalEventArchiveStore } from "@maxprice/usage-core";
 import {
   backedSessionsFromPaths,
   classifyUnbacked,
@@ -41,7 +41,7 @@ import {
 // attribution below is by basename, so a drift between the two would silently
 // move a 40 MB file into `other`.
 export const STORAGE_FILE = {
-  fleetReplica: "fleet-events.jsonl",
+  fleetReplica: "fleet-events.sqlite",
   localArchive: "local-archive.jsonl",
   scanCache: "scan-cache.json",
   usageHistory: "usage-history.jsonl",
@@ -277,7 +277,7 @@ export type StorageReporterDeps = {
   // The Local archive (ADR-0069), or null while degraded / not yet loaded.
   // Clean compacts it exactly as it compacts the replica; the preview folds its
   // superseded lines into the same "duplicated rows" numbers.
-  getLocalArchive: () => FleetEventStore | null;
+  getLocalArchive: () => LocalEventArchiveStore | null;
   selfMachineId: string;
   // The engine store's `ready`, as a synchronous boolean — guard 1's first
   // half. Read off the live status snapshot, which is the app's own answer to
@@ -393,10 +393,10 @@ export async function cleanStorage(deps: StorageReporterDeps): Promise<StorageCl
   const replica = deps.getReplica();
   let duplicateRows = 0;
   let duplicateBytes = 0;
+  let databaseBytes = 0;
   if (replica !== null) {
-    const { droppedLines, freedBytes } = await replica.compact();
-    duplicateRows = droppedLines;
-    duplicateBytes = freedBytes;
+    const { freedBytes } = await replica.compact();
+    databaseBytes = freedBytes;
   }
 
   // The Local archive half (ADR-0069 §9): an epoch-preserving rewrite with no
@@ -412,10 +412,11 @@ export async function cleanStorage(deps: StorageReporterDeps): Promise<StorageCl
   }
 
   return {
-    bytes: scanCacheBytes + duplicateBytes,
+    bytes: scanCacheBytes + duplicateBytes + databaseBytes,
     scanCacheBytes,
     duplicateRows,
     duplicateBytes,
+    databaseBytes,
   };
 }
 
@@ -462,9 +463,9 @@ export async function buildStorageSnapshot(deps: StorageReporterDeps): Promise<S
   // Local archive's numbers FOLD into the replica's (ADR-0069 §9) rather than
   // earning wire fields: it is the same kind of waste with the same remedy, and
   // the renderer's one "and N duplicated rows" clause covers both.
-  const duplicateRows = (replica?.garbageLines() ?? 0) + (localArchive?.garbageLines() ?? 0);
-  const duplicateBytes =
-    (replica?.reclaimableBytes() ?? 0) + (localArchive?.reclaimableBytes() ?? 0);
+  const duplicateRows = localArchive?.garbageLines() ?? 0;
+  const databaseBytes = replica?.reclaimableBytes() ?? 0;
+  const duplicateBytes = localArchive?.reclaimableBytes() ?? 0;
 
   // The archive's left edge (issue #139) — the "Storing history back to <date>" line.
   //
@@ -518,10 +519,11 @@ export async function buildStorageSnapshot(deps: StorageReporterDeps): Promise<S
       },
       localArchiveEarliestAt,
       clean: {
-        bytes: scanCacheBytes + duplicateBytes,
+        bytes: scanCacheBytes + duplicateBytes + databaseBytes,
         scanCacheBytes,
         duplicateRows,
         duplicateBytes,
+        databaseBytes,
       },
       forget: classification.forget,
     },
@@ -603,9 +605,20 @@ async function walkAppData(
       // and it is one file: skip it rather than failing the whole bar.
       continue;
     }
-    const slot = named.get(dirent.name);
+    const slot =
+      named.get(dirent.name) ??
+      (dirent.name === STORAGE_FILE.fleetReplica + "-wal" ||
+      dirent.name === STORAGE_FILE.fleetReplica + "-shm"
+        ? "fleetReplica"
+        : undefined);
     if (slot !== undefined) {
-      out[slot] = { state: "measured", id: slot, bytes: size, files: 1 };
+      const prior = out[slot];
+      out[slot] = {
+        state: "measured",
+        id: slot,
+        bytes: size + (prior?.state === "measured" ? prior.bytes : 0),
+        files: 1 + (prior?.state === "measured" ? prior.files : 0),
+      };
       continue;
     }
     otherBytes += size;

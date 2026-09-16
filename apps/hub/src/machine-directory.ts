@@ -1,5 +1,5 @@
 // Exported via a package.json subpath solely for the sidecar fleet test rig (apps/sidecar/src/test-hub.ts) — keep signatures stable, a cross-app test contract.
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { z } from "zod";
 import { hubMachineSchema, type HubMachine } from "@maxprice/shared";
 
@@ -44,6 +44,7 @@ export type MachineDirectory = {
 export function createMachineDirectory(opts: {
   path: string;
   nowImpl?: () => string;
+  writeFileImpl?: typeof writeFileSync;
 }): MachineDirectory {
   const path = opts.path;
   const now = opts.nowImpl ?? (() => new Date().toISOString());
@@ -85,10 +86,16 @@ export function createMachineDirectory(opts: {
 
   // Atomic whole-file rewrite (the config.ts writeConfig pattern): tmp +
   // rename so a crash mid-write never truncates the directory.
-  function persist(): void {
-    const serialized = `${JSON.stringify({ machines: [...machines.values()] }, null, 2)}\n`;
+  function persist(next = machines): void {
+    const serialized = `${JSON.stringify({ machines: [...next.values()] }, null, 2)}\n`;
     const tmp = `${path}.tmp`;
-    writeFileSync(tmp, serialized);
+    (opts.writeFileImpl ?? writeFileSync)(tmp, serialized);
+    const fd = openSync(tmp, "r+");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, path);
   }
 
@@ -142,14 +149,17 @@ export function createMachineDirectory(opts: {
     },
     remove: (machineId) => {
       if (!machines.has(machineId)) return false;
-      machines.delete(machineId);
+      const next = new Map(machines);
+      next.delete(machineId);
       // Null dangling aliases: an entry merged into the purged id becomes
       // standalone again — its rows survive (purge is never name-transitive)
       // and must not fold into a name that no longer exists.
-      for (const [id, m] of machines) {
-        if (m.mergedInto === machineId) machines.set(id, { ...m, mergedInto: null });
+      for (const [id, m] of next) {
+        if (m.mergedInto === machineId) next.set(id, { ...m, mergedInto: null });
       }
-      persist();
+      persist(next);
+      machines.clear();
+      for (const [id, m] of next) machines.set(id, m);
       return true;
     },
     has: (machineId) => machines.has(machineId),

@@ -1,9 +1,9 @@
 import { EVENT_PUSH_BATCH_MAX, sessionPairKey } from "@maxprice/shared";
 import {
-  createFleetEventStore,
+  createLocalEventArchiveStore as createFleetEventStore,
   fleetEventKey,
   fleetTokenTotal,
-  type FleetEventStore,
+  type LocalEventArchiveStore as FleetEventStore,
 } from "@maxprice/usage-core";
 import type { EventStore, StoreChange, StoredEvent } from "./engine/store";
 import { storedEventToWire } from "./stored-event-wire";
@@ -14,7 +14,7 @@ import { storedEventToWire } from "./stored-event-wire";
 // Claude Code prunes its session JSONL on a rolling window; once a transcript
 // is swept, this file is the only copy of that history on a hub-less install.
 //
-// The store is createFleetEventStore in HUB mode, unmodified (ADR-0069 §2):
+// The store remains the JSONL Local archive implementation (ADR-0069 §2):
 // fsync'd appends, torn-tail tolerance, bad-header REPAIR, rewrite compaction.
 // The locally-minted seqs and the epoch header are inert freight. ONE inversion
 // happens here at the call site, not in the store: hub-mode load() THROWS on an
@@ -33,43 +33,13 @@ import { storedEventToWire } from "./stored-event-wire";
 // Replica-fed self rows riding back from a hub qualify too — past local
 // retention they legitimately DEEPEN the archive.
 //
-// FORGET DURING A DEGRADE (ADR-0069 §8, "non-negotiable"). A forget that lands
-// while the archive is unopenable cannot rewrite anything, and the next
-// successful load would re-seed the engine with exactly the rows the user
-// deleted — the archive resurrecting deliberately-forgotten data is the
-// privacy regression the ADR forbids. So a forget that cannot be applied is
-// REMEMBERED in `pendingForgets` and replayed by the next successful open,
-// BEFORE that open seeds the engine. A rewrite failure on an already-open store
-// is replayed by the next sweep. Both failures REJECT the forget call after
-// queuing the retry: fleet.ts still performs the mandatory resync, but the HTTP
-// request cannot acknowledge durability that the archive did not achieve. The
-// pending set remains process-lifetime RAM; reporting the failure is what keeps
-// a restart before the retry from becoming a falsely successful privacy action.
-//
-// FORGET LEAVES A PERMANENT INGESTION BAR (`forgottenPairs`, also ADR-0069 §8).
-// The rewrite prunes the FILE; it cannot prune the live engine, and the client
-// forget only removes those rows from RAM later — fleet.ts rewrites the archive,
-// then unlinks the replica, rescans, and swaps the store (a forgotten session is
-// storage-unbacked, so nothing short of that resync drops it). In the window
-// between those two the engine still holds the forgotten rows, and every
-// ingestion route here is key-blind: the sweep's filter is "self and unstamped",
-// and after the rewrite those rows are precisely unstamped. A tick landing in
-// that window re-appends them — and the damage does not stop at the file, since
-// the next boot's seed puts them back in the engine unstamped against the
-// replica, where the ordinary push loop sends them BACK to the hub. A silent,
-// permanent, fleet-propagating undo of a privacy action. (The same bar also
-// covers the narrower replica-off-during-rewrite rebuild, which would otherwise
-// self-heal only until the next sweep converted it into the same resurrection.)
-// So every pair passed to `forgetSessions` — on every path, including the
-// degraded one — is remembered here and barred from the change feed, the sweep,
-// and `seedInto` alike.
-//
-// NEVER CLEARED, deliberately: a forgotten session can produce no new legitimate
-// events, because its transcript is gone — that is what made it forgettable in
-// the first place. So a process-lifetime bar costs nothing real and needs no
-// invalidation rule. This is RAM only, matching `pendingForgets`' posture and
-// its documented residual above: a forget followed by a process restart relies
-// on the rewrite having landed, which on the ordinary path it has.
+// A failed Local archive rewrite stays queued in RAM. Fleet forgetting also
+// retains a durable intent across restart and bars contribution/promotion until
+// local pruning and replica reconciliation complete (ADR-0100).
+// forgottenPairs prevents queued engine rows from undoing a local rewrite in
+// this process. The durable intent covers restart before action completion.
+// Eligible own replica rows can deepen this archive only after a complete
+// authoritative drain, rechecked when each queued append actually executes.
 
 const DEFAULT_SWEEP_MS = 300_000;
 
@@ -77,6 +47,7 @@ export type LocalArchiveDeps = {
   path: string; // <app-data>/local-archive.jsonl
   machineId: string; // this machine's own id — the ONLY machineId archived
   getStore: () => EventStore; // live engine accessor (the fleet rebuild swaps stores)
+  mayArchiveFleet?: (row: StoredEvent) => boolean;
   onDegraded: (degraded: boolean) => void; // edge-triggered; wire to patchStatus
   sweepMs?: number; // default DEFAULT_SWEEP_MS
   createStoreImpl?: (path: string) => FleetEventStore; // test seam
@@ -155,6 +126,14 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
   // archive holds its key at ≥ its token fullness. fleetTokenTotal is
   // structural over the four token counts, which StoredEvent and FleetEvent
   // both carry.
+  function eligible(row: StoredEvent): boolean {
+    const local = deps.getStore().localContribution(row.messageId, row.requestId);
+    return (
+      (local !== undefined && fleetTokenTotal(local) >= fleetTokenTotal(row)) ||
+      (deps.mayArchiveFleet?.(row) ?? false)
+    );
+  }
+
   function stamped(row: StoredEvent): boolean {
     const held = archive?.get(row.messageId, row.requestId);
     return held !== undefined && fleetTokenTotal(held) >= fleetTokenTotal(row);
@@ -197,7 +176,9 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
       for (let i = 0; i < rows.length; i += EVENT_PUSH_BATCH_MAX) {
         // Re-check the stamp inside the chain: an earlier link may have
         // archived the same key at equal fullness (scan/watcher overlap).
-        const batch = rows.slice(i, i + EVENT_PUSH_BATCH_MAX).filter((r) => !stamped(r));
+        const batch = rows
+          .slice(i, i + EVENT_PUSH_BATCH_MAX)
+          .filter((r) => !forgotten(r) && eligible(r) && !stamped(r));
         if (batch.length === 0) continue;
         try {
           await a.push(batch.map(storedEventToWire), deps.machineId);
@@ -218,7 +199,11 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
       .map((c) => c.event)
       .filter(
         (e): e is StoredEvent =>
-          e !== null && e.machineId === deps.machineId && !forgotten(e) && !stamped(e),
+          e !== null &&
+          e.machineId === deps.machineId &&
+          !forgotten(e) &&
+          eligible(e) &&
+          !stamped(e),
       );
     enqueueAppend(own);
   }
@@ -250,7 +235,7 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     archive = store;
     // ADR-0098: seed after the engine's walk — see fleet.ts loadReplicaAtBoot.
     await deps.getStore().ready;
-    deps.getStore().appendFleet([...store.all()]);
+    deps.getStore().appendFleet([...store.all()], "archive");
   }
 
   async function applyPendingForgets(store: FleetEventStore): Promise<void> {
@@ -285,7 +270,10 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
 
   function seedInto(store: EventStore): number {
     if (archive === null) return 0;
-    return store.appendFleet([...archive.all()].filter((r) => !forgotten(r)));
+    return store.appendFleet(
+      [...archive.all()].filter((r) => !forgotten(r)),
+      "archive",
+    );
   }
 
   async function sweep(): Promise<void> {
@@ -325,7 +313,11 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
       .query()
       .filter(
         (e): e is StoredEvent =>
-          e !== null && e.machineId === deps.machineId && !forgotten(e) && !stamped(e),
+          e !== null &&
+          e.machineId === deps.machineId &&
+          !forgotten(e) &&
+          eligible(e) &&
+          !stamped(e),
       );
     enqueueAppend(own);
     await chain;
@@ -345,7 +337,7 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     const keys = new Set(sessions.map((s) => sessionPairKey(s.projectSlug, s.sessionId)));
     // Bar these pairs from every ingestion route FIRST, before any await: the
     // rewrite below prunes the file, but the live engine keeps serving the rows
-    // until the caller's resync swaps the store, and a sweep or change-feed tick
+    // until the caller removes the exact report rows, and a sweep or change-feed tick
     // landing in that window would put them straight back (and, next boot, back
     // on the hub). Unconditional and ahead of the degrade branch so the queued
     // path is covered too. Never cleared — see the header.

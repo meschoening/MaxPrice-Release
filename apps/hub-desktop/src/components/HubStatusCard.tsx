@@ -9,7 +9,6 @@ import { formatRelativeTime } from "@maxprice/shared";
 import { formatUptime } from "@/lib/relative-time";
 import { dotVariant } from "@/lib/dot-variant";
 import { showToast } from "@/lib/toast";
-import { cn } from "@/lib/utils";
 import {
   autostartRow,
   eventsDown,
@@ -19,7 +18,6 @@ import {
   hubDaemonDot,
   hubDaemonLabel,
   hubDaemonState,
-  hygieneState,
   isDeliberateLoopback,
   showFirewallWarning,
 } from "@/lib/presentation";
@@ -127,39 +125,27 @@ export function HubStatusCard(): React.ReactElement {
           </p>
         </div>
       ) : null}
-      {status?.events !== undefined && hygieneState(status.events) !== "clean" ? (
-        <div
-          className={cn("inset centered", hygieneState(status.events) === "unreadable" && "warn")}
-          role="note"
-        >
-          {(status.events.unreadableLines ?? 0) > 0 ? (
-            <p className="lead">
-              {formatCount(status.events.unreadableLines ?? 0)} unreadable line(s) in the archive —
-              those events were acked and are lost.
-            </p>
-          ) : null}
-          {(status.events.garbageLines ?? 0) > 0 ? (
-            <p>
-              {formatCount(status.events.garbageLines ?? 0)} stale line(s) from replaced events
-              {status.events.reclaimableBytes !== undefined
-                ? ` · ${formatBytes(status.events.reclaimableBytes)}`
-                : "."}
-            </p>
-          ) : null}
-          {(status.events.garbageLines ?? 0) > 0 ? (
-            <div className="btns">
-              <button
-                type="button"
-                className="chip"
-                disabled={compact.isPending}
-                onClick={() =>
-                  compact.mutate(undefined, { onSuccess: () => showToast("Archive compacted") })
-                }
-              >
-                {compact.isPending ? "Compacting…" : "Compact now"}
-              </button>
-            </div>
-          ) : null}
+      {status?.events !== undefined ? (
+        <div className="inset centered" role="note">
+          <p>{formatBytes(status.events.changeBytes ?? 0)} retained synchronization history</p>
+          <p>
+            About {formatBytes(status.events.reclaimableBytes ?? 0)} unused database space.
+            Compaction preserves usage and synchronization history.
+          </p>
+          <div className="btns">
+            <button
+              type="button"
+              className="chip"
+              disabled={compact.isPending}
+              onClick={() =>
+                compact.mutate(undefined, {
+                  onSuccess: (result) => showToast(`Reclaimed ${formatBytes(result.freedBytes)}`),
+                })
+              }
+            >
+              {compact.isPending ? "Compacting…" : "Compact now"}
+            </button>
+          </div>
           {compact.isError ? <p className="err">{compact.error.message}</p> : null}
         </div>
       ) : null}

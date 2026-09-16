@@ -1,4 +1,6 @@
 import {
+  HUB_PROTOCOL_VERSION,
+  hubCompactResponseSchema,
   hubClientsResponseSchema,
   hubMachinesResponseSchema,
   hubStatusSchema,
@@ -20,6 +22,7 @@ export async function hubFetch(path: string, init?: RequestInit): Promise<Respon
   const url = path.startsWith("http") ? path : `${base.replace(/\/$/, "")}${path}`;
   const headers = new Headers(init?.headers);
   headers.set("Authorization", `Bearer ${token}`);
+  headers.set("x-maxprice-protocol", String(HUB_PROTOCOL_VERSION));
   return fetch(url, { ...init, headers });
 }
 
@@ -90,9 +93,18 @@ export function renameMachine(machineId: string, name: string): Promise<void> {
 export function mergeMachine(machineId: string, into: string): Promise<void> {
   return mutate(`/api/machines/${encodeURIComponent(machineId)}/merge`, jsonPost({ into }));
 }
-export function purgeMachine(machineId: string): Promise<void> {
-  return mutate(`/api/machines/${encodeURIComponent(machineId)}`, { method: "DELETE" });
+export async function purgeMachine(machineId: string): Promise<void> {
+  const key = `maxprice-purge:${machineId}`;
+  const operationId = localStorage.getItem(key) ?? crypto.randomUUID();
+  localStorage.setItem(key, operationId);
+  await mutate(`/api/machines/${encodeURIComponent(machineId)}`, {
+    ...jsonPost({ operationId }),
+    method: "DELETE",
+  });
+  localStorage.removeItem(key);
 }
-export function compactStore(): Promise<void> {
-  return mutate("/api/store/compact", { method: "POST" });
+export async function compactStore(): Promise<{ freedBytes: number }> {
+  const response = await hubFetch("/api/store/compact", { method: "POST" });
+  if (!response.ok) throw new Error(`Compaction failed (${response.status})`);
+  return hubCompactResponseSchema.parse(await response.json());
 }

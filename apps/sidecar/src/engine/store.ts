@@ -314,7 +314,11 @@ export type EventStore = {
   // wire rows onto `StoredEvent` and upserts each through the SAME merge rule
   // the local path uses. Returns how many rows changed RAM (new + replaced),
   // the caller's poke-worthiness signal.
-  appendFleet: (rows: FleetEvent[]) => number;
+  appendFleet: (rows: FleetEvent[], source?: "archive") => number;
+  contributions: () => StoredEvent[];
+  localContribution: (messageId: string, requestId?: string) => StoredEvent | undefined;
+  replaceContributions: (rows: StoredEvent[]) => void;
+  removeFleetKeys: (rows: readonly { messageId: string; requestId?: string }[]) => void;
   // Query the store. Returns matching events in ascending timestamp order. The
   // returned array is READ-ONLY — callers MUST NOT mutate it: the unfiltered
   // path (since/until unset, no project/session/model filter) returns the
@@ -403,6 +407,7 @@ export function createEventStore(opts: {
   // keyed upsert — a duplicate key is resolved by `upsert`'s
   // largest-token-total rule, never blindly re-added.
   const events = new Map<string, StoredEvent>();
+  const contributions = new Map<string, StoredEvent>();
 
   // Distinct raw model strings seen by `upsert` — see `EventStore.models`.
   const modelsSeen = new Set<string>();
@@ -512,8 +517,16 @@ export function createEventStore(opts: {
   // byte-identical content-block lines) keep first-seen, and a streamed
   // message's final row replaces the `output_tokens: 1` partial regardless of
   // which the scan reads first.
-  function upsert(input: StoredEventInput, changes: StoreChange[]): boolean {
+  function upsert(input: StoredEventInput, changes: StoreChange[], local = false): boolean {
     const key = dedupKey(input.messageId, input.requestId);
+    let derived: StoredEvent | undefined;
+    if (local) {
+      const held = contributions.get(key);
+      if (held === undefined || tokenTotal(input) > tokenTotal(held)) {
+        derived = withEventMs(input);
+        contributions.set(key, derived);
+      }
+    }
     const existing = events.get(key);
     if (existing !== undefined && tokenTotal(existing) >= tokenTotal(input)) return false;
     // Derive `ms` HERE and nowhere else (ADR-0089) — this is the single funnel
@@ -522,7 +535,7 @@ export function createEventStore(opts: {
     // a re-scan or a scan/watcher overlap re-presents rows that are already
     // stored, and parsing a timestamp only to discard the row is the exact
     // waste this change exists to remove.
-    const event: StoredEvent = withEventMs(input);
+    const event: StoredEvent = derived ?? withEventMs(input);
     events.set(key, event);
     modelsSeen.add(event.model);
     // A new or replacing event invalidates the memoized sorted snapshot.
@@ -575,6 +588,7 @@ export function createEventStore(opts: {
         const excludedKey = dedupKey(record.messageId, record.requestId);
         if (!foreignKeys.has(excludedKey)) newForeignEvidence = true;
         foreignKeys.add(excludedKey);
+        contributions.delete(excludedKey);
         const incumbent = events.get(excludedKey);
         if (incumbent !== undefined) {
           events.delete(excludedKey);
@@ -588,6 +602,7 @@ export function createEventStore(opts: {
         upsert(
           { ...record, organizationUuid, projectSlug, sessionId, machineId: selfMachineId },
           changes,
+          true,
         )
       ) {
         changed += 1;
@@ -629,7 +644,7 @@ export function createEventStore(opts: {
   // upsert through the one merge rule. Returns how many rows changed RAM
   // (new + replaced), the caller's poke-worthiness signal. ONE change-feed emit
   // per call — i.e. per applied replica page.
-  function appendFleet(rows: FleetEvent[]): number {
+  function appendFleet(rows: FleetEvent[], source?: "archive"): number {
     const changes: StoreChange[] = [];
     let changed = 0;
     for (const row of rows) {
@@ -653,7 +668,7 @@ export function createEventStore(opts: {
         sessionId: row.sessionId,
         machineId: row.machineId,
       };
-      if (upsert(stored, changes)) changed += 1;
+      if (upsert(stored, changes, source === "archive")) changed += 1;
     }
     emitChanges(changes);
     return changed;
@@ -851,6 +866,7 @@ export function createEventStore(opts: {
         )
           continue;
         events.delete(key);
+        contributions.delete(key);
         changes.push({ event: null, replaced: event });
       }
       if (changes.length === 0) return;
@@ -860,6 +876,39 @@ export function createEventStore(opts: {
       emitChanges(changes);
     },
     appendFleet,
+    localContribution: (messageId, requestId) => contributions.get(dedupKey(messageId, requestId)),
+    contributions: () =>
+      [...contributions.values()].sort((a, b) =>
+        a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
+      ),
+    replaceContributions: (rows) => {
+      contributions.clear();
+      for (const row of rows)
+        if (!foreignKeys.has(dedupKey(row.messageId, row.requestId)))
+          contributions.set(dedupKey(row.messageId, row.requestId), row);
+    },
+    removeFleetKeys: (rows) => {
+      const changes: StoreChange[] = [];
+      for (const row of rows) {
+        const key = dedupKey(row.messageId, row.requestId);
+        const previous = events.get(key);
+        if (previous !== undefined) {
+          events.delete(key);
+          changes.push({ event: null, replaced: previous });
+        }
+        const local = contributions.get(key);
+        if (local !== undefined) {
+          events.set(key, local);
+          changes.push({ event: local, replaced: null });
+        }
+      }
+      if (changes.length > 0) {
+        sorted = null;
+        modelsSeen.clear();
+        for (const row of events.values()) modelsSeen.add(row.model);
+        emitChanges(changes);
+      }
+    },
     query,
     onChanged: (listener) => {
       changeListeners.add(listener);

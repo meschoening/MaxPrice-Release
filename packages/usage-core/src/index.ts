@@ -6,7 +6,14 @@
 export * from "./usage-client";
 export * from "./poller";
 export * from "./sample-store";
-export * from "./fleet-event-store";
+export {
+  createFleetEventStore as createLocalEventArchiveStore,
+  fleetEventKey,
+  fleetTokenTotal,
+  fleetRowBytes,
+  type FleetEventStore as LocalEventArchiveStore,
+} from "./fleet-event-store";
+export * from "./fleet-sync-store";
 export * from "./identity-directory";
 export * from "./event-sync";
 export * from "./hub-client";

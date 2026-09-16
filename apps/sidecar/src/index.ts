@@ -1934,6 +1934,7 @@ async function main(): Promise<void> {
   // always on. Constructed before the fleet so rebuildEngine can seed from it.
   const localArchive = createLocalArchive({
     path: join(appDataDir, STORAGE_FILE.localArchive),
+    mayArchiveFleet: (row) => fleet.mayArchiveFleet(row),
     machineId,
     getStore: getEngineStore,
     onDegraded: (d) => {

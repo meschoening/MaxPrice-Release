@@ -1,5 +1,3 @@
-import type { HubEventsPullResponse } from "@maxprice/shared";
-
 const MIN_GZIP_BYTES = 1024;
 
 // An explicit gzip preference overrides wildcard acceptance, including q=0.
@@ -21,10 +19,7 @@ function acceptsGzip(header: string | undefined): boolean {
 // A page is capped at 5,000 rows. Bun's native level-1 gzip keeps compression
 // bounded to one page; node:zlib's async wrapper was much slower in the Windows
 // compiled-build benchmark. Snapshot and compress the same envelope atomically.
-export function eventDownloadResponse(
-  page: HubEventsPullResponse,
-  acceptEncoding: string | undefined,
-): Response {
+export function eventDownloadResponse(page: unknown, acceptEncoding: string | undefined): Response {
   const json = JSON.stringify(page);
   const headers = new Headers({ "content-type": "application/json", vary: "Accept-Encoding" });
   if (Buffer.byteLength(json) < MIN_GZIP_BYTES || !acceptsGzip(acceptEncoding)) {

@@ -100,6 +100,7 @@ export const storageReportSchema = z.object({
     scanCacheBytes: z.number().int().nonnegative(),
     duplicateRows: z.number().int().nonnegative(),
     duplicateBytes: z.number().int().nonnegative(),
+    databaseBytes: z.number().int().nonnegative(),
   }),
 
   // null ⇒ no hub configured, or the fleet replica is off ⇒ the action is
@@ -170,6 +171,7 @@ export const storageCleanResponseSchema = z.object({
   scanCacheBytes: z.number().int().nonnegative(),
   duplicateRows: z.number().int().nonnegative(),
   duplicateBytes: z.number().int().nonnegative(),
+  databaseBytes: z.number().int().nonnegative(),
 });
 export type StorageCleanResponse = z.infer<typeof storageCleanResponseSchema>;
 

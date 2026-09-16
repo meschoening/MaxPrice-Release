@@ -349,14 +349,15 @@ export function createIdentityDirectory(opts: {
       return rowResult.changed || assertionResult.changed;
     },
     removeMachine: (machineId) => {
-      let changed = false;
-      for (const [k, r] of rows)
-        if (r.machineId === machineId) {
-          rows.delete(k);
-          changed = true;
-        }
-      if (changed) persist();
-      return changed;
+      if (loadFailed || contentLost) throw new Error("Identity directory unavailable for deletion");
+      const next = new Map([...rows].filter(([, row]) => row.machineId !== machineId));
+      if (next.size === rows.size) return false;
+      // Purge completion is a durability promise, unlike a best-effort probe.
+      // A failed write leaves RAM intact so retry still has the work to do.
+      writeSnapshot(next);
+      rows.clear();
+      for (const [key, row] of next) rows.set(key, row);
+      return true;
     },
   };
 }

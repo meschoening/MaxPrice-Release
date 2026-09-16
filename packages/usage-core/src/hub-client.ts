@@ -43,14 +43,16 @@ export type HubFleetHooks = {
   onConnected: (ctx: {
     url: string;
     headers: Record<string, string>;
-    events: { epoch: string; seq: number } | null;
+    events: { epoch: string; seq: number; deletionGeneration: number } | null;
   }) => void;
   // Any transition off "connected": fail() of every kind, configure(), stop().
   // Idempotent on the receiving side.
   onDisconnected: () => void;
   onEventsPoke: (seq: number) => void; // hub:events SSE frame
   onMachinesPoke: () => void; // hub:machines SSE frame
-  onStatusEvents: (events: { epoch: string; seq: number } | null) => void; // hub:status frames
+  onStatusEvents: (
+    events: { epoch: string; seq: number; deletionGeneration: number } | null,
+  ) => void; // hub:status frames
 };
 
 // Cap on the SSE frame buffer (f7). A UsageSample/HubStatus JSON frame is
@@ -170,7 +172,10 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
   let stateBeforeConnecting: HubConnection = "off";
 
   function headers(c: HubClientConfig): Record<string, string> {
-    const h: Record<string, string> = { "x-maxprice-machine": deps.machineId };
+    const h: Record<string, string> = {
+      "x-maxprice-machine": deps.machineId,
+      "x-maxprice-protocol": String(HUB_PROTOCOL_VERSION),
+    };
     // No password configured ⇒ no Authorization header at all (ADR-0037): an
     // open hub ignores credentials; a protected hub 401s → "unauthorized".
     if (c.password !== null) h.authorization = `Bearer ${c.password}`;
@@ -288,7 +293,7 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
     // it survives the block-scoped `status` const out to the connected block
     // where onConnected fires — the ADR-0041 seam ([[HubFleetHooks]]). null ⇒ a
     // pre-event-sync hub (no `events` on its status).
-    let hubEvents: { epoch: string; seq: number } | null = null;
+    let hubEvents: { epoch: string; seq: number; deletionGeneration: number } | null = null;
     try {
       const statusRes = await fetchImpl(`${c.url}/api/status`, {
         headers: headers(c),

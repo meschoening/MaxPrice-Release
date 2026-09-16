@@ -238,7 +238,7 @@ async function serve(): Promise<void> {
   // loads synchronously (small file); the event store's load runs inside
   // `ready` below so no /api/* route can observe a half-loaded archive.
   const fleetEvents = createFleetEventStore({
-    path: join(dataDir, "events.jsonl"),
+    path: join(dataDir, "events.sqlite"),
     mode: "hub",
   });
   const machineDirectory = createMachineDirectory({
@@ -513,12 +513,18 @@ export async function cliRenameMachine(
   machineId: string,
   name: string,
 ): Promise<string> {
-  const trimmed = name.trim();
-  if (trimmed === "" || trimmed.length > 63) throw new Error("invalid name (1-63 chars)");
-  const result = openDirectory(dataDir).rename(machineId, trimmed);
-  if (result === "unknown") throw new Error(`unknown machine: ${machineId}`);
-  if (result === "collision") throw new Error(`name already in use: ${trimmed}`);
-  return `renamed ${machineId} to "${trimmed}"`;
+  const store = createFleetEventStore({ path: join(dataDir, "events.sqlite"), mode: "hub" });
+  try {
+    await store.load();
+    const trimmed = name.trim();
+    if (trimmed === "" || trimmed.length > 63) throw new Error("invalid name (1-63 chars)");
+    const result = openDirectory(dataDir).rename(machineId, trimmed);
+    if (result === "unknown") throw new Error(`unknown machine: ${machineId}`);
+    if (result === "collision") throw new Error(`name already in use: ${trimmed}`);
+    return `renamed ${machineId} to "${trimmed}"`;
+  } finally {
+    await store.close();
+  }
 }
 
 export async function cliMergeMachine(
@@ -526,12 +532,18 @@ export async function cliMergeMachine(
   sourceId: string,
   targetId: string,
 ): Promise<string> {
-  const result = openDirectory(dataDir).merge(sourceId, targetId);
-  if (result === "unknown-source") throw new Error(`unknown machine: ${sourceId}`);
-  if (result === "unknown-target") throw new Error(`unknown machine: ${targetId}`);
-  if (result === "self") throw new Error("cannot merge a machine into itself");
-  if (result === "cycle") throw new Error("merge would create an alias cycle");
-  return `merged ${sourceId} into ${targetId} (alias only — no events rewritten)`;
+  const store = createFleetEventStore({ path: join(dataDir, "events.sqlite"), mode: "hub" });
+  try {
+    await store.load();
+    const result = openDirectory(dataDir).merge(sourceId, targetId);
+    if (result === "unknown-source") throw new Error(`unknown machine: ${sourceId}`);
+    if (result === "unknown-target") throw new Error(`unknown machine: ${targetId}`);
+    if (result === "self") throw new Error("cannot merge a machine into itself");
+    if (result === "cycle") throw new Error("merge would create an alias cycle");
+    return `merged ${sourceId} into ${targetId} (alias only — no events rewritten)`;
+  } finally {
+    await store.close();
+  }
 }
 
 export async function cliPurgeMachine(
@@ -539,50 +551,39 @@ export async function cliPurgeMachine(
   machineId: string,
   confirmName: (expected: string) => boolean,
 ): Promise<string> {
-  const directory = openDirectory(dataDir);
-  const entry = directory.list().find((m) => m.machineId === machineId);
-  if (entry === undefined) throw new Error(`unknown machine: ${machineId}`);
-  if (!confirmName(entry.name)) throw new Error("confirmation did not match — aborted");
-  const store = createFleetEventStore({ path: join(dataDir, "events.jsonl"), mode: "hub" });
+  const store = createFleetEventStore({ path: join(dataDir, "events.sqlite"), mode: "hub" });
   try {
+    // The database's exclusive connection lock also protects directory work
+    // from a daemon or another offline command owning this archive.
     await store.load();
-    const { droppedRows } = await store.rewrite({
-      keep: (r) => r.machineId !== machineId,
-      newEpoch: true,
-    });
-    directory.remove(machineId);
-    // ADR-0062 §4: the purge cascades to identity rows here too, so the offline
-    // CLI leaves the same state behind as the console's DELETE.
-    const identityDirectory = createIdentityDirectory({
-      path: join(dataDir, "identity-directory.json"),
-    });
-    identityDirectory.load();
-    if (identityDirectory.usable()) {
-      identityDirectory.removeMachine(machineId);
-    } else {
-      // A removal against a store that did not fully load is RAM-only and
-      // evaporates when this process exits — and it can never be re-issued,
-      // since the machine is now gone from the directory that BOTH purge paths
-      // resolve against, so a repeat run answers "unknown machine" while the
-      // stale rows keep serving. Tell the operator that, rather than leaving a
-      // purge that silently un-purges itself (or suggesting a re-run that
-      // cannot succeed).
-      console.error(
-        `identity rows for ${machineId} were NOT purged: identity-directory.json could not be read or was corrupt (a .bak was kept if so). Re-running this purge will NOT help — ${machineId} is already gone from the machine directory. Fix or remove the file, then remove those rows by hand.`,
-      );
-    }
-    return `purged "${entry.name}" (${machineId}): ${droppedRows} event(s) dropped; epoch re-minted — every client reseeds on next contact`;
+    const directory = openDirectory(dataDir);
+    const scope = `machine:${machineId}`;
+    const pending = store.pendingOperations().find((operation) => operation.scope === scope);
+    const entry = directory.list().find((machine) => machine.machineId === machineId);
+    if (entry === undefined && pending === undefined)
+      throw new Error(`unknown machine: ${machineId}`);
+    if (!confirmName(entry?.name ?? machineId))
+      throw new Error("confirmation did not match - aborted");
+    const identity = createIdentityDirectory({ path: join(dataDir, "identity-directory.json") });
+    identity.load();
+    if (!identity.usable()) throw new Error("identity directory unavailable; purge is incomplete");
+    const operationId = pending?.id ?? crypto.randomUUID();
+    const receipt = await store.remove(operationId, scope, (row) => row.machineId === machineId);
+    identity.removeMachine(machineId);
+    if (entry !== undefined) directory.remove(machineId);
+    store.completeOperation(operationId);
+    return `purged "${entry?.name ?? machineId}" (${machineId}): ${receipt.removed} event(s) dropped; clients receive an incremental deletion`;
   } finally {
     await store.close();
   }
 }
 
 export async function cliCompact(dataDir: string): Promise<string> {
-  const store = createFleetEventStore({ path: join(dataDir, "events.jsonl"), mode: "hub" });
+  const store = createFleetEventStore({ path: join(dataDir, "events.sqlite"), mode: "hub" });
   try {
     await store.load();
-    const { droppedLines } = await store.rewrite({ newEpoch: false });
-    return `compacted: ${droppedLines} stale line(s) removed (epoch preserved — cursors survive)`;
+    const { freedBytes } = await store.compact();
+    return `compacted: ${freedBytes} bytes reclaimed; usage and incremental history preserved`;
   } finally {
     await store.close();
   }
