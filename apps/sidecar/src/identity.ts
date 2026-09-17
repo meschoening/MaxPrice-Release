@@ -1,4 +1,4 @@
-import { basename, dirname, isAbsolute, relative, sep } from "node:path";
+import { basename, isAbsolute, join, relative, sep } from "node:path";
 
 // Map a JSONL file path to the `(projectSlug, sessionId)` pair the event store
 // tags every event with. Claude Code lays sessions out two ways:
@@ -46,11 +46,25 @@ function stripJsonl(name: string): string {
 
 // The flat transcript a subagent transcript belongs to, or null for any other
 // path: `<root>/<slug>/<session>/subagents/agent-x.jsonl` → `<root>/<slug>/<session>.jsonl`.
-// A subagent transcript carries no Owner record of its own; the watcher flushes
-// the parent FIRST so the store learns the session's owner before the
-// subagent's events arrive (ADR-0098). Pure path arithmetic — never a stat.
-export function parentSessionPath(path: string): string | null {
-  const dir = dirname(path);
-  if (basename(dir) !== "subagents") return null;
-  return `${dirname(dir)}.jsonl`;
+// Only the canonical `subagents` directory under the matching root's slug and
+// session identifies a parent. Descendants can be arbitrarily deep — Claude
+// Code also nests workflow subagents (and their `journal.jsonl`)
+// at `<session>/subagents/workflows/wf_*/agent-x.jsonl` (#253), and the same
+// rule keys the deeper layout to the same session. A subagent transcript
+// carries no Owner record of its own; the watcher flushes the parent FIRST so
+// the store learns the session's owner before the subagent's events arrive
+// (ADR-0098). Pure path arithmetic — never a stat.
+export function parentSessionPath(path: string, roots: string[]): string | null {
+  for (const root of roots) {
+    const rel = relative(root, path);
+    if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) continue;
+    // Match identityFromPath's first containing root, including when roots
+    // overlap. A `subagents` name elsewhere cannot change that identity.
+    const segments = rel.split(sep);
+    if (segments.length >= 4 && segments[2] === "subagents") {
+      return join(root, segments[0]!, `${segments[1]}.jsonl`);
+    }
+    return null;
+  }
+  return null;
 }

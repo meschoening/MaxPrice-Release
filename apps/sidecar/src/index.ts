@@ -69,7 +69,12 @@ import {
 } from "./storage";
 import { createIdentityProber } from "./identity-probe";
 import { createLocalArchive } from "./local-archive";
-import { createOrganizationRegistry, listOrganizations, readCurrentLogin } from "./organizations";
+import {
+  createOrganizationRegistry,
+  listOrganizations,
+  readCurrentLogin,
+  readRemoteControlAtStartup,
+} from "./organizations";
 import { gateOrganizationWatcher, prepareOrganizationStore } from "./organization-boot";
 import { createOrganizationRepair } from "./organization-repair";
 import { createSettingsWatch, type SettingsWatch } from "./settings-watch";
@@ -2137,7 +2142,11 @@ async function main(): Promise<void> {
         await homeSettled;
         // The live login is display-only here ("(current login)" in the select);
         // the home itself never follows it.
-        const login = await readCurrentLogin(watchRoots);
+        const [login, remoteControlAtStartup] = await Promise.all([
+          readCurrentLogin(watchRoots),
+          // ADR-0101: display-only, like the login — the hint in Settings.
+          readRemoteControlAtStartup(watchRoots),
+        ]);
         // After the boot load+remember, never beside it: the registry persists
         // through one fixed tmp path with no write queue.
         await registryReady;
@@ -2148,6 +2157,7 @@ async function main(): Promise<void> {
           home: currentHome,
           currentLogin: login,
           trackedLimits: usagePoller.getCredential()?.orgId ?? null,
+          remoteControlAtStartup,
           seen: getEngineStore().organizationsSeen(),
           registry: organizationRegistry,
         });

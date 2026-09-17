@@ -5,8 +5,9 @@ import { useSettings, useUpdateSettings } from "@/state/use-settings";
 // Settings → Claude account: the Home organization (CONTEXT.md, ADR-0098).
 // MaxPrice shows usage for exactly one organization; this is where it is
 // chosen. Labels only — a plan word or a short id, never an upstream name and
-// never a count: the app does not acknowledge that other usage exists. Hidden
-// until the sidecar has answered; an empty list (nothing known) renders nothing.
+// never a count: the app does not acknowledge that other usage exists. Hints
+// when Claude Code's `remoteControlAtStartup` is off (ADR-0101). Hidden until
+// the sidecar has answered; an empty list (nothing known) renders nothing.
 export function HomeOrganizationSelect(): React.ReactElement | null {
   const { data } = useOrganizations();
   const { data: settings } = useSettings();
@@ -38,6 +39,14 @@ export function HomeOrganizationSelect(): React.ReactElement | null {
         </div>
       </div>
       <p className="subline">MaxPrice shows usage for this organization only.</p>
+      {data.remoteControlAtStartup ? null : (
+        // ADR-0101: the one nudge that keeps interactive CLI sessions
+        // attributable. Setup guidance; names no hidden usage and no count.
+        <p className="hint-line">
+          Turn on Remote Control at startup in Claude Code (/config) so every terminal session
+          records its organization.
+        </p>
+      )}
     </>
   );
 }

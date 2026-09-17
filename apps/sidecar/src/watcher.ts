@@ -76,12 +76,13 @@ export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher
       watch(roots, {
         ignoreInitial: true,
         // Stay inside the resolved Claude roots: don't follow symlinks out of
-        // the tree (keeps identityFromPath's relative-path assumption valid),
-        // and cap recursion at the deepest layout Claude Code writes — subagent
-        // transcripts live at <root>/<slug>/<session>/subagents/agent-*.jsonl,
-        // four levels below each root (flat sessions are two).
+        // the tree (keeps identityFromPath's relative-path assumption valid).
+        // Recursion is deliberately uncapped, matching the boot scan's
+        // recursive readdir: a `depth` cap sized to "the deepest layout Claude
+        // Code writes" silently stopped watching workflow subagents once they
+        // moved two levels deeper (<session>/subagents/workflows/wf_*/agent-*.jsonl,
+        // #253), so anything that deep only surfaced at the next boot.
         followSymlinks: false,
-        depth: 4,
         // Ignore non-.jsonl files once a stat confirms they are files. During
         // the initial scan chokidar may call this without `stats`; `schedule()`
         // is the authoritative event-level filter (it re-checks the suffix), so
@@ -125,7 +126,7 @@ export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher
     // those points exist before the subagent's records arrive — a busy parent's
     // debounce keeps resetting and can trail the subagent's (ADR-0098). The
     // parent's own pending timer later reads an empty delta, which is harmless.
-    const parent = parentSessionPath(path);
+    const parent = parentSessionPath(path, opts.roots);
     if (parent !== null) await flushOne(parent, false);
     await flushOne(path, true);
   }

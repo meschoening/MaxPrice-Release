@@ -25,6 +25,11 @@ export const organizationsResponseSchema = z.object({
   // The org id the usage-limits credential tracks (ADR-0023); null when
   // disconnected. Lets the connection status name what it is polling.
   trackedLimits: z.string().nullable(),
+  // Whether Claude Code attaches Remote Control to every interactive session
+  // on this machine (ADR-0101) — the setting that makes each one write an
+  // Owner record. Settings hints when false. Setup guidance only: no count and
+  // no mention of hidden usage rides with it.
+  remoteControlAtStartup: z.boolean(),
   organizations: z.array(organizationEntrySchema),
 });
 export type OrganizationsResponse = z.infer<typeof organizationsResponseSchema>;

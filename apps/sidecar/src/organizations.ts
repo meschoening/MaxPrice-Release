@@ -75,6 +75,40 @@ export async function readCurrentLogin(
   return null;
 }
 
+// Whether Claude Code will attach Remote Control to every interactive session
+// on this machine (ADR-0101): `remoteControlAtStartup: true` in a watched
+// root's own `<configDir>/settings.json`, and `disableRemoteControl` not set
+// anywhere. That setting is what makes every interactive session write an
+// Owner record; Settings hints when it is off. Live-read like the login file;
+// nothing here changes the home. Managed and project settings files are out of
+// scope — the user file is where the setting is documented to live.
+const claudeSettingsSchema = z
+  .object({
+    remoteControlAtStartup: z.unknown().optional(),
+    disableRemoteControl: z.unknown().optional(),
+  })
+  .passthrough();
+
+export async function readRemoteControlAtStartup(
+  roots: readonly string[],
+  readFileImpl: (path: string) => Promise<string> = (p) => readFile(p, "utf8"),
+): Promise<boolean> {
+  let enabled = false;
+  for (const file of new Set(roots.map((root) => join(dirname(root), "settings.json")))) {
+    let json: unknown;
+    try {
+      json = JSON.parse(await readFileImpl(file));
+    } catch {
+      continue;
+    }
+    const parsed = claudeSettingsSchema.safeParse(json);
+    if (!parsed.success) continue;
+    if (parsed.data.disableRemoteControl === true) return false;
+    if (parsed.data.remoteControlAtStartup === true) enabled = true;
+  }
+  return enabled;
+}
+
 // organizations.json — `{ version: 1, organizations: { [uuid]: { organizationType } } }`.
 // Disposable by contract: deleting it costs a label, never a number.
 const registryFileSchema = z.object({
@@ -135,6 +169,7 @@ export function listOrganizations(input: {
   home: string | null;
   currentLogin: CurrentLogin | null;
   trackedLimits: string | null;
+  remoteControlAtStartup: boolean;
   seen: ReadonlySet<string>;
   registry: OrganizationRegistry;
 }): OrganizationsResponse {
@@ -164,6 +199,7 @@ export function listOrganizations(input: {
     home: input.home,
     currentLogin: current,
     trackedLimits: input.trackedLimits,
+    remoteControlAtStartup: input.remoteControlAtStartup,
     organizations,
   };
 }
