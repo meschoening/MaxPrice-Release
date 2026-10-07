@@ -545,7 +545,10 @@ function applyWindow(
 // chronological merge. Extracted so the block-span window resolver and the
 // blocks aggregator share ONE implementation — the /api/intraday block frame
 // must be the same window /api/blocks reports active, by construction.
-export function formPendingBlocks(events: StoredEvent[], samples: UsageSample[]): BlockFormation {
+export function formPendingBlocks(
+  events: StoredEvent[],
+  samples: readonly UsageSample[],
+): BlockFormation {
   // Every epoch-ms below — the window partition walk, the heuristic walk, the
   // gap check, flushBlock/computeBurnRate — reads `event.ms`, derived once at
   // `upsert` (ADR-0089). Events whose timestamp doesn't parse are dropped here:
@@ -642,19 +645,20 @@ export function formPendingBlocks(events: StoredEvent[], samples: UsageSample[])
 // module both this aggregator and intraday.ts depend on) — imported above.
 
 // Resolve the ACTIVE block's window for the /api/intraday `block` span
-// (ADR-0031). `events` must be the UNFILTERED store query — boundaries are
-// all-model/all-project (ADR-0017/0028) — and the active predicates mirror
-// flushBlock's exactly (parity-tested): a resolved window is active while
-// `now < end`, the latest-ending one winning — disjointness does NOT make the
-// winner unique (an annulled window's truncated end is its successor's start,
-// so before that instant both satisfy `now < end`); aggregateBlocks settles
-// the same tie with its rows-level demotion, and both implementations
-// converge on the latest-ending window. With none live, a heuristic block is
-// active on recent activity inside its window, the latest-ending one winning
-// (the same demotion rule).
+// (ADR-0031). `events` is formation input, never project/model/machine-
+// filtered — boundaries are all-model/all-project (ADR-0017/0028) — and with a
+// Home it is the Quota organization's rows (ADR-0108), otherwise every row.
+// The active predicates mirror flushBlock's exactly (parity-tested): a
+// resolved window is active while `now < end`, the latest-ending one winning
+// — disjointness does NOT make the winner unique (an annulled window's
+// truncated end is its successor's start, so before that instant both satisfy
+// `now < end`); aggregateBlocks settles the same tie with its rows-level
+// demotion, and both implementations converge on the latest-ending window.
+// With none live, a heuristic block is active on recent activity inside its
+// window, the latest-ending one winning (the same demotion rule).
 export function resolveBlockSpanWindow(
   events: StoredEvent[],
-  samples: UsageSample[],
+  samples: readonly UsageSample[],
   now: number,
 ): ResolvedBlockSpan | null {
   return resolveFormedBlockSpan(formPendingBlocks(events, samples), now);
@@ -729,41 +733,45 @@ export type AggregateBlocksOptions = {
   // projection. Injected so the active path is testable; defaults to
   // `Date.now()`.
   now?: number;
-  // The model filter (ADR-0017). Blocks FORM from all events — the 5-hour
-  // quota window is a fact about Claude's rate limit, so boundaries, gaps,
-  // `isActive`, `burnRate`, and `projection` ignore this filter. Only the
-  // per-block SUMS narrow: `costUSD`, `tokenCounts`, `totalTokens`, `models`,
-  // and `entries` count matching events only. Empty / omitted = no filter.
+  // The model filter (ADR-0017). Blocks FORM from every model's events (the
+  // Quota organization's with a Home — ADR-0108) — the 5-hour quota window is
+  // a fact about Claude's rate limit, so boundaries, gaps, `isActive`,
+  // `burnRate`, and `projection` ignore this filter. Only the per-block SUMS
+  // narrow: `costUSD`, `tokenCounts`, `totalTokens`, `models`, and `entries`
+  // count matching events only. Empty / omitted = no filter.
   models?: string[];
   // The machine filter (ADR-0041) — the sum-narrowing axis, exactly parallel to
-  // `models`: blocks FORM from all events, so boundaries, gaps, `isActive`,
+  // `models`: blocks FORM from every machine's events (the Quota
+  // organization's with a Home — ADR-0108), so boundaries, gaps, `isActive`,
   // `burnRate`, `projection`, and `fiveHourLimitPct` NEVER narrow (quota truth
-  // is account-wide). Only each block's SUMS narrow: `costUSD`, `tokenCounts`,
-  // `totalTokens`, `models`, `machines`, and `entries` count matching events
-  // only. Exact-match on machineId (opaque ids — no substring semantics).
-  // Empty / omitted = no filter.
+  // is Organization-wide). Only each block's SUMS narrow: `costUSD`,
+  // `tokenCounts`, `totalTokens`, `models`, `machines`, and `entries` count
+  // matching events only. Exact-match on machineId (opaque ids — no substring
+  // semantics). Empty / omitted = no filter.
   machines?: string[];
   // The IANA zone the window post-filter interprets `startTime` in (ADR-0015)
   // — the request's `tz`. Only consulted when a date bound is set; omitted =
   // the host zone.
   timeZone?: string;
-  // The usage history, capturedAt-sorted (the sample store's `all()`). When
-  // present, resolved reset windows PARTITION block formation (ADR-0028/0029)
-  // and fiveHourLimitPct is filled on observed/annulled rows only (live latest
-  // for the active block, peak-in-window for completed; heuristic rows are
-  // always null — ADR-0030). Omitted/empty → the pure hour-floor heuristic and
-  // all-null limit % — the golden-parity path.
-  samples?: UsageSample[];
+  // The usage history, capturedAt-sorted (the sample store's `all()`, or the
+  // Quota organization's `all(scope)`). When present, resolved reset windows
+  // PARTITION block formation (ADR-0028/0029) and fiveHourLimitPct is filled on
+  // observed/annulled rows only (live latest for the active block,
+  // peak-in-window for completed; heuristic rows are always null — ADR-0030).
+  // Omitted/empty → the pure hour-floor heuristic and all-null limit % — the
+  // golden-parity path.
+  samples?: readonly UsageSample[];
 };
 
 // Aggregate a store query result into the `/api/blocks` response body.
 //
 // `events` must be the *unwindowed* event set — `/api/blocks` is cross-project
-// (the project filter never reaches it), and the store query carries NO
-// filters; the model filter (ADR-0017) narrows per-block sums via
-// `options.models`, never the store query. The date window is a post-filter on
-// each built block's `startTime` (`options.since` / `options.until`); see the
-// module SPIKE.
+// (the project filter never reaches it), and the store query is never
+// project/model/machine-filtered: with a Home it selects the Quota
+// organization's rows (ADR-0108), otherwise every row. The model filter
+// (ADR-0017) narrows per-block sums via `options.models`, never the store
+// query. The date window is a post-filter on each built block's `startTime`
+// (`options.since` / `options.until`); see the module SPIKE.
 //
 // The algorithm (ADR-0028/0029 — resolved windows partition the heuristic walk):
 //   1. Sort events by timestamp ascending (drop unparseable timestamps).

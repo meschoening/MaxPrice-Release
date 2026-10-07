@@ -1,5 +1,10 @@
 import { join, dirname } from "node:path";
-import { createForgetIntent, type FleetForgetIntent } from "./fleet-forget-intent";
+import {
+  createForgetIntent,
+  forgetIntentMode,
+  type FleetForgetIntent,
+  type FleetForgetMode,
+} from "./fleet-forget-intent";
 import {
   createEventSync,
   fleetTokenTotal,
@@ -11,16 +16,25 @@ import {
 } from "@maxprice/usage-core";
 import {
   EVENT_FORGET_SESSIONS_MAX,
+  HUB_ORGANIZATIONS_PATH,
   IDENTITY_PUSH_BATCH_MAX,
+  ORGANIZATION_ASSERTION_DIRECTORY_PATH,
+  ORGANIZATION_DIRECTORY_PATH,
   PROJECT_IDENTITY_PATH,
   buildAutomaticProjectIdentity,
   hubEventsForgetResponseSchema,
   hubStatusSchema,
   hubMachinesResponseSchema,
+  hubOrganizationAssertionDirectorySchema,
+  hubOrganizationDirectorySchema,
+  hubOrganizationsResponseSchema,
   hubProjectIdentityResponseSchema,
   projectMergeAssertionKey,
   resolveProjectMergeAssertions,
   type ForgetSessionRef,
+  type HubMachine,
+  type OrganizationAssertionEntry,
+  type OrganizationLabelEntry,
   type ProjectIdentityRow,
   type ProjectMergeAssertion,
   type ProjectMergeMutationRequest,
@@ -31,10 +45,14 @@ import {
 } from "@maxprice/shared";
 import type { ZodType } from "zod";
 import { createMachineDirectoryCache } from "./machine-directory-cache";
+import { publishedHomes, samePublishedHomes } from "./engine/presumption";
 import { scanGate } from "./scan-gate";
 import { storedEventToWire } from "./stored-event-wire";
 import type { EventStore, LocalAppend, StoredEvent } from "./engine/store";
 import type { LiveHub } from "./live-hub";
+import type { OrganizationAssertions } from "./organization-assertions";
+import type { OrganizationLabels } from "./organization-labels";
+import type { LearnedOrg } from "./organizations";
 
 // ADR-0041 (M5) — the sidecar's fleet-event WIRING module. This is the ONE place
 // replica lifecycle, the share/replica toggles, the debounced renderer pokes +
@@ -53,7 +71,10 @@ import type { LiveHub } from "./live-hub";
 // ADR-0062 adds the Identity directory's sync to the same home: push rides
 // the shareEvents gate, pull rides the replica gate + the directory sweep,
 // and a pre-identity hub's 404 latches per-connection. See the identity
-// section below.
+// section below. #288 adds the Organization directory's (ADR-0105 §8), which
+// rides neither gate — see its section. #310 adds the Organization assertion
+// directory's (ADR-0107 §11), which rides neither gate either — see its section.
+// #366 adds the Organization roster pull, gated on neither as well.
 
 // { cursor, target } | null — the seed-progress shape on the status snapshot.
 type HubSeed = StatusSnapshot["hubSeed"];
@@ -64,6 +85,25 @@ type Conn = { url: string; headers: Record<string, string> };
 
 // A serialized refresh's trigger, plus the force-reset a connection edge needs.
 type RefreshTrigger = { (): void; reset: () => void };
+
+// The label store as the Organization directory sync sees it (#288): what to
+// push, and where to adopt the union. `ready` is main()'s `labelsReady` —
+// nothing is pushed or adopted before the store has loaded, because the load
+// would overwrite an entry adopted ahead of it.
+type FleetOrganizationLabels = {
+  ready: Promise<void>;
+  entries: () => ReadonlyMap<string, Readonly<OrganizationLabelEntry>>;
+  merge: OrganizationLabels["merge"];
+};
+
+// The assertion store as the Organization assertion directory sync sees it
+// (#310) — the label store's shape above, for the same reason: `ready` is
+// main()'s `assertionsReady`, and nothing is pushed or adopted before it.
+type FleetOrganizationAssertions = {
+  ready: Promise<void>;
+  entries: () => ReadonlyMap<string, Readonly<OrganizationAssertionEntry>>;
+  merge: OrganizationAssertions["merge"];
+};
 
 // Deadline on every fleet-side hub request, matching hub-client's own 30s. A
 // tailnet peer that goes black-holed (asleep laptop, dropped route) leaves a
@@ -103,13 +143,42 @@ export type FleetSyncDeps = {
   // replica-off toggle or an epoch resync would rebuild an engine that forgot
   // everything the corpus no longer backs.
   seedLocalArchive?: (store: EventStore) => void;
-  // The forget propagation (ADR-0069 §8): rewrite the local archive to drop the
-  // sessions whose hub batches LANDED, before the resync's rebuild re-seeds the
-  // engine — otherwise the archive resurrects the forgotten rows immediately.
+  // A user Forget's propagation (ADR-0069 §8): rewrite the local archive to drop
+  // the sessions whose hub batches LANDED, before the resync's rebuild re-seeds
+  // the engine — otherwise the archive resurrects the forgotten rows immediately.
   forgetLocalArchive?: (sessions: readonly ForgetSessionRef[]) => Promise<void>;
+  // The evidence repair's propagation (#375, `repairOrganizations`): drop only
+  // those sessions' rows whose key the live store excludes, barring nothing, so
+  // their admitted rows stay archived. Never the pair-wide forget above: absent,
+  // as in a rig that wires no archive, the repair's local half does nothing.
+  forgetExcludedFromLocalArchive?: (sessions: readonly ForgetSessionRef[]) => Promise<void>;
+  // main()'s half of the presumption cell (`withPublishedHomes`, #281): the
+  // machineId -> published Home map the Machine directory implies. The fleet
+  // owns the directory, so it builds the map and decides when it CHANGED; the
+  // report cache sees the swap by identity (ADR-0057's rebind trigger), and the
+  // fleet's own `pokeNow` is the wholesale invalidation that follows it.
+  installPublishedHomes?: (homes: ReadonlyMap<string, string>) => void;
+  // The user's renames, synced with the Hub's Organization directory (#288).
+  // Absent — a rig that wires no label store — and the fleet neither pushes
+  // nor pulls them.
+  organizationLabels?: FleetOrganizationLabels;
+  // The user's Organization assertions, synced with the Hub's Organization
+  // assertion directory (#310). Absent — a rig that wires no assertion store —
+  // and the fleet neither pushes nor pulls them.
+  organizationAssertions?: FleetOrganizationAssertions;
+  // main()'s assertion writer (#310): called after an adoption that changed
+  // some session's resolved Organization, BEFORE the fleet's own wholesale
+  // invalidation, so every renderer's refetch already sees the new claims.
+  assertionsAdopted?: () => void;
+  // #366: the Hub's roster, learned into this machine's Organization registry
+  // so Settings lists every Organization the Hub's key can see. Absent — a rig
+  // that wires no registry — and the fleet never pulls it. Resolves true when
+  // the registry changed.
+  learnOrganizations?: (orgs: readonly LearnedOrg[]) => Promise<boolean>;
   getRoots: () => string[];
   emitMachinesChanged: () => void; // liveHub broadcast of SSE_EVENT.machinesChanged
   emitIdentityChanged: () => void; // liveHub broadcast of SSE_EVENT.identityChanged (ADR-0062)
+  emitOrganizationsChanged?: () => void; // liveHub broadcast of SSE_EVENT.organizationsChanged (#288)
   initial: { shareEvents: boolean; fleetReplica: boolean; hubConfigured: boolean };
   fetchImpl?: typeof fetch;
   debounceMs?: number; // default 500 — the trailing poke/status debounce
@@ -167,18 +236,56 @@ export type FleetSync = {
   identity: () => SidecarProjectIdentityResponse; // loopback GET /api/project-identity body
   setProjectMerge: (request: ProjectMergeMutationRequest) => ProjectMergeMutationResponse;
   // A durable action receipt joins Hub deletion, Local archive pruning, and
-  // replica reconciliation. Retries complete the same action (ADR-0100).
+  // replica reconciliation. Retries complete the same action (ADR-0100). The
+  // pruning is pair-wide and bars the pairs (ADR-0069 §8).
   forget: (sessions: readonly ForgetSessionRef[]) => Promise<FleetForgetResult>;
+  // The Organization repair's forget, against its own Hub target. On the Hub it
+  // is `forget`'s pair-wide deletion; its Local archive half is key-scoped
+  // (#375): only the pairs' rows whose key the live store excludes go, their
+  // admitted rows stay, and no pair joins the archive's `forgottenPairs`. With
+  // `keepLocalArchive` (#311, ADR-0107 §12) it is lossless: the same Hub
+  // deletion, replica removal and resync, but no Local archive rewrite at all.
+  // Neither takes a row out of the engine (#378), where `forget` does.
+  // The durable intent records the mode, so a resumed forget completes in its
+  // own mode, and while one is pending a caller of any other mode is refused
+  // as `busy`.
   repairOrganizations: (
     sessions: readonly ForgetSessionRef[],
     target: string,
+    opts?: { keepLocalArchive?: boolean },
   ) => Promise<FleetForgetResult>;
   // ADR-0098: a full engine rebuild (fresh store → walk → archive + replica
-  // seed → swap) WITHOUT unlinking the replica — for a Home organization change
-  // and the repair, where the replica is still valid but the engine's verdicts
-  // are not. Serialized through the reconcile chain like everything that swaps
-  // the store; resolves once the swap has happened.
-  rebuildEngine: () => Promise<void>;
+  // seed → swap) WITHOUT unlinking the replica — for a tracked-set change and
+  // the repair, where the replica is still valid but the engine's verdicts are
+  // not. Serialized through the reconcile chain like everything that swaps the
+  // store; resolves once the swap has happened.
+  //
+  // `keepRetainedView` (#276) leaves a retained report view (ADR-0099)
+  // published across the walk — still showing the pre-change picture, which an
+  // ADDITIVE tracked-set change leaves correct-but-incomplete rather than
+  // wrong. Only such a change may ask for it — see `requestRebuild`.
+  rebuildEngine: (opts?: { keepRetainedView?: boolean }) => Promise<void>;
+  // Release without starting a walk; settings edits may be queued elsewhere.
+  releaseRetainedView: () => void;
+  // "Tell every renderer to refetch", and nothing else (#277, D8): no rebuild,
+  // no store swap, no release of a retained report view. A Home organization
+  // change that leaves the tracked set alone moves no row and re-walks nothing
+  // — it only re-answers the Presumed organization at query time — so this poke
+  // IS the whole effect. Exposed here rather than rebuilt at the call site so
+  // there stays exactly one definition of the wholesale invalidation.
+  invalidateReports: () => void;
+  // The Home this process runs under (#281), published to the Hub's Machine
+  // directory so every peer presumes this machine's owner-less rows under it.
+  // Publishing starts only once this has been called; an unchanged value is a
+  // no-op, and a value set while disconnected is published on the next connect.
+  setHome: (home: string | null) => void;
+  // A local rename wrote (#288): push the label map to the Hub's Organization
+  // directory. A no-op while disconnected — the next connect pushes anyway.
+  organizationLabelsChanged: () => void;
+  // A local assertion edit wrote (#310): push the assertion map to the Hub's
+  // Organization assertion directory. A no-op while disconnected — the next
+  // connect pushes anyway.
+  organizationAssertionsChanged: () => void;
   // Test-observability seam (ADR-0041, Task 12 convergence suite): the live
   // replica store, or null when detached (replica off / hub unconfigured). The
   // fleet fixed-point asserter reads `.all()` off it to compare the client's
@@ -220,6 +327,24 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // hub:machines poke.
   const cache = createMachineDirectoryCache({ path: deps.directoryCachePath });
   cache.load();
+
+  // The published Homes last handed to main() (#281). Starts as the empty map,
+  // which is exactly what main()'s initial presumption carries.
+  let installedHomes: ReadonlyMap<string, string> = publishedHomes([], deps.machineId);
+  // Hand main() the presumption map a directory list implies — only when it
+  // CHANGED. Every GET carries fresh `live`/`lastSeenAt` join fields, so an
+  // unconditional install would mint a new presumption identity, and clear
+  // every report cache in the fleet, on every 5-minute sweep.
+  function adoptPublishedHomes(machines: readonly HubMachine[], poke: boolean): void {
+    const next = publishedHomes(machines, deps.machineId);
+    if (samePublishedHomes(installedHomes, next)) return;
+    installedHomes = next;
+    deps.installPublishedHomes?.(next);
+    if (poke) pokeNow();
+  }
+  // Boot: the persisted directory presumes peers offline, before any connect.
+  // No poke — there is no renderer yet to tell.
+  adoptPublishedHomes(cache.list(), false);
 
   // The Identity directory (ADR-0062 §3): own probed rows + the mirrored fleet
   // union. Unlike the disposable cache above this is AUTHORITATIVE — a dead
@@ -276,8 +401,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     detachReportRelay = null;
     const retained = retainedReportStore;
     if (retained === null || retained === store) return;
-    detachReportRelay = store.onLocalAppend(({ records, projectSlug, sessionId }) => {
-      retained.append(records, projectSlug, sessionId);
+    detachReportRelay = store.onLocalAppend(({ records, projectSlug, sessionId, isSubagent }) => {
+      retained.append(records, projectSlug, sessionId, isSubagent);
     });
   }
   // Creates the replica store, records it as the live one, AND returns the same
@@ -304,10 +429,10 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
             batch.sessions.map((s) => JSON.stringify([s.projectSlug, s.sessionId])),
           ) ?? [],
       );
-      return deps
-        .getStore()
-        .contributions()
-        .filter((row) => !blocked.has(JSON.stringify([row.projectSlug, row.sessionId])));
+      const rows = deps.getStore().contributions();
+      // Nothing pending is the usual case: skip a key built per row per push (#361).
+      if (blocked.size === 0) return rows;
+      return rows.filter((row) => !blocked.has(JSON.stringify([row.projectSlug, row.sessionId])));
     },
     prepareContributions: async () => {
       await deps.ingestionReady;
@@ -319,7 +444,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       try {
         await scanGate.run(() => fresh.scan(deps.getRoots()));
         for (const batch of batches)
-          fresh.append(batch.records, batch.projectSlug, batch.sessionId);
+          fresh.append(batch.records, batch.projectSlug, batch.sessionId, batch.isSubagent);
         deps.seedLocalArchive?.(fresh);
         if (current === deps.getStore()) {
           current.replaceContributions(fresh.contributions());
@@ -476,8 +601,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     // thread exactly as much as they do.
     try {
       await scanGate.run(() => fresh.scan(deps.getRoots()));
-      for (const { records, projectSlug, sessionId } of appended) {
-        fresh.append(records, projectSlug, sessionId);
+      for (const { records, projectSlug, sessionId, isSubagent } of appended) {
+        fresh.append(records, projectSlug, sessionId, isSubagent);
       }
       // The Local archive seeds BEFORE the replica (ADR-0069 §6): same rows either
       // way (the one merge rule dedups), but archive-first keeps the first-seen
@@ -510,6 +635,10 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   let pendingReconcile = false;
   let pendingResync = false;
   let pendingRebuild = false;
+  // Whether the coalesced rebuild requests want the retained report view
+  // released. RELEASE WINS (#276): a keep is only sound for the change that
+  // asked for it, so one request that did not ask decides for all of them.
+  let pendingRelease = false;
 
   function scheduleReconcile(): void {
     if (reconciling) {
@@ -575,7 +704,10 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     if (pendingResync) {
       eventSync.suspend();
       pendingResync = false;
-      // A Home organization rebuild cannot retain the preceding home's view.
+      // A rebuild request that coalesced into this resync releases the view,
+      // whichever it asked for (#277, and #276's keep with it): retention here
+      // is the RESYNC's, and a release is never wrong — it costs the reseed's
+      // continuity and nothing else.
       // A known forget already pruned its sessions; keep all unrelated reports.
       if (replica !== null && !pendingRebuild) {
         retainedReportStore ??= deps.getStore();
@@ -583,12 +715,14 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
         releaseReportStore();
       }
       pendingRebuild = false; // a resync rebuilds anyway
+      pendingRelease = false; // …and has just decided the view itself
       if (replica !== null) await replica.unlink();
       await rebuildEngine();
       eventSync.resync();
     } else if (pendingRebuild) {
       pendingRebuild = false;
-      releaseReportStore();
+      if (pendingRelease) releaseReportStore();
+      pendingRelease = false;
       await rebuildEngine();
     }
   }
@@ -617,9 +751,28 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // a request landing on an in-flight reconcile coalesces into that chain's
   // do/while rather than a new link — so the chain in hand covers our resync
   // either way.
-  async function requestRebuild(): Promise<void> {
-    // A changed Home organization must never retain the preceding home's view.
-    releaseReportStore();
+  async function requestRebuild(opts?: { keepRetainedView?: boolean }): Promise<void> {
+    const keep = opts?.keepRetainedView === true;
+    // A RESTRICTIVE tracked-set change must never retain the preceding set's
+    // view: those rows were admitted under the exclusion rule this rebuild is
+    // replacing (#277, D8), so they must stop being reported AT REQUEST TIME —
+    // not when the reconcile chain gets round to it, which on an in-flight
+    // reseed is the only moment a retained view exists at all.
+    //
+    // An ADDITIVE one may keep it (#276). NOT because the view picks the new
+    // rows up — it cannot: `appendFleet` refuses any row whose key that store's
+    // own walk excluded, which is exactly the newly tracked Organization's.
+    // Because every row it DOES hold was admitted under a SUBSET of the new
+    // set, so nothing it shows is wrong, only incomplete until the reseed
+    // releases it and reports fall through to the live store. The alternative
+    // is dropping to a half-seeded store mid-reseed, which is worse.
+    //
+    // A Home change that leaves the set identical never reaches here at all —
+    // it re-answers the presumption at query time and pokes.
+    if (!keep) releaseReportStore();
+    // …and again in the reconcile pass, because requests coalesce and a view
+    // can be retained between this call and that pass: release wins.
+    pendingRelease ||= !keep;
     pendingRebuild = true;
     scheduleReconcile();
     await reconcileChain;
@@ -634,9 +787,12 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // action must settle before a different selection can be accepted.
   let forgetInflight: Promise<FleetForgetResult> | null = null;
 
+  // `mode` is a new intent's. The empty resume (connect and sweep) writes no
+  // intent and compares no mode, so its default is never read.
   async function forget(
     sessions: readonly ForgetSessionRef[],
     target?: string,
+    mode: FleetForgetMode = "pair",
   ): Promise<FleetForgetResult> {
     if (forgetInflight !== null) {
       return {
@@ -646,7 +802,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
         landed: false,
       };
     }
-    forgetInflight = forgetInner(sessions, target);
+    forgetInflight = forgetInner(sessions, target, mode);
     try {
       return await forgetInflight;
     } finally {
@@ -657,6 +813,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   async function forgetInner(
     sessions: readonly ForgetSessionRef[],
     target: string | undefined,
+    mode: FleetForgetMode,
   ): Promise<FleetForgetResult> {
     await deps.ingestionReady;
     if (forgetIntent.error() !== null)
@@ -693,6 +850,20 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
           detail: "a different deletion is awaiting completion",
           landed: false,
         };
+      // #311, #375: nor may a caller of another mode resume it. Every mode's
+      // answer covers its own archive half only: a lossless intent never
+      // rewrote the archive, a key-scoped one left the pairs' admitted rows and
+      // barred nothing, and a pair-wide one dropped and barred them all. The
+      // empty resume (connect and sweep) passes no sessions, so no mode is
+      // compared: it completes any pending intent in that intent's own mode,
+      // after which this caller's retry runs.
+      if (forgetIntentMode(intent) !== mode)
+        return {
+          ok: false,
+          reason: "busy",
+          detail: "a deletion of another kind is awaiting completion",
+          landed: false,
+        };
     }
     if (intent !== null && intent.hub !== connection.url)
       return {
@@ -726,6 +897,14 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
         intent = {
           hub: connection.url,
           epoch: status.events.epoch,
+          // #311: a lossless forget has no archive half, so it is written
+          // already done. A resume on connect or on the sweep reads this and
+          // never rewrites the archive either (ADR-0107 §12). `lossless`
+          // records the mode itself, which only a same-mode caller may resume.
+          ...(mode === "lossless" ? { lossless: true, localComplete: true } : {}),
+          // #375: and the evidence repair's key-scoped archive half, which a
+          // resume after a restart must run in place of the pair-wide one.
+          ...(mode === "excluded" ? { excludedOnly: true } : {}),
           batches: [],
         } satisfies FleetForgetIntent;
         for (let i = 0; i < sessions.length; i += EVENT_FORGET_SESSIONS_MAX)
@@ -767,12 +946,27 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       }
       const forgotten = intent.batches.flatMap((batch) => batch.sessions);
       if (!intent.localComplete) {
-        await deps.forgetLocalArchive?.(forgotten);
+        // The intent's mode, not the caller's: a resume runs the half the
+        // intent was written for (#375).
+        const forgetLocal =
+          forgetIntentMode(intent) === "excluded"
+            ? deps.forgetExcludedFromLocalArchive
+            : deps.forgetLocalArchive;
+        await forgetLocal?.(forgotten);
         intent.localComplete = true;
         forgetIntent.write(intent);
       }
-      deps.getStore().removeMachineSessions(deps.machineId, forgotten);
-      retainedReportStore?.removeMachineSessions(deps.machineId, forgotten);
+      // Only Storage's Forget takes the pairs' own rows out of the engine
+      // (#378). A repair's forget leaves them: the store already refuses what
+      // the repair forgets, an excluded key never being in its event map
+      // (#374) and a dormant row never entering it (ADR-0107 §12), so every
+      // own row a repaired pair still holds is admitted. Removing them relied
+      // on the resync's push to walk them back, and with sharing off, or event
+      // sync degraded, that push returns before it re-prepares anything.
+      if (forgetIntentMode(intent) === "pair") {
+        deps.getStore().removeMachineSessions(deps.machineId, forgotten);
+        retainedReportStore?.removeMachineSessions(deps.machineId, forgotten);
+      }
       const result: FleetForgetResult = {
         ok: true,
         sessionsRequested: forgotten.length,
@@ -845,11 +1039,18 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // failure, terminal action only on a completed schema-valid body. They lived
   // as near-verbatim copies; these two functions are the single copy. Identity
   // adds exactly two things on top — the replica/capability guard and the 404
-  // latch — and differs only in URL, schema, and terminal action.
+  // latch — and differs only in URL, schema, and terminal action. The
+  // serializer has a third user that is no pull at all: the Home publish
+  // (#281), a PUT that wants the same one-in-flight, last-value-wins shape and
+  // takes no part in the fetch ladder. The Organization directory (#288) is
+  // one of each: a pull that climbs the ladder, and a push (a POST) that
+  // doesn't.
 
   // The serializer. Returns the TRIGGER: a call landing while a refresh is in
   // flight coalesces into exactly ONE follow-up pass (the settings-watch
-  // do/while — last state wins), so a sweep can never stack on a poke.
+  // do/while — last state wins), so a sweep can never stack on a poke. `label`
+  // names the work in the chain's catch-all log ("directory refresh", "home
+  // publish").
   function createSerializedRefresh(
     label: string,
     once: (c: Conn, gen: number) => Promise<void>,
@@ -890,7 +1091,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
         })
         // The chain must never reject — a void-ed rejection escalates to the
         // process unhandledRejection handler.
-        .catch((err) => console.error(`[sidecar] fleet ${label} refresh failed:`, err));
+        .catch((err) => console.error(`[sidecar] fleet ${label} failed:`, err));
     };
     // Force-reset, for a connection edge. Clearing the flags alone would NOT be
     // enough (F17): the real serializer is the promise CHAIN, so a `.then()`
@@ -907,9 +1108,10 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
 
   // The fetch ladder: GET → ok → json → schema, warning ONCE at whichever rung
   // fails and never handing the caller a partial result. `notFound` is reported
-  // apart from `failed` because the two callers disagree about what a 404
-  // MEANS: to identity it is a pre-identity hub (a capability latch), to the
-  // directory it is just another rejection.
+  // apart from `failed` because the three callers disagree about what a 404
+  // MEANS: to identity and to the Organization directory's pull (#288) it is a
+  // Hub that predates the route (a per-connection capability latch), to the
+  // machine directory it is just another rejection.
   async function fetchAndParse<T>(
     url: string,
     headers: Record<string, string>,
@@ -965,16 +1167,24 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     // periodic, so without this floor one dropped POST left this machine's
     // rows out of the fleet union until reconnect — ADR-0055's defect class
     // on the push half, the same reason the event sweep pushes AND pulls. An
-    // unchanged re-push is a no-op merge hub-side (newest-probedAt-wins).
+    // unchanged re-push is a no-op merge hub-side (newest-probedAt-wins). The
+    // Organization directory's push rides it for the same reason (#288), and so
+    // does the Organization assertion directory's (#310); since each answer is
+    // its union, it is each directory's pull floor too. So does the
+    // Organization roster pull (#366): no poke announces a roster change, so
+    // the sweep is how a later listing reaches this client.
     directorySweep = setIntervalImpl(() => {
       refreshDirectory();
       refreshIdentity();
       void pushIdentity();
+      pushOrganizationLabels();
+      pushOrganizationAssertions();
+      pullOrganizationRoster();
       if (forgetIntent.read() !== null) void forget([]);
     }, directorySweepMs);
   }
 
-  const refreshDirectory = createSerializedRefresh("directory", refreshDirectoryOnce);
+  const refreshDirectory = createSerializedRefresh("directory refresh", refreshDirectoryOnce);
 
   async function refreshDirectoryOnce(c: Conn, myGen: number): Promise<void> {
     const out = await fetchAndParse(
@@ -989,12 +1199,93 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     if (out.kind !== "ok") {
       // The directory has no capability latch, so a 404 is just another
       // rejection here — say so, exactly as the pre-extraction `!res.ok` arm
-      // did (the identity half is the only caller for which 404 means more).
+      // did (identity and the Organization directory latch on a 404 instead).
       if (out.kind === "notFound") console.warn("[sidecar] fleet directory refresh rejected (404)");
       return;
     }
     cache.update(out.data.machines);
+    adoptPublishedHomes(out.data.machines, true);
     deps.emitMachinesChanged();
+    // Re-publish when the directory's self entry disagrees with the Home this
+    // process runs under — DAMPED. It heals only a publish this connection has
+    // not landed yet (a failed PUT, a connect whose GET beat its PUT, a
+    // `setHome` still in flight) or a Hub that lost the field (listed null
+    // while this process runs under a Home) — on connect, on every poke and on
+    // the sweep (ADR-0055's retry floor); a match, the common case, sends
+    // nothing. It never fights a DIFFERENT non-null Home listed after ours
+    // landed: that is another writer — two installs sharing one machine id (a
+    // copied app-data directory, a roaming profile) — and fighting it loops
+    // without limit, because each changing PUT makes the Hub poke every client
+    // and the other install's refresh PUTs back. Every round costs an fsync'd
+    // directory rewrite on the Hub and, on every peer, a presumption flip, a
+    // report-cache clear and a usage poke. So the last writer wins on the Hub,
+    // and this install says so once per connection.
+    if (home !== undefined) {
+      const self = out.data.machines.find((m) => m.machineId === deps.machineId);
+      const listed = self?.homeOrganization ?? null;
+      if (listed !== home) {
+        if (landedHome !== home || listed === null) publishHome();
+        else if (!warnedHomeConflict) {
+          warnedHomeConflict = true;
+          console.warn(
+            "[sidecar] fleet home publish stood down: the Hub lists a different Home for this machine than the one this connection published — another install is likely publishing under the same machine id (e.g. a copied app-data directory); leaving the last writer's Home in place",
+          );
+        }
+      }
+    }
+  }
+
+  // ── The published Home (#281) ──
+  // This machine's Home, written to its own Machine directory entry (PUT
+  // /api/machines/:self) so every peer presumes this machine's owner-less rows
+  // under it. Directory metadata only: no event row carries it, and the Hub
+  // stores it verbatim. Deliberately NOT gated on `shareEvents` or the replica:
+  // the directory entry exists on any authenticated contact, and rows shared
+  // before sharing was switched off still need their producer's Home.
+  //
+  // The Home this process runs under, as main() last handed it. `undefined`
+  // until the first `setHome` — a first launch's Home is not known until the
+  // seed walk settles, and publishing a placeholder would only make every peer
+  // drop its caches twice.
+  let home: string | null | undefined;
+  // The Home this CONNECTION last saw the Hub accept: the value SENT in a PUT
+  // answered 2xx — not the live `home` at completion, so a `setHome` landing
+  // mid-flight still counts as not landed. The heal's damper (above) reads it,
+  // with `warnedHomeConflict` keeping its warning to one per connection. Both
+  // are reset on every connection edge (`resetRefreshSerializers`), so a
+  // reconnect — the one after a Hub restart included — publishes and heals
+  // afresh.
+  let landedHome: string | null | undefined;
+  let warnedHomeConflict = false;
+  // The SAME serializer as the pulls: one PUT in flight, and a burst of
+  // `setHome` calls coalesces into one follow-up that publishes the last value.
+  const publishHome = createSerializedRefresh("home publish", publishHomeOnce);
+
+  async function publishHomeOnce(c: Conn, myGen: number): Promise<void> {
+    // Read at run time, not at trigger time: last value wins.
+    const value = home;
+    if (value === undefined) return;
+    const deadline = requestDeadline();
+    try {
+      const res = await fetchImpl(`${c.url}/api/machines/${encodeURIComponent(deps.machineId)}`, {
+        method: "PUT",
+        headers: { ...c.headers, "content-type": "application/json" },
+        body: JSON.stringify({ homeOrganization: value }),
+        signal: deadline.signal,
+      });
+      // A superseded connection's answer says nothing about the live one.
+      if (connGen !== myGen) return;
+      // A 2xx lands the value SENT — the damper's memory. Otherwise warn once
+      // and give up — no retry queue: the next directory refresh sees the
+      // stale self entry and re-publishes (above).
+      if (res.ok) landedHome = value;
+      else console.warn(`[sidecar] fleet home publish failed: ${res.status}`);
+    } catch (err) {
+      if (connGen !== myGen) return;
+      console.warn(`[sidecar] fleet home publish failed: ${String(err)}`);
+    } finally {
+      deadline.clear();
+    }
   }
 
   // ── Identity directory sync (ADR-0062 §4) ──
@@ -1095,7 +1386,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
 
   // Serialized like refreshDirectory above — the SAME serializer, so a sweep
   // landing on an in-flight pull can never stack.
-  const refreshIdentity = createSerializedRefresh("identity", refreshIdentityOnce);
+  const refreshIdentity = createSerializedRefresh("identity refresh", refreshIdentityOnce);
 
   async function refreshIdentityOnce(c: Conn, myGen: number): Promise<void> {
     // The two things identity adds to the shared ladder: the replica gate (the
@@ -1137,6 +1428,299 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     if (identityStore.adoptUnion(out.data.rows, out.data.assertions ?? [], deps.machineId)) {
       deps.emitIdentityChanged();
     }
+  }
+
+  // ── Organization directory sync (#288, ADR-0105 §8) ──
+  // The user's renames go fleet-wide through the Hub's Organization directory.
+  // The push POSTs this machine's whole label map, and the Hub answers with
+  // the union after merging it — push and pull in one round trip — which is
+  // adopted newest-`editedAt`-wins. It runs on connect, on a local rename that
+  // wrote, and on the directory sweep; a hub:organizations poke pulls with a
+  // GET. Like the published Home, and unlike the identity rows, it is gated on
+  // neither `shareEvents` nor the replica: a label is user-authored
+  // presentation, fleet-wide whenever a Hub is configured. A Hub that predates
+  // the directory 404s, which latches `organizationDirectoryUnsupported` for
+  // THIS connection (the identity precedent); any other push failure warns
+  // once per connection, and the sweep retries. `onConnected` clears both. A
+  // pull, poke-driven and so rare, warns at whichever ladder rung it fails.
+  let organizationDirectoryUnsupported = false;
+  let warnedOrganizationDirectory = false;
+  function warnOrganizationDirectory(detail: string): void {
+    if (warnedOrganizationDirectory) return;
+    warnedOrganizationDirectory = true;
+    console.warn(`[sidecar] organization directory sync failed: ${detail}`);
+  }
+
+  // Adopt a union. The pair a local rename fires — the wholesale invalidation
+  // and organizations:changed — fires only when some Organization's label
+  // changed: an `editedAt` that moved alone is written to disk and shown to
+  // no one. A merge that rejects (a disk fault) restored the store as it was,
+  // so there is nothing to announce.
+  async function adoptOrganizationLabels(
+    labels: FleetOrganizationLabels,
+    union: Record<string, OrganizationLabelEntry>,
+  ): Promise<void> {
+    let merged: { wrote: boolean; labelChanged: boolean };
+    try {
+      merged = await labels.merge(union);
+    } catch (err) {
+      console.warn(`[sidecar] organization directory adopt failed: ${String(err)}`);
+      return;
+    }
+    if (!merged.labelChanged) return;
+    pokeNow();
+    deps.emitOrganizationsChanged?.();
+  }
+
+  // The SAME serializer as the pulls: one push in flight, and a burst of
+  // triggers coalesces into one follow-up that sends the map as it is then.
+  const pushOrganizationLabels = createSerializedRefresh(
+    "organization directory push",
+    pushOrganizationLabelsOnce,
+  );
+
+  async function pushOrganizationLabelsOnce(c: Conn, myGen: number): Promise<void> {
+    const labels = deps.organizationLabels;
+    if (labels === undefined || organizationDirectoryUnsupported) return;
+    await labels.ready;
+    if (connGen !== myGen) return;
+    let union: Record<string, OrganizationLabelEntry>;
+    const deadline = requestDeadline();
+    try {
+      const res = await fetchImpl(`${c.url}${ORGANIZATION_DIRECTORY_PATH}`, {
+        method: "POST",
+        headers: { ...c.headers, "content-type": "application/json" },
+        body: JSON.stringify({ labels: Object.fromEntries(labels.entries()) }),
+        signal: deadline.signal,
+      });
+      // Everything below belongs to the connection that ASKED (F16): a
+      // superseded Hub's 404 must not latch the fresh connection, nor its
+      // union be adopted.
+      if (connGen !== myGen) return;
+      if (res.status === 404) {
+        organizationDirectoryUnsupported = true; // pre-#288 Hub: silent, per-connection
+        return;
+      }
+      if (!res.ok) {
+        warnOrganizationDirectory(String(res.status));
+        return;
+      }
+      const parsed = hubOrganizationDirectorySchema.safeParse(await res.json());
+      if (connGen !== myGen) return;
+      if (!parsed.success) {
+        warnOrganizationDirectory("malformed answer");
+        return;
+      }
+      union = parsed.data.labels;
+    } catch (err) {
+      if (connGen !== myGen) return;
+      warnOrganizationDirectory(String(err));
+      return;
+    } finally {
+      deadline.clear();
+    }
+    await adoptOrganizationLabels(labels, union);
+  }
+
+  const refreshOrganizationLabels = createSerializedRefresh(
+    "organization directory refresh",
+    refreshOrganizationLabelsOnce,
+  );
+
+  async function refreshOrganizationLabelsOnce(c: Conn, myGen: number): Promise<void> {
+    const labels = deps.organizationLabels;
+    if (labels === undefined || organizationDirectoryUnsupported) return;
+    await labels.ready;
+    if (connGen !== myGen) return;
+    const out = await fetchAndParse(
+      `${c.url}${ORGANIZATION_DIRECTORY_PATH}`,
+      c.headers,
+      hubOrganizationDirectorySchema,
+      "organization directory",
+    );
+    // As the push: a superseded connection's answer neither latches nor lands.
+    if (connGen !== myGen) return;
+    if (out.kind === "notFound") {
+      organizationDirectoryUnsupported = true; // pre-#288 Hub: silent, per-connection
+      return;
+    }
+    if (out.kind === "failed") return;
+    await adoptOrganizationLabels(labels, out.data.labels);
+  }
+
+  // ── Organization assertion directory sync (#310, ADR-0107 §11) ──
+  // The Organization directory's sync above, copied for the user's
+  // Organization assertions: the push POSTs this machine's whole assertion map
+  // and adopts the union the Hub answers, on connect, on a local edit that
+  // wrote, and on the directory sweep; a hub:organization-assertions poke pulls
+  // with a GET. Gated on neither `shareEvents` nor the replica: any machine may
+  // assert any session, and archive-only history has no living producer to
+  // carry a claim (#306 item 6). A 404 latches
+  // `organizationAssertionDirectoryUnsupported` for THIS connection, apart from
+  // the label directory's latch — a Hub may serve one and not the other; any
+  // other push failure warns once per connection, and the sweep retries.
+  // `onConnected` clears both.
+  let organizationAssertionDirectoryUnsupported = false;
+  let warnedOrganizationAssertionDirectory = false;
+  function warnOrganizationAssertionDirectory(detail: string): void {
+    if (warnedOrganizationAssertionDirectory) return;
+    warnedOrganizationAssertionDirectory = true;
+    console.warn(`[sidecar] organization assertion directory sync failed: ${detail}`);
+  }
+
+  // Adopt a union. Only a change to some session's resolved Organization is
+  // announced: main() installs the new claims (`assertionsAdopted`), then the
+  // wholesale invalidation tells every renderer to refetch. An `editedAt` that
+  // moved alone, or a tombstone for a session with no claim, is written to
+  // disk and shown to no one. A merge that rejects restored the store, so there
+  // is nothing to announce. No roster poke: a claim moves no Organization's
+  // row in Settings.
+  async function adoptOrganizationAssertions(
+    store: FleetOrganizationAssertions,
+    union: Record<string, OrganizationAssertionEntry>,
+  ): Promise<void> {
+    let merged: { wrote: boolean; assertionChanged: boolean };
+    try {
+      merged = await store.merge(union);
+    } catch (err) {
+      console.warn(`[sidecar] organization assertion directory adopt failed: ${String(err)}`);
+      return;
+    }
+    if (!merged.assertionChanged) return;
+    deps.assertionsAdopted?.();
+    pokeNow();
+  }
+
+  const pushOrganizationAssertions = createSerializedRefresh(
+    "organization assertion directory push",
+    pushOrganizationAssertionsOnce,
+  );
+
+  async function pushOrganizationAssertionsOnce(c: Conn, myGen: number): Promise<void> {
+    const store = deps.organizationAssertions;
+    if (store === undefined || organizationAssertionDirectoryUnsupported) return;
+    await store.ready;
+    if (connGen !== myGen) return;
+    let union: Record<string, OrganizationAssertionEntry>;
+    const deadline = requestDeadline();
+    try {
+      const res = await fetchImpl(`${c.url}${ORGANIZATION_ASSERTION_DIRECTORY_PATH}`, {
+        method: "POST",
+        headers: { ...c.headers, "content-type": "application/json" },
+        body: JSON.stringify({ assertions: Object.fromEntries(store.entries()) }),
+        signal: deadline.signal,
+      });
+      // Everything below belongs to the connection that ASKED: a superseded
+      // Hub's 404 must not latch the fresh connection, nor its union land.
+      if (connGen !== myGen) return;
+      if (res.status === 404) {
+        organizationAssertionDirectoryUnsupported = true; // pre-#310 Hub: silent, per-connection
+        return;
+      }
+      if (!res.ok) {
+        warnOrganizationAssertionDirectory(String(res.status));
+        return;
+      }
+      const parsed = hubOrganizationAssertionDirectorySchema.safeParse(await res.json());
+      if (connGen !== myGen) return;
+      if (!parsed.success) {
+        warnOrganizationAssertionDirectory("malformed answer");
+        return;
+      }
+      union = parsed.data.assertions;
+    } catch (err) {
+      if (connGen !== myGen) return;
+      warnOrganizationAssertionDirectory(String(err));
+      return;
+    } finally {
+      deadline.clear();
+    }
+    await adoptOrganizationAssertions(store, union);
+  }
+
+  const refreshOrganizationAssertions = createSerializedRefresh(
+    "organization assertion directory refresh",
+    refreshOrganizationAssertionsOnce,
+  );
+
+  async function refreshOrganizationAssertionsOnce(c: Conn, myGen: number): Promise<void> {
+    const store = deps.organizationAssertions;
+    if (store === undefined || organizationAssertionDirectoryUnsupported) return;
+    await store.ready;
+    if (connGen !== myGen) return;
+    const out = await fetchAndParse(
+      `${c.url}${ORGANIZATION_ASSERTION_DIRECTORY_PATH}`,
+      c.headers,
+      hubOrganizationAssertionDirectorySchema,
+      "organization assertion directory",
+    );
+    // As the push: a superseded connection's answer neither latches nor lands.
+    if (connGen !== myGen) return;
+    if (out.kind === "notFound") {
+      organizationAssertionDirectoryUnsupported = true; // pre-#310 Hub: silent, per-connection
+      return;
+    }
+    if (out.kind === "failed") return;
+    await adoptOrganizationAssertions(store, out.data.assertions);
+  }
+
+  // ── Organization roster pull (#366, #360's resolution) ──
+  // A hub-connected client's roster learns every Organization the Hub's key
+  // lists: the Hub polls for the fleet (ADR-0035), so this client never asks
+  // claude.ai. GET /api/organizations on connect and on the directory sweep;
+  // each listed row that carries hints is recorded as Connect records one
+  // (hints, a first-seen time, the Hub's Limits answer, a null answer keeping a
+  // recorded one). A directory-only row adds nothing, and a failed or empty pull
+  // changes nothing. The learned rows go in one call, as the Hub key's complete
+  // listing (every roster entry carries hints), so an Organization the Hub no
+  // longer lists is marked off the account and kept (organizations.ts, #360
+  // item 3). Gated on neither `shareEvents` nor the replica, like the
+  // label directory. The live answers keep coming from HubStatus.organizations.
+  //
+  // No capability latch: the protocol is exact-match and every v5 Hub serves
+  // the route, so a 404 is one more rejection — said so, as the machine
+  // directory says it — and the sweep asks again. A learn that changed the
+  // registry, or that rejected after the registry's in-memory update, pokes the
+  // roster alone: a roster row moves no report, so there is no wholesale
+  // invalidation.
+  const pullOrganizationRoster = createSerializedRefresh(
+    "organization roster pull",
+    pullOrganizationRosterOnce,
+  );
+
+  async function pullOrganizationRosterOnce(c: Conn, myGen: number): Promise<void> {
+    const learn = deps.learnOrganizations;
+    if (learn === undefined) return;
+    const out = await fetchAndParse(
+      `${c.url}${HUB_ORGANIZATIONS_PATH}`,
+      c.headers,
+      hubOrganizationsResponseSchema,
+      "organization roster",
+    );
+    // A superseded connection's roster must not land: the fresh connect re-asked.
+    if (connGen !== myGen) return;
+    if (out.kind !== "ok") {
+      if (out.kind === "notFound") {
+        console.warn("[sidecar] fleet organization roster refresh rejected (404)");
+      }
+      return;
+    }
+    const learned: LearnedOrg[] = [];
+    for (const row of out.data.organizations) {
+      if (!row.listed || row.hints === undefined) continue;
+      learned.push({ id: row.uuid, hints: row.hints, limits: row.limits?.limits ?? null });
+    }
+    if (learned.length === 0) return;
+    let changed: boolean;
+    try {
+      changed = await learn(learned);
+    } catch (err) {
+      console.warn(`[sidecar] organization roster learn failed: ${String(err)}`);
+      // The registry updates its memory before its write, so the roster may
+      // already show what this learn rejected on: announce it anyway.
+      changed = true;
+    }
+    if (changed) deps.emitOrganizationsChanged?.();
   }
 
   // ── FleetSync surface ──
@@ -1197,16 +1781,29 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     }
   }
 
-  // Both refresh serializers, force-reset — run on BOTH connection edges. F17:
+  // Every refresh serializer, force-reset — run on BOTH connection edges. F17:
   // an identity GET that never settled used to leave `identityRefreshing`
   // latched true forever, because nothing cleared it (onDisconnected did not
   // touch it, and onConnected only re-called the trigger, which then took the
   // "already refreshing" branch) — so one black-holed fetch silently ended this
   // client's identity pulls until the app restarted. The directory half carried
-  // the identical wedge; since the extraction they share the remedy too.
+  // the identical wedge; since the extraction they share the remedy too, and
+  // the Home publish (#281), which rides the same serializer, shares it again —
+  // along with its per-connection memory: what this connection landed, and
+  // whether its damper has warned. The Organization directory's push and pull
+  // (#288) share it too, and so do the Organization assertion directory's
+  // (#310) and the Organization roster pull (#366).
   function resetRefreshSerializers(): void {
     refreshDirectory.reset();
     refreshIdentity.reset();
+    publishHome.reset();
+    pushOrganizationLabels.reset();
+    refreshOrganizationLabels.reset();
+    pushOrganizationAssertions.reset();
+    refreshOrganizationAssertions.reset();
+    pullOrganizationRoster.reset();
+    landedHome = undefined;
+    warnedHomeConflict = false;
   }
 
   const hooks: HubFleetHooks = {
@@ -1216,6 +1813,11 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
 
       resetRefreshSerializers();
       refreshDirectory();
+      // Publish the Home on EVERY successful connect (#261 item 2) — the Hub
+      // answers an unchanged Home with no write and no poke. When the directory
+      // GET above is answered before this PUT lands, its self entry still lacks
+      // the Home and the refresh re-publishes it: two identical PUTs, harmless.
+      publishHome();
       armDirectorySweep();
       // Identity (ADR-0062): a NEW connection gets a fresh capability probe —
       // the 404 latch is per-connection, so an upgraded hub is noticed here.
@@ -1224,6 +1826,19 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       identityUnsupported = false;
       void pushIdentity();
       refreshIdentity();
+      // The Organization directory (#288): the same fresh probe, and a fresh
+      // warning, for a new connection. Then push the label map; its answer is
+      // the union, so there is no separate pull.
+      organizationDirectoryUnsupported = false;
+      warnedOrganizationDirectory = false;
+      pushOrganizationLabels();
+      // The Organization assertion directory (#310): the same fresh probe and
+      // fresh warning, then the push, whose answer is the union.
+      organizationAssertionDirectoryUnsupported = false;
+      warnedOrganizationAssertionDirectory = false;
+      pushOrganizationAssertions();
+      // The Organization roster (#366): learn every Organization the Hub's key lists.
+      pullOrganizationRoster();
       // event-sync mirrors its capability verdict through onDegraded — the
       // synchronous connect verdict AND any later 404 latch (M7) both land on
       // the loopback status without waiting for a reconnect cycle.
@@ -1256,6 +1871,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     onEventsPoke: (seq) => eventSync.onEventsPoke(seq),
     onStatusEvents: (events) => eventSync.onStatusEvents(events),
     onMachinesPoke: () => refreshDirectory(),
+    onOrganizationsPoke: () => refreshOrganizationLabels(),
+    onOrganizationAssertionsPoke: () => refreshOrganizationAssertions(),
   };
 
   return {
@@ -1333,9 +1950,24 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       return { assertion };
     },
     reportStore: () => retainedReportStore ?? deps.getStore(),
+    releaseRetainedView: () => {
+      if (retainedReportStore === null) return;
+      releaseReportStore();
+      pokeNow();
+    },
     forget,
-    repairOrganizations: (sessions, target) => forget(sessions, target),
+    repairOrganizations: (sessions, target, opts) =>
+      forget(sessions, target, opts?.keepLocalArchive === true ? "lossless" : "excluded"),
     rebuildEngine: requestRebuild,
+    invalidateReports: pokeNow,
+    setHome: (next) => {
+      if (next === home) return;
+      home = next;
+      // No-ops while disconnected; `onConnected` publishes the value later.
+      publishHome();
+    },
+    organizationLabelsChanged: () => pushOrganizationLabels(),
+    organizationAssertionsChanged: () => pushOrganizationAssertions(),
     getReplica: () => replica,
     mayArchiveFleet: (row) => {
       if (
@@ -1347,11 +1979,15 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       )
         return false;
       if (!eventSync.isCaughtUp()) return false;
+      // An identity test — "this row IS the replica's copy" — so it must match
+      // in tag too (ADR-0103): a row fuller or emptier by Organization evidence
+      // alone is a different copy.
       const held = replica.get(row.messageId, row.requestId);
       return (
         held !== undefined &&
         held.machineId === row.machineId &&
-        fleetTokenTotal(held) === fleetTokenTotal(row)
+        fleetTokenTotal(held) === fleetTokenTotal(row) &&
+        held.organizationUuid === row.organizationUuid
       );
     },
     stop: async () => {

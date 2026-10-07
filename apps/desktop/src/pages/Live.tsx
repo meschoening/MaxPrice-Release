@@ -8,6 +8,7 @@ import { useTimeDisplay } from "@/state/use-settings";
 import { useWeekWindow } from "@/state/use-week";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { AXIS_LABELS, GROUP_BY_AXES, selectionLabel, type GroupByAxis } from "@/lib/group-by";
+import { useQuotaSurface } from "@/state/use-quota-surface";
 import { useCorpusEmpty } from "@/state/use-corpus-empty";
 import { useBootPaintPublisher } from "@/lib/boot-paint";
 import { EmptyState } from "@/components/EmptyState";
@@ -15,6 +16,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { TodayTile } from "@/components/today-tile";
 import { ThisWeekTile } from "@/components/this-week-tile";
 import { ActiveBlockTile } from "@/components/active-block-tile";
+import { ChartSpanNote } from "@/components/chart-span-note";
 import { CostChartCard } from "@/components/cost-chart-card";
 import { ListRow } from "@/components/list-row";
 import { useFlipList } from "@/state/use-flip-list";
@@ -112,6 +114,9 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
   // ADR-0083: the This-week tile follows the Week setting.
   const week = useWeekWindow();
   const display = useTimeDisplay();
+  // The block span frames the Quota organization's block (ADR-0108); under All
+  // a note beside the controls says whose.
+  const { tag: quotaTag } = useQuotaSurface();
 
   return (
     <>
@@ -138,6 +143,7 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
               setGroupByAxes={setGroupByAxes}
               visibleAxes={visibleAxes}
             />
+            <ChartSpanNote span={span} quotaTag={quotaTag} />
           </div>
           <div className="seg" role="tablist" aria-label="Span">
             {SPAN_TABS.map((tab) => (

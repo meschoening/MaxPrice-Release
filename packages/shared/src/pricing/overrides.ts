@@ -5,7 +5,8 @@
 // release day with no upstream price entry, which would price its real spend
 // at $0 across every report. Each entry here is a *published* Anthropic price
 // hand-vendored for that gap — never an invented number (that stance is
-// ADR-0011's and it stands).
+// ADR-0011's and it stands). An entry may also fill a key upstream prices but
+// the bundled snapshot lacks, while #381 blocks refreshing it (ADR-0027).
 //
 // Precedence is the load-bearing rule: THE SNAPSHOT ALWAYS WINS. An override
 // fills a model key only when the active snapshot lacks it, so the day
@@ -35,6 +36,22 @@ export const PRICING_OVERRIDES: Record<string, ModelPricing> = {
     output_cost_per_token: 5e-5,
     cache_creation_input_token_cost: 1.25e-5,
     cache_read_input_token_cost: 1e-6,
+  },
+  // claude-opus-5-5: Anthropic-published pricing ($4 / $20 / $5 / $0.20 per Mtok).
+  // Remove once the bundled snapshot carries the key (blocked by #381).
+  "claude-opus-5-5": {
+    input_cost_per_token: 4e-6,
+    output_cost_per_token: 2e-5,
+    cache_creation_input_token_cost: 5e-6,
+    cache_read_input_token_cost: 2e-7,
+  },
+  // claude-sonnet-5-5: Anthropic-published pricing ($2 / $10 / $2.50 / $0.20 per Mtok).
+  // Remove once the bundled snapshot carries the key (blocked by #381).
+  "claude-sonnet-5-5": {
+    input_cost_per_token: 2e-6,
+    output_cost_per_token: 1e-5,
+    cache_creation_input_token_cost: 2.5e-6,
+    cache_read_input_token_cost: 2e-7,
   },
 };
 

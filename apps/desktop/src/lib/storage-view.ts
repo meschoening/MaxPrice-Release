@@ -301,6 +301,9 @@ export const STORAGE_COPY = {
       const rest = forget.sessionCount - forget.sampleSessions.length;
       return rest > 0 ? `…and ${rest.toLocaleString()} more sessions` : null;
     },
+    // A row count in the confirm's two lists — each sampled session, and each
+    // Organization's share when the rows span more than one (#295).
+    rows: (rows: number): string => `${rows.toLocaleString()} rows`,
     confirmCta: "Forget history",
     confirmCancel: "Cancel",
   },

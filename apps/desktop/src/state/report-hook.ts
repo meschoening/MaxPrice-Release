@@ -1,4 +1,9 @@
-import { keepPreviousData, useQuery, type UseQueryResult } from "@tanstack/react-query";
+import {
+  hashKey,
+  useQuery,
+  type PlaceholderDataFunction,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import type { CostMode, QueryInput } from "@maxprice/shared";
 import type { z } from "zod";
 import { sidecarFetch } from "@/lib/sidecar";
@@ -19,6 +24,9 @@ export type ReportQueryInput = {
   // (the renderer expands merge-alias closures before calling). Serialized as
   // repeated `machine=` params, mirroring `models`.
   machines?: string[];
+  // The resolved Organization scope (#278) — a tracked uuid or "all"; absent =
+  // the Home organization. Serialized as one `organization=` param.
+  organization?: string;
 };
 
 // Collapse a hook's loose input into the canonical QueryInput used for both
@@ -34,17 +42,26 @@ export function normalize(opts: ReportQueryInput): QueryInput {
     projects: opts.projects,
     models: opts.models,
     machines: opts.machines,
+    organization: opts.organization,
   };
 }
 
 // Shared serializer for the filter params common to every report URL — `mode`,
-// the optional `tz`, and the repeated `project` / `model` multi-selects. Called
+// the optional `tz`, the repeated `project` / `model` / `machine` multi-selects,
+// and the optional `organization` scope (#278). Called
 // by `buildReportUrl` and `buildIntradayUrl` (use-intraday.ts) AFTER each has
 // set its own window param (since/until vs span), so the produced query strings
 // stay byte-identical to the two hand-rolled copies this replaced (f21).
 export function appendFilterParams(
   params: URLSearchParams,
-  input: { mode: string; tz?: string; projects?: string[]; models?: string[]; machines?: string[] },
+  input: {
+    mode: string;
+    tz?: string;
+    projects?: string[];
+    models?: string[];
+    machines?: string[];
+    organization?: string;
+  },
 ): void {
   params.set("mode", input.mode);
   if (input.tz) params.set("tz", input.tz);
@@ -55,6 +72,9 @@ export function appendFilterParams(
   // ADR-0041 (M6): the machine filter axis, repeated `machine=` params — absent
   // when unset, so non-machine URLs stay byte-identical to pre-M6.
   for (const m of input.machines ?? []) params.append("machine", m);
+  // #278: the Organization scope. Absent = Home, so a single-Organization
+  // machine's URLs stay byte-identical to before the scope existed.
+  if (input.organization) params.set("organization", input.organization);
 }
 
 // Shared URL composer for every /api/<report> endpoint. The param shape is
@@ -83,8 +103,23 @@ export function buildReportUrl(path: string, input: QueryInput): string {
 // rows across an ordinary filter edit, which is a different (and unasked-for)
 // product decision. The one caller today is the anchored previous-week query
 // (ADR-0083), whose instant-bounded `until` moves with the current week's
-// fetch — see use-live-data.ts.
+// fetch — see use-live-data.ts. The report factory only retains rows across
+// that right-edge move; scope and anchor changes clear the placeholder.
 export type ReportQueryOptions = { enabled?: boolean; keepPrevious?: boolean };
+
+// Only the moving right edge may reuse rows. A new Organization, filter, or
+// week anchor must wait for its own data, even when `until` changes with it.
+export function keepPreviousUntil<T>(
+  key: readonly [string, QueryInput],
+): PlaceholderDataFunction<T> {
+  const scopeHash = hashKey([key[0], { ...key[1], until: undefined }]);
+  return (data, previous) => {
+    if (!previous) return undefined;
+    const [family, input] = previous.queryKey;
+    if (typeof input !== "object" || input === null) return undefined;
+    return hashKey([family, { ...input, until: undefined }]) === scopeHash ? data : undefined;
+  };
+}
 
 export type ReportHook<T, K extends readonly [string, QueryInput]> = {
   queryKey: (opts: ReportQueryInput) => K;
@@ -120,7 +155,7 @@ export function makeReportHook<
       queryKey: queryKey(opts),
       queryFn: ({ signal }) => fetchReport(opts, signal),
       enabled: options?.enabled ?? true,
-      placeholderData: options?.keepPrevious ? keepPreviousData : undefined,
+      placeholderData: options?.keepPrevious ? keepPreviousUntil<T>(queryKey(opts)) : undefined,
     });
 
   return { queryKey, buildUrl, fetch: fetchReport, useReport };

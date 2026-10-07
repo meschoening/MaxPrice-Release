@@ -12,8 +12,10 @@ import {
   type FleetEvent,
   type StoredEventWire,
   type HubEventStamp,
+  fleetCopySupersedes,
+  internRowStrings,
 } from "@maxprice/shared";
-import { fleetEventKey, fleetTokenTotal } from "./fleet-event-store";
+import { fleetEventKey } from "./fleet-event-store";
 
 export class FleetRecoveryRequired extends Error {}
 export class FleetUploadConflict extends Error {}
@@ -200,7 +202,7 @@ export function createFleetEventStore(opts: {
           )
           .all()
           .map(({ key, seq, body }) => {
-            const row = fleetEventSchema.parse(JSON.parse(body));
+            const row = internRowStrings(fleetEventSchema.parse(JSON.parse(body)));
             if (key !== fleetEventKey(row.messageId, row.requestId) || seq !== row.seq)
               throw new Error("Fleet database integrity mismatch");
             return [key, row];
@@ -209,13 +211,34 @@ export function createFleetEventStore(opts: {
     }
     return (cache ??= [...rowsByKey.values()].sort((a, b) => a.seq - b.seq));
   }
+  // One row by key, as this connection sees it. The parsed rows are already
+  // resident once `all()` has run (`load` runs it): the committed map, under
+  // the open transaction's own writes, so a key put earlier in the same batch
+  // reads back exactly as SQLite would return it. The push loop and the archive
+  // sweep ask this once per local row, and the Hub once per pushed row, so the
+  // SQLite read, JSON parse and schema parse per call cost seconds of
+  // synchronous CPU per pass on a real corpus (#361). Callers only read the row.
   function event(messageId: string, requestId: string | undefined): FleetEvent | undefined {
+    return eventByKey(fleetEventKey(messageId, requestId));
+  }
+  // `event` for a caller that already holds the key (`fleetEventKey`): the push
+  // loop builds each row's key once per pass and reuses it (#361).
+  function eventByKey(key: string): FleetEvent | undefined {
+    if (rowsByKey !== null) {
+      if (staged !== null) {
+        const pending = staged.rows.get(key);
+        if (pending !== undefined) return pending ?? undefined;
+        if (staged.clear) return undefined;
+      }
+      return rowsByKey.get(key);
+    }
     const row = database()
       .query<{ body: string }, [string]>("SELECT body FROM events WHERE key=?")
-      .get(fleetEventKey(messageId, requestId));
+      .get(key);
     return row === null ? undefined : fleetEventSchema.parse(JSON.parse(row.body));
   }
   function put(row: FleetEvent): void {
+    internRowStrings(row); // it becomes resident on commit (#361)
     database()
       .query(
         "INSERT INTO events(key,seq,body) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET seq=excluded.seq, body=excluded.body",
@@ -275,7 +298,10 @@ export function createFleetEventStore(opts: {
       for (const input of rows) {
         const previous = event(input.messageId, input.requestId);
         let row = previous;
-        if (previous === undefined || fleetTokenTotal(input) > fleetTokenTotal(previous)) {
+        // The one merge rule (ADR-0103): a larger total, or an equal total
+        // gaining a tag or a smaller one (#374). A loser is stamped with the
+        // incumbent's seq below.
+        if (previous === undefined || fleetCopySupersedes(input, previous)) {
           const seq = number("eventSeq") + 1;
           row = fleetEventSchema.parse({ ...input, machineId, seq });
           put(row);
@@ -348,13 +374,19 @@ export function createFleetEventStore(opts: {
     }
     const rows: FleetChange[] = [];
     let bytes = 0;
-    const query = database().query<{ body: string; bytes: number }, [number, number, number]>(
+    // A statement of its own, finalized below: leaving a cached query()'s
+    // iterate() early breaks every later run of that SQL (#358).
+    const query = database().prepare<{ body: string; bytes: number }, [number, number, number]>(
       "SELECT body,bytes FROM changes WHERE cursor>? AND cursor<=? ORDER BY cursor LIMIT ?",
     );
-    for (const row of query.iterate(since, through, limit)) {
-      if (rows.length > 0 && bytes + row.bytes > 4 * 1024 * 1024) break;
-      rows.push(fleetChangeSchema.parse(JSON.parse(row.body)));
-      bytes += row.bytes;
+    try {
+      for (const row of query.iterate(since, through, limit)) {
+        if (rows.length > 0 && bytes + row.bytes > 4 * 1024 * 1024) break;
+        rows.push(fleetChangeSchema.parse(JSON.parse(row.body)));
+        bytes += row.bytes;
+      }
+    } finally {
+      query.finalize();
     }
     return {
       epoch: get("epoch"),
@@ -437,6 +469,7 @@ export function createFleetEventStore(opts: {
       set("snapshotTotal", page.total);
       const insert = database().query("INSERT INTO events(key,seq,body) VALUES (?,?,?)");
       for (const row of page.events) {
+        internRowStrings(row); // it becomes resident on commit (#361)
         try {
           insert.run(fleetEventKey(row.messageId, row.requestId), row.seq, JSON.stringify(row));
           staged?.rows.set(fleetEventKey(row.messageId, row.requestId), row);
@@ -554,6 +587,7 @@ export function createFleetEventStore(opts: {
     },
     all,
     get: event,
+    getByKey: eventByKey,
     size,
     fileBytes,
     reclaimableBytes,

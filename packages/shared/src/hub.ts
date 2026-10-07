@@ -1,5 +1,19 @@
 import { z } from "zod";
-import { usageConnectionSchema, usageReadingSchema, usageSampleSchema } from "./usage-limits";
+import {
+  organizationRosterHintsSchema,
+  organizationUsageStatusSchema,
+  usageConnectionSchema,
+  usageReadingSchema,
+  usageSampleSchema,
+  usageOrganizationsSchema,
+} from "./usage-limits";
+import {
+  ORGANIZATION_ASSERTION_DIRECTORY_MAX,
+  organizationAssertionEntrySchema,
+  organizationLabelEntrySchema,
+  organizationUuidKeySchema,
+  sessionIdKeySchema,
+} from "./organizations";
 
 // Hub wire protocol (ADR-0035): the contract between the standalone always-on
 // hub (apps/hub) and each sidecar's hub-client. Crosses MACHINE boundaries —
@@ -8,7 +22,10 @@ import { usageConnectionSchema, usageReadingSchema, usageSampleSchema } from "./
 // HUB_PROTOCOL_VERSION match (no shims; the failure mode is a clear "mismatch"
 // connection state, never quiet misbehavior). Bump the version on ANY breaking
 // change to the shapes below.
-export const HUB_PROTOCOL_VERSION = 4;
+// v5 (ADR-0103/0104): fleet event rows carry Organization evidence, an
+// equal-total tagged copy supersedes an untagged one, and usage live/status
+// maps carry independent Organization answers. One bump across the map.
+export const HUB_PROTOCOL_VERSION = 5;
 
 // The hub's fixed default port. Unlike the sidecar (ADR-0002's dynamic port +
 // stdout handshake — only possible with a parent process), remote clients must
@@ -26,9 +43,13 @@ export const HUB_SSE_EVENT = {
   // durable watermark `{ seq }`, hub:machines an empty directory-changed
   // signal `{}` — SSE is a poke, never a data channel (a data-bearing stream
   // interleaved with a mid-seed paged pull can advance the cursor past
-  // unpulled rows).
+  // unpulled rows). hub:organizations is the Organization directory's empty
+  // changed-signal `{}` the same way (#288), and hub:organization-assertions
+  // the Organization assertion directory's (#310).
   events: "hub:events",
   machines: "hub:machines",
+  organizations: "hub:organizations",
+  organizationAssertions: "hub:organization-assertions",
 } as const;
 
 // Version-detection preamble. This pair — { service, protocolVersion } — is
@@ -56,15 +77,20 @@ export type HubStatusPreamble = z.infer<typeof hubStatusPreambleSchema>;
 // GET /api/status response AND the hub:status SSE payload. `service` is a
 // literal so a client pointed at some other HTTP server fails loudly here
 // rather than misparsing. `usageConnection` is the HUB's claude.ai connection
-// (the sidecar mirrors it into its own status while hub-connected).
+// at key level; a connected sidecar projects Home's displayed state from
+// organizations, without letting Home's absence/unreadability trigger fallback.
 export const hubStatusSchema = z.object({
   service: z.literal("maxprice-hub"),
   protocolVersion: z.number().int(),
   usageConnection: usageConnectionSchema,
   usageLastSampleAt: z.string().nullable(),
-  // Protocol v3: each live window is nullable independently of the others.
-  // null means a successful poll found no account window in flight.
-  usageCurrentSample: usageReadingSchema.nullable(),
+  // Missing key: no authoritative current answer. A present null means a
+  // successful read found no windows for that Organization. A partial reading
+  // keeps each window independently nullable (ADR-0090/0104).
+  usageCurrent: z.record(usageReadingSchema.nullable()),
+  // Retained cadence survives partial/none reads, including for a new client.
+  usageWeeklyResetAt: z.record(z.string()),
+  organizations: usageOrganizationsSchema,
   sampleCount: z.number().int().nonnegative(),
   credentialPresent: z.boolean(),
   // Provenance + display fields (ADR-0036). All .optional() — additive; protocol
@@ -74,14 +100,10 @@ export const hubStatusSchema = z.object({
   //   credentialUpdatedAt: ISO; when the key was last set/healed; null if never.
   //   credentialSource:    the machineId that last set/healed it, or "local"
   //                        for the console's own POST; null if never.
-  //   orgId:               the tracked org id (non-secret) from the stored
-  //                        credential; null if no credential. Lets the console
-  //                        SHOW orgId and PREFILL the replace form's org field.
   //   startedAt:           ISO; hub process start, stamped once in serve(); the
   //                        console renders real uptime from it.
   credentialUpdatedAt: z.string().nullable().optional(),
   credentialSource: z.string().nullable().optional(),
-  orgId: z.string().nullable().optional(),
   startedAt: z.string().nullable().optional(),
   // Whether a hub password is currently set (ADR-0037). Optional — additive,
   // protocol stayed v1 when introduced (a pre-0037 hub omits it). Consumed by the operator
@@ -185,7 +207,8 @@ export const EVENT_PUSH_BATCH_MAX = 1000; // rows per POST /api/events
 export const EVENT_PULL_LIMIT_MAX = 5000; // `limit` clamp on GET /api/events
 
 // The wire/disk row for one stored usage event, machine-tagged and seq-stamped.
-// = the engine's StoredEvent fields + the two hub-minted fleet fields.
+// = the engine's StoredEvent fields, less its RAM-only `ms` and its `machineId`
+// (the push body omits it), + the two hub-minted fleet fields.
 // .passthrough() everywhere; .optional()-only evolution FOREVER (survives
 // protocol bumps — the hub store outlives every client version).
 export const storedEventWireSchema = z
@@ -206,6 +229,11 @@ export const storedEventWireSchema = z
     cwd: z.string().optional(), // crosses verbatim (ADR-0009 remote paths)
     projectSlug: z.string(),
     sessionId: z.string(),
+    // v5 (ADR-0103): owner evidence only — the Organization a record's owner
+    // resolved, never the Home organization or a presumption. Absent means no
+    // evidence. Opaque to the Hub: stored and re-served, never a reason to
+    // refuse a row; it enters only the merge rule (fleet-dedup.ts).
+    organizationUuid: z.string().min(1).optional(),
   })
   .passthrough();
 export type StoredEventWire = z.infer<typeof storedEventWireSchema>;
@@ -340,6 +368,15 @@ export const hubMachineSchema = z
     name: z.string(),
     registeredAt: z.string(), // ISO
     mergedInto: z.string().nullable(), // alias chain; resolution is transitive
+    // The machine's own Home organization as it last published it (#261 item 2,
+    // ADR-0103): how a viewer resolves the Presumed organization of this
+    // machine's owner-less rows. Written only by the machine itself through the
+    // self PUT, stored verbatim, never interpreted by the Hub; the tracked set is
+    // never published. Absent or null = nothing published, and a viewer presumes
+    // the rows under its own Home — exactly the pre-v5 answer. Capped at 64: an
+    // Organization uuid is 36 characters, and the cap keeps one peer from making
+    // every `GET /api/machines` serve megabytes.
+    homeOrganization: z.string().min(1).max(64).nullable().optional(),
     live: z.boolean().optional(), // M7: roster join
     lastSeenAt: z.string().nullable().optional(), // M7: null = not seen since daemon start
     eventCount: z.number().int().nonnegative().optional(), // M7: store join
@@ -353,9 +390,10 @@ export type HubMachine = z.infer<typeof hubMachineSchema>;
 // (a malformed directory stops at the first repeat rather than spinning).
 // Returns `id` itself when unmerged (mergedInto === null) or unknown; returns
 // the missing target id when the chain dangles. The ONE alias resolver shared
-// by the client renderer (resolveMachineTarget) and the hub console
-// (resolveMergeTargetName) so both walk identically (ADR-0041).
-export function resolveMergeTarget(machines: HubMachine[], id: string): string {
+// by the client renderer (resolveMachineTarget), the hub console
+// (resolveMergeTargetName) and the sidecar's presumption map (publishedHomes)
+// so all three walk identically (ADR-0041).
+export function resolveMergeTarget(machines: readonly HubMachine[], id: string): string {
   const byId = new Map(machines.map((m) => [m.machineId, m]));
   let current = id;
   const seen = new Set<string>();
@@ -371,13 +409,98 @@ export function resolveMergeTarget(machines: HubMachine[], id: string): string {
 export const hubMachinesResponseSchema = z.object({ machines: z.array(hubMachineSchema) });
 export type HubMachinesResponse = z.infer<typeof hubMachinesResponseSchema>;
 
-// PUT /api/machines/:id (self-rename) body:
+// POST /api/machines/:id/name (the console's rename-any) body:
 export const hubMachineRenameRequestSchema = z.object({ name: z.string().min(1) });
 export type HubMachineRenameRequest = z.infer<typeof hubMachineRenameRequestSchema>;
+
+// PUT /api/machines/:id — a machine updating its OWN entry: a self-rename,
+// its published Home, or both. At least one key; `homeOrganization: null`
+// clears the published Home (a machine with no Home). The Home is the directory
+// entry's own field, cap included, so the Hub never accepts a value its
+// directory loader would reject.
+export const hubMachineSelfUpdateRequestSchema = z
+  .object({
+    name: z.string().min(1).optional(),
+    homeOrganization: hubMachineSchema.shape.homeOrganization,
+  })
+  .refine((b) => b.name !== undefined || b.homeOrganization !== undefined, {
+    message: "name or homeOrganization is required",
+  });
+export type HubMachineSelfUpdateRequest = z.infer<typeof hubMachineSelfUpdateRequestSchema>;
 
 // POST /api/machines/:id/merge body (M7): mark :id an alias of `into`.
 export const hubMachineMergeRequestSchema = z.object({ into: z.string().min(1) });
 export type HubMachineMergeRequest = z.infer<typeof hubMachineMergeRequestSchema>;
+
+// The Organization directory (#288, ADR-0105 §8): the fleet's union of
+// Organization label entries. GET answers it; POST is a client's push of its
+// whole local map and answers the merged union (push and pull in one round
+// trip); PUT /:uuid is the operator's rename. Newest `editedAt` wins
+// (./newest-wins.ts). Labels only: the Hub never interprets an Organization.
+export const ORGANIZATION_DIRECTORY_PATH = "/api/organization-directory";
+// Bounds the UNION, tombstones included, not just one push: the Hub refuses
+// (409 "organization directory is full") any POST or PUT whose merged union
+// would pass it, so every answer, and every client map adopted from one,
+// fits this schema. Updating a uuid the union holds never grows it.
+export const ORGANIZATION_DIRECTORY_MAX = 1000;
+export const hubOrganizationDirectorySchema = z.object({
+  labels: z
+    .record(organizationUuidKeySchema, organizationLabelEntrySchema)
+    .refine((labels) => Object.keys(labels).length <= ORGANIZATION_DIRECTORY_MAX, {
+      message: `at most ${ORGANIZATION_DIRECTORY_MAX} organizations`,
+    }),
+});
+export type HubOrganizationDirectory = z.infer<typeof hubOrganizationDirectorySchema>;
+
+// GET /api/organizations on the Hub (#294): the console's view of the
+// Organizations the Hub knows — its roster (what its key last listed, #284)
+// joined with the Organization directory's labels and the live `organizations`
+// status map. Same path as the sidecar's roster route, on a different server.
+// Resolved here like the sidecar's: `label` is the rename, else the roster
+// hints' plan word, else "Organization <first 8>", with no collision suffix
+// (`displayOrganizationLabels` adds that at render time). Never the upstream
+// name (ADR-0098 §6). Read by the console, and by a hub-connected client,
+// which learns the listed rows into its own Organization registry (#366).
+export const HUB_ORGANIZATIONS_PATH = "/api/organizations";
+export const hubOrganizationSchema = z.object({
+  uuid: z.string().min(1),
+  label: z.string().min(1),
+  renamed: z.boolean(),
+  // In the roster: the key last listed it. false: known only from a
+  // directory label (another machine's Organization, or one the key no longer lists).
+  listed: z.boolean(),
+  // #366: the roster's hints for a listed row, so a client that learns the
+  // Hub's roster resolves the same default label the console shows. Absent on
+  // a directory-only row. Never the upstream name (ADR-0098 §6).
+  hints: organizationRosterHintsSchema.optional(),
+  // The live status map's entry; else the roster's last answer with no times;
+  // null when nothing has answered.
+  limits: organizationUsageStatusSchema.nullable(),
+});
+export type HubOrganization = z.infer<typeof hubOrganizationSchema>;
+export const hubOrganizationsResponseSchema = z.object({
+  organizations: z.array(hubOrganizationSchema),
+});
+export type HubOrganizationsResponse = z.infer<typeof hubOrganizationsResponseSchema>;
+
+// The Organization assertion directory (#310, ADR-0107 §11): the fleet's union
+// of Organization assertions, sessionId → { organizationUuid, editedAt },
+// tombstones included. GET answers it; POST is a client's push of its whole
+// local map and answers the merged union (push and pull in one round trip).
+// Newest `editedAt` wins (./newest-wins.ts). Opaque: the Hub never checks that
+// a session or an Organization exists, and there is no operator edit.
+export const ORGANIZATION_ASSERTION_DIRECTORY_PATH = "/api/organization-assertion-directory";
+export const hubOrganizationAssertionDirectorySchema = z.object({
+  assertions: z
+    .record(sessionIdKeySchema, organizationAssertionEntrySchema)
+    .refine(
+      (assertions) => Object.keys(assertions).length <= ORGANIZATION_ASSERTION_DIRECTORY_MAX,
+      { message: `at most ${ORGANIZATION_ASSERTION_DIRECTORY_MAX} sessions` },
+    ),
+});
+export type HubOrganizationAssertionDirectory = z.infer<
+  typeof hubOrganizationAssertionDirectorySchema
+>;
 
 // A hub password is sent verbatim as `Authorization: Bearer <password>`. A
 // value carrying whitespace or non-ASCII bytes — e.g. the app's own status

@@ -1,20 +1,32 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { formatRelativeTime, usageConnectionDot, usageConnectionLabel } from "@maxprice/shared";
+import {
+  formatRelativeTime,
+  usageConnectionDot,
+  usageConnectionLabel,
+  type HubOrganization,
+  type UsageConnection,
+} from "@maxprice/shared";
+import { useHubOrganizations } from "@/state/use-hub-organizations";
 import { useHubStatus } from "@/state/use-hub-status";
 import { useNowTick } from "@/state/use-now-tick";
 import { hubFetch, hubStatusQueryKey } from "@/lib/hub-api";
 import { dotVariant } from "@/lib/dot-variant";
 import { showToast } from "@/lib/toast";
-import { formatProvenance } from "@/lib/presentation";
+import {
+  accountOrganizationValue,
+  discoveredOrganizations,
+  formatProvenance,
+  organizationLabels,
+} from "@/lib/presentation";
 
 export function ClaudeAccountCard(): React.ReactElement {
   const { data: status } = useHubStatus();
+  const { data: organizations } = useHubOrganizations();
   const qc = useQueryClient();
   const now = useNowTick();
   const [editing, setEditing] = useState(false);
   const [sessionKey, setSessionKey] = useState("");
-  const [orgId, setOrgId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -32,7 +44,6 @@ export function ClaudeAccountCard(): React.ReactElement {
       });
       if (!res.ok) throw new Error(`credential ${res.status}: ${await res.text()}`);
       setSessionKey("");
-      setOrgId("");
       setEditing(false);
       await qc.invalidateQueries({ queryKey: hubStatusQueryKey() });
       showToast(body === null ? "Key cleared" : "Key saved");
@@ -57,10 +68,7 @@ export function ClaudeAccountCard(): React.ReactElement {
           <span>Last sample</span>
           <b>{formatRelativeTime(status?.usageLastSampleAt ?? null, now)}</b>
         </div>
-        <div className="krow">
-          <span>Organization</span>
-          <b>{status?.orgId ?? "—"}</b>
-        </div>
+        <AccountOrganizationRow rows={organizations?.organizations} connection={conn} />
         <div className="krow">
           <span>Key</span>
           <b>
@@ -81,22 +89,14 @@ export function ClaudeAccountCard(): React.ReactElement {
             placeholder="Paste sessionKey cookie value"
             aria-label="claude.ai session key"
           />
-          <input
-            className="input"
-            type="text"
-            value={orgId}
-            onChange={(e) => setOrgId(e.target.value)}
-            placeholder="Organization id (orgId)"
-            aria-label="organization id"
-          />
           <div className="btns">
             <button
               type="button"
               className="chip active"
-              disabled={busy || sessionKey.trim() === "" || orgId.trim() === ""}
-              onClick={() =>
-                void postCredential({ sessionKey: sessionKey.trim(), orgId: orgId.trim() })
-              }
+              disabled={busy || sessionKey.trim() === ""}
+              // The key alone (ADR-0104): the Hub lists and polls every
+              // Organization it can read.
+              onClick={() => void postCredential({ sessionKey: sessionKey.trim() })}
             >
               {busy ? "Saving…" : "Save key"}
             </button>
@@ -108,7 +108,6 @@ export function ClaudeAccountCard(): React.ReactElement {
                 setEditing(false);
                 setError(null);
                 setSessionKey("");
-                setOrgId("");
               }}
             >
               Cancel
@@ -117,16 +116,7 @@ export function ClaudeAccountCard(): React.ReactElement {
         </div>
       ) : (
         <div className="btnrow">
-          <button
-            type="button"
-            className="chip"
-            onClick={() => {
-              // Prefill the org from the contract so the operator usually
-              // just pastes a new session key (the form still POSTs both).
-              setOrgId(status?.orgId ?? "");
-              setEditing(true);
-            }}
-          >
+          <button type="button" className="chip" onClick={() => setEditing(true)}>
             Replace key…
           </button>
           <button
@@ -146,5 +136,28 @@ export function ClaudeAccountCard(): React.ReactElement {
         fresh <code>sessionKey</code> when claude.ai reports the session expired.
       </p>
     </section>
+  );
+}
+
+// The Organization row (#294): what the key discovered, by label. The labels
+// span every row the roster answers, so a collision suffix here reads as it
+// does on the Organizations card and the Machines card's Home lines.
+export function AccountOrganizationRow({
+  rows,
+  connection,
+}: {
+  rows: readonly HubOrganization[] | undefined;
+  connection: UsageConnection;
+}): React.ReactElement {
+  return (
+    <div className="krow">
+      <span>Organization</span>
+      <b>
+        {accountOrganizationValue(
+          discoveredOrganizations(rows, connection),
+          organizationLabels(rows ?? []),
+        )}
+      </b>
+    </div>
   );
 }

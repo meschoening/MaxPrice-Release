@@ -6,8 +6,10 @@ import { z } from "zod";
 // rather than drifting.
 //
 // `issues` is the array of Zod issues from `safeParse(...).error.issues`
-// — present on 502 responses (schema validation failed) and absent on
-// 400/500 responses (validation rejection or generic runner failure).
+// — present on 502 responses (schema validation failed) and on the 400 a
+// request body that fails its schema earns from PUT /api/organizations/:uuid
+// (#287); absent on other 400/500 responses (validation rejection or generic
+// runner failure).
 const issueSchema = z.object({
   code: z.string(),
   path: z.array(z.union([z.string(), z.number()])),

@@ -1,7 +1,14 @@
 import { readdir, stat } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
-import type { StorageCleanResponse, StorageReport, StorageSegment } from "@maxprice/shared";
+import type {
+  FleetEvent,
+  StorageCleanResponse,
+  StorageReport,
+  StorageSegment,
+} from "@maxprice/shared";
 import type { FleetEventStore, LocalEventArchiveStore } from "@maxprice/usage-core";
+import { eventOrganization } from "./engine/presumption";
+import type { EventStore } from "./engine/store";
 import {
   backedSessionsFromPaths,
   classifyUnbacked,
@@ -45,9 +52,16 @@ export const STORAGE_FILE = {
   localArchive: "local-archive.jsonl",
   scanCache: "scan-cache.json",
   usageHistory: "usage-history.jsonl",
-  // ADR-0098 — both land in the storage report's `other` catch-all on purpose:
-  // a few hundred bytes each, and naming them would put a segment on the bar.
+  // ADR-0098, #287 and #310 — all four land in the storage report's `other`
+  // catch-all on purpose: naming them would put a segment on the bar. The
+  // registry and the repair marker are a few hundred bytes each; the labels
+  // file and the assertions file are the user's edits — durable, unlike the
+  // disposable registry beside them — and the assertions file can reach
+  // ~5.1 MB at its 20,000-session cap (~2.7 MB with UUID session ids). `clean`
+  // never touches `other`.
   organizations: "organizations.json",
+  organizationLabels: "organization-labels.json",
+  organizationAssertions: "organization-assertions.json",
   organizationRepair: "organization-repair.json",
 } as const;
 
@@ -291,6 +305,18 @@ export type StorageReporterDeps = {
   // seconds later. Only the object holding the in-memory copy can both delete
   // the file and stop the write that would restore it.
   dropScanCache: () => Promise<number>;
+  // Self rows the engine is withholding, wired to the live store's
+  // `isWithheld`: dormant rows (#311) and rows tagged with an Excluded
+  // Organization (#295) — a walked session's awaiting the scoped repair, or a
+  // pruned session's that ADR-0103's accepted departure keeps for good. They
+  // are in neither Forget count and draw no archive edge, but Clean keeps
+  // them: they stay in the file and in the bytes.
+  withheld?: (row: FleetEvent) => boolean;
+  // The Organization an unbacked row counts under, for Forget's
+  // per-Organization disclosure (#295; `UnbackedInput.organizationOf`). Wired
+  // to `eventOrganization` over the live store's presumption. Omitted = the
+  // report never carries `forget.organizations`.
+  organizationOf?: (row: FleetEvent) => string | undefined;
   concurrency?: number;
   // Test seam, handed to every `walkTree` this snapshot runs. It exists for one
   // assertion the suite could not otherwise make: that a per-file stat failure
@@ -300,6 +326,26 @@ export type StorageReporterDeps = {
   // half of guard 1 with the suite green.
   statImpl?: (path: string) => Promise<{ size: number }>;
 };
+
+// The breakdown's resolver over the live store (#295): each unbacked row's
+// Organization the way every report answers it (`eventOrganization`), except
+// one the store does not track. The tracked set is fixed when a store is built,
+// but `installAssertions` swaps the presumption live, ahead of the rebuild it
+// queues; in that window a claim on an Excluded organization resolves an
+// owner-less row to it while `withheld` still lets the row through. Answering
+// `undefined` drops the whole breakdown (the classifier's every-row rule)
+// rather than naming what is excluded (ADR-0098); the counts stay the store's
+// until its successor lands.
+export function forgetOrganizationOf(
+  store: Pick<EventStore, "presumption" | "trackedOrganizations">,
+  row: FleetEvent,
+): string | undefined {
+  const organization = eventOrganization(row, store.presumption());
+  const tracked = store.trackedOrganizations();
+  return organization !== undefined && tracked !== null && !tracked.has(organization)
+    ? undefined
+    : organization;
+}
 
 // What one measurement produces. The wire carries `report` only; `forgetSessions`
 // is the full actionable list #128's route takes, kept beside it because the
@@ -483,9 +529,14 @@ export async function buildStorageSnapshot(deps: StorageReporterDeps): Promise<S
   //
   // null on an empty or absent archive — see the wire field's comment for why
   // that draws nothing rather than an em dash.
+  //
+  // A withheld line (#311: a dormant row; #295: an Excluded-tagged one, which
+  // the archive feeder already refuses under ADR-0103) draws no edge: it stays
+  // in the file and in its bytes, but no report counts it.
   let localArchiveEarliestAt: string | null = null;
   if (localArchive !== null) {
     for (const row of localArchive.all()) {
+      if (deps.withheld?.(row) === true) continue;
       if (localArchiveEarliestAt === null || row.timestamp < localArchiveEarliestAt) {
         localArchiveEarliestAt = row.timestamp;
       }
@@ -506,6 +557,8 @@ export async function buildStorageSnapshot(deps: StorageReporterDeps): Promise<S
     roots,
     missingRoots: corpus.missingRoots,
     emptyRoots: corpus.emptyRoots,
+    withheld: deps.withheld,
+    organizationOf: deps.organizationOf,
   });
 
   return {

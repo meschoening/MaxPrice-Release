@@ -1,5 +1,7 @@
+import { internRowStrings } from "@maxprice/shared";
 import {
   jsonlRecordSchema,
+  loginRecordSchema,
   ownerRecordSchema,
   type AssistantRecord,
   type ParseLineResult,
@@ -84,7 +86,9 @@ export function toUsageRecord(
   if (usage === undefined) return null;
 
   const split = usage.cache_creation;
-  return {
+  // The categorical fields are interned (#361): every record of a session
+  // repeats them, and the scan cache keeps every record resident.
+  return internRowStrings({
     timestamp: record.timestamp,
     messageId: record.message.id,
     requestId: record.requestId,
@@ -106,7 +110,7 @@ export function toUsageRecord(
     costUSD: record.costUSD,
     cwd: record.cwd,
     organizationUuid,
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -138,15 +142,42 @@ export function preFilterSkips(line: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Owner records (ADR-0098)
+// Attribution records (ADR-0098, ADR-0109)
 // ---------------------------------------------------------------------------
 
+// Each regex requires its literal, so a plain substring test ahead of it is a
+// fast reject with identical results: nearly every line carries neither, and
+// the cold scan runs these checks on every line of every transcript.
+const OWNER_LITERAL = "bridge-session";
 const OWNER_MARKER = /"type"\s*:\s*"bridge-session"/;
+const LOGIN_LITERAL = "credential_org";
+const LOGIN_MARKER = /"type"\s*:\s*"credential_org"/;
+// The command name a user's in-session `/login` writes. JSON.stringify escapes
+// none of these characters, so a raw substring test is a sound pre-check.
+const SLASH_LOGIN_MARKER = "<command-name>/login</command-name>";
+// A command line's text opens with its command tags: `<command-name>` first
+// (2.1.263, the only real `/login` observed), or `<command-message>` first
+// (older writers). A prompt that merely quotes the command name — a pasted
+// code review does — has prose before it, and must not arm the gate.
+const COMMAND_LINE = /^\s*<command-(?:name|message)>/;
 
-// The owner in effect while a file is read: the organization the most recent
-// owner record named, or `undefined` before the first one. One per file for
-// the whole-file reader; the watcher keeps one per path across tail reads.
-export type OwnerCursor = { organizationUuid: string | undefined };
+// The attribution in effect while a file is read. `owner` is the Owner cursor
+// (ADR-0098): the organization the most recent Owner record named. `login` is
+// the Login cursor (ADR-0109): set by the file's first Login record and moved
+// by a later one only when a `/login` command line came since the previous
+// Login record (`loginSinceRecord`) — a change with none records a login made
+// elsewhere, which does not move billing. Once `login` is set it is the file's
+// only evidence; `owner` keeps updating so a tail read never has to look back.
+// One per file for the whole-file reader; the watcher keeps one per path.
+export type AttributionCursor = {
+  owner: string | undefined;
+  login: string | undefined;
+  loginSinceRecord: boolean;
+};
+
+export function freshCursor(): AttributionCursor {
+  return { owner: undefined, login: undefined, loginSinceRecord: false };
+}
 
 // Parse one line as an Owner record. Returns the organization it names, or
 // `undefined` when the line is not an owner record, is malformed, or is the
@@ -154,7 +185,7 @@ export type OwnerCursor = { organizationUuid: string | undefined };
 // BEFORE `preFilterSkips`, which would otherwise discard the line: it ends in
 // `}` and carries no assistant marker.
 export function parseOwnerLine(line: string): string | undefined {
-  if (!OWNER_MARKER.test(line)) return undefined;
+  if (!line.includes(OWNER_LITERAL) || !OWNER_MARKER.test(line)) return undefined;
   let json: unknown;
   try {
     json = JSON.parse(line);
@@ -163,6 +194,78 @@ export function parseOwnerLine(line: string): string | undefined {
   }
   const parsed = ownerRecordSchema.safeParse(json);
   return parsed.success ? parsed.data.ownerOrganizationUuid : undefined;
+}
+
+// Parse one line as a Login record. Returns the organization it names, or
+// `undefined` when the line is not one or is malformed — neither of which
+// changes any cursor state. Checked BEFORE `preFilterSkips`, like the Owner
+// record: an attachment line ends in `}` and carries no assistant marker.
+export function parseLoginLine(line: string): string | undefined {
+  if (!line.includes(LOGIN_LITERAL) || !LOGIN_MARKER.test(line)) return undefined;
+  let json: unknown;
+  try {
+    json = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  const parsed = loginRecordSchema.safeParse(json);
+  return parsed.success ? parsed.data.attachment.organizationUuid : undefined;
+}
+
+// Whether a line is a `/login` command line, in either shape Claude Code logs a
+// local command in: a `user` record with string `message.content` (the one real
+// `/login` observed, 2.1.263), or a `system` record of subtype `local_command`
+// with string top-level `content` (how `/context`, `/rename` and once `/model`
+// were logged on 2.1.261–2.1.281). `/login`'s shape on 2.1.281+ is unobserved,
+// and a `/login` the gate missed would silently ignore the Login record it
+// writes, so both shapes count. Either way the text must open with the command
+// tags and name `/login`; array content (tool results) never counts.
+export function isSlashLoginLine(line: string): boolean {
+  if (!line.includes(SLASH_LOGIN_MARKER)) return false;
+  let json: unknown;
+  try {
+    json = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (typeof json !== "object" || json === null) return false;
+  const record = json as {
+    type?: unknown;
+    subtype?: unknown;
+    content?: unknown;
+    message?: { content?: unknown } | null;
+  };
+  const text =
+    record.type === "user"
+      ? record.message?.content
+      : record.type === "system" && record.subtype === "local_command"
+        ? record.content
+        : undefined;
+  return typeof text === "string" && COMMAND_LINE.test(text) && text.includes(SLASH_LOGIN_MARKER);
+}
+
+// Advance the cursor over one line. Returns true when the line is an Owner or
+// Login record, which is never a usage event. Every Login record, counted or
+// ignored, closes the `/login` gate it was judged against.
+export function readAttribution(cursor: AttributionCursor, line: string): boolean {
+  const owner = parseOwnerLine(line);
+  if (owner !== undefined) {
+    cursor.owner = owner;
+    return true;
+  }
+  const login = parseLoginLine(line);
+  if (login !== undefined) {
+    if (cursor.login === undefined || cursor.loginSinceRecord) cursor.login = login;
+    cursor.loginSinceRecord = false;
+    return true;
+  }
+  if (isSlashLoginLine(line)) cursor.loginSinceRecord = true;
+  return false;
+}
+
+// The Organization a usage line read now is attributed to (Rule A, ADR-0109).
+export function attributedOrganization(cursor: AttributionCursor): string | undefined {
+  return cursor.login ?? cursor.owner;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,9 +301,9 @@ export async function collectUsageRecords(path: string): Promise<UsageRecord[]> 
   // file captured mid-write leaves a real unterminated final line instead.
   const lineCount = lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
   const records: UsageRecord[] = [];
-  const owner: OwnerCursor = { organizationUuid: undefined };
+  const cursor = freshCursor();
   for (let i = 0; i < lineCount; i++) {
-    const record = handleLine(path, stripCarriageReturn(lines[i] as string), i + 1, owner);
+    const record = handleLine(path, stripCarriageReturn(lines[i] as string), i + 1, cursor);
     if (record !== null) records.push(record);
   }
   return records;
@@ -249,14 +352,11 @@ function handleLine(
   path: string,
   line: string,
   lineNumber: number,
-  owner: OwnerCursor,
+  cursor: AttributionCursor,
 ): UsageRecord | null {
-  // An owner record moves the cursor and is never a usage event (ADR-0098).
-  const named = parseOwnerLine(line);
-  if (named !== undefined) {
-    owner.organizationUuid = named;
-    return null;
-  }
+  // An attribution record moves the cursor and is never a usage event
+  // (ADR-0098, ADR-0109). A `/login` line arms the gate and falls through.
+  if (readAttribution(cursor, line)) return null;
   // The pre-filter: a line that provably cannot be an assistant record skips
   // JSON.parse + Zod (and, per the predicate's contract, warrants no warning).
   if (preFilterSkips(line)) return null;
@@ -272,7 +372,7 @@ function handleLine(
   // `assistantRecordSchema`; `type === "assistant"` narrows `JsonlRecord` to
   // `AssistantRecord` for free, with no second parse.
   if (result.record.type !== "assistant") return null;
-  return toUsageRecord(result.record, owner.organizationUuid);
+  return toUsageRecord(result.record, attributedOrganization(cursor));
 }
 
 // Parse an in-memory batch of JSONL lines into `UsageRecord`s, applying the
@@ -281,26 +381,24 @@ function handleLine(
 // rule excludes all yield nothing. Unlike `handleLine` this stays silent on a
 // parse failure — the watcher's incremental tail-read has no file:line context
 // to warn with, and a truncation re-read replaying old lines is expected. The
-// store dedups, so a replayed line is harmless.
-export type ParsedLines = { records: UsageRecord[]; owner: string | undefined };
+// store dedups, so a replayed line is harmless. Attribution records move the
+// cursor exactly as they do in the whole-file reader, so a file read in tail
+// chunks tags every row as one whole-file read would.
+export type ParsedLines = { records: UsageRecord[]; cursor: AttributionCursor };
 
-// `initialOwner` is the owner in effect at the end of the previous read of the
-// same file (the watcher's per-path memory); the returned `owner` is what the
-// next read must start from. A first read starts at byte 0 (tail-reader), so
-// it sees the file's own owner records.
-export function parseLines(lines: string[], initialOwner: string | undefined): ParsedLines {
-  const owner: OwnerCursor = { organizationUuid: initialOwner };
+// `initial` is the cursor at the end of the previous read of the same file
+// (the watcher's per-path memory); the returned `cursor` is what the next
+// read must start from. A copy is advanced, never `initial` itself. A first
+// read starts at byte 0 (tail-reader), so it sees the file's own records.
+export function parseLines(lines: string[], initial: AttributionCursor | undefined): ParsedLines {
+  const cursor: AttributionCursor = initial === undefined ? freshCursor() : { ...initial };
   const records: UsageRecord[] = [];
   for (const line of lines) {
-    const named = parseOwnerLine(line);
-    if (named !== undefined) {
-      owner.organizationUuid = named;
-      continue;
-    }
+    if (readAttribution(cursor, line)) continue;
     const result = parseLine(line);
     if (!result.ok || result.record.type !== "assistant") continue;
-    const record = toUsageRecord(result.record, owner.organizationUuid);
+    const record = toUsageRecord(result.record, attributedOrganization(cursor));
     if (record !== null) records.push(record);
   }
-  return { records, owner: owner.organizationUuid };
+  return { records, cursor };
 }

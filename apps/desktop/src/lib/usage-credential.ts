@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   discoverOrgsResponseSchema,
-  usageCredentialSchema,
-  type UsageCredential,
+  storedUsageCredentialSchema,
+  type DiscoveredOrg,
+  type StoredUsageCredential,
 } from "@maxprice/shared";
 import { getSidecarUrl } from "@/lib/sidecar";
 import { insideTauri } from "@/lib/tauri";
@@ -29,25 +30,27 @@ export async function usageAuthHeaders(): Promise<Record<string, string>> {
 // launch and on every change it reads the credential and pushes it to the
 // sidecar over loopback so the poller can run.
 
-export async function readCredential(): Promise<UsageCredential | null> {
+// A key-only blob, or a legacy pre-#283 blob that parses with its `orgId`
+// intact — the evidence the sidecar's one-time history stamp needs (ADR-0104).
+export async function readCredential(): Promise<StoredUsageCredential | null> {
   const raw = await invoke<string | null>("get_credential");
   if (raw === null) return null;
   try {
-    const parsed = usageCredentialSchema.safeParse(JSON.parse(raw));
+    const parsed = storedUsageCredentialSchema.safeParse(JSON.parse(raw));
     return parsed.success ? parsed.data : null;
   } catch {
     return null; // corrupt keychain value — treat as not configured
   }
 }
 
-export async function writeCredential(cred: UsageCredential | null): Promise<void> {
+export async function writeCredential(cred: StoredUsageCredential | null): Promise<void> {
   await invoke("set_credential", { value: cred === null ? null : JSON.stringify(cred) });
 }
 
-// Push the current credential to the sidecar so its poller can run. Throws on a
-// non-2xx so the Settings "Connect" flow can surface failure; the launch-time
-// caller should .catch() it (a down sidecar at boot is non-fatal).
-export async function pushCredentialToSidecar(cred: UsageCredential | null): Promise<void> {
+// Push the stored blob to the sidecar, verbatim, so its poller can run. Throws
+// on a non-2xx so the Settings "Connect" flow can surface failure; the
+// launch-time caller should .catch() it (a down sidecar at boot is non-fatal).
+export async function pushCredentialToSidecar(cred: StoredUsageCredential | null): Promise<void> {
   const base = await getSidecarUrl();
   const res = await fetch(`${base}/api/usage/credential`, {
     method: "POST",
@@ -57,12 +60,39 @@ export async function pushCredentialToSidecar(cred: UsageCredential | null): Pro
   if (!res.ok) throw new Error(`credential push ${res.status}`);
 }
 
-// Discover the orgs reachable with `sessionKey`. Used by the Settings
-// "Connect" flow to resolve the org id before storing the credential
-// (ADR-0023). Returns `{ orgs: [], error: "expired" | "error" }` on failure
-// so the UI can surface a targeted message without catching.
+// Hand a stored credential to the sidecar. A legacy blob's `orgId` leaves the
+// keychain only after the sidecar acknowledges the push that carried it — the ack
+// means the usage history it names is stamped (#279, ADR-0104). A failed push, or
+// a crash between the ack and the rewrite, leaves the blob as it was: the next
+// push stamps again, and a stamp with nothing unstamped does no I/O.
+export async function syncCredential(
+  stored: StoredUsageCredential,
+  io: {
+    push: (cred: StoredUsageCredential) => Promise<void>;
+    write: (cred: StoredUsageCredential) => Promise<void>;
+  } = { push: pushCredentialToSidecar, write: writeCredential },
+): Promise<void> {
+  await io.push(stored);
+  if (stored.orgId !== undefined) await io.write({ sessionKey: stored.sessionKey });
+}
+
+// Connect replaces the key and keeps any legacy `orgId` not yet acknowledged, so
+// a reconnect after a failed stamp still stamps with what the old poller read.
+export function credentialForConnect(
+  sessionKey: string,
+  existing: StoredUsageCredential | null,
+): StoredUsageCredential {
+  return existing?.orgId === undefined ? { sessionKey } : { sessionKey, orgId: existing.orgId };
+}
+
+// Discover the orgs reachable with `sessionKey`, each carrying its roster hints
+// and what its usage endpoint answered (`limits`, #270). The Settings "Connect"
+// flow runs it before storing the key: it proves the key and seeds the roster
+// with every Organization the key can see (ADR-0104). Returns
+// `{ orgs: [], error: "expired" | "error" }` on failure so the UI can surface a
+// targeted message without catching.
 export async function discoverOrgsViaSidecar(sessionKey: string): Promise<{
-  orgs: Array<{ id: string; name: string; capabilities: string[] }>;
+  orgs: DiscoveredOrg[];
   error: string | null;
 }> {
   const base = await getSidecarUrl();

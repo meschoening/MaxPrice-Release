@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { usageConnectionSchema, usageReadingSchema } from "./usage-limits";
+import {
+  usageConnectionSchema,
+  usageCurrentSchema,
+  usageOrganizationsSchema,
+} from "./usage-limits";
 import { hubConnectionSchema } from "./hub";
 
 // Wire contract for the Part 3 live data pipeline — the SSE channel the
@@ -26,6 +30,10 @@ export const SSE_EVENT = {
   machinesChanged: "machines:changed",
   // Identity directory changed — refetch /api/project-identity and refold (ADR-0062).
   identityChanged: "identity:changed",
+  // Organization roster changed — refetch GET /api/organizations (#287, ADR-0105):
+  // a settings edit started or finished re-walking, or a rename landed. Payload
+  // is empty — a poke, never data.
+  organizationsChanged: "organizations:changed",
 } as const;
 
 // `usage:new` — emitted once per 500ms-debounced write window per JSONL file.
@@ -46,10 +54,16 @@ export const blockTickEventSchema = z.object({
   timestamp: z.string(),
 });
 
-// `usage:sample` — emitted once per successful 1/min usage poll (ADR-0023/0024).
-// Carries the authoritative live value so the renderer's rings update without
-// polling the sidecar. null means a successful poll found no window in flight.
-export const usageSampleEventSchema = usageReadingSchema.nullable();
+// `usage:sample` — one Organization's authoritative live value AND its cadence
+// (ADR-0023/0024, ADR-0104), emitted as each polled Organization's read lands.
+// `organizationUuid` names it even when `sample` is null (a successful read of
+// no window), so a consumer can key every reading; weeklyResetAt belongs to
+// that same Organization, so no reading borrows another's cadence. A change of
+// Organization scope emits nothing: the consumer derives its display from what
+// it already holds.
+export const usageSampleEventSchema = usageCurrentSchema.extend({
+  organizationUuid: z.string().min(1),
+});
 
 // How a pricing refresh attempt failed (ADR-0053). Classified inside
 // `refreshPricing` at the seam that failed, so the renderer can say something
@@ -234,9 +248,10 @@ export const statusSnapshotSchema = z.object({
   // Usage-limits connection state for the subtle status indicator (ADR-0023).
   // `disconnected` until a credential is pushed and a poll succeeds.
   usageConnection: usageConnectionSchema,
-  // ISO 8601 capturedAt of the last SUCCESSFUL usage poll; null until the first
-  // poll succeeds (a later failing poll leaves the prior value in place).
+  // Cross-Organization complete-history cursor. Partial/none answers and
+  // failures do not advance it; per-Organization read times live below.
   usageLastSampleAt: z.string().nullable(),
+  organizations: usageOrganizationsSchema,
   // Sidecar→hub connection state (ADR-0035). `off` whenever no hub is
   // configured — the strictly-optional default.
   hubConnection: hubConnectionSchema,

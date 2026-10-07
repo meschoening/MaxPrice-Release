@@ -2,10 +2,12 @@ import { useCallback, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ArrowUpRight, Ellipsis } from "lucide-react";
 import {
+  ALL_ORGANIZATIONS,
   deriveProjectName,
   deriveProjectPath,
   formatRelativeTime,
   parentProjectSlug,
+  resolveOrganizationScope,
   type CostMode,
   type ProjectAnchorSnapshot,
   type ProjectRow,
@@ -13,6 +15,8 @@ import {
 import { resolveDateRange, useFilters } from "@/state/filters";
 import { useWeekWindow } from "@/state/use-week";
 import { useSettings } from "@/state/use-settings";
+import { useOrganizationScope } from "@/state/use-organization-scope";
+import { useOrganizationLabels } from "@/state/use-organizations";
 import { useProjects } from "@/state/use-projects";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useProjectAxis } from "@/state/use-project-axis";
@@ -22,6 +26,7 @@ import { densifyDays } from "@/lib/daily-rows";
 import { useEscapeToDeselect } from "@/state/use-escape-deselect";
 import { ymdShift } from "@/lib/dates";
 import { foldMachineIdList } from "@/lib/machines";
+import { projectOrganizationsCell } from "@/lib/organization-scope-view";
 import { expandProjectFilter } from "@/lib/project-identity";
 import { foldProjectRows, groupChildren } from "@/lib/projects";
 import { EmptyState } from "@/components/EmptyState";
@@ -120,6 +125,10 @@ export function ProjectsPage(): React.ReactElement {
   const { data: settings } = useSettings();
   const costMode = settings?.costMode ?? "auto";
   const tz = settings?.timezone;
+  // ADR-0106: the Organization scope rides every query here beside `mode` and
+  // `tz`, the strips' charts included.
+  const { organization, isAll } = useOrganizationScope();
+  const labels = useOrganizationLabels();
   // ADR-0062: `projectParams` is the selection closure-expanded across Repo
   // identity before it reaches the wire (both the table's query and the
   // aggregate strip's `filterProjects`); `index` is the fold context the table
@@ -138,16 +147,30 @@ export function ProjectsPage(): React.ReactElement {
     until,
     mode: costMode,
     tz,
+    organization,
     projects,
     models,
     machines: machineAxis.machineParams,
   });
   // The picker is deliberately independent of the page's current date,
-  // project, model and machine filters: a dead checkout must remain available
-  // as a merge source even when the visible table has no row for it.
+  // project, model and machine filters and of the Organization scope: a dead
+  // checkout must remain available as a merge source even when the visible
+  // table has no row for it. So it asks for All organizations whenever two or
+  // more are tracked, offering a checkout whose only usage is in another
+  // Organization under every scope, and sends no param otherwise, where All is
+  // Home and the request is Home's own.
+  const mergeOrganization =
+    resolveOrganizationScope(
+      ALL_ORGANIZATIONS,
+      settings?.homeOrganization ?? null,
+      settings?.trackedOrganizations ?? [],
+    ) === ALL_ORGANIZATIONS
+      ? ALL_ORGANIZATIONS
+      : undefined;
   const allTimeQuery = useProjects({
     mode: costMode,
     tz,
+    organization: mergeOrganization,
     projects: [],
     models: [],
     machines: [],
@@ -375,6 +398,29 @@ export function ProjectsPage(): React.ReactElement {
             }),
           ]
         : []),
+      // The Organizations column (#268 item 11): only under All organizations,
+      // where projects with usage in several Organizations share one list.
+      // Scoped to one, the chip already names it.
+      ...(isAll
+        ? [
+            projectColumn({
+              id: "organizations",
+              header: "Organizations",
+              width: "140px",
+              sortValue: (p) => p.organizations.length,
+              isEmpty: (p) => p.organizations.length === 0,
+              cell: (p) => {
+                const cell = projectOrganizationsCell(p.organizations, labels);
+                if (cell === null) return <span className="text-soft">—</span>;
+                return (
+                  <span className="trunc" title={cell.title}>
+                    {cell.text}
+                  </span>
+                );
+              },
+            }),
+          ]
+        : []),
       projectColumn({
         id: "sessions",
         header: "Sessions",
@@ -452,7 +498,7 @@ export function ProjectsPage(): React.ReactElement {
     ],
     // `tz` is captured per render; openInLive is stable enough for cells.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [tz, machineAxis, foldedIds, projectAxis.index, wide, barMax],
+    [tz, machineAxis, foldedIds, isAll, labels, projectAxis.index, wide, barMax],
   );
 
   // An empty result while the corpus is non-empty is just a filtered-out date
@@ -475,6 +521,7 @@ export function ProjectsPage(): React.ReactElement {
             filterProjects={stripProjects}
             costMode={costMode}
             tz={tz}
+            organization={organization}
             filterModels={models}
             onOpenInLive={openInLive}
           />
@@ -498,6 +545,7 @@ export function ProjectsPage(): React.ReactElement {
             rangeLabel={RANGE_LABEL[dateRange]}
             costMode={costMode}
             tz={tz}
+            organization={organization}
             filterProjects={projects}
             filterModels={models}
           />
@@ -525,9 +573,10 @@ export function ProjectsPage(): React.ReactElement {
             // + cost 90 + last activity 132 + merge 48) + ≥150px for the
             // project name. Below this the table scrolls horizontally instead
             // of crushing the name. The Machines column adds its own 130px to
-            // the floor when enabled (ADR-0041 M6). Dropped entirely at narrow,
-            // where the row wraps and nothing is off-screen (ADR-0073).
-            minWidth={machineAxis.enabled ? 850 : 720}
+            // the floor when enabled (ADR-0041 M6), and the Organizations
+            // column its own 140px under All organizations. Dropped entirely at
+            // narrow, where the row wraps and nothing is off-screen (ADR-0073).
+            minWidth={720 + (machineAxis.enabled ? 130 : 0) + (isAll ? 140 : 0)}
             defaultSort={{ columnId: "costRange", dir: "desc" }}
             searchKeys={projectSearchKeys}
             rowClassName={(r) => (staleDays(r.project, tz) != null ? "opacity-[0.46]" : undefined)}
@@ -567,6 +616,7 @@ function ProjectDetailStrip({
   filterProjects,
   costMode,
   tz,
+  organization,
   filterModels,
   onOpenInLive,
 }: {
@@ -577,6 +627,7 @@ function ProjectDetailStrip({
   filterProjects: string[];
   costMode: CostMode;
   tz: string | undefined;
+  organization: string | undefined;
   filterModels: string[];
   onOpenInLive: (slug: string) => void;
 }): React.ReactElement {
@@ -590,6 +641,7 @@ function ProjectDetailStrip({
     until: chartUntil,
     mode: costMode,
     tz,
+    organization,
     projects: filterProjects,
     models: filterModels,
   });
@@ -661,6 +713,7 @@ function ProjectsAggregateStrip({
   rangeLabel,
   costMode,
   tz,
+  organization,
   filterProjects,
   filterModels,
 }: {
@@ -668,6 +721,7 @@ function ProjectsAggregateStrip({
   rangeLabel: string;
   costMode: CostMode;
   tz: string | undefined;
+  organization: string | undefined;
   filterProjects: string[];
   filterModels: string[];
 }): React.ReactElement {
@@ -681,6 +735,7 @@ function ProjectsAggregateStrip({
     until: chartUntil,
     mode: costMode,
     tz,
+    organization,
     projects: filterProjects,
     models: filterModels,
   });

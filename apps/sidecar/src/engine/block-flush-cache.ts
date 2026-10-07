@@ -15,7 +15,8 @@ type Entry = WeakMap<PendingBlock, { length: number; totals: BlockTotals }>;
 
 // Owned by createBlockReports, whose formation guard guarantees that a reused
 // PendingBlock can ONLY gain suffix events. Any replacement, historical insert,
-// geometry change or store swap rebuilds with new block objects (ADR-0091).
+// geometry change, store swap, change of Quota organization, or presumption
+// change under a scoped slot rebuilds with new block objects (ADR-0091).
 // Thus object identity + length proves unchanged ordered membership here; it
 // is NOT a safe cache for arbitrary caller-mutated PendingBlock arrays.
 export function createBlockFlushCache() {
@@ -25,7 +26,7 @@ export function createBlockFlushCache() {
   let utils: number[] = [];
   let view: SampleView | null = null;
 
-  function sampleView(samples: UsageSample[]): SampleView | null {
+  function sampleView(samples: readonly UsageSample[]): SampleView | null {
     // Compare all values used by precomputeSamples, in input order. Neither
     // array identity nor length detects historical edits or in-place mutation.
     // Retain primitive copies so mutating a previously seen sample is visible.
@@ -47,7 +48,8 @@ export function createBlockFlushCache() {
       mode: CostMode,
       models: string[],
       machines: string[],
-      samples: UsageSample[],
+      organizations: string[],
+      samples: readonly UsageSample[],
     ): BlockFlushContext {
       const currentPricing = activePricingSnapshot();
       if (pricing !== currentPricing) {
@@ -56,7 +58,25 @@ export function createBlockFlushCache() {
       }
       const loweredModels = [...new Set(lowerModelNeedles(models))].sort();
       const machineIds = [...new Set(machines)].sort();
-      const key = JSON.stringify([mode, loweredModels, machineIds]);
+      // Organization uuids are opaque, so they are deduplicated and sorted like
+      // the machine ids and never case-folded the way model needles are.
+      //
+      // THE AXIS IS THE QUOTA ORGANIZATION. `createBlockReports.blocks()` is
+      // the only caller: it passes `[Q]` for a request scoped to a Quota
+      // organization and `[]` for an unscoped one. ADR-0092 reuses totals on
+      // "the same block object and the same event count prove unchanged
+      // ordered membership" — a claim about ONE formation. The Organization is
+      // a formation-shaping input, so that proof covers only requests for the
+      // scope that formed the block; keying the totals by the scope keeps any
+      // other scope's request from answering from this formation's entry.
+      //
+      // It is NOT a member of `AggregateBlocksOptions`, and must not become one:
+      // `models`/`machines` are sum-narrowing axes, tested per event inside
+      // `foldBlockTotals`, and the Organization is not — it chooses which rows
+      // and samples blocks form from. Listing it there would advertise a
+      // narrowing the blocks aggregator does not perform.
+      const organizationIds = [...new Set(organizations)].sort();
+      const key = JSON.stringify([mode, loweredModels, machineIds, organizationIds]);
       let entry = entries.get(key);
       if (entry === undefined) {
         if (entries.size >= MAX_ENTRIES) entries.delete(entries.keys().next().value as string);

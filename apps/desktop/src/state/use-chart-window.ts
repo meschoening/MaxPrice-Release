@@ -3,6 +3,7 @@ import { chartWindow, type LiveChartSlice } from "@/lib/chart-source";
 import { densifyDays } from "@/lib/daily-rows";
 import { useFilters } from "./filters";
 import { useSettings } from "./use-settings";
+import { useOrganizationScope } from "./use-organization-scope";
 import { useDaily } from "./use-daily";
 import { useMachineAxis } from "./use-machine-axis";
 import { useProjectAxis } from "./use-project-axis";
@@ -26,6 +27,8 @@ export function useChartWindow(): LiveChartSlice {
   const { data: settings } = useSettings();
   const costMode = settings?.costMode ?? "auto";
   const tz = settings?.timezone;
+  // ADR-0106: the Organization scope rides beside `mode` and `tz`.
+  const { organization } = useOrganizationScope();
   // ADR-0062: closure-expanded across Repo identity before it reaches the wire.
   const projects = useProjectAxis().projectParams;
   const models = useFilters((s) => s.models);
@@ -45,6 +48,7 @@ export function useChartWindow(): LiveChartSlice {
     until: chartUntil,
     mode: costMode,
     tz,
+    organization,
     projects,
     models,
     machines,

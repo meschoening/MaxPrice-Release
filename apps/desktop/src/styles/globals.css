@@ -844,6 +844,51 @@ a.sb-footrow:hover .sb-label {
   gap: 8px;
   flex-wrap: wrap;
 }
+/* The Organization scope chip: a .chip leaf left of the refresh pill,
+   present only while two or more Organizations are tracked. Under All the
+   quota half names the Quota organization, and it is the half that yields:
+   "All organizations" keeps its width and the quota label truncates, so no
+   Home label can crowd the scope out. Below the narrow threshold the quota
+   half drops and the pill caps at 180px, so a long label cannot wrap the
+   right cluster onto a second topbar row. The pill clips anything left over;
+   its own focus outline sits outside the box and is not clipped. The icon and
+   caret never shrink: a flex item SVG otherwise takes its share of the
+   squeeze and dwindles. */
+.scope-chip {
+  max-width: 300px;
+  overflow: hidden;
+  font-weight: 600;
+}
+.scope-chip svg {
+  flex-shrink: 0;
+}
+.scope-chip .scope-chip-icon {
+  width: 14px;
+  height: 14px;
+  opacity: 0.7;
+}
+.scope-chip-all {
+  flex-shrink: 0;
+}
+.scope-chip-quota {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-left: 7px;
+  border-left: 1px solid var(--panel-border);
+  color: var(--soft);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+@container content (max-width: 799.98px) {
+  .scope-chip {
+    max-width: 180px;
+  }
+  .scope-chip-quota {
+    display: none;
+  }
+}
 
 /* --- floating stat tiles ---
 
@@ -1209,6 +1254,19 @@ a.sb-footrow:hover .sb-label {
   font-size: 11px;
   font-weight: 800;
 }
+/* In a limit row's place when the Quota organization reports no limit or its
+   limits can't be read: the row's top margin and label size, in the soft
+   ink, with the Organization's label in full ink. */
+.no-limits-note {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--soft);
+}
+.no-limits-note b {
+  color: var(--text);
+  font-weight: 600;
+}
 .block-foot {
   margin-top: 6px;
   font-size: 11.5px;
@@ -1238,6 +1296,24 @@ a.sb-footrow:hover .sb-label {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+/* Whose block the block span frames, under All organizations. A long label
+   ellipsizes rather than wrapping the head: the head breaks its line on the
+   controls' max-content, so the note's text is contained out of it, and the
+   controls grow into whatever room the span tabs leave for the note to fill. */
+.chart-controls:has(> .chart-span-note) {
+  flex-grow: 1;
+}
+.chart-span-note {
+  font-size: 11px;
+  color: var(--soft);
+  margin-left: 8px;
+  white-space: nowrap;
+  flex: 1 1 0;
+  min-width: 0;
+  contain: inline-size;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .legend-row {
   display: flex;
@@ -1798,6 +1874,58 @@ a.sb-footrow:hover .sb-label {
   background: color-mix(in oklch, var(--accent) 18%, transparent);
   border-color: color-mix(in oklch, var(--accent) 55%, var(--panel-border));
 }
+/* The Sessions page's selection bar (#312, owner-less-review.tsx), in the
+   strip's place while owner-less sessions are selected: its actions sit at the
+   strip's end, `Assign to…` carrying the caret of the chooser it opens, and the
+   partly owned note reads in the warn tint — only part of those sessions
+   moves. */
+.strip-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+/* Glass gives a disabled chip no look of its own; here `Clear assignment` is
+   disabled whenever nothing selected is assigned, which must read at a glance,
+   and both it and `Assign to…` while a write is in flight. */
+.strip-actions .chip:disabled,
+.strip-action.assign-trigger:disabled {
+  opacity: 0.45;
+}
+.strip-action.assign-trigger {
+  gap: 6px;
+}
+.strip-action.assign-trigger svg {
+  width: 11px;
+  height: 11px;
+}
+/* The caret turns while the chooser is open, as a chip trigger's does. */
+.strip-action.assign-trigger .caret {
+  transition: transform 0.2s;
+}
+.strip-action.assign-trigger[data-state="open"] .caret {
+  transform: rotate(180deg);
+}
+/* The chooser's head (organization-chooser.tsx): whose usage a pick moves,
+   above the scope chip's options. */
+.menu-head {
+  padding: 5px 9px 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--soft);
+}
+/* Unlike a plain hint it may wrap onto two lines: kept on one, it pushed the
+   actions onto a second strip line at the default window width. The small
+   basis is what lets it share their line (a wrapping flex row breaks by basis,
+   before anything shrinks); the cap keeps it from spreading into their room. */
+.strip-note {
+  flex: 1 1 160px;
+  max-width: 300px;
+  line-height: 1.4;
+  color: var(--warn);
+}
 
 /* the model split bar — flat data fills on glass, never frosted */
 .splitbar {
@@ -2140,6 +2268,128 @@ a.sb-footrow:hover .sb-label {
 .row.pinned .trunc {
   font-weight: 600;
 }
+/* The Sessions table's Organization attribution (#312, past one tracked
+   Organization): the `presumed` / `assigned` pill after an owner-less
+   session's short id, soft for a presumption and accent for an assertion,
+   and the All-scope Organization cell of a partly owned session — its owned
+   label over its owner-less part, a `.lead` that needs no rule of its own
+   until the narrow run below (session-attribution.tsx). */
+.cell .lead b.attr-id-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.attr-tag {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: nowrap;
+  color: var(--soft);
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+}
+.attr-tag.assigned {
+  color: var(--accent);
+  background: color-mix(in oklch, var(--accent) 14%, transparent);
+}
+.attr-tag .part {
+  font-weight: 500;
+  opacity: 0.8;
+}
+/* The owner-less review list (#312, owner-less-review.tsx), in the Sessions
+   table's place: one row per project, its sessions disclosed beneath on the
+   child tint and indented past the project's checkbox and chevron. Selected
+   rows take the accent tint; a project reads selected only when every session
+   it shows is. The rows are flex runs, not table grid rows — each carries its
+   own trailing cost column. */
+.review-group {
+  border-bottom: 1px solid color-mix(in oklch, var(--hairline) 60%, transparent);
+}
+.review-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 18px;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+.review-row:hover {
+  background: color-mix(in oklch, var(--text) 5%, transparent);
+}
+.review-head b {
+  min-width: 0;
+  font-weight: 600;
+}
+.review-child {
+  padding-left: 60px;
+  background: color-mix(in oklch, var(--text) 3%, transparent);
+}
+.review-child:hover {
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+}
+.review-row.checked {
+  background: color-mix(in oklch, var(--accent) 10%, transparent);
+}
+.review-row.checked:hover {
+  background: color-mix(in oklch, var(--accent) 14%, transparent);
+}
+.review-meta {
+  flex: none;
+  color: var(--soft);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.review-summary {
+  flex: none;
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--soft);
+  white-space: nowrap;
+}
+.review-cost {
+  flex: none;
+  width: 80px;
+  text-align: right;
+  font-weight: 800;
+}
+.review-rest {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+}
+.review-when {
+  margin-left: auto;
+  font-size: 11.5px;
+}
+/* The review list's checkbox: the menu option's box, squared, with a third
+   (mixed) state for a project some of whose shown sessions are selected. */
+.tri-check {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  border: 1px solid var(--panel-border);
+  background: color-mix(in oklch, var(--text) 5%, transparent);
+}
+.tri-check svg {
+  width: 9px;
+  height: 9px;
+  color: var(--text);
+}
+.tri-check.on {
+  background: color-mix(in oklch, var(--accent) 30%, transparent);
+  border-color: color-mix(in oklch, var(--accent) 50%, var(--panel-border));
+}
+.tri-check:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 .empty-msg {
   padding: 34px 16px;
   text-align: center;
@@ -2249,6 +2499,14 @@ a.sb-footrow:hover .sb-label {
      the run wraps rather than clipping. */
   .row > .cell:not(:first-child) .trunc {
     display: inline;
+  }
+  /* The same fault in a partly owned session's Organization cell (#312): its
+     owned label over its owner-less part stood two lines tall inside one
+     labelled slot. On the run the two read side by side. */
+  .row > .cell:not(:first-child) .org-cell-split {
+    flex-direction: row;
+    align-items: baseline;
+    gap: 6px;
   }
   /* A cell holding only a control has no text baseline, so baseline alignment
      falls back to its bottom margin edge and drops it 3.17px below its
@@ -2946,6 +3204,148 @@ a.sb-footrow:hover .sb-label {
   background: color-mix(in oklch, var(--text) 7%, transparent);
 }
 
+/* --- the Organizations list (Claude account, past one Organization): the
+   Storage sample's flat-tint table recipe (`.st-sample`) at row scale. A row
+   is two lines — the label and its tags, then the plan word and the Limits
+   answer — beside `Make Home` and the tracked switch; the chevron opens the
+   row's facts in the App info pairs grammar. Excluded rows go soft. Every
+   control keeps the global `:focus-visible` ring, so each carries a radius. --- */
+.org-list {
+  width: 100%;
+  border-radius: 12px;
+  overflow: hidden;
+  background: color-mix(in oklch, var(--text) 3.5%, transparent);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-inner);
+}
+.org-list-item + .org-list-item {
+  border-top: 1px solid color-mix(in oklch, var(--hairline) 70%, transparent);
+}
+.org-list-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+}
+.org-list-chevron {
+  display: inline-flex;
+  flex: none;
+  padding: 4px;
+  margin: -4px -6px -4px -4px;
+  border-radius: 6px;
+  color: var(--soft);
+}
+.org-list-chevron:hover {
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+}
+.org-list-chevron svg {
+  width: 12px;
+  height: 12px;
+  transition: transform 0.15s var(--ease-glass);
+}
+.org-list-item.open .org-list-chevron svg {
+  transform: rotate(90deg);
+}
+.org-list-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.org-list-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.org-list-label {
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  text-align: left;
+  overflow-wrap: anywhere;
+  border-radius: 4px;
+}
+.org-list-label:hover {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+.org-list-meta {
+  font-size: 11px;
+  color: var(--soft);
+}
+.org-list-row.off .org-list-label {
+  color: var(--soft);
+}
+.org-list-limits {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.org-list-limits .dot {
+  width: 6px;
+  height: 6px;
+}
+.org-list-reading {
+  color: var(--accent);
+  animation: glass-pulse 2.4s ease-in-out infinite;
+}
+.org-list-tag {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--soft);
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+  white-space: nowrap;
+}
+.org-list-tag.home {
+  color: var(--accent);
+  background: color-mix(in oklch, var(--accent) 14%, transparent);
+}
+.org-list-tag.new {
+  color: var(--up);
+  background: color-mix(in oklch, var(--up) 14%, transparent);
+}
+.org-list-link {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+  border-radius: 4px;
+}
+.org-list-link:hover {
+  text-decoration: underline;
+}
+.org-list-row .toggle {
+  flex: none;
+}
+.org-list-rename {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 100%;
+}
+.org-list-rename .input {
+  width: 190px;
+  max-width: 100%;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  font-size: 12px;
+}
+.org-list-facts {
+  padding: 4px 12px 12px 31px;
+}
+.org-list-facts .ai-pairs {
+  row-gap: 5px;
+}
+.org-list-facts .ai-pairs dd {
+  font-size: 11.5px;
+}
+
 /* The timezone/currency selects are fixed-width fields, not row fills. */
 .tz-wrap {
   flex: none;
@@ -3633,6 +4033,11 @@ a.sb-footrow:hover .sb-label {
   font-weight: 700;
   font-family: var(--font-mono);
 }
+/* The error line keeps `.err`'s ink, which `.st-confirm p` would outrank. */
+.st-confirm .err {
+  font-size: 11px;
+  color: var(--bad);
+}
 
 /* --- first-launch empty state: a glass panel wearing a DASHED border (T6's
    empty insets promoted to a page-level surface), tray glyph in a tint
@@ -4116,6 +4521,11 @@ body.popout-window {
   display: block; /* its own 14.25px line, not the parent's 19.5px line box */
   font-size: 9.5px;
   letter-spacing: 0.1em;
+  /* A 40-character Organization label ellipsizes on the eyebrow's own line, so
+     the tag costs no height (popout_content_height is unchanged). */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .popout-root .a-head .hd {
   min-width: 0;

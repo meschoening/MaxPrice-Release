@@ -5,6 +5,7 @@ import { inRange } from "./range";
 import { defaultTimeZone } from "./timezone";
 import type { ModelRollup } from "./model-rollup";
 import { byTimestamp, emptyModelRollup, foldModelUsage } from "./model-rollup";
+import { eventOrganization, NO_PRESUMPTION, type Presumption } from "./presumption";
 import {
   capturePath,
   emptyPathCapture,
@@ -55,11 +56,12 @@ import type { StoredEvent } from "./store";
 // EVERY COLUMN IS RANGE-SCOPED, WITH ONE EXCEPTION (ADR-0068).
 //
 // `costRange`, the four token counts, `totalTokens`, `modelsUsed`,
-// `modelBreakdowns`, `lastActivity`, `machines` and `sessions` are summed or
-// counted over only the events INSIDE the date window. The exception is
-// `firstActivity`, the earliest activity date across ALL the project's events
-// — its all-time scope is the point of the stat, which answers "since when has
-// this project existed"; windowing it would collapse it to the window's start.
+// `modelBreakdowns`, `lastActivity`, `machines`, `organizations` and `sessions`
+// are summed or counted over only the events INSIDE the date window. The
+// exception is `firstActivity`, the earliest activity date across ALL the
+// project's events — its all-time scope is the point of the stat, which answers
+// "since when has this project existed"; windowing it would collapse it to the
+// window's start.
 //
 // Through ADR-0057 this file also carried a SECOND, unwindowed `ModelRollup`
 // per bucket, behind a `costAllTime` column and an all-time `sessions` count.
@@ -154,6 +156,14 @@ export type ProjectBucket = {
   // — a Set preserves insertion order. Range-scoped, parallel to the range
   // rollup's `modelsUsed`.
   machines: Set<string>;
+  // Organizations the IN-WINDOW events count under, first-seen order (#278) —
+  // each resolved evidence first, Organization assertion second (#309),
+  // Presumed organization third (`eventOrganization`); an event that resolves
+  // to none adds nothing.
+  // Range-scoped exactly like `machines`. A directory worked in under two
+  // Organizations stays ONE bucket naming both — the engine never splits a
+  // project row (#262 item 5).
+  organizations: Set<string>;
   // The project's real directory, recovered from its events' `cwd` (ADR-0009)
   // — the `cwd` that encodes back to the slug, falling back to the first one
   // seen. Held as a running capture rather than by retaining member events; see
@@ -169,6 +179,7 @@ function emptyBucket(): ProjectBucket {
     firstInWindowDate: "",
     sessions: new Set(),
     machines: new Set(),
+    organizations: new Set(),
     cwd: emptyPathCapture(),
   };
 }
@@ -191,6 +202,7 @@ function flushRow(slug: string, bucket: ProjectBucket): ProjectRow {
     modelBreakdowns: Array.from(r.models.values()),
     lastActivity: bucket.lastActivity,
     machines: Array.from(bucket.machines),
+    organizations: Array.from(bucket.organizations),
     sessions: bucket.sessions.size,
     // The one column the window does not scope (ADR-0068).
     firstActivity: bucket.firstActivity,
@@ -214,6 +226,10 @@ function flushRow(slug: string, bucket: ProjectBucket): ProjectRow {
 // `YYYYMMDD` (inclusive local dates) or ISO instants (half-open `[since,
 // until)` on the event's own timestamp — ADR-0083 decision 3); `inRange`
 // decides which. An omitted bound is unbounded on that side.
+//
+// `presumption` is the Presumed organization rule `organizations` resolves an
+// owner-less event through (#278); the default presumes nothing, so an
+// untagged event adds no Organization at all.
 export function foldProjectEvent(
   buckets: Map<string, ProjectBucket>,
   event: StoredEvent,
@@ -221,6 +237,7 @@ export function foldProjectEvent(
   timeZone: string,
   since?: string,
   until?: string,
+  presumption: Presumption = NO_PRESUMPTION,
 ): void {
   const date = localDate(event.timestamp, timeZone);
   // An unparseable timestamp is dropped *before* it touches any accumulator
@@ -276,6 +293,11 @@ export function foldProjectEvent(
     // ADR-0041: `machines` is range-scoped — only in-window events contribute,
     // parallel to the range rollup's `modelsUsed`.
     bucket.machines.add(event.machineId);
+    // #278: range-scoped the same way, and resolved through THE rule — never
+    // read off `event.organizationUuid` — so an owner-less event names its
+    // session's asserted Organization, else its Presumed organization.
+    const org = eventOrganization(event, presumption);
+    if (org !== undefined) bucket.organizations.add(org);
     if (date.dashed > bucket.lastActivity) bucket.lastActivity = date.dashed;
     if (bucket.firstInWindowDate === "") {
       // Events are folded timestamp-ascending, so the first in-window event
@@ -324,6 +346,10 @@ export type AggregateProjectsOptions = {
   // in-window partition are bucketed in (ADR-0015) — the request's `tz`. Only
   // consulted via `localDate`; omitted = the host zone.
   timeZone?: string;
+  // The Presumed organization rule `organizations` resolves an owner-less event
+  // through (#278) — the store's own `presumption()` when the oracle is
+  // compared against the report cache; omitted = presume nothing.
+  presumption?: Presumption;
 };
 
 // TEST-ONLY ORACLE — production-dead (ADR-0057). The shipped path is
@@ -355,7 +381,15 @@ export function aggregateProjects(
   // the project's rollup when in-window.
   const buckets = new Map<string, ProjectBucket>();
   for (const event of byTimestamp(allEvents)) {
-    foldProjectEvent(buckets, event, mode, timeZone, options.since, options.until);
+    foldProjectEvent(
+      buckets,
+      event,
+      mode,
+      timeZone,
+      options.since,
+      options.until,
+      options.presumption,
+    );
   }
 
   return assembleProjects(buckets);

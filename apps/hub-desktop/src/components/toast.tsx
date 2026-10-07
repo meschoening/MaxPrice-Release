@@ -7,7 +7,10 @@ import { cn } from "@/lib/utils";
 // restarts the clock). The recipe lives in @maxprice/glass (`.toast`, tucked to
 // bottom 14px by the hub's tray-scale override); this is the hub host, mounted
 // once by App. Console mutations land their confirmations here — callers use
-// `showToast` from @/lib/toast. Kept in lockstep with the desktop's ToastHost.
+// `showToast` from @/lib/toast. The desktop's ToastHost started from this one
+// and has since gained an action variant (#312's Undo) that the hub, with
+// nothing to undo, does not carry. A plain message still behaves the same on
+// both: the same dwell, one at a time.
 
 const DWELL_MS = 2200;
 

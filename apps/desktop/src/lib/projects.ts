@@ -166,6 +166,7 @@ function absorb(into: ProjectRow, m: ProjectRow): ProjectRow {
     cacheReadTokens: into.cacheReadTokens + m.cacheReadTokens,
     modelsUsed: unionInOrder(into.modelsUsed, m.modelsUsed),
     machines: unionInOrder(into.machines, m.machines),
+    organizations: unionInOrder(into.organizations, m.organizations),
     modelBreakdowns: mergeBreakdowns(into.modelBreakdowns, m.modelBreakdowns),
     lastActivity: maxStr(into.lastActivity, m.lastActivity),
     sessions: into.sessions + m.sessions,

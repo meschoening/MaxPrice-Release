@@ -1,11 +1,13 @@
 import { z } from "zod";
 import { costModeSchema } from "./cost-mode";
+import { resolveOrganizationScope } from "./organization-scope";
 import { hostTimeFormat, timeFormatSchema } from "./time-format";
 import { DEFAULT_WEEK, weekSettingSchema } from "./week";
 
-// Settings (CONTEXT.md): durable user config, persisted as settings.json in
+// Settings (GLOSSARY.md): durable user config, persisted as settings.json in
 // the OS app-data dir. Distinct from ephemeral filter-rail/chart state.
-// `timezone` and `costMode` travel to the engine as `tz`/`mode` query params;
+// `timezone` and `costMode` travel to the engine as `tz`/`mode` query params,
+// and `organizationScope` as `organization` (#278);
 // `claudePaths` is the only field the sidecar consumes directly (ADR-0014).
 // `timeFormat` travels nowhere — it is renderer-only (ADR-0060).
 
@@ -120,7 +122,7 @@ export const settingsSchema = z
     // the same absent/non-bool → true semantics — keep the two in lockstep.
     keepRunningInBackground: z.boolean().default(true).catch(true),
     // Whether the tray popout draws the Model-scoped weekly limit row
-    // (CONTEXT.md) — default OFF, an opt-in for the one account shape that
+    // (GLOSSARY.md) — default OFF, an opt-in for the one account shape that
     // reports one. Two gates AND together: this field and the sample actually
     // carrying the window (the Settings switch itself only renders while it
     // does). The Rust shell reads this field straight out of settings.json to
@@ -128,13 +130,33 @@ export const settingsSchema = z
     // `keepRunningInBackground` precedent) — absent/non-bool → false; keep the
     // two in lockstep. Popout only: the Live page and the readout ignore it.
     showModelLimit: z.boolean().default(false).catch(false),
-    // The Home organization (CONTEXT.md, ADR-0098): the ONE organization whose
+    // The Home organization (GLOSSARY.md, ADR-0098): the ONE organization whose
     // usage the app shows. `null` = not chosen yet — the sidecar then uses the
     // login it observed at boot, and the renderer persists that value on first
     // launch so a later `/login` elsewhere can never silently move the home.
     // Consumed by the sidecar via the settings watch (in-session engine
     // rebuild, no relaunch). An empty string is not an organization.
     homeOrganization: z.string().min(1).nullable().default(null).catch(null),
+    // The tracked set (the #260 lifecycle decision, item 1): the Organizations
+    // whose usage THIS machine counts, beyond the Home organization —
+    // generalising ADR-0098's single Home organization (#275; #299 is the
+    // slice that records it in the ADR). The sidecar reads this as the list
+    // UNION {Home} on every settings read, so Home is always tracked and a
+    // hand-edited file cannot exclude it; an absent or empty list is therefore
+    // exactly {Home} and an upgraded machine runs today's engine with no
+    // migration. uuids, order insignificant, duplicates and empty strings
+    // dropped by the sidecar's resolver (`resolveTrackedOrganizations`) rather
+    // than here, so one junk member cannot wipe the user's whole list.
+    trackedOrganizations: z.array(z.string()).default([]).catch([]),
+    // The Organization scope (GLOSSARY.md, #278): which tracked Organization
+    // every report describes — a uuid, "all" (`ALL_ORGANIZATIONS`), or `null`
+    // for the Home organization. Renderer-owned (ADR-0014): it travels as the
+    // `organization` query param, absent while the scope is Home. The sidecar
+    // reads it from the file only for the status's usage connection, which
+    // describes the scope's Quota organization (#285). Resolved on read by
+    // `parseSettings` below, not here, so this schema stays the plain object
+    // the sidecar's settings read uses. An empty string is not an organization.
+    organizationScope: z.string().min(1).nullable().default(null).catch(null),
   })
   .passthrough();
 
@@ -146,7 +168,21 @@ export const DEFAULT_SETTINGS: Settings = settingsSchema.parse({});
 // per-field `.catch()` above recovers individual bad fields in-place, so the
 // wholesale fallback here only fires for non-object input (`null`, a string,
 // etc.) that can't carry any recoverable fields at all.
+//
+// `organizationScope` is resolved here against the parsed Home and tracked
+// list (#278), so a stale value — a uuid no longer tracked, `all` on a machine
+// that tracks only Home, the Home uuid itself — reads as Home (`null`) to every
+// renderer consumer. Spread, so the passthrough keys survive.
 export function parseSettings(value: unknown): Settings {
   const result = settingsSchema.safeParse(value);
-  return result.success ? result.data : DEFAULT_SETTINGS;
+  if (!result.success) return DEFAULT_SETTINGS;
+  const data = result.data;
+  return {
+    ...data,
+    organizationScope: resolveOrganizationScope(
+      data.organizationScope,
+      data.homeOrganization,
+      data.trackedOrganizations,
+    ),
+  };
 }

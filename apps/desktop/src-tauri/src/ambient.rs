@@ -54,12 +54,33 @@ pub struct Readout {
     /// will draw its `<Model> limit` row — the shell sizes the window for it
     /// (`popout::popout_content_height`) before showing.
     pub has_model_window: bool,
+    /// Present only while more than one Organization is tracked (ADR-0106
+    /// §11) — absent, not null, on a single-Organization machine, so its body
+    /// and therefore its tooltip stay byte-identical to before the scope.
+    /// Absent reads as None (so does a `null` the sidecar never sends); a
+    /// present-but-malformed object still fails the parse, a contract break
+    /// like any other field's. The label is the sidecar's (roster-resolved,
+    /// collision-suffixed), never resolved here.
+    #[serde(default)]
+    pub organizations: Option<ReadoutOrganizations>,
+}
+
+/// The readout's multi-Organization half (packages/shared/src/readout.ts;
+/// keep in lockstep): `quota_label` names the Organization whose limit the
+/// utilization half reads (the scope's Quota organization — Home under All),
+/// and `all` says the money half is the union of every tracked Organization.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadoutOrganizations {
+    pub quota_label: String,
+    pub all: bool,
 }
 
 /// Ambient state managed by the Tauri builder: the pending update (read by the
 /// popout via `get_pending_update`, worn by the tray badge) and the poller's
-/// kick channel (`write_settings` pokes it so a cost-mode/timezone flip updates
-/// the readout immediately instead of up-to-60s later).
+/// kick channel (`write_settings` pokes it so a cost-mode/timezone/Organization
+/// scope flip updates the readout immediately instead of up-to-60s later —
+/// the scope rides the same settings.json write as the other two).
 #[derive(Default)]
 pub struct AmbientState {
     pub pending_update: Mutex<Option<String>>,
@@ -85,15 +106,29 @@ pub fn kick(state: &AmbientState) {
 /// (T5 decision 5), degrading to the bare app name when there is nothing
 /// honest to say (T5 decision 6 — vanish, not apologize).
 ///
+/// While more than one Organization is tracked (the readout carries
+/// `organizations`; ADR-0106 §11) the tooltip has the room the menu-bar title
+/// lacks, so it names what each metric describes: the limit is always ONE
+/// Organization's — the Quota organization, Home under All — so it carries that
+/// label; today's cost is the scope's money, so only All says so. A single
+/// Organization's tooltip is byte-identical to before.
+///
 /// The mirror of `title_text` below, and dead for the same reason on the other
 /// side: only the non-macOS write path calls it, while the tests that pin its
 /// wording must keep running everywhere.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn tooltip_text(readout: Option<&Readout>) -> String {
-    match ambient_metric(readout) {
-        Metric::Limit(pct) => format!("MaxPrice — 5-hour limit {pct}%"),
-        Metric::Today(cost) => format!("MaxPrice — today ${cost:.2}"),
-        Metric::None => "MaxPrice".to_string(),
+    let organizations = readout.and_then(|r| r.organizations.as_ref());
+    match (ambient_metric(readout), organizations) {
+        (Metric::Limit(pct), Some(orgs)) => {
+            format!("MaxPrice — {} 5-hour limit {pct}%", orgs.quota_label)
+        }
+        (Metric::Limit(pct), None) => format!("MaxPrice — 5-hour limit {pct}%"),
+        (Metric::Today(cost), Some(orgs)) if orgs.all => {
+            format!("MaxPrice — today ${cost:.2} (all organizations)")
+        }
+        (Metric::Today(cost), _) => format!("MaxPrice — today ${cost:.2}"),
+        (Metric::None, _) => "MaxPrice".to_string(),
     }
 }
 
@@ -156,6 +191,15 @@ fn ambient_metric(readout: Option<&Readout>) -> Metric {
     }
 }
 
+/// The readout's query params, read off settings.json per poll.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadoutParams {
+    pub mode: String,
+    pub tz: Option<String>,
+    /// The resolved Organization scope: a tracked uuid, "all", or None for Home.
+    pub organization: Option<String>,
+}
+
 /// Read the readout's query params off the raw settings.json value, mirroring
 /// the Zod schema's semantics by hand (the `background_residency_enabled`
 /// precedent — the shell cannot run the schema):
@@ -165,7 +209,11 @@ fn ambient_metric(readout: Option<&Readout>) -> Metric {
 ///   an invalid one 400s, which reads as a failed poll → vanish — and the
 ///   renderer's own schema degrades + heals the stored value on its next
 ///   write). Absent → omitted, letting the sidecar default to the host zone.
-pub fn settings_readout_params(settings: &serde_json::Value) -> (String, Option<String>) {
+/// - `organizationScope`: resolved against Home and the tracked list exactly
+///   as the renderer's `parseSettings` resolves it (`resolve_organization_scope`
+///   below), so the tray asks for the scope the Today tile answers (ADR-0106
+///   §11). Home → None → no param, so a single-Organization URL is unchanged.
+pub fn settings_readout_params(settings: &serde_json::Value) -> ReadoutParams {
     let mode = match settings.get("costMode").and_then(|v| v.as_str()) {
         Some(m @ ("auto" | "calculate" | "display")) => m.to_string(),
         _ => "auto".to_string(),
@@ -174,16 +222,63 @@ pub fn settings_readout_params(settings: &serde_json::Value) -> (String, Option<
         .get("timezone")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    (mode, tz)
+    ReadoutParams {
+        mode,
+        tz,
+        organization: resolve_organization_scope(settings),
+    }
+}
+
+/// `z.string().min(1).nullable().catch(null)` by hand: a non-empty string, or
+/// nothing — absent, null, a non-string and "" all read as null.
+fn non_empty_str(v: Option<&serde_json::Value>) -> Option<&str> {
+    v.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+}
+
+/// A hand mirror of `resolveOrganizationScope`
+/// (packages/shared/src/organization-scope.ts; keep in lockstep) over the three
+/// Zod fields it reads (packages/shared/src/settings.ts): `homeOrganization`
+/// and `organizationScope` are `z.string().min(1).nullable().catch(null)`, and
+/// `trackedOrganizations` is `z.array(z.string()).catch([])` — which drops the
+/// WHOLE list on one non-string element, not just that element, so this does
+/// too (else the shell would count a second member the renderer does not, and
+/// ask for All where the Today tile answers Home). The rule itself: no Home
+/// narrows nothing; a scope naming nothing tracked, or naming Home itself, is
+/// Home; `all` over a one-member set is Home.
+fn resolve_organization_scope(settings: &serde_json::Value) -> Option<String> {
+    let home = non_empty_str(settings.get("homeOrganization"))?;
+    let scope = non_empty_str(settings.get("organizationScope"))?;
+    let tracked: Vec<&str> = match settings
+        .get("trackedOrganizations")
+        .and_then(|v| v.as_array())
+    {
+        Some(list) if list.iter().all(|v| v.is_string()) => {
+            list.iter().filter_map(|v| v.as_str()).collect()
+        }
+        _ => Vec::new(),
+    };
+    let mut members: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    members.insert(home);
+    members.extend(tracked.into_iter().filter(|s| !s.is_empty()));
+    if scope == "all" {
+        return (members.len() >= 2).then(|| "all".to_string());
+    }
+    (scope != home && members.contains(scope)).then(|| scope.to_string())
 }
 
 /// Build the readout URL. `tz` is percent-encoded: IANA zone ids can carry `+`
-/// (`Etc/GMT+8`), which a query parser reads as a space.
-pub fn readout_url(port: u16, mode: &str, tz: Option<&str>) -> String {
+/// (`Etc/GMT+8`), which a query parser reads as a space. `organization` is
+/// appended only when the scope is not Home (ADR-0106 §2: absent means Home),
+/// encoded the same way for symmetry — a uuid or `all` never needs it.
+pub fn readout_url(port: u16, mode: &str, tz: Option<&str>, organization: Option<&str>) -> String {
     let mut url = format!("http://127.0.0.1:{port}/api/readout?mode={mode}");
     if let Some(tz) = tz {
         url.push_str("&tz=");
         url.push_str(&percent_encode(tz));
+    }
+    if let Some(organization) = organization {
+        url.push_str("&organization=");
+        url.push_str(&percent_encode(organization));
     }
     url
 }
@@ -274,8 +369,13 @@ fn fetch_readout(app: &AppHandle) -> Option<Readout> {
     let settings = crate::settings_path(app)
         .and_then(|p| crate::read_settings_at(&p))
         .unwrap_or_else(|_| serde_json::json!({}));
-    let (mode, tz) = settings_readout_params(&settings);
-    let url = readout_url(port, &mode, tz.as_deref());
+    let params = settings_readout_params(&settings);
+    let url = readout_url(
+        port,
+        &params.mode,
+        params.tz.as_deref(),
+        params.organization.as_deref(),
+    );
 
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
@@ -398,6 +498,17 @@ mod tests {
             today_cost: today,
             has_data,
             has_model_window: false,
+            organizations: None,
+        }
+    }
+
+    fn scoped(r: Readout, label: &str, all: bool) -> Readout {
+        Readout {
+            organizations: Some(ReadoutOrganizations {
+                quota_label: label.to_string(),
+                all,
+            }),
+            ..r
         }
     }
 
@@ -468,28 +579,139 @@ mod tests {
         assert_eq!(tooltip_text(Some(&r)), "MaxPrice — today $3.50");
     }
 
+    // --- more than one tracked Organization (#291; ADR-0106 §11) ---
+
+    #[test]
+    fn more_than_one_tracked_names_the_quota_organization_in_the_tooltip() {
+        let live = scoped(readout(true, Some(82.0), 12.4, true), "Team", false);
+        assert_eq!(
+            tooltip_text(Some(&live)),
+            "MaxPrice — Team 5-hour limit 82%"
+        );
+        // Under All the limit is still one Organization's (the Quota organization, Home).
+        let live_all = scoped(readout(true, Some(40.0), 12.4, true), "Acme", true);
+        assert_eq!(
+            tooltip_text(Some(&live_all)),
+            "MaxPrice — Acme 5-hour limit 40%"
+        );
+        // The today fallback is money: under All it says so; scoped to one it does not.
+        let today_all = scoped(readout(false, None, 12.4, true), "Acme", true);
+        assert_eq!(
+            tooltip_text(Some(&today_all)),
+            "MaxPrice — today $12.40 (all organizations)"
+        );
+        let today_one = scoped(readout(false, None, 12.4, true), "Team", false);
+        assert_eq!(tooltip_text(Some(&today_one)), "MaxPrice — today $12.40");
+        // Vanish stays bare.
+        let fresh = scoped(readout(false, None, 0.0, false), "Acme", true);
+        assert_eq!(tooltip_text(Some(&fresh)), "MaxPrice");
+    }
+
+    #[test]
+    fn the_macos_title_never_names_an_organization() {
+        let live = scoped(readout(true, Some(82.0), 12.4, true), "Team", false);
+        assert_eq!(title_text(Some(&live)), " 82%");
+        let today_all = scoped(readout(false, None, 12.4, true), "Acme", true);
+        assert_eq!(title_text(Some(&today_all)), " $12.40");
+    }
+
     // --- settings mirroring (the background_residency_enabled precedent) ---
 
     #[test]
     fn settings_params_mirror_the_schema_defaults() {
-        let (mode, tz) = settings_readout_params(&serde_json::json!({}));
-        assert_eq!(mode, "auto");
-        assert_eq!(tz, None);
+        let params = settings_readout_params(&serde_json::json!({}));
+        assert_eq!(params.mode, "auto");
+        assert_eq!(params.tz, None);
+        assert_eq!(params.organization, None);
 
-        let (mode, tz) = settings_readout_params(&serde_json::json!({
+        let params = settings_readout_params(&serde_json::json!({
             "costMode": "calculate",
             "timezone": "America/Chicago",
         }));
-        assert_eq!(mode, "calculate");
-        assert_eq!(tz.as_deref(), Some("America/Chicago"));
+        assert_eq!(params.mode, "calculate");
+        assert_eq!(params.tz.as_deref(), Some("America/Chicago"));
 
         // Junk degrades exactly like `.catch("auto")` / a non-string tz.
-        let (mode, tz) = settings_readout_params(&serde_json::json!({
+        let params = settings_readout_params(&serde_json::json!({
             "costMode": "bogus",
             "timezone": 42,
         }));
-        assert_eq!(mode, "auto");
-        assert_eq!(tz, None);
+        assert_eq!(params.mode, "auto");
+        assert_eq!(params.tz, None);
+    }
+
+    fn org_settings(scope: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "homeOrganization": "aaaa1111",
+            "trackedOrganizations": ["bbbb2222"],
+            "organizationScope": scope,
+        })
+    }
+
+    #[test]
+    fn the_scope_resolves_like_the_shared_rule() {
+        // Home (null / absent) → no param: today's URL.
+        assert_eq!(
+            settings_readout_params(&org_settings(serde_json::Value::Null)).organization,
+            None
+        );
+        // A tracked uuid → that uuid.
+        assert_eq!(
+            settings_readout_params(&org_settings(serde_json::json!("bbbb2222")))
+                .organization
+                .as_deref(),
+            Some("bbbb2222")
+        );
+        // All over two members → "all".
+        assert_eq!(
+            settings_readout_params(&org_settings(serde_json::json!("all")))
+                .organization
+                .as_deref(),
+            Some("all")
+        );
+        // Unresolvable: an untracked uuid, the Home uuid itself, a non-string, "".
+        for junk in [
+            serde_json::json!("cccc3333"),
+            serde_json::json!("aaaa1111"),
+            serde_json::json!(42),
+            serde_json::json!(""),
+        ] {
+            assert_eq!(
+                settings_readout_params(&org_settings(junk)).organization,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn all_over_one_member_is_home() {
+        let one = serde_json::json!({ "homeOrganization": "aaaa1111", "organizationScope": "all" });
+        assert_eq!(settings_readout_params(&one).organization, None);
+        // Home repeated in the list, and "" entries, add no member.
+        let dup = serde_json::json!({
+            "homeOrganization": "aaaa1111",
+            "trackedOrganizations": ["aaaa1111", ""],
+            "organizationScope": "all",
+        });
+        assert_eq!(settings_readout_params(&dup).organization, None);
+    }
+
+    #[test]
+    fn no_home_narrows_nothing() {
+        let s = serde_json::json!({ "trackedOrganizations": ["bbbb2222"], "organizationScope": "bbbb2222" });
+        assert_eq!(settings_readout_params(&s).organization, None);
+    }
+
+    #[test]
+    fn a_tracked_list_with_a_non_string_is_dropped_whole() {
+        // Zod's `.catch([])` drops the WHOLE array on one bad element, so the
+        // renderer sees one member and resolves "all" to Home; the shell must too.
+        let s = serde_json::json!({
+            "homeOrganization": "aaaa1111",
+            "trackedOrganizations": ["bbbb2222", 7],
+            "organizationScope": "all",
+        });
+        assert_eq!(settings_readout_params(&s).organization, None);
     }
 
     // --- URL building ---
@@ -497,17 +719,33 @@ mod tests {
     #[test]
     fn readout_url_carries_mode_and_encoded_tz() {
         assert_eq!(
-            readout_url(4242, "auto", Some("America/Chicago")),
+            readout_url(4242, "auto", Some("America/Chicago"), None),
             "http://127.0.0.1:4242/api/readout?mode=auto&tz=America/Chicago"
         );
         // `+` in an IANA id must not decode as a space sidecar-side.
         assert_eq!(
-            readout_url(4242, "display", Some("Etc/GMT+8")),
+            readout_url(4242, "display", Some("Etc/GMT+8"), None),
             "http://127.0.0.1:4242/api/readout?mode=display&tz=Etc/GMT%2B8"
         );
         assert_eq!(
-            readout_url(80, "auto", None),
+            readout_url(80, "auto", None, None),
             "http://127.0.0.1:80/api/readout?mode=auto"
+        );
+    }
+
+    #[test]
+    fn readout_url_carries_the_organization_only_when_scoped() {
+        assert_eq!(
+            readout_url(4242, "auto", Some("America/Chicago"), None),
+            "http://127.0.0.1:4242/api/readout?mode=auto&tz=America/Chicago"
+        );
+        assert_eq!(
+            readout_url(4242, "auto", Some("America/Chicago"), Some("bbbb2222")),
+            "http://127.0.0.1:4242/api/readout?mode=auto&tz=America/Chicago&organization=bbbb2222"
+        );
+        assert_eq!(
+            readout_url(80, "auto", None, Some("all")),
+            "http://127.0.0.1:80/api/readout?mode=auto&organization=all"
         );
     }
 
@@ -531,5 +769,21 @@ mod tests {
         assert_eq!(parse_readout("not json"), None);
         // A missing field is a contract break, not a default — refuse it.
         assert_eq!(parse_readout(r#"{"blockLive":false}"#), None);
+    }
+
+    #[test]
+    fn parses_the_optional_organizations_field() {
+        let body = r#"{"blockLive":true,"utilizationPct":82,"todayCost":12.48,"hasData":true,"hasModelWindow":false,"organizations":{"quotaLabel":"Acme · 1a2b3c4d","all":true}}"#;
+        assert_eq!(
+            parse_readout(body),
+            Some(scoped(
+                readout(true, Some(82.0), 12.48, true),
+                "Acme · 1a2b3c4d",
+                true
+            ))
+        );
+        // A malformed organizations object is a contract break, not a default.
+        let bad = r#"{"blockLive":true,"utilizationPct":82,"todayCost":12.48,"hasData":true,"hasModelWindow":false,"organizations":{"quotaLabel":"Acme"}}"#;
+        assert_eq!(parse_readout(bad), None);
     }
 }

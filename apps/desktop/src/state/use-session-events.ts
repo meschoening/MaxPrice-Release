@@ -60,30 +60,40 @@ function emptyData(): SessionEventsData {
 // streamed query is still hit by that invalidation (and the machine axis riding
 // as the fifth element leaves that prefix untouched). See the `sessionKey` doc
 // comment in `packages/shared/src/query-keys.ts`.
+//
+// The Organization scope (ADR-0106 §2) rides as a sixth element, and only when
+// named: under Home the key stays the five elements above.
+type SessionEventsKey = [string, string, CostMode, string[], string[]];
+
 export function sessionEventsQueryKey(
   id: string,
   mode: CostMode,
   models: string[] = [],
   machines: string[] = [],
-): [string, string, CostMode, string[], string[]] {
-  return [...sessionKey(id), mode, [...models].sort(), [...machines].sort()];
+  organization?: string,
+): SessionEventsKey | [...SessionEventsKey, string] {
+  const key: SessionEventsKey = [...sessionKey(id), mode, [...models].sort(), [...machines].sort()];
+  return organization === undefined ? key : [...key, organization];
 }
 
 // The NDJSON endpoint path. `mode` and the repeated `model` / `machine` params
 // map onto the query the sidecar validates (ADR-0017 / ADR-0041 M6); an unknown
 // id is not an HTTP error (it streams a zero-event `summary`), so there is no
 // id-encoding subtlety here beyond URL-escaping. Absent machines ⇒ the URL is
-// byte-identical to the pre-M6 shape.
+// byte-identical to the pre-M6 shape, and an absent `organization` (Home) adds
+// no param.
 export function buildSessionEventsUrl(
   id: string,
   mode: CostMode,
   models: string[] = [],
   machines: string[] = [],
+  organization?: string,
 ): string {
   const params = new URLSearchParams();
   params.set("mode", mode);
   for (const m of models) params.append("model", m);
   for (const m of machines) params.append("machine", m);
+  if (organization !== undefined) params.set("organization", organization);
   return `/api/session/${encodeURIComponent(id)}/events?${params.toString()}`;
 }
 
@@ -192,7 +202,8 @@ export function applySessionFrame(
 // `machines` (ADR-0041 M6) narrows the fetch alongside `models`; it is appended
 // LAST — after the `fetchImpl` test seam — and defaulted, so the streaming-core
 // tests' positional `(id, mode, models, signal, fetchImpl)` calls stay unchanged
-// while the hook threads it through to both the key and the URL.
+// while the hook threads it through to both the key and the URL. The
+// Organization scope (`organization`, ADR-0106) follows it on the same terms.
 export async function streamSessionEvents(
   id: string,
   mode: CostMode,
@@ -200,9 +211,12 @@ export async function streamSessionEvents(
   signal: AbortSignal | undefined,
   fetchImpl: typeof sidecarFetch = sidecarFetch,
   machines: string[] = [],
+  organization?: string,
 ): Promise<SessionEventsData> {
-  const key = sessionEventsQueryKey(id, mode, models, machines);
-  const res = await fetchImpl(buildSessionEventsUrl(id, mode, models, machines), { signal });
+  const key = sessionEventsQueryKey(id, mode, models, machines, organization);
+  const res = await fetchImpl(buildSessionEventsUrl(id, mode, models, machines, organization), {
+    signal,
+  });
   if (!res.ok) {
     // A non-2xx carries the pinned `{ error, issues? }` envelope (e.g. an
     // invalid mode). Surface the body text in the thrown message.
@@ -300,16 +314,19 @@ export async function streamSessionEvents(
 
 // Drives the session detail page. `id` is the route param; `mode` is the cost
 // mode; `models` is the filter rail's model multi-select (ADR-0017); `machines`
-// is the alias-expanded machine multi-select (ADR-0041 M6). A change to any of
-// the four produces a new key → an automatic re-stream.
+// is the alias-expanded machine multi-select (ADR-0041 M6); `organization` is
+// the Organization scope (ADR-0106), absent under Home. A change to any of the
+// five produces a new key → an automatic re-stream.
 export function useSessionEvents(
   id: string,
   mode: CostMode,
   models: string[] = [],
   machines: string[] = [],
+  organization?: string,
 ): UseQueryResult<SessionEventsData> {
   return useQuery<SessionEventsData>({
-    queryKey: sessionEventsQueryKey(id, mode, models, machines),
-    queryFn: ({ signal }) => streamSessionEvents(id, mode, models, signal, sidecarFetch, machines),
+    queryKey: sessionEventsQueryKey(id, mode, models, machines, organization),
+    queryFn: ({ signal }) =>
+      streamSessionEvents(id, mode, models, signal, sidecarFetch, machines, organization),
   });
 }

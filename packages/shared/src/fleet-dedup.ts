@@ -1,13 +1,21 @@
-// The ONE fleet merge rule (ADR-0041), defined ONCE for the three stores that
-// MUST agree byte-for-byte: the engine's event store
-// (apps/sidecar/src/engine/store.ts), the hub archive, and the client replica
-// (both packages/usage-core/src/fleet-event-store.ts). Each store re-exports
-// these under its own local names; the cross-store parity tests pin the
+// The ONE fleet merge rule (ADR-0041, ADR-0103), defined ONCE for the stores
+// that MUST agree byte-for-byte: the engine's event store
+// (apps/sidecar/src/engine/store.ts); the Hub and the client replica (both
+// packages/usage-core/src/fleet-sync-store.ts, SQLite — the Hub decides, and
+// the replica mirrors the Hub's decisions and runs no comparison of its own);
+// and the Local archive (packages/usage-core/src/fleet-event-store.ts, JSONL).
+// The push loop's stamp (usage-core event-sync.ts) and the Local archive sweep
+// ask the same question of a copy held elsewhere. Stores that re-export these
+// do so under their own local names; the cross-store parity tests pin the
 // invariant. Claude Code writes several rows per assistant message sharing
 // `(messageId, requestId)` — 2–3 byte-identical content-block lines plus, for a
 // streamed turn, an early `output_tokens: 1` partial ahead of the final row —
-// and every store keeps exactly ONE row per distinct key: the largest
-// token-total, ties keep first-seen.
+// and every store keeps exactly ONE row per distinct key: the fullest copy
+// (the largest token-total; at an equal total a copy carrying Organization
+// evidence over one carrying none, and of two carrying different evidence the
+// lexicographically smaller `organizationUuid` — #374), ties keep first-seen.
+// The tag order is what lets every store end on the same copy in any arrival
+// order, and lets a key's verdict ignore the tracked set (ADR-0103 §2, §5).
 
 // The global dedup key. `JSON.stringify` on a two-element tuple encodes an
 // absent requestId (`undefined`) and an empty-string requestId as DISTINCT keys
@@ -17,17 +25,80 @@ export function fleetDedupKey(messageId: string, requestId: string | undefined):
   return JSON.stringify([messageId, requestId ?? null]);
 }
 
-// An event's total token count — the dedup tie-breaker. When two rows share a
-// key, the store keeps the one with the larger total (the dedup rule), so a
-// streamed message counts its FINAL row, not the `output_tokens: 1` partial
-// that precedes it; the byte-identical content-block lines tie, so first-seen
-// wins among those. The structural param is satisfied by every StoredEvent /
-// UsageRecord / FleetEvent.
-export function fleetDedupTokenTotal(r: {
+// The four token counts every copy of a key carries. The structural type is
+// satisfied by every StoredEvent / UsageRecord / FleetEvent.
+export type FleetDedupTokens = {
   inputTokens: number;
   outputTokens: number;
   cacheCreationTokens: number;
   cacheReadTokens: number;
-}): number {
+};
+
+// An event's total token count — the dedup tie-breaker. When two rows share a
+// key, the store keeps the one with the larger total (the dedup rule), so a
+// streamed message counts its FINAL row, not the `output_tokens: 1` partial
+// that precedes it; the byte-identical content-block lines tie, so first-seen
+// wins among those.
+export function fleetDedupTokenTotal(r: FleetDedupTokens): number {
   return r.inputTokens + r.outputTokens + r.cacheCreationTokens + r.cacheReadTokens;
+}
+
+/** How full one copy of a key is: its token total and its Organization evidence, if any. */
+export interface FleetFullness {
+  total: number;
+  organizationUuid: string | undefined;
+}
+
+// `organizationUuid` is owner evidence only: present when a record resolved
+// it, absent for "no evidence" — never the Home organization or a presumption
+// (ADR-0103).
+export function fleetDedupFullness(
+  row: FleetDedupTokens & { organizationUuid?: string },
+): FleetFullness {
+  return { total: fleetDedupTokenTotal(row), organizationUuid: row.organizationUuid };
+}
+
+/**
+ * THE fullness order, on its parts: a copy of `aTotal` tokens with evidence
+ * `aOrganization` is strictly fuller than one of `bTotal` with `bOrganization`
+ * — a larger total; at an equal total, a tag against none, or of two tags the
+ * lexicographically smaller (#374). Two equal tags, or two absent ones, are a
+ * tie. Every comparison below reads this one definition; it takes parts rather
+ * than `FleetFullness` objects because the merge rule runs on every upsert of
+ * every feeder and must not allocate (#361).
+ */
+export function fleetFullnessPartsExceed(
+  aTotal: number,
+  aOrganization: string | undefined,
+  bTotal: number,
+  bOrganization: string | undefined,
+): boolean {
+  if (aTotal !== bTotal) return aTotal > bTotal;
+  return (
+    aOrganization !== undefined && (bOrganization === undefined || aOrganization < bOrganization)
+  );
+}
+
+/** `a` is strictly fuller than `b` (`fleetFullnessPartsExceed`). */
+export function fleetFullnessExceeds(a: FleetFullness, b: FleetFullness): boolean {
+  return fleetFullnessPartsExceed(a.total, a.organizationUuid, b.total, b.organizationUuid);
+}
+
+/**
+ * The one merge rule: `candidate` replaces `incumbent`. An untagged tie and a
+ * same-tag tie keep first-seen, so single-Organization bytes never move; a tie
+ * between two different tags goes to the smaller uuid (#374).
+ */
+export function fleetCopySupersedes(
+  candidate: FleetDedupTokens & { organizationUuid?: string },
+  incumbent: FleetDedupTokens & { organizationUuid?: string },
+): boolean {
+  // Monotone: a tag is never lost at an equal total, and a strictly larger
+  // untagged copy still beats a smaller tagged one — no field merging.
+  return fleetFullnessPartsExceed(
+    fleetDedupTokenTotal(candidate),
+    candidate.organizationUuid,
+    fleetDedupTokenTotal(incumbent),
+    incumbent.organizationUuid,
+  );
 }

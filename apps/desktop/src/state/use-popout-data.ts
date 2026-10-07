@@ -4,18 +4,25 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { listen } from "@tauri-apps/api/event";
 import {
+  ALL_ORGANIZATIONS,
+  resolveOrganizationScope,
   statusSnapshotSchema,
   type BlockRow,
   type ModelScopedWindow,
+  type OrganizationsResponse,
+  type Settings,
   type StatusSnapshot,
   type UsageWindow,
 } from "@maxprice/shared";
+import { organizationLabel, organizationLabelMap } from "@/lib/organization-scope-view";
 import { sidecarFetch } from "@/lib/sidecar";
 import { insideTauri } from "@/lib/tauri";
 import { applyStoredTheme } from "@/lib/theme";
 import { ymdShift } from "@/lib/dates";
 import { blocksQueryKey, fetchBlocks } from "./use-blocks";
 import { dailyQueryKey, fetchDaily } from "./use-daily";
+import { scopeParams, type ScopeParams } from "./use-organization-scope";
+import { fetchOrganizations, organizationsQueryKey } from "./use-organizations";
 import { fetchUsageCurrent, usageCurrentQueryKey } from "./use-usage-current";
 import { useSettings } from "./use-settings";
 
@@ -24,6 +31,12 @@ import { useSettings } from "./use-settings";
 // readout string, and the ambient Rust writer never feeds it. This webview has
 // its own QueryClient (one bundle, two windows — main.tsx), so nothing here
 // can collide with the main window's cache.
+//
+// Those fetches follow the persisted Organization scope (ADR-0106 §11) through
+// the same `scopeParams` as the main window: the money queries carry the
+// scope, usage current reads the Quota organization's entry. The settings
+// query is one of the queries `popout:shown` invalidates, so a scope flip
+// made in the main window lands on the popout's next open.
 //
 // Refetch model: a Rust-emitted `popout:shown` poke invalidates everything on
 // every show, plus a slow interval so a popout left open keeps breathing —
@@ -112,6 +125,45 @@ export async function fetchPopoutStatus(signal?: AbortSignal): Promise<StatusSna
   return statusSnapshotSchema.parse(await res.json());
 }
 
+// The persisted Organization scope as the popout's query params. The settings
+// cache already holds the RESOLVED scope (`parseSettings`), so `scopeParams`
+// only maps it, exactly as `useOrganizationScope` does for the main window.
+// `multi` is "more than one Organization is tracked", asked of the shared
+// resolution rule itself: All resolves to All. Pure; exported for its test.
+export function popoutScope(
+  settings:
+    | Pick<Settings, "homeOrganization" | "trackedOrganizations" | "organizationScope">
+    | undefined,
+): ScopeParams & { multi: boolean } {
+  const home = settings?.homeOrganization ?? null;
+  const { organization, quotaOrganization, isAll } = scopeParams(
+    settings?.organizationScope ?? null,
+    home,
+  );
+  const multi =
+    home !== null &&
+    resolveOrganizationScope(ALL_ORGANIZATIONS, home, settings?.trackedOrganizations ?? []) ===
+      ALL_ORGANIZATIONS;
+  return { organization, quotaOrganization, isAll, multi };
+}
+
+// The Active block eyebrow's tag: the Quota organization's label, under every
+// scope, while more than one Organization is tracked. The popout has no scope
+// chip, so unlike the main window's tile (which tags only under All) the
+// eyebrow is the one place that says whose block this is. The label is the
+// collision-suffixed one over the whole roster, with the shared fallback for a
+// uuid the roster lacks. A roster not yet loaded, or failed, tags nothing:
+// flashing `Organization <first 8>` before the real label would be worse than
+// an untagged eyebrow for a moment. Pure; exported for its test.
+export function popoutQuotaTag(
+  multi: boolean,
+  quotaOrganization: string | undefined,
+  roster: OrganizationsResponse | undefined,
+): string | null {
+  if (!multi || quotaOrganization === undefined || roster === undefined) return null;
+  return organizationLabel(organizationLabelMap(roster.organizations), quotaOrganization);
+}
+
 export type PopoutData = {
   anyError: boolean;
   settled: boolean;
@@ -126,10 +178,15 @@ export type PopoutData = {
   modelWindow: ModelScopedWindow | null;
   todayCost: number;
   todayTokens: number;
+  // The Quota organization's label for the eyebrow (`popoutQuotaTag`).
+  quotaTag: string | null;
+  // The scope is All organizations.
+  allOrganizations: boolean;
 };
 
 export function usePopoutData(): PopoutData {
   const { data: settings } = useSettings();
+  const { organization, quotaOrganization, isAll, multi } = popoutScope(settings);
   // Is this window on screen? FALSE is the truthful initial state: the popout
   // window is created hidden (`"visible": false` in tauri.conf.json) and stays
   // that way until the first tray click. Only the Rust pokes below move it —
@@ -146,8 +203,9 @@ export function usePopoutData(): PopoutData {
     refetchInterval: shown ? POPOUT_REFRESH_MS : false,
     retry: POPOUT_RETRY,
   });
-  // Today's row only — the Today tile's cost + tokens (ADR-0020's calendar day).
-  const dailyInput = { since: today, until: today, mode, tz };
+  // Today's row only — the Today tile's cost + tokens (ADR-0020's calendar day),
+  // under the scope: every tracked Organization's day under All.
+  const dailyInput = { since: today, until: today, mode, tz, organization };
   const dailyQ = useQuery({
     queryKey: dailyQueryKey(dailyInput),
     queryFn: ({ signal }) => withDeadline(signal, (s) => fetchDaily(dailyInput, s)),
@@ -156,8 +214,9 @@ export function usePopoutData(): PopoutData {
   });
   // The active block can straddle midnight, so the window reaches back a day.
   // Blocks are cross-project by design and the popout carries no filter rail,
-  // so the input is bare (ADR-0017 untouched).
-  const blocksInput = { since: yesterday, until: today, mode, tz };
+  // so the input carries only the scope (ADR-0017 untouched), which the
+  // sidecar resolves to the Quota organization's Blocks (ADR-0108).
+  const blocksInput = { since: yesterday, until: today, mode, tz, organization };
   const blocksQ = useQuery({
     queryKey: blocksQueryKey(blocksInput),
     queryFn: ({ signal }) => withDeadline(signal, (s) => fetchBlocks(blocksInput, s)),
@@ -165,9 +224,20 @@ export function usePopoutData(): PopoutData {
     retry: POPOUT_RETRY,
   });
   const usageQ = useQuery({
-    queryKey: usageCurrentQueryKey(),
-    queryFn: ({ signal }) => withDeadline(signal, (s) => fetchUsageCurrent(s)),
+    queryKey: usageCurrentQueryKey(quotaOrganization),
+    queryFn: ({ signal }) => withDeadline(signal, (s) => fetchUsageCurrent(s, quotaOrganization)),
     refetchInterval: shown ? POPOUT_REFRESH_MS : false,
+    retry: POPOUT_RETRY,
+  });
+  // The roster, for the Quota organization's label only — fetched only on a
+  // machine that tracks more than one Organization, so a single-Organization
+  // popout makes exactly its four fetches. Not part of `settled` or
+  // `anyError`: a label is not a reading, so a slow or failed roster leaves
+  // the eyebrow untagged rather than blanking the popout.
+  const rosterQ = useQuery({
+    queryKey: organizationsQueryKey(),
+    queryFn: ({ signal }) => withDeadline(signal, (s) => fetchOrganizations(s)),
+    enabled: multi,
     retry: POPOUT_RETRY,
   });
 
@@ -216,6 +286,8 @@ export function usePopoutData(): PopoutData {
     modelWindow: usageQ.data?.sample?.weeklyModel ?? null,
     todayCost: todayRow?.totalCost ?? 0,
     todayTokens: todayRow?.totalTokens ?? 0,
+    quotaTag: popoutQuotaTag(multi, quotaOrganization, rosterQ.data),
+    allOrganizations: isAll,
   };
 }
 

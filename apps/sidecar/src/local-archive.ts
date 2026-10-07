@@ -1,8 +1,13 @@
-import { EVENT_PUSH_BATCH_MAX, sessionPairKey } from "@maxprice/shared";
+import {
+  EVENT_PUSH_BATCH_MAX,
+  type FleetEvent,
+  type ForgetSessionRef,
+  sessionPairKey,
+} from "@maxprice/shared";
 import {
   createLocalEventArchiveStore as createFleetEventStore,
+  fleetCopySupersedes,
   fleetEventKey,
-  fleetTokenTotal,
   type LocalEventArchiveStore as FleetEventStore,
 } from "@maxprice/usage-core";
 import type { EventStore, StoreChange, StoredEvent } from "./engine/store";
@@ -24,10 +29,11 @@ import { storedEventToWire } from "./stored-event-wire";
 //
 // Writes converge by RECONCILIATION (the ADR-0055 shape): the engine store's
 // onChanged feed appends promptly; the boot/interval sweep is the guarantee —
-// it re-offers every self row the archive does not hold at ≥ its token
-// fullness (the stamp predicate, pointed at the archive instead of the
-// replica). That sweep is what makes crash-loss, a deleted file, and the
-// first boot after upgrade all self-heal from whatever the corpus still holds.
+// it re-offers every self row the archive does not hold at ≥ its fullness
+// (token total, then Organization evidence — the stamp predicate, pointed at
+// the archive instead of the replica). That sweep is what makes crash-loss, a
+// deleted file, and the first boot after upgrade all self-heal from whatever
+// the corpus still holds.
 //
 // Own events only (ADR-0069 §4): rows whose machineId is this machine's.
 // Replica-fed self rows riding back from a hub qualify too — past local
@@ -36,8 +42,15 @@ import { storedEventToWire } from "./stored-event-wire";
 // A failed Local archive rewrite stays queued in RAM. Fleet forgetting also
 // retains a durable intent across restart and bars contribution/promotion until
 // local pruning and replica reconciliation complete (ADR-0100).
-// forgottenPairs prevents queued engine rows from undoing a local rewrite in
-// this process. The durable intent covers restart before action completion.
+// forgottenPairs is the user Forget's bar: it prevents queued engine rows from
+// undoing that pair-wide rewrite in this process (ADR-0069 §8). The durable
+// intent covers restart before action completion.
+// The evidence repair's forget is key-scoped instead (#375): it removes only a
+// named pair's rows whose key the live store excludes and sets no bar. An
+// excluded key is never in the engine's event map, so no sweep or change-feed
+// tick can archive it again, and a seed's copy of it is refused or competes as
+// an excluded copy (#374). A key the set admits again is an engine row the
+// next sweep re-archives. The repair never removes an admitted row.
 // Eligible own replica rows can deepen this archive only after a complete
 // authoritative drain, rechecked when each queued append actually executes.
 
@@ -64,6 +77,15 @@ export type LocalArchive = {
   forgetSessions: (
     sessions: readonly { projectSlug: string; sessionId: string }[],
   ) => Promise<void>; // rejects until rewrite is durable; fleet still resyncs
+  // #375: the evidence repair's forget. Drops only the named pairs' rows whose
+  // key the live store excludes; their admitted rows stay and no pair is barred.
+  // Rejects until the rewrite is durable, as `forgetSessions` does.
+  forgetExcludedKeys: (sessions: readonly ForgetSessionRef[]) => Promise<void>;
+  // #368 review: every pair whose archived rows include a key the live store
+  // excludes (`isExcludedKey`), rows of a forgotten pair skipped — the repair's
+  // "this done pair is still owed" test. In-memory: one pass over the loaded
+  // rows, no disk read. Empty while the archive has never loaded.
+  excludedPairs: () => ForgetSessionRef[];
   // For the storage reporter. `null` means the archive has never LOADED — before
   // the first open, and after a load failure. It is NOT the inverse of
   // `degraded()`: a failed push degrades with the store still present and
@@ -92,17 +114,23 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
   // handle, so a straggler sweep enqueueing afterwards would silently reopen a
   // file nobody is going to close again. Every entry point consults this.
   let stopped = false;
-  // Forgets that had no archive to rewrite — replayed by the next successful
-  // open, before it seeds. See the header's FORGET DURING A DEGRADE note.
+  // Forgets that failed or had no archive to rewrite — replayed by the next
+  // successful open, before it seeds (see `forgetSessions` for why the queue
+  // is written before the open), or by the sweep's retry.
   const pendingForgets = new Set<string>();
-  // Every pair this process has been asked to forget, barred from re-entering
-  // the archive or the engine for the process lifetime. See the header's FORGET
-  // LEAVES A PERMANENT INGESTION BAR note for the race and for why never
-  // clearing is safe. Deliberately NOT merged with `pendingForgets`, whose keys
-  // must keep clearing once replayed.
+  // Every pair `forgetSessions` has named (a user's Forget), barred from
+  // re-entering the archive or the engine for the process lifetime: see the
+  // header's paragraph on the user Forget's bar, and ADR-0069 §8 for the race
+  // it closes. Deliberately NOT merged with `pendingForgets`, whose keys must
+  // keep clearing once replayed.
   const forgottenPairs = new Set<string>();
+  // The key-scoped twin of `pendingForgets` (#375): pairs whose repair forget
+  // failed or had no archive to rewrite. Replayed by the next successful open
+  // once the engine's walk has settled (the predicate reads the live store's
+  // verdicts) and before the seed, or by the sweep's retry. Never barred.
+  const pendingExcludedForgets = new Set<string>();
   // Serializes every archive write (change-feed appends, sweep batches, the
-  // forget rewrite) so RAM/apply order matches disk order and a failure can't
+  // forget rewrites) so RAM/apply order matches disk order and a failure can't
   // interleave. `chain` NEVER rejects — append failures report via setDegraded,
   // while a forget keeps its rejecting `link` for the caller and forks a
   // swallowed continuation back into `chain`. Anything awaiting sweep/stop is
@@ -123,20 +151,24 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
   }
 
   // The stamp predicate, pointed at the archive: a row is archived ⇔ the
-  // archive holds its key at ≥ its token fullness. fleetTokenTotal is
-  // structural over the four token counts, which StoredEvent and FleetEvent
-  // both carry.
+  // archive holds its key at ≥ its fullness — i.e. the row does not supersede
+  // the held copy under the one merge rule (ADR-0103: a larger total, or an
+  // equal total with Organization evidence against none). `eligible` asks the
+  // same question of the local contribution: the row is this machine's own
+  // unless it is fuller than anything the transcripts gave. fleetCopySupersedes
+  // is structural over the four token counts and the tag, which StoredEvent
+  // and FleetEvent both carry.
   function eligible(row: StoredEvent): boolean {
     const local = deps.getStore().localContribution(row.messageId, row.requestId);
     return (
-      (local !== undefined && fleetTokenTotal(local) >= fleetTokenTotal(row)) ||
+      (local !== undefined && !fleetCopySupersedes(row, local)) ||
       (deps.mayArchiveFleet?.(row) ?? false)
     );
   }
 
   function stamped(row: StoredEvent): boolean {
     const held = archive?.get(row.messageId, row.requestId);
-    return held !== undefined && fleetTokenTotal(held) >= fleetTokenTotal(row);
+    return held !== undefined && !fleetCopySupersedes(row, held);
   }
 
   function forgotten(row: { projectSlug: string; sessionId: string }): boolean {
@@ -152,9 +184,11 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
   // emit repeated keys — `upsert` emits one StoreChange per CHANGING record, so
   // a streamed turn's `output_tokens: 1` partial and its final row arrive as two
   // changes sharing one key. Last-wins is exact rather than merely plausible:
-  // the engine emits a second change for a key only on a STRICTLY greater token
-  // total, so the later row is always the fuller one. It also keeps the archive
-  // free of an immediately-superseded line per streamed turn.
+  // the engine emits a second change for a key only when the new copy is
+  // STRICTLY fuller (a greater token total, or an equal total that gained
+  // Organization evidence — ADR-0103), so the later row is always the fuller
+  // one. It also keeps the archive free of an immediately-superseded line per
+  // streamed turn.
   //
   // A no-op for the sweep, whose rows come from the engine's dedup map and are
   // unique by construction — applied there anyway so the invariant holds at the
@@ -222,6 +256,17 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     return (row) => !keys.has(sessionPairKey(row.projectSlug, row.sessionId));
   }
 
+  // The key-scoped keep-predicate (#375): a row of a named pair goes only when
+  // the live store excludes its key. Read per row, as the rewrite runs, so a
+  // store swapped while the rewrite waited on the chain is the one asked.
+  function keepAllButExcluded(pairs: ReadonlySet<string>): (row: FleetEvent) => boolean {
+    return (row) =>
+      !(
+        pairs.has(sessionPairKey(row.projectSlug, row.sessionId)) &&
+        deps.getStore().isExcludedKey(row.messageId, row.requestId)
+      );
+  }
+
   // Create + load the store, replay any pending forget, seed the engine from
   // what survived. Shared by boot, the sweep's degrade-retry, and a forget that
   // arrives with no archive open. Throws on any of those failing.
@@ -232,6 +277,8 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     // re-ingests a forgotten row. A throw here leaves `archive` null and the
     // pending set intact, so the next sweep retries the pair together.
     await applyPendingForgets(store);
+    // #375: guarded here, not inside, so an empty queue adds no await to boot.
+    if (pendingExcludedForgets.size > 0) await applyPendingExcludedForgets(store);
     archive = store;
     // ADR-0098: seed after the engine's walk — see fleet.ts loadReplicaAtBoot.
     await deps.getStore().ready;
@@ -243,6 +290,17 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     const keys = new Set(pendingForgets);
     await store.rewrite({ keep: keepAllBut(keys), newEpoch: false });
     for (const key of keys) pendingForgets.delete(key);
+  }
+
+  // #375: the predicate asks the store which keys it excludes, and before the
+  // walk has settled it knows none — the rewrite would keep every row and clear
+  // the queue. Hence the wait, which the boot seed makes anyway.
+  async function applyPendingExcludedForgets(store: FleetEventStore): Promise<void> {
+    await deps.getStore().ready;
+    if (pendingExcludedForgets.size === 0) return;
+    const pairs = new Set(pendingExcludedForgets);
+    await store.rewrite({ keep: keepAllButExcluded(pairs), newEpoch: false });
+    for (const key of pairs) pendingExcludedForgets.delete(key);
   }
 
   // One open in flight at a time. Without this a sweep racing a forget (or two
@@ -288,11 +346,15 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     }
     const a = archive;
     if (a === null) return; // unreachable: openAndSeed either assigns or throws
-    if (pendingForgets.size > 0) {
+    if (pendingForgets.size > 0 || pendingExcludedForgets.size > 0) {
       // A failed rewrite leaves the store open and readable. Retry the pending
       // privacy deletion on that SAME serialized write chain; waiting for a
       // future reopen would make the queue inert for the rest of this process.
-      const link = chain.then(() => applyPendingForgets(a));
+      // Both queues, pair-wide first, as the open replays them (#375).
+      const link = chain.then(async () => {
+        await applyPendingForgets(a);
+        if (pendingExcludedForgets.size > 0) await applyPendingExcludedForgets(a);
+      });
       chain = link.then(
         () => {},
         () => {},
@@ -328,6 +390,20 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     sweepTimer ??= setIntervalImpl(() => {
       void sweep();
     }, sweepMs);
+  }
+
+  function excludedPairs(): ForgetSessionRef[] {
+    if (archive === null) return [];
+    const store = deps.getStore();
+    const pairs = new Map<string, ForgetSessionRef>();
+    for (const row of archive.all()) {
+      if (forgotten(row) || !store.isExcludedKey(row.messageId, row.requestId)) continue;
+      pairs.set(sessionPairKey(row.projectSlug, row.sessionId), {
+        projectSlug: row.projectSlug,
+        sessionId: row.sessionId,
+      });
+    }
+    return [...pairs.values()];
   }
 
   async function forgetSessions(
@@ -396,6 +472,52 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     }
   }
 
+  // #375: `forgetSessions`' shape and failure contract, minus the bar. Nothing
+  // joins `forgottenPairs`: the rewrite removes only excluded keys, which no
+  // ingestion route can carry back (see the header), so the pair's admitted
+  // rows keep archiving and a key the set admits again re-archives.
+  async function forgetExcludedKeys(sessions: readonly ForgetSessionRef[]): Promise<void> {
+    if (sessions.length === 0) return;
+    const pairs = new Set(sessions.map((s) => sessionPairKey(s.projectSlug, s.sessionId)));
+    if (archive === null) {
+      if (stopped) return;
+      // Queued BEFORE the open, as `forgetSessions` does: the open replays the
+      // queue once the walk has settled, so on success this call's rewrite
+      // below is a no-op; on failure the pairs wait for the next open.
+      for (const key of pairs) pendingExcludedForgets.add(key);
+      try {
+        await openAndSeed();
+        setDegraded(false);
+      } catch (err) {
+        console.warn(
+          `[sidecar] local archive unavailable — ${String(pairs.size)} excluded-key forget(s) queued for the next successful open:`,
+          err,
+        );
+        throw err;
+      }
+    }
+    const a = archive;
+    if (a === null) return; // unreachable: openAndSeed either assigns or throws
+    // No `ready` wait here, unlike the replay: every caller runs after the walk
+    // (the repair behind the boot gate, `fleet.forget` behind `ingestionReady`).
+    const link = chain.then(() => a.rewrite({ keep: keepAllButExcluded(pairs), newEpoch: false }));
+    chain = link.then(
+      () => {},
+      () => {},
+    );
+    try {
+      await link;
+      for (const key of pairs) pendingExcludedForgets.delete(key);
+    } catch (err) {
+      // The file may still hold the excluded rows; the sweep retries them. No
+      // engine route can resurrect them meanwhile: the store refuses the key.
+      for (const key of pairs) pendingExcludedForgets.add(key);
+      console.warn("[sidecar] local archive excluded-key forget rewrite failed:", err);
+      setDegraded(true);
+      throw err;
+    }
+  }
+
   return {
     loadAtBoot,
     attachStore,
@@ -403,6 +525,8 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     sweep,
     startSweeps,
     forgetSessions,
+    forgetExcludedKeys,
+    excludedPairs,
     store: () => archive,
     degraded: () => isDegraded,
     stop: async () => {

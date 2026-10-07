@@ -1,6 +1,6 @@
 {
   "name": "maxprice",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -18,11 +18,13 @@
     "build:hub": "bun --filter @maxprice/hub build:credstore && bun --filter @maxprice/hub build:binaries && bun --filter @maxprice/hub-desktop tauri build --no-sign",
     "typecheck": "bun --filter '*' typecheck && bun run typecheck:scripts",
     "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json",
-    "test": "bun --filter '*' test && bun run test:scripts",
-    "test:scripts": "bun test scripts/release-tooling.test.ts scripts/public-sync.test.ts scripts/updater-manifest.test.ts scripts/check-unpriced-models.test.ts scripts/prepare-release.test.ts scripts/ownerless-sessions.test.ts",
+    "test": "bun --filter '*' test && bun run test:scripts && bun run test:hooks",
+    "test:hooks": "bun test scripts/git-hooks/pre-commit.test.ts --timeout 30000",
+    "test:scripts": "bun test scripts/release-tooling.test.ts scripts/public-sync.test.ts scripts/updater-manifest.test.ts scripts/check-unpriced-models.test.ts scripts/prepare-release.test.ts scripts/ownerless-sessions.test.ts scripts/acceptance/compare.test.ts scripts/acceptance/clock.test.ts scripts/acceptance/harness.test.ts scripts/acceptance/upgrade.test.ts scripts/acceptance/rehearsal-real-copy.test.ts scripts/acceptance/memory-real-copy.test.ts scripts/acceptance/renderer/api-requests.test.ts scripts/acceptance/renderer/browser.test.ts scripts/acceptance/renderer/evidence.test.ts scripts/acceptance/renderer/flows-oracle.test.ts scripts/acceptance/renderer/identity-matrix.test.ts scripts/acceptance/renderer/identity.test.ts scripts/acceptance/renderer/matrix-cells.test.ts scripts/acceptance/renderer/matrix-oracle.test.ts scripts/acceptance/renderer/mirror.test.ts scripts/acceptance/renderer/pixels.test.ts scripts/acceptance/renderer/roster.test.ts scripts/acceptance/renderer/settle.test.ts scripts/acceptance/renderer/sidecar-events.test.ts scripts/acceptance/renderer/sides.test.ts scripts/acceptance/renderer/summary.test.ts scripts/acceptance/renderer/vite.test.ts scripts/acceptance/renderer/waits.test.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "hooks:install": "git config core.hooksPath scripts/git-hooks"
   },
   "devDependencies": {
     "@eslint/js": "^9.18.0",
@@ -32,6 +34,7 @@
     "eslint": "^9.18.0",
     "eslint-plugin-react-hooks": "^5.1.0",
     "eslint-plugin-react-refresh": "^0.4.16",
+    "playwright-core": "1.63.0",
     "prettier": "^3.4.2",
     "typescript": "^5.7.3",
     "typescript-eslint": "^8.20.0"

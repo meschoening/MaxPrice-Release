@@ -102,7 +102,7 @@ export const assistantRecordSchema = z
   })
   .passthrough();
 
-// The Owner record (CONTEXT.md): the line Claude Code writes when a session is
+// The Owner record (GLOSSARY.md): the line Claude Code writes when a session is
 // attached to Remote Control or the desktop app, naming the Organization that
 // owns the session from that line on. It is attribution evidence, never a
 // usage event, and it is NOT a member of `jsonlRecordSchema` — the scan reads
@@ -115,6 +115,24 @@ export const ownerRecordSchema = z
   })
   .passthrough();
 export type OwnerRecord = z.infer<typeof ownerRecordSchema>;
+
+// The Login record (GLOSSARY.md, ADR-0109): the `credential_org` attachment
+// Claude Code 2.1.281+ writes at a session's first query, and again at each
+// change, naming the Organization of the login in use. Attribution evidence
+// that outranks the Owner record; like it, never a usage event and read ahead
+// of the pre-filter (jsonl.ts). A record without a nonempty uuid is no evidence.
+export const loginRecordSchema = z
+  .object({
+    type: z.literal("attachment"),
+    attachment: z
+      .object({
+        type: z.literal("credential_org"),
+        organizationUuid: z.string().min(1),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+export type LoginRecord = z.infer<typeof loginRecordSchema>;
 
 // Every non-assistant record kind. The engine reads none of their innards, so
 // each is modelled as `{ type: <literal> }` open — enough to discriminate, no
@@ -181,7 +199,7 @@ export type JsonlRecord = z.infer<typeof jsonlRecordSchema>;
 //   - `cacheCreation`   — `message.usage.cache_creation` 5m/1h split, when present
 //   - `costUSD`         — top-level `costUSD`, when present (never `null`)
 //   - `cwd`             — top-level `cwd`, the session's working directory
-//   - `organizationUuid` — the nearest preceding owner record's `ownerOrganizationUuid`
+//   - `organizationUuid` — the Login or Owner record in effect above it (jsonl.ts)
 export type UsageRecord = {
   timestamp: string;
   messageId: string;
@@ -201,10 +219,12 @@ export type UsageRecord = {
     | undefined;
   costUSD: number | undefined;
   cwd: string | undefined;
-  // The Organization (CONTEXT.md, ADR-0098) named by the most recent Owner
-  // record ABOVE this line in the same file; `undefined` when none precedes it
-  // — a session that was never attached, or a subagent transcript (those
-  // inherit their parent session's owner inside the store).
+  // The Organization (GLOSSARY.md, ADR-0098, ADR-0109) this line is attributed
+  // to: the file's Login cursor once a Login record precedes it, else the most
+  // recent Owner record ABOVE this line in the same file; `undefined` when
+  // neither precedes it — a session that was never attached. A subagent
+  // transcript's rows are tagged the same way, and the store ignores that tag:
+  // every subagent row inherits its parent session's owner (ADR-0109 §5).
   organizationUuid: string | undefined;
 };
 
@@ -218,8 +238,10 @@ export type UsageRecord = {
 // A version mismatch discards the whole cache — one slow boot, never a wrong
 // number. Lives beside `UsageRecord` so the shape and its cache version are
 // reviewed together.
-// History: 1 — the original shape; 2 — ADR-0098 added `organizationUuid`.
-export const SCAN_CACHE_VERSION = 2;
+// History: 1 — the original shape; 2 — ADR-0098 added `organizationUuid`;
+// 3 — ADR-0109: a Login record outranks the Owner record, so a cached
+// record's `organizationUuid` may be stale.
+export const SCAN_CACHE_VERSION = 3;
 
 // ---------------------------------------------------------------------------
 // parseLine result

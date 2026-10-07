@@ -12,12 +12,15 @@ import {
   usageEventSchema,
   usageSampleEventSchema,
   type UsageCurrent,
+  type OrganizationsResponse,
 } from "@maxprice/shared";
 import { queryClient } from "@/lib/query";
 import { getSidecarUrl, resetSidecarUrl, SidecarStartupError } from "@/lib/sidecar";
 import { useLiveStatus } from "@/state/use-live-status";
 import { usageCurrentQueryKey } from "@/state/use-usage-current";
 import { machinesQueryKey } from "@/state/use-machines";
+import { organizationsQueryKey } from "@/state/use-organizations";
+import { organizationAssertionsQueryKey } from "@/state/use-organization-assertions";
 import { projectIdentityQueryKey } from "@/state/use-project-identity";
 
 // The renderer end of the Part 3 live data pipeline (ADR-0007): one EventSource
@@ -152,12 +155,55 @@ export function setInvalidationPaused(paused: boolean): void {
   }
 }
 
+// Refetch the Organization roster (#287) — a narrow invalidation, never a
+// round (ADR-0058). Un-awaited: the roster read touches login and settings
+// files beside user-chosen watch roots, which can hang on a dead network mount
+// (#183), so no gate may wait on it. A rejection is dropped, as allSettled
+// drops a round refetch's.
+//
+// Single-flight (`cancelRefetch: false`): a poke that finds a roster fetch in
+// flight joins it rather than aborting it for a fresh GET. The abort would
+// free only this `fetch` — the sidecar handler keeps awaiting its file reads,
+// which have no deadline — so on a dead mount every poke would wedge more of
+// the sidecar's fs pool. The price: a fetch already in flight when a poke
+// lands can answer the roster from before it; the next poke corrects it.
+function pokeRoster(client: QueryClient): void {
+  client
+    .invalidateQueries({ queryKey: organizationsQueryKey() }, { cancelRefetch: false })
+    .catch(() => {});
+}
+
+// Refetch the Organization assertion map (#312) — like the roster poke, a
+// narrow invalidation outside the round's gate, whose rejection is dropped.
+// Unlike the roster read it touches no file (the sidecar answers from memory),
+// so an in-flight GET is cancelled for a fresh one: the poke usually follows a
+// write, and an answer from before that write is the one to discard. Only an
+// active query refetches, and only the Settings list showing an Excluded
+// Organization enables one, so most rounds send nothing.
+function pokeOrganizationAssertions(client: QueryClient): void {
+  client.invalidateQueries({ queryKey: organizationAssertionsQueryKey() }).catch(() => {});
+}
+
 // Start a round: every report family plus each distinct per-session detail key
 // accumulated so far. The gate releases when ALL its refetches settle —
 // allSettled, so a rejected refetch releases it rather than wedging it.
+//
+// Each round also pokes the Organization roster (#287): it moves with the
+// corpus — a round's rows can name an Organization it has not listed, which
+// also stamps that Organization's first-seen time — and no event says so. A
+// settings edit and a rename have their own `organizations:changed` poke, but
+// an event is lost while the stream is down, and the reconnect's catch-up
+// round is what rereads the roster then. Paced by round starts, but NOT one of
+// the round's refetches: see `pokeRoster`.
+//
+// And the Organization assertion map (#312), for the same reason: a PUT that
+// changes a claim and a Hub adoption both end in a usage:new round (the
+// sidecar's `pokeNow`), and no event names the assertions themselves.
 function startRound(client: QueryClient): void {
   roundInFlight = true;
   const gen = roundGeneration;
+  pokeRoster(client);
+  pokeOrganizationAssertions(client);
   const invalidations: Array<Promise<unknown>> = [invalidateDataFamilies(client)];
   for (const id of pendingSessionIds) {
     invalidations.push(client.invalidateQueries({ queryKey: sessionKey(id) }));
@@ -257,8 +303,8 @@ function cancelUsageInvalidation(): void {
 }
 
 // `usage:new` — a JSONL write landed. Pulse the refresh pill immediately, then
-// schedule a debounced refetch of every report family plus the per-session
-// detail key (a Part 5 stub today).
+// schedule a debounced refetch of every report family, the Organization roster
+// and the per-session detail key (a Part 5 stub today).
 //
 // `markEvent` stays UNGATED by the F9 visibility pause, as do
 // `handleStatusEvent` and `handleUsageSampleEvent`'s `setQueryData` below:
@@ -300,7 +346,7 @@ export function handleBlockTick(client: QueryClient): void {
 // `status:changed` — the sidecar's status snapshot. Feeds the live-status store
 // and marks the channel connected (a frame is proof the channel is live).
 //
-// ONE refetch trigger lives here, and it is gated on a VALUE change (#108): the
+// Report refetches are gated on a VALUE change (#108): the
 // active price snapshot's `capturedAt`. Cost is priced per event at query time
 // from the sidecar's active snapshot, so when a pricing refresh swaps it, every
 // cached report row is silently priced by the OLD snapshot until something else
@@ -314,25 +360,85 @@ export function handleStatusEvent(client: QueryClient, dataText: string): void {
   const snapshot = parseEvent(statusSnapshotSchema, dataText);
   if (snapshot === null) return;
   const previous = useLiveStatus.getState().pricing;
+  const previousOrganizations = useLiveStatus.getState().organizations;
   useLiveStatus.getState().applyStatusSnapshot(snapshot);
   useLiveStatus.getState().setConnectionState("connected");
+  // Limits polls emit status, not organizations:changed. Refresh the roster
+  // when an answer moves, including the first frame after reconnect. Compare
+  // cached answers too: a single-flight roster read may predate the transition,
+  // so the next status frame must retry until the roster catches up. Timestamp
+  // churn alone costs no GET, and this narrow poke never holds a report round.
+  const roster = client.getQueryData<OrganizationsResponse>(organizationsQueryKey());
+  const organizationUuids = new Set([
+    ...Object.keys(previousOrganizations),
+    ...Object.keys(snapshot.organizations),
+  ]);
+  if (
+    [...organizationUuids].some(
+      (uuid) => previousOrganizations[uuid]?.limits !== snapshot.organizations[uuid]?.limits,
+    ) ||
+    roster?.organizations.some((entry) => {
+      const status = snapshot.organizations[entry.uuid];
+      return status !== undefined && entry.limits?.answer !== status.limits;
+    })
+  ) {
+    pokeRoster(client);
+  }
   const next = snapshot.pricing ?? null;
   if (previous !== null && next !== null && previous.capturedAt !== next.capturedAt) {
     requestInvalidationRound(client, { sweepSessionRoot: true });
   }
 }
 
+// `organizations:changed` — the roster moved on the sidecar (#287, ADR-0105):
+// a settings edit started applying or finished its walk, a rename landed, a
+// label adopted from the Hub's Organization directory changed one (#288), or a
+// listing changed the registry: the Hub's roster pulled by a hub-connected
+// client, or a Hub-less client's own key listing (#366). Refetches the roster
+// through the same narrow, single-flight poke a round starts with — never a
+// round of its own. Not paused while the window is hidden (F9), like the two
+// directory pokes. Each poke costs two loopback reads, the roster and the
+// displayed usage-current entry. A settings edit that changes the tracked set
+// pokes twice, as it starts applying and again once its walk ends; one that
+// moves Home alone pokes once, and one that changes neither does not poke.
+//
+// It also invalidates every usage-current entry: a roster change can move
+// which Organization an earlier answer belonged to. A uuid the sidecar did not
+// track yet was answered as Home, and that answer sits on the uuid's own
+// entry. A fetch still in flight may predate the change, and TanStack joins a
+// first fetch rather than replacing it, so each is cancelled before the
+// refetch. The roster's poke never cancels (`pokeRoster`); this one can,
+// because the answer is the poller's memory, never a file read that could
+// hang. Only the entries a window displays refetch now; the rest are marked
+// stale and refetch when next displayed, painting their cached answer until
+// that fetch settles.
+export function handleOrganizationsChanged(client: QueryClient): void {
+  pokeRoster(client);
+  const usageCurrent = { queryKey: usageCurrentQueryKey() };
+  void client.cancelQueries(usageCurrent).then(() => client.invalidateQueries(usageCurrent));
+}
+
+// `usage:sample` — one Organization's reading, keyed the way usage current is
+// (ADR-0106 §8). The sidecar emits every polled Organization's, and the
+// stream keeps one entry per Organization: each reading lands on
+// `usageCurrentQueryKey(organizationUuid)`, whatever the settings say. The
+// display picks its entry from the scope and Home (`useOrganizationScope`), so
+// neither a scope change nor a Home change needs an event, and a reading never
+// paints another Organization's rings.
+//
 // A valid null is an authoritative "no window in flight" result, so this
 // cannot use parseEvent's null-as-failure sentinel.
 export function handleUsageSampleEvent(client: QueryClient, dataText: string): void {
   try {
     const parsed = usageSampleEventSchema.safeParse(JSON.parse(dataText));
     if (!parsed.success) return;
-    // A null sample must not drop the last-known weekly reset (ADR-0083).
-    client.setQueryData<UsageCurrent>(usageCurrentQueryKey(), (prev) => ({
-      sample: parsed.data,
-      weeklyResetAt: parsed.data?.weekly?.resetAt ?? prev?.weeklyResetAt ?? null,
-    }));
+    const { organizationUuid, sample, weeklyResetAt } = parsed.data;
+    // The reading and its cadence travel together, so no entry borrows
+    // another Organization's week.
+    client.setQueryData<UsageCurrent>(usageCurrentQueryKey(organizationUuid), {
+      sample,
+      weeklyResetAt,
+    });
   } catch {
     // Malformed SSE payloads leave the prior cache untouched.
   }
@@ -495,6 +601,9 @@ async function openConnection(): Promise<void> {
     // that surfaces as a new query key on its own (ADR-0062 §4) — sweeping the
     // report families here would refetch the whole corpus for nothing.
     void queryClient.invalidateQueries({ queryKey: projectIdentityQueryKey });
+  });
+  es.addEventListener(SSE_EVENT.organizationsChanged, () => {
+    handleOrganizationsChanged(queryClient);
   });
   es.addEventListener("error", () => {
     // Take over reconnection ourselves rather than letting EventSource's

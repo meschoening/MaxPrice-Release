@@ -59,6 +59,7 @@ export type LiveStatusState = {
   // Settings section and future status indicator always reflect the poller.
   usageConnection: UsageConnection;
   usageLastSampleAt: string | null;
+  organizations: StatusSnapshot["organizations"];
   // Hub connection state (ADR-0035). `off` until a hub URL is configured.
   hubConnection: HubConnection;
   // The last SETTLED hub state (anything but `connecting`), feeding
@@ -108,6 +109,7 @@ export const useLiveStatus = create<LiveStatusState>((set) => ({
   bootFailure: null,
   usageConnection: "disconnected",
   usageLastSampleAt: null,
+  organizations: {},
   hubConnection: "off",
   lastSettledHubConnection: null,
   hubSeed: null,
@@ -134,6 +136,7 @@ export const useLiveStatus = create<LiveStatusState>((set) => ({
       bootProgress: snapshot.bootProgress ?? null,
       usageConnection: snapshot.usageConnection,
       usageLastSampleAt: snapshot.usageLastSampleAt,
+      organizations: snapshot.organizations,
       hubConnection: snapshot.hubConnection,
       // The last SETTLED hub state, feeding foot-status' sticky rule. Derived
       // here rather than in a component ref so it is complete from the FIRST

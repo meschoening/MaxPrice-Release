@@ -4,7 +4,7 @@ import {
   type EmittedStatusSnapshot,
   type StatusSnapshot,
   type UsageEvent,
-  type UsageReading,
+  type UsageSampleEvent,
 } from "@maxprice/shared";
 
 // Transport-agnostic messages the hub fans out. The SSE route translates each
@@ -15,7 +15,7 @@ export type LiveMessage =
   | { type: typeof SSE_EVENT.usageNew; data: UsageEvent }
   | { type: typeof SSE_EVENT.blockTick; data: BlockTickEvent }
   | { type: typeof SSE_EVENT.statusChanged; data: StatusSnapshot }
-  | { type: typeof SSE_EVENT.usageSample; data: UsageReading | null }
+  | { type: typeof SSE_EVENT.usageSample; data: UsageSampleEvent }
   // Fleet machine-directory poke (ADR-0041 M5) — empty data, a pure refetch
   // signal for GET /api/machines. Broadcast on every hub:machines poke and on
   // this machine's own directory-cache refresh.
@@ -24,6 +24,10 @@ export type LiveMessage =
   // GET /api/project-identity. Broadcast whenever the directory's rows change:
   // a local probe recording something new, or a hub pull adopting the union.
   | { type: typeof SSE_EVENT.identityChanged; data: Record<string, never> }
+  // Organization-roster poke (#287, ADR-0105) — empty data, a pure refetch
+  // signal for GET /api/organizations. Broadcast when a settings edit starts
+  // applying and again when its walk ends, and after a rename that wrote.
+  | { type: typeof SSE_EVENT.organizationsChanged; data: Record<string, never> }
   | { type: typeof SSE_EVENT.heartbeat };
 
 export type LiveSubscriber = (message: LiveMessage) => void;
@@ -34,13 +38,16 @@ export type LiveHub = {
   // unsubscribe function.
   subscribe: (subscriber: LiveSubscriber) => () => void;
   emitUsage: (event: UsageEvent) => void;
-  emitUsageSample: (sample: UsageReading | null) => void;
+  emitUsageSample: (event: UsageSampleEvent) => void;
   // Broadcast a machines:changed poke (empty payload) so subscribers refetch
   // GET /api/machines (ADR-0041 M5).
   emitMachinesChanged: () => void;
   // Broadcast an identity:changed poke (empty payload) so subscribers refetch
   // GET /api/project-identity and refold (ADR-0062).
   emitIdentityChanged: () => void;
+  // Broadcast an organizations:changed poke (empty payload) so subscribers
+  // refetch GET /api/organizations (#287, ADR-0105).
+  emitOrganizationsChanged: () => void;
   getStatus: () => StatusSnapshot;
   setStatus: (status: StatusSnapshot) => void;
   // Merge a partial update into the current status and broadcast it. Unlike a
@@ -90,9 +97,11 @@ export function createLiveHub(opts: CreateLiveHubOptions): LiveHub {
     ((handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>));
   const subscribers = new Set<LiveSubscriber>();
   let status: StatusSnapshot = opts.initialStatus;
-  // undefined until the first authoritative poll. Afterwards retain sample OR
-  // null so a reconnect cannot miss a reset between first paint and SSE.
-  let usageCurrent: UsageReading | null | undefined;
+  // Each Organization's last reading, absent until its first authoritative
+  // one. Retains sample OR null per Organization, so a reconnect cannot miss a
+  // reset between first paint and SSE, and replays every Organization rather
+  // than only the one that emitted last.
+  const usageCurrent = new Map<string, UsageSampleEvent>();
   let blockTickTimer: unknown = null;
   let heartbeatTimer: unknown = null;
 
@@ -133,8 +142,8 @@ export function createLiveHub(opts: CreateLiveHubOptions): LiveHub {
 
   function subscribe(subscriber: LiveSubscriber): () => void {
     deliver(subscriber, { type: SSE_EVENT.statusChanged, data: status });
-    if (usageCurrent !== undefined) {
-      deliver(subscriber, { type: SSE_EVENT.usageSample, data: usageCurrent });
+    for (const event of usageCurrent.values()) {
+      deliver(subscriber, { type: SSE_EVENT.usageSample, data: event });
     }
     subscribers.add(subscriber);
     if (subscribers.size === 1) startTimers();
@@ -147,12 +156,13 @@ export function createLiveHub(opts: CreateLiveHubOptions): LiveHub {
   return {
     subscribe,
     emitUsage: (event) => broadcast({ type: SSE_EVENT.usageNew, data: event }),
-    emitUsageSample: (sample) => {
-      usageCurrent = sample;
-      broadcast({ type: SSE_EVENT.usageSample, data: sample });
+    emitUsageSample: (event) => {
+      usageCurrent.set(event.organizationUuid, event);
+      broadcast({ type: SSE_EVENT.usageSample, data: event });
     },
     emitMachinesChanged: () => broadcast({ type: SSE_EVENT.machinesChanged, data: {} }),
     emitIdentityChanged: () => broadcast({ type: SSE_EVENT.identityChanged, data: {} }),
+    emitOrganizationsChanged: () => broadcast({ type: SSE_EVENT.organizationsChanged, data: {} }),
     getStatus: () => status,
     setStatus: (next) => {
       status = next;

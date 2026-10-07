@@ -175,9 +175,9 @@ function PopoutActions(): React.ReactElement {
 // uncaught render error, so an effect living in Popout would die with it and
 // pin the tooltip on its last string forever. The SSE subscription rides along
 // for the same reason — it exists to flip this tooltip fast when the daemon
-// dies (no machines callback; the popout renders no directory).
+// dies (no directory callbacks; the popout renders no directory).
 export function TrayTooltip(): null {
-  useHubStream({ machines: false });
+  useHubStream({ directories: false });
   const { data: status, isError } = useHubStatus();
   const { data: firewall } = useFirewallCheck();
 

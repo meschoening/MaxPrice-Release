@@ -32,6 +32,11 @@ export type PopoutHead =
       // "3h 18m · resets 7:00 PM" (no "elapsed" — the ring's countdown already
       // carries the time story). Ellipsis-guarded by CSS, not truncated here.
       metaText: string;
+      // The Quota organization's label after "Active block" (#291), set only
+      // while more than one Organization is tracked: the popout has no scope
+      // chip, so the eyebrow names whose block this is. null on a
+      // one-Organization machine, and until the roster answers.
+      eyebrowTag: string | null;
     }
   | { kind: "idle" }; // the dashed "No active block" inset
 
@@ -58,6 +63,10 @@ export type PopoutViewState =
       // fact — `pct` null under the ADR-0030 rule like the other two rows.
       // Labelled from the wire ("Fable limit"), never from an assumed family.
       modelRow: { label: string; pct: number | null } | null;
+      // The Today row's name: "Today", or "Today · all" under All
+      // organizations, where its money is the day over every tracked
+      // Organization rather than the Quota organization's alone.
+      todayLabel: string;
       todayText: string;
       // Today's total tokens (the daily row's totalTokens, every token type),
       // abbreviated and drawn to the right of the cost: "41.2M tok".
@@ -88,6 +97,11 @@ export type PopoutViewInput = {
   todayTokens: number;
   now: number;
   display: TimeDisplay;
+  // The Quota organization's label while more than one Organization is
+  // tracked, else null (use-popout-data's `popoutQuotaTag`).
+  quotaTag: string | null;
+  // The scope is All organizations: the Today row spans every tracked one.
+  allOrganizations: boolean;
 };
 
 export function popoutView(input: PopoutViewInput): PopoutViewState {
@@ -106,6 +120,7 @@ export function popoutView(input: PopoutViewInput): PopoutViewState {
     input.now,
   );
 
+  const todayLabel = input.allOrganizations ? "Today · all" : "Today";
   const todayText = `$${input.todayCost.toFixed(2)}`;
   const todayTokensText = `${abbreviate(input.todayTokens)} tok`;
   const weeklyPct = freshPct(input.weeklyWindow, input.usageConnected, input.now);
@@ -127,6 +142,7 @@ export function popoutView(input: PopoutViewInput): PopoutViewState {
       limitPct: tile.kind === "tile" ? tile.limitPct : null,
       weeklyPct,
       modelRow,
+      todayLabel,
       todayText,
       todayTokensText,
     };
@@ -142,6 +158,7 @@ export function popoutView(input: PopoutViewInput): PopoutViewState {
     costText: active !== null ? `$${active.block.costUSD.toFixed(2)}` : "$0.00",
     tokensText: `${abbreviate(active?.block.totalTokens ?? 0)} tok`,
     metaText: `${formatElapsed(input.now - startMs)} · resets ${formatWallClock(endMs, input.display)}`,
+    eyebrowTag: input.quotaTag,
   };
 
   return {
@@ -150,6 +167,7 @@ export function popoutView(input: PopoutViewInput): PopoutViewState {
     limitPct: tile.limitPct,
     weeklyPct,
     modelRow,
+    todayLabel,
     todayText,
     todayTokensText,
   };

@@ -1,13 +1,17 @@
 {
   "name": "@maxprice/hub",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "exports": {
     "./server": "./src/server.ts",
     "./auth": "./src/auth.ts",
     "./fanout": "./src/fanout.ts",
-    "./machine-directory": "./src/machine-directory.ts"
+    "./machine-directory": "./src/machine-directory.ts",
+    "./organization-directory": "./src/organization-directory.ts",
+    "./organization-assertion-directory": "./src/organization-assertion-directory.ts",
+    "./organization-roster": "./src/organization-roster.ts",
+    "./poll-set": "./src/poll-set.ts"
   },
   "scripts": {
     "dev": "bun --watch run src/index.ts",

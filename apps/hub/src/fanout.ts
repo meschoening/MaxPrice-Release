@@ -8,9 +8,13 @@ export type HubMessage =
   | { type: typeof HUB_SSE_EVENT.sample; data: UsageSample }
   | { type: typeof HUB_SSE_EVENT.status; data: HubStatus }
   // ADR-0041: pokes, never data. hub:events = post-fsync durable watermark;
-  // hub:machines = the directory changed (registration or rename).
+  // hub:machines = the directory changed (registration or rename);
+  // hub:organizations = the Organization directory changed (#288).
   | { type: typeof HUB_SSE_EVENT.events; data: { seq: number } }
   | { type: typeof HUB_SSE_EVENT.machines; data: Record<string, never> }
+  | { type: typeof HUB_SSE_EVENT.organizations; data: Record<string, never> }
+  // hub:organization-assertions = the Organization assertion directory changed (#310).
+  | { type: typeof HUB_SSE_EVENT.organizationAssertions; data: Record<string, never> }
   | { type: typeof HUB_SSE_EVENT.heartbeat };
 
 export type HubSubscriber = (message: HubMessage) => void;
@@ -20,6 +24,8 @@ export type HubFanout = {
   emitSample: (sample: UsageSample) => void;
   emitEventsPoke: (seq: number) => void;
   emitMachinesPoke: () => void;
+  emitOrganizationsPoke: () => void;
+  emitOrganizationAssertionsPoke: () => void;
   getStatus: () => HubStatus;
   patchStatus: (partial: Partial<HubStatus>) => void;
   subscriberCount: () => number;
@@ -76,6 +82,9 @@ export function createHubFanout(opts: CreateHubFanoutOptions): HubFanout {
     emitSample: (sample) => broadcast({ type: HUB_SSE_EVENT.sample, data: sample }),
     emitEventsPoke: (seq) => broadcast({ type: HUB_SSE_EVENT.events, data: { seq } }),
     emitMachinesPoke: () => broadcast({ type: HUB_SSE_EVENT.machines, data: {} }),
+    emitOrganizationsPoke: () => broadcast({ type: HUB_SSE_EVENT.organizations, data: {} }),
+    emitOrganizationAssertionsPoke: () =>
+      broadcast({ type: HUB_SSE_EVENT.organizationAssertions, data: {} }),
     getStatus: () => status,
     patchStatus: (partial) => {
       status = { ...status, ...partial };

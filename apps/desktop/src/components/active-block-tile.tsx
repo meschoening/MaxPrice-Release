@@ -5,11 +5,15 @@ import {
   ringStrokeDasharray,
   type ActiveBlockTileState,
 } from "@/lib/active-block-tile-state";
+import type { NoLimits } from "@/lib/organization-scope-view";
+import { NoLimitsNote } from "@/components/no-limits-note";
 import { UsageExpiredHint } from "@/components/usage-expired-hint";
 import { UnpricedChip } from "@/components/unpriced-chip";
 import { useLiveStatus } from "@/state/use-live-status";
 import { useNowTick } from "@/state/use-now-tick";
 import { useTimeDisplay } from "@/state/use-settings";
+import { useOrganizationScope } from "@/state/use-organization-scope";
+import { useQuotaSurface } from "@/state/use-quota-surface";
 import { useUsageCurrent } from "@/state/use-usage-current";
 import { useBump } from "@/state/use-bump";
 import { cn } from "@/lib/utils";
@@ -42,7 +46,10 @@ export function ActiveBlockTile({
   // the day the engine bucketed into; the timeFormat decides 24h vs AM/PM
   // (ADR-0060). Both arrive together as one TimeDisplay.
   const display = useTimeDisplay();
-  const { data: usage } = useUsageCurrent();
+  // The ring reads the Quota organization's reading (ADR-0106 §8).
+  const { quotaOrganization } = useOrganizationScope();
+  const { data: usage } = useUsageCurrent(quotaOrganization);
+  const { tag: quotaTag, noLimits } = useQuotaSurface();
   const usageConnection = useLiveStatus((s) => s.usageConnection);
   const tileState = activeBlockTileState(
     block,
@@ -60,13 +67,11 @@ export function ActiveBlockTile({
   // reading renders the idle ring below.
   if (tileState.kind === "empty-inset") {
     return (
-      <div className="tile panel" data-block-state="idle">
-        <span className="eyebrow">Active block</span>
-        <div className="inset dashed my-auto">
-          <p>No active block — start a Claude Code session to open one.</p>
-        </div>
-        {usageConnection === "expired" ? <UsageExpiredHint /> : null}
-      </div>
+      <ActiveBlockEmptyInset
+        quotaTag={quotaTag}
+        noLimits={noLimits}
+        usageExpired={usageConnection === "expired"}
+      />
     );
   }
 
@@ -79,13 +84,51 @@ export function ActiveBlockTile({
       bumping={bumping}
       usageExpired={usageConnection === "expired"}
       models={block?.models ?? []}
+      quotaTag={quotaTag}
+      noLimits={noLimits}
     />
+  );
+}
+
+type QuotaSurfaceProps = {
+  // The Quota organization's label, set only under All organizations.
+  quotaTag: string | null;
+  // Set when the Quota organization reports no limits, or they can't be read.
+  noLimits: NoLimits | null;
+};
+
+// The eyebrow names whose block this is only under All organizations; scoped to
+// one Organization, the scope chip already names it.
+function ActiveBlockEyebrow({ quotaTag }: Pick<QuotaSurfaceProps, "quotaTag">): React.ReactElement {
+  return (
+    <span className="eyebrow">
+      Active block
+      {quotaTag !== null ? <span className="eyebrow-tag"> · {quotaTag}</span> : null}
+    </span>
+  );
+}
+
+// The tile with no live usage connection: the explicit empty inset.
+export function ActiveBlockEmptyInset({
+  quotaTag,
+  noLimits,
+  usageExpired,
+}: QuotaSurfaceProps & { usageExpired: boolean }): React.ReactElement {
+  return (
+    <div className="tile panel" data-block-state="idle">
+      <ActiveBlockEyebrow quotaTag={quotaTag} />
+      <div className="inset dashed my-auto">
+        <p>No active block — start a Claude Code session to open one.</p>
+      </div>
+      {noLimits !== null ? <NoLimitsNote noLimits={noLimits} what="5-hour" /> : null}
+      {usageExpired ? <UsageExpiredHint /> : null}
+    </div>
   );
 }
 
 type TileState = Extract<ActiveBlockTileState, { kind: "tile" }>;
 
-export type ActiveBlockTileContentProps = {
+export type ActiveBlockTileContentProps = QuotaSurfaceProps & {
   state: TileState;
   typicalBlockTokens: number;
   now: number;
@@ -109,6 +152,8 @@ export function ActiveBlockTileContent({
   bumping,
   usageExpired,
   models,
+  quotaTag,
+  noLimits,
 }: ActiveBlockTileContentProps): React.ReactElement {
   const { accountWindow, active, limitPct, ringCenterLabel, ringFrac } = state;
   const valueText = tileValueText(state);
@@ -163,9 +208,11 @@ export function ActiveBlockTileContent({
       </div>
       <div className="block-body">
         <div className="block-head">
-          <span className="eyebrow">Active block</span>
+          <ActiveBlockEyebrow quotaTag={quotaTag} />
           {tileStartMs !== null && tileEndMs !== null ? (
-            <span className="window-chip num">{windowChip(tileStartMs, tileEndMs, display)}</span>
+            <span className="window-chip num">
+              {windowChip(tileStartMs, tileEndMs, display) + (noLimits !== null ? " est." : "")}
+            </span>
           ) : null}
         </div>
         <div className="block-value-row">
@@ -180,7 +227,9 @@ export function ActiveBlockTileContent({
             </span>
           ) : null}
         </div>
-        {limitPct !== null ? (
+        {/* An Organization with no readable limits shows no meter, whatever the
+            reading says, and its note sits where the meter would. */}
+        {limitPct !== null && noLimits === null ? (
           <div className="limit-row">
             <label>5-hour limit used</label>
             <span
@@ -196,6 +245,7 @@ export function ActiveBlockTileContent({
             <b className="num">{limitPct}%</b>
           </div>
         ) : null}
+        {noLimits !== null ? <NoLimitsNote noLimits={noLimits} what="5-hour" /> : null}
         {active !== null || accountWindow !== null ? (
           <div className="block-foot num">
             <b>

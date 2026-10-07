@@ -140,6 +140,22 @@ export const storageReportSchema = z.object({
           detail: z.string(),
         })
         .nullable(),
+      // How the unbacked rows split across Organizations (#295) — the one
+      // disclosure Forget makes about them, because Storage itself is never
+      // scoped by Organization: Forget removes every unbacked session of this
+      // machine whatever its rows carry. Each row counts where every report
+      // counts it (evidence, then assertion, then presumption).
+      //
+      // ABSENT unless the rows span MORE THAN ONE Organization and every one
+      // of them resolves to one, so a single-Organization machine's response
+      // is byte-identical to the one it got before, and the entries always sum
+      // to `unbackedRows`. Ordered biggest first, ties by uuid. INFORMATIONAL
+      // only: never a ceiling (`unbackedRows` stays the one number the confirm
+      // authorises) and never sent back — the forget request does not carry
+      // it. Last in the object, so its absence leaves the key order alone too.
+      organizations: z
+        .array(z.object({ organizationUuid: z.string(), rows: z.number().int().positive() }))
+        .optional(),
     })
     .nullable(),
 });

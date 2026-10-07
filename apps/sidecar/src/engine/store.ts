@@ -1,15 +1,25 @@
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  fleetCopySupersedes,
   fleetDedupKey,
   fleetDedupTokenTotal,
+  fleetFullnessPartsExceed,
   worktreeSlugPrefix,
+  type FleetDedupTokens,
   type FleetEvent,
   type ForgetSessionRef,
 } from "@maxprice/shared";
-import { identityFromPath } from "../identity";
+import { identityFromPath, parentSessionPath } from "../identity";
 import { collectUsageRecords } from "./jsonl";
 import { localDate } from "./local-date";
+import {
+  eventOrganization,
+  NO_DORMANT,
+  NO_PRESUMPTION,
+  presumedOrganization,
+  type Presumption,
+} from "./presumption";
 import { isInstantBound } from "./range";
 import type { ScanCache } from "./scan-cache";
 import { defaultTimeZone } from "./timezone";
@@ -42,12 +52,17 @@ import type { UsageRecord } from "./types";
 // `UsageRecord` — `StoredEvent` does not duplicate it.
 //
 // `organizationUuid` on a stored row is the RESOLVED Organization (ADR-0098):
-// the record's own tag when the parser set one, otherwise the owner the
-// session's owner points name at its timestamp (inherited, for a subagent
-// record, which carries no owner record of its own). A row whose resolved
-// organization is not the Home organization never becomes a `StoredEvent` at
-// all — `appendInternal` drops it at the feeder. RAM-only: `storedEventToWire`
-// does not carry it.
+// the record's own tag for a parent transcript's row; for a subagent's row,
+// the owner the session's owner points name at its timestamp (a subagent
+// transcript carries no Attribution evidence of its own, so the parser's tag
+// from its copied Login record is ignored — ADR-0109 §5). A row whose
+// resolved organization is not a member of the store's tracked set never
+// becomes a `StoredEvent` at all — `appendInternal` drops it at the feeder.
+// The set generalises ADR-0098's single Home organization (#275); #299
+// records it in the ADR. Dormant rows (#311) are refused too, and are not
+// foreign. The wire carries the tag (ADR-0103): `storedEventToWire`
+// projects it as owner evidence and `appendFleet` reads it back, so a replica
+// or archive row keeps the tag its producer resolved. Absent still means "no evidence".
 export type StoredEvent = UsageRecord & {
   projectSlug: string;
   sessionId: string;
@@ -103,6 +118,7 @@ export type StoreChange =
   | { event: null; replaced: StoredEvent }; // newly proven foreign: remove the incumbent
 
 export type LocalAppend = {
+  isSubagent: boolean;
   records: UsageRecord[];
   projectSlug: string;
   sessionId: string;
@@ -167,6 +183,18 @@ export type StoreQuery = {
   // semantics would be meaningless here. Alias expansion (mergedInto chains) is
   // renderer-side; the engine stays id-exact.
   machines?: string[];
+  // Organization uuids to include (#261 item 6, #262 item 4). Empty / omitted =
+  // every Organization. EXACT match on the event's RESOLVED-OR-PRESUMED
+  // Organization — its own `organizationUuid` where owner evidence tagged it,
+  // else the Organization its session is asserted to (#309), else its
+  // machine's Presumed organization (`eventOrganization` in ./presumption) —
+  // so the axis narrows by the Organization the app counts a row UNDER, not by
+  // the evidence the row happens to carry. Uuids are opaque, so no substring
+  // and no case folding, exactly like `machines`. An event that resolves to
+  // NOTHING (no evidence, no assertion, and no Home to presume it under) never
+  // matches a non-empty selection: it is absent from every scoped answer
+  // rather than present in all of them.
+  organizations?: string[];
 };
 
 // Case-insensitive substring match of one model name against a list of
@@ -201,7 +229,10 @@ export function matchesModelFilter(model: string, models: string[]): boolean {
 // The NON-DATE filter axes of a store query — everything `compileAxisMatcher`
 // can decide from one event alone (the date axis needs the query's zone and is
 // applied separately by `query`).
-export type StoreAxisQuery = Pick<StoreQuery, "projects" | "sessions" | "models" | "machines">;
+export type StoreAxisQuery = Pick<
+  StoreQuery,
+  "projects" | "sessions" | "models" | "machines" | "organizations"
+>;
 
 // The non-date filter axes compiled ONCE into a per-event predicate — the one
 // definition of "does this event belong to this query's corpus". `query`'s
@@ -214,7 +245,18 @@ export type StoreAxisQuery = Pick<StoreQuery, "projects" | "sessions" | "models"
 // A closure, not a `(event, query)` predicate, because the membership Sets must
 // be built once per query — the cache holds the compiled matcher on its entry
 // and runs it per changed event, where rebuilding Sets would be a real cost.
-export function compileAxisMatcher(q: StoreAxisQuery): ((e: StoredEvent) => boolean) | null {
+//
+// `presumption` is the rule the Organization axis resolves an owner-less event
+// through, taken EXPLICITLY rather than read from anywhere: this function is
+// pure, and the store is the one source of the value (`EventStore.presumption`)
+// so a retained matcher and the cold build that fed it can never have been
+// compiled against different Homes. The default keeps every caller that filters
+// on no Organization — `identity-probe.ts` filters on `projects` alone —
+// one-argument and unaffected.
+export function compileAxisMatcher(
+  q: StoreAxisQuery,
+  presumption: Presumption = NO_PRESUMPTION,
+): ((e: StoredEvent) => boolean) | null {
   const projectFilter = q.projects && q.projects.length > 0 ? new Set(q.projects) : null;
   // The worktree half of the project axis (ADR-0061), precomputed: one prefix
   // per selected project, tested with `startsWith` only after the exact Set
@@ -235,6 +277,22 @@ export function compileAxisMatcher(q: StoreAxisQuery): ((e: StoredEvent) => bool
     worktreePrefixes.some((p) => slug.startsWith(p));
   const sessionFilter = q.sessions && q.sessions.length > 0 ? new Set(q.sessions) : null;
   const machineFilter = q.machines && q.machines.length > 0 ? new Set(q.machines) : null;
+  // The Organization axis (#261/#262) — a genuine per-event predicate whenever
+  // the selection is non-empty, and NEVER short-circuited to `null` because the
+  // selection happens to cover every Organization the store holds right now.
+  //
+  // WHY THE "COVERS EVERYTHING PRESENT" NO-OP IS NOT TAKEN HERE. The set of
+  // Organizations present in the engine GROWS, and this matcher is RETAINED:
+  // the report cache compiles one per entry and keeps it (ADR-0057). With two
+  // Organizations tracked and only Home holding data, an entry scoped to
+  // `[Home]` would compile to `null` — "everything belongs" — and the first row
+  // the watcher appended for the other Organization would be counted under the
+  // Home scope, silently, for as long as that entry lived. `query` takes the
+  // no-op instead, PER CALL, re-reading the present set every time; the two
+  // agree at every instant (the invariant ADR-0057 actually needs), and only
+  // the retained one has to survive growth — which is this one.
+  const organizationFilter =
+    q.organizations && q.organizations.length > 0 ? new Set(q.organizations) : null;
   // Lowered ONCE here rather than per event (see `lowerModelNeedles`); the
   // `.length === 0` "unfiltered" check is unaffected by the mapping.
   const models = lowerModelNeedles(q.models ?? []);
@@ -242,6 +300,7 @@ export function compileAxisMatcher(q: StoreAxisQuery): ((e: StoredEvent) => bool
     projectFilter === null &&
     sessionFilter === null &&
     machineFilter === null &&
+    organizationFilter === null &&
     models.length === 0
   ) {
     return null;
@@ -250,6 +309,14 @@ export function compileAxisMatcher(q: StoreAxisQuery): ((e: StoredEvent) => bool
     if (!matchesProject(e.projectSlug)) return false;
     if (machineFilter !== null && !machineFilter.has(e.machineId)) return false;
     if (sessionFilter !== null && !sessionFilter.has(e.sessionId)) return false;
+    if (organizationFilter !== null) {
+      // Resolved-or-presumed, never the raw tag: an owner-less row belongs to
+      // the Organization its session is asserted to, else the one the
+      // presumption names for its machine. `undefined` — no evidence, no
+      // assertion and no Home to presume under — matches no selection.
+      const organization = eventOrganization(e, presumption);
+      if (organization === undefined || !organizationFilter.has(organization)) return false;
+    }
     return matchesLoweredModelFilter(e.model, models);
   };
 }
@@ -258,18 +325,34 @@ export function compileAxisMatcher(q: StoreAxisQuery): ((e: StoredEvent) => bool
 // Dedup key
 // ---------------------------------------------------------------------------
 
-// The dedup key + token-total tie-breaker are the ONE fleet merge rule, defined
+// The dedup key + fullness tie-breaker are the ONE fleet merge rule, defined
 // once in `@maxprice/shared` (fleet-dedup.ts) and shared byte-for-byte with the
 // hub archive + client replica (packages/usage-core/src/fleet-event-store.ts).
 // Aliased to the local names `upsert` calls; the cross-store parity tests pin
 // the invariant. Claude Code writes several rows per assistant message sharing
 // `(messageId, requestId)` — 2–3 byte-identical content-block lines (E1 finding
 // #1) plus, for a streamed turn, an `output_tokens: 1` partial ahead of the
-// final row — and the store keeps exactly one per distinct tuple: the largest
-// token-total, ties first-seen (an absent requestId is a DISTINCT key from an
-// empty-string one — see fleet-dedup.ts).
+// final row — and the store keeps exactly one per distinct tuple: the fullest
+// copy (the largest token-total; at an equal total, a copy carrying
+// Organization evidence over one carrying none, and of two different tags the
+// smaller uuid — ADR-0103, #374), ties first-seen (an absent requestId is a
+// DISTINCT key from an empty-string one — see fleet-dedup.ts).
 const dedupKey = fleetDedupKey;
-const tokenTotal = fleetDedupTokenTotal;
+const supersedes = fleetCopySupersedes;
+
+// The forget unit's one order, (projectSlug, sessionId) ascending, shared by
+// `foreignSessions()` and `dormantPairs()` so a marker diff over either is stable.
+function byPair(a: ForgetSessionRef, b: ForgetSessionRef): number {
+  return a.projectSlug === b.projectSlug
+    ? a.sessionId < b.sessionId
+      ? -1
+      : a.sessionId > b.sessionId
+        ? 1
+        : 0
+    : a.projectSlug < b.projectSlug
+      ? -1
+      : 1;
+}
 
 // ---------------------------------------------------------------------------
 // EventStore
@@ -301,8 +384,14 @@ export type EventStore = {
   // that is long gone.
   scan: (roots: string[], onProgress?: (p: ScanProgress) => void) => Promise<number>;
   // Incremental-append path — the watcher's `flush` calls this with freshly
-  // parsed records and the project/session they belong to. Deduped.
-  append: (records: UsageRecord[], projectSlug: string, sessionId: string) => void;
+  // parsed records and the project/session they belong to. Only a subagent
+  // batch inherits the parent session's owner points. Deduped.
+  append: (
+    records: UsageRecord[],
+    projectSlug: string,
+    sessionId: string,
+    isSubagent?: boolean,
+  ) => void;
   // Local ingest only, including duplicate and excluded records: rebuilds must
   // replay owner evidence as well as changed rows. Batches are read-only to
   // subscribers. Fleet pages never emit here.
@@ -358,25 +447,86 @@ export type EventStore = {
   // than a resolver side effect precisely so the answer does not depend on
   // which reports have run. Re-derived when foreign evidence removes rows.
   models: () => ReadonlySet<string>;
-  // ADR-0098: every session that held at least one record the Home organization
-  // rule excluded, as the forget unit (ADR-0063) — the repair's input. Sorted by
-  // (projectSlug, sessionId) so a marker diff is stable.
+  // ADR-0098: every session that held at least one record the tracked set
+  // excluded, or a copy of one (#370), as the forget unit (ADR-0063) — the
+  // repair's input. Only pairs a walk or watcher read yielded a record for
+  // (#370 review). Sorted by
+  // (projectSlug, sessionId) so a marker diff is stable. "foreign" here means
+  // "not a member of the tracked set" (#275); the name predates the set.
   foreignSessions: () => ForgetSessionRef[];
+  // #368 review, #374: whether an excluded copy holds this dedup key — the
+  // fullest copy any own feeder offered is tagged with an Organization outside
+  // the tracked set (`excludedHolders`). A key two transcripts share (a resumed
+  // session's copied lines) whose copies resolve differently is excluded only
+  // while the excluded copy wins the merge; an admitted copy that supersedes
+  // it takes the key back. An excluded key is never in the event map: the two
+  // are disjoint by construction. The repair asks this of each Local archive
+  // row (`localArchive.excludedPairs()`).
+  isExcludedKey: (messageId: string, requestId?: string) => boolean;
   onForeignEvidence: (listener: (sessions: readonly ForgetSessionRef[]) => void) => () => void;
-  // ADR-0098: every Organization any record named, kept OR excluded. Settings'
-  // select is built from this — it is the only place a foreign organization's
-  // existence is allowed to surface, as a label with no count.
-  organizationsSeen: () => ReadonlySet<string>;
+  // #311 (ADR-0107 §12): the dormant snapshot this store was built with — the
+  // sessions whose owner-less own rows it refuses (`dormantSessions` in
+  // ./presumption.ts). A construction-time constant, like the tracked set: a
+  // change is a rebuild. `NO_DORMANT` when nothing is dormant.
+  dormantSessions: () => ReadonlySet<string>;
+  // #311: every (projectSlug, sessionId) a LOCALLY BACKED feeder (walk,
+  // watcher, archive) offered a dormant row for, sorted like
+  // `foreignSessions()` — the repair's lossless Hub forget list. A dormant row
+  // only the replica carries is refused but never listed: forgetting it would
+  // delete its last copy. Dormant pairs are never foreign.
+  dormantPairs: () => ForgetSessionRef[];
+  // #311: THE dormancy test: this machine's own row, no evidence, its session
+  // in the construction-time snapshot. Another machine's row is never dormant.
+  // No production caller since #295: it is the dormant half of `isWithheld`
+  // below, which is what Storage reads, kept as its own test for the store
+  // suite.
+  isDormant: (row: { machineId: string; sessionId: string; organizationUuid?: string }) => boolean;
+  // #295: Storage's ONE withholding predicate (`StorageReporterDeps.withheld`),
+  // which the Forget classifier and the archive's earliest-date reader both
+  // skip. This machine's own row, and EITHER dormant (`isDormant`) OR tagged
+  // with an Organization outside a non-null tracked set (`outsideTrackedSet`).
+  // An own Excluded-tagged row is one of two populations: (a) a walked
+  // session's, awaiting the scoped repair (Hub offline) — transient, and the
+  // repair owns it; (b) a pruned session's, which ADR-0103's accepted
+  // departure leaves on the Hub and in the replica for good, since the repair
+  // forgets walked sessions only and the replica feeder never filters by tag.
+  // No report counts either (every scope narrows to the tracked set), and
+  // Storage neither counts nor names what is excluded (ADR-0098), so Forget
+  // never offers them. Another machine's row is never withheld: this machine
+  // cannot forget it, and the classifier skips it before asking.
+  isWithheld: (row: { machineId: string; sessionId: string; organizationUuid?: string }) => boolean;
+  // ADR-0098: every Organization any record named, kept OR excluded — walked
+  // transcripts and, since the wire carries the tag (ADR-0103), fleet rows too,
+  // refused or not — split by whose record named it (#287). `machine`: walked
+  // records, archive rows, and replica rows carrying this machine's own id.
+  // `fleet`: replica rows of any other machine. An Organization may be in
+  // both. These feed the roster's "seen on" facts — the only place an
+  // untracked organization's existence is allowed to surface, as a label with
+  // no count.
+  organizationsSeen: () => { machine: ReadonlySet<string>; fleet: ReadonlySet<string> };
   // ADR-0098: how many sessions each Organization owned when they ended — the
   // organization of every session's LAST owner point. Sessions, not events, and
-  // counted whether or not the Home organization rule excluded them, so a store
-  // built with NO home (a first launch) can say which organization this machine
+  // counted whether or not the tracked set excluded them, so a store built with
+  // NO tracked set (a first launch) can say which organization this machine
   // mostly works under. Internal to the sidecar's first-launch seed; it never
   // leaves the process — the app shows no count of anything it hides.
   organizationSessionCounts: () => ReadonlyMap<string, number>;
-  // ADR-0098: the Home organization this store was built with; null = none,
-  // nothing excluded (the golden corpus runs this way).
-  homeOrganization: () => string | null;
+  // The tracked set this store was built with (the #260 lifecycle decision,
+  // item 7): the Organizations whose usage it counts, generalising ADR-0098's
+  // single Home organization (#275; #299 records it in the ADR). `null` =
+  // nothing is excluded (the golden corpus runs this way, and so does the
+  // first-launch selection walk).
+  trackedOrganizations: () => ReadonlySet<string> | null;
+  // The Presumed organization rule in force (#261 item 2, see
+  // ./presumption.ts): how an owner-less event's Organization is answered at
+  // query time. The store is the ONE source of it — a holder that needs the
+  // same rule (the report cache) reads it from here rather than taking its own
+  // injectable, so an entry's retained axis matcher and the cold build's
+  // `store.query` can never be compiled against different Homes. Read through
+  // the thunk on every call, so a settings change is visible immediately and a
+  // swap is detectable by IDENTITY (`createPresumption` mints a new one per
+  // call).
+  presumption: () => Presumption;
 };
 
 // How many files the initial scan reads+parses concurrently. Parse work is
@@ -392,42 +542,164 @@ export function createEventStore(opts: {
   // otherwise — instead of always parsing. The store never saves the cache;
   // that is main()'s one post-ready write (`wireScanCachePersist`).
   scanCache?: ScanCache;
-  // The Home organization (CONTEXT.md, ADR-0098). A record whose resolved
-  // organization differs is dropped at the feeder and never becomes a
-  // StoredEvent. `null`/omitted = nothing is excluded.
-  homeOrganization?: string | null;
+  // The tracked set (the #260 lifecycle decision, item 7): the Organizations
+  // whose usage this store counts, already unioned with the Home organization
+  // by `resolveTrackedOrganizations`. A record whose resolved organization is
+  // not a member is dropped at the feeder and never becomes a StoredEvent.
+  // `null`/omitted = nothing is excluded. This generalises ADR-0098's single
+  // Home organization (#275); #299 records it in the ADR.
+  trackedOrganizations?: ReadonlySet<string> | null;
+  // #311 (ADR-0107 §12): the dormant snapshot — `dormantSessions(assertions,
+  // tracked)` taken at construction. This machine's own owner-less rows in
+  // these sessions are refused on every feeder, and are not foreign. A
+  // construction-time constant beside the tracked set, so a change is a
+  // rebuild. Omitted = `NO_DORMANT`: nothing is dormant.
+  dormantSessions?: ReadonlySet<string>;
+  // The Presumed organization rule (#261 item 2), threaded as a THUNK rather
+  // than a value: a Home change re-answers the presumption without rebuilding
+  // the store, because it moves no row and re-walks nothing. Omitted =
+  // `NO_PRESUMPTION`, under which an owner-less row resolves to no Organization
+  // at all — today's behaviour, and the golden corpus's.
+  getPresumption?: () => Presumption;
 }): EventStore {
   // The machine id every locally-scanned/watched row is tagged with (ADR-0041).
   // The fleet feeder carries each replica row's own hub-minted id instead.
   const selfMachineId = opts.selfMachineId;
   const scanCache = opts.scanCache;
+  const getPresumption = opts.getPresumption ?? ((): Presumption => NO_PRESUMPTION);
 
   // The deduped event set, keyed by `(messageId, requestId)`. A Map (not an
   // array) so a re-scan / truncation re-read / scan-watcher overlap is an O(1)
-  // keyed upsert — a duplicate key is resolved by `upsert`'s
-  // largest-token-total rule, never blindly re-added.
+  // keyed upsert — a duplicate key is resolved by `upsert`'s fullest-copy
+  // rule, never blindly re-added.
   const events = new Map<string, StoredEvent>();
   const contributions = new Map<string, StoredEvent>();
 
   // Distinct raw model strings seen by `upsert` — see `EventStore.models`.
   const modelsSeen = new Set<string>();
 
-  const homeOrganization = opts.homeOrganization ?? null;
+  // Which Organizations the STORED events currently resolve under, in the two
+  // halves the presumption splits them into: the distinct tags of tagged rows,
+  // and the machines of the rest — an owner-less row's Organization is not a
+  // property of the row, so it contributes its MACHINE here and is resolved
+  // against the presumption when the question is asked. Maintained beside
+  // `modelsSeen` in `upsert` and rebuilt with it by `rebuildDerivedSets`.
+  //
+  // NOT `organizationsSeen()`, and they must never be confused: that is every
+  // Organization any RECORD named, kept OR excluded, and exists so the roster
+  // can list an untracked one. These are the Organizations of STORED events, AFTER
+  // exclusion, and they never leave this module — their only job is to let
+  // `query` decide whether the Organization axis is a no-op right now.
+  //
+  // Deliberately an OVER-APPROXIMATION between rebuilds: a replacement can
+  // change a row's tag and strand a member neither set can retract on the hot
+  // path. A tag gained at an equal total (ADR-0103) leaves the row's machine in
+  // `untaggedMachines`; a tagged → untagged flip, or a tie won by a smaller
+  // tag (#374), leaves the old Organization in `taggedOrganizations`. A tag is
+  // never lost at an equal total, so that flip needs an untagged copy with a
+  // strictly LARGER token total — but the merge rule never merges fields, so it
+  // stays possible and add-only stays the rule. Over-approximating can only
+  // ever LOSE the shortcut — it can never admit an event the axis predicate
+  // would reject — so add-only is safe here, and the four removal paths
+  // rebuild both sets exactly.
+  const taggedOrganizations = new Set<string>();
+  const untaggedMachines = new Set<string>();
+
+  // Record one newly-stored event in every derived set. The single definition
+  // of what those sets hold, so the incremental path and the rebuild below
+  // cannot drift apart.
+  function recordDerived(event: StoredEvent): void {
+    modelsSeen.add(event.model);
+    if (event.organizationUuid !== undefined) taggedOrganizations.add(event.organizationUuid);
+    else untaggedMachines.add(event.machineId);
+  }
+
+  // Re-derive every add-only set from `events`. THE response to a shrinking
+  // store, and the four paths that can shrink one (`appendInternal`'s
+  // exclusion branch, `appendFleet`'s archive eviction (#374),
+  // `removeMachineSessions`, `removeFleetKeys`) all call it:
+  // a model belonging only to removed events must not linger in pricing
+  // discovery, and an Organization or machine belonging only to removed events
+  // must not keep costing `query` its no-op. O(events), so once per batch.
+  function rebuildDerivedSets(): void {
+    modelsSeen.clear();
+    taggedOrganizations.clear();
+    untaggedMachines.clear();
+    for (const event of events.values()) recordDerived(event);
+  }
+
+  const trackedOrganizations = opts.trackedOrganizations ?? null;
+
+  // The ONE admission test (ADR-0098, #275), shared by the walk and the Local
+  // archive feed: an Organization outside a non-null tracked set is excluded.
+  // No evidence (`undefined`) never is, and a null set excludes nothing.
+  function outsideTrackedSet(organizationUuid: string | undefined): boolean {
+    return (
+      trackedOrganizations !== null &&
+      organizationUuid !== undefined &&
+      !trackedOrganizations.has(organizationUuid)
+    );
+  }
+
+  // #311 (ADR-0107 §12): the dormant snapshot, beside the tracked set and, like
+  // it, a construction-time constant. `NO_DORMANT` keeps every older caller and
+  // the golden corpus exactly as they were.
+  const dormant = opts.dormantSessions ?? NO_DORMANT;
+  // Pairs a LOCALLY BACKED feeder (walk, watcher, archive) offered a dormant
+  // row for: the repair's lossless forget list. A dormant row only the replica
+  // carries is refused unrecorded, because forgetting it would delete its last copy.
+  const dormantPairsSeen = new Map<string, ForgetSessionRef>();
+
+  // THE dormancy test (#311, ADR-0107 §12): this machine's own row, no
+  // evidence after resolution, its session in the snapshot. A refused dormant
+  // row is never foreign: it enters neither `foreignSessions` nor
+  // `excludedHolders`, so the evidence repair, whose forgets are lossy where no
+  // transcript backs the pair (ADR-0103 §5), never sees it.
+  function dormantRow(
+    sessionId: string,
+    organizationUuid: string | undefined,
+    own: boolean,
+  ): boolean {
+    return own && organizationUuid === undefined && dormant.has(sessionId);
+  }
 
   // ADR-0098 state. `ownerPoints`: per session, the (ms, organization) of every
-  // TAGGED record its transcripts carried, ascending — a subagent record, which
-  // carries no owner record of its own, resolves against these by timestamp.
-  // Filled from every record BEFORE the exclusion below, so a foreign parent
-  // still teaches the store who owns its subagents. `foreignSessions`: the
-  // repair's forget list. `foreignKeys`: the dedup key of every excluded
-  // record — `appendFleet` refuses them, so an UNTAGGED copy of a foreign event
-  // (the local archive, the replica, the hub before the repair lands) cannot
-  // re-enter through the side door. `organizationsSeen`: Settings' list.
+  // TAGGED record its parent transcript carried, ascending — a subagent record,
+  // which carries no Attribution evidence of its own (ADR-0109 §5), resolves
+  // against these by timestamp.
+  // Filled from every record BEFORE the exclusion below, so a parent outside
+  // the tracked set still teaches the store who owns its subagents.
+  // `foreignSessions`: the repair's forget list; the name predates the tracked
+  // set (#275) and keeps its spelling, "foreign" now reading "not a member of
+  // the tracked set". `excludedHolders`: per excluded dedup key, the fullness
+  // of the excluded copy holding it (ADR-0103 §5, #374). Every copy of a key
+  // competes under the one merge rule whatever its Organization, so the key's
+  // winner is decided without the tracked set and without the walk order; the
+  // set then admits or refuses the winner whole. A key is excluded only while
+  // an excluded copy holds it, and every feeder (another walked transcript,
+  // the Local archive, the replica, the Hub before the repair lands) offers a
+  // copy that takes the key back only when it supersedes that holder. A
+  // holder is always tagged (no evidence is never excluded), and the map
+  // never shares a key with `events`.
+  // `organizationsSeen`: the roster's "seen on this machine / the fleet".
   const ownerPoints = new Map<string, Array<{ ms: number; organizationUuid: string }>>();
   const foreignSessions = new Map<string, ForgetSessionRef>();
-  const foreignKeys = new Set<string>();
+  const excludedHolders = new Map<string, { total: number; organizationUuid: string }>();
+  // #370: every pair a walk or watcher read yielded at least one record for,
+  // at any time in this process. An unreadable file, an empty one and an
+  // unlink flush each arrive as an empty batch and mark nothing (#370
+  // review): none of them recovered a row, so the archive may hold the only
+  // copy of that pair's rows. The forget list only ever holds marked pairs,
+  // because the repair's forgets are lossy where no transcript backs the pair
+  // (ADR-0103 §5): the Hub forget is pair-wide, so a pair only the Hub holds
+  // would lose its rows there, and the Local archive forget drops excluded
+  // lines it may hold the only copy of. Marked still does not mean "still on
+  // disk": a transcript pruned after a successful read and before the next
+  // restart stays marked. Since #375 that costs no admitted row: the archive
+  // forget keeps them, and the resync re-pushes them from it.
+  const walkedPairs = new Set<string>();
   const foreignListeners = new Set<(sessions: readonly ForgetSessionRef[]) => void>();
-  const organizationsSeen = new Set<string>();
+  const organizationsSeen = { machine: new Set<string>(), fleet: new Set<string>() };
 
   function sessionKey(projectSlug: string, sessionId: string): string {
     return `${projectSlug}\u0000${sessionId}`;
@@ -461,6 +733,73 @@ export function createEventStore(opts: {
       else break;
     }
     return owner;
+  }
+
+  // #374: offer one excluded copy of `key` (`total` tokens, tagged
+  // `organizationUuid`) to the competition for it. It loses to a holder or an
+  // admitted incumbent at least as full, and changes nothing. Otherwise it
+  // becomes the key's holder; an admitted incumbent it supersedes is evicted
+  // (its contribution with it), so the caller can list a walked pair whose
+  // copy may already be archived or pushed. Returns the evicted incumbent,
+  // `null` when the key is newly excluded with nothing to evict, and
+  // `undefined` when it was not newly excluded (the copy lost, or replaced a
+  // holder in place). Allocates only when a key is newly excluded (#361).
+  function offerExcluded(
+    key: string,
+    total: number,
+    organizationUuid: string,
+    changes: StoreChange[],
+  ): StoredEvent | null | undefined {
+    const holder = excludedHolders.get(key);
+    if (holder !== undefined) {
+      if (
+        fleetFullnessPartsExceed(total, organizationUuid, holder.total, holder.organizationUuid)
+      ) {
+        holder.total = total;
+        holder.organizationUuid = organizationUuid;
+      }
+      return undefined;
+    }
+    const incumbent = events.get(key);
+    if (
+      incumbent !== undefined &&
+      !fleetFullnessPartsExceed(
+        total,
+        organizationUuid,
+        fleetDedupTokenTotal(incumbent),
+        incumbent.organizationUuid,
+      )
+    ) {
+      return undefined;
+    }
+    excludedHolders.set(key, { total, organizationUuid });
+    contributions.delete(key);
+    if (incumbent === undefined) return null;
+    events.delete(key);
+    sorted = null;
+    changes.push({ event: null, replaced: incumbent });
+    return incumbent;
+  }
+
+  // #374: whether an admitted copy of `key` may enter: no excluded copy holds
+  // the key, or the candidate supersedes the one that does. The caller removes
+  // the holder only once it really upserts, so a refusal between this test and
+  // the upsert (a dormant row) leaves the key held.
+  function beatsExcludedHolder(
+    key: string,
+    candidate: FleetDedupTokens,
+    organizationUuid: string | undefined,
+  ): boolean {
+    const holder = excludedHolders.get(key);
+    return (
+      holder === undefined ||
+      fleetFullnessPartsExceed(
+        fleetDedupTokenTotal(candidate),
+        organizationUuid,
+        holder.total,
+        holder.organizationUuid,
+      )
+    );
   }
 
   // Lazily-built timestamp-sorted snapshot of every event, memoized so a burst
@@ -507,28 +846,32 @@ export function createEventStore(opts: {
   }
 
   // The ONE merge rule (shared with the hub store and the replica): keyed
-  // whole-row largest-token-total upsert, ties keep first-seen. Returns
-  // whether RAM changed, and appends that change to the caller's batch. Both
-  // feeders — local scan/watcher and the fleet replica — converge through this
-  // exact function. When a record's dedup key is already present the store
-  // keeps whichever event has the larger token total (`tokenTotal`) — the
-  // golden oracle's dedup rule, now the ONE fleet rule. A new record replaces
-  // the stored one only when strictly larger, so equal-total duplicates (the
-  // byte-identical content-block lines) keep first-seen, and a streamed
-  // message's final row replaces the `output_tokens: 1` partial regardless of
-  // which the scan reads first.
+  // whole-row fullest-copy upsert, ties keep first-seen. Returns whether RAM
+  // changed, and appends that change to the caller's batch. Both feeders —
+  // local scan/watcher and the fleet replica — converge through this exact
+  // function, and the local contributions map applies the same rule. When a
+  // record's dedup key is already present the store keeps whichever event is
+  // fuller (`supersedes`): the larger token total — the golden oracle's dedup
+  // rule — or, at an equal total, the copy carrying Organization evidence over
+  // one carrying none (ADR-0103). A new record replaces the stored one only
+  // when strictly fuller, so equal-total duplicates (the byte-identical
+  // content-block lines) keep first-seen, a streamed message's final row
+  // replaces the `output_tokens: 1` partial regardless of which the scan reads
+  // first, and a tag gained at an equal total is a replacement like any other
+  // — `{ event, replaced }` on the change feed. No field merging: a strictly
+  // larger untagged copy still displaces a smaller tagged one whole-row.
   function upsert(input: StoredEventInput, changes: StoreChange[], local = false): boolean {
     const key = dedupKey(input.messageId, input.requestId);
     let derived: StoredEvent | undefined;
     if (local) {
       const held = contributions.get(key);
-      if (held === undefined || tokenTotal(input) > tokenTotal(held)) {
+      if (held === undefined || supersedes(input, held)) {
         derived = withEventMs(input);
         contributions.set(key, derived);
       }
     }
     const existing = events.get(key);
-    if (existing !== undefined && tokenTotal(existing) >= tokenTotal(input)) return false;
+    if (existing !== undefined && !supersedes(input, existing)) return false;
     // Derive `ms` HERE and nowhere else (ADR-0089) — this is the single funnel
     // both feeders converge on, so the `ms === Date.parse(timestamp)` invariant
     // cannot be violated by a caller. Deliberately AFTER the dedup rejection:
@@ -537,7 +880,7 @@ export function createEventStore(opts: {
     // waste this change exists to remove.
     const event: StoredEvent = derived ?? withEventMs(input);
     events.set(key, event);
-    modelsSeen.add(event.model);
+    recordDerived(event);
     // A new or replacing event invalidates the memoized sorted snapshot.
     sorted = null;
     // The displaced row rides along so a subscriber can un-count it without
@@ -557,46 +900,92 @@ export function createEventStore(opts: {
     records: Iterable<UsageRecord>,
     projectSlug: string,
     sessionId: string,
+    isSubagent: boolean,
   ): number {
     const changes: StoreChange[] = [];
     let newForeignEvidence = false;
+    // Other walked pairs whose admitted copy this batch evicted (#370).
+    const evictedPairs = new Map<string, ForgetSessionRef>();
     let changed = 0;
     const key = sessionKey(projectSlug, sessionId);
+    // Whether this pair was on the forget list before the batch (#370 review).
+    const listedBefore = foreignSessions.has(key);
     const batch = Array.isArray(records) ? (records as UsageRecord[]) : [...records];
-    // Pass 1 — learn the session's owner points from every tagged record, so a
-    // later record in the same batch can own an earlier subagent record.
+    // #370 review: only a read that yielded a record marks the pair walked. An
+    // unreadable file and an empty one reach here as an empty batch, as does an
+    // unlink flush, and none of them recovered a row of the transcript.
+    if (batch.length > 0) walkedPairs.add(key);
+    // Pass 1 — learn the session's owner points from every tagged record of a
+    // parent transcript. A subagent's tag teaches no point (ADR-0109 §5) and
+    // still marks its Organization seen on this machine.
     // ADR-0098's ONE sanctioned Date.parse on ingest: this is the RAW record's
     // timestamp, classified before `upsert` derives `ms` (ADR-0089 governs
     // stored events, which these are not yet).
     for (const record of batch) {
       if (record.organizationUuid !== undefined) {
-        organizationsSeen.add(record.organizationUuid);
-        addOwnerPoint(key, Date.parse(record.timestamp), record.organizationUuid);
+        organizationsSeen.machine.add(record.organizationUuid);
+        if (!isSubagent) addOwnerPoint(key, Date.parse(record.timestamp), record.organizationUuid);
       }
     }
     // Pass 2 — resolve, exclude, upsert.
     for (const record of batch) {
-      const organizationUuid =
-        record.organizationUuid ??
-        (ownerPoints.has(key) ? resolveOwner(key, Date.parse(record.timestamp)) : undefined);
-      if (
-        homeOrganization !== null &&
-        organizationUuid !== undefined &&
-        organizationUuid !== homeOrganization
-      ) {
+      // A subagent transcript carries no Attribution evidence of its own (ADR-0109
+      // §5): its Login record is a copy of the parent's raw login-cache value at
+      // spawn, which no `/login` gates, so the parser's tag is ignored and the row
+      // takes the parent session's owner point at its timestamp.
+      const organizationUuid = isSubagent
+        ? resolveOwner(key, Date.parse(record.timestamp))
+        : record.organizationUuid;
+      if (outsideTrackedSet(organizationUuid)) {
+        // The pair holds an excluded record whether or not its copy wins the
+        // key: an earlier build that tracked this Organization may have
+        // archived or pushed its rows.
         foreignSessions.set(key, { projectSlug, sessionId });
-        const excludedKey = dedupKey(record.messageId, record.requestId);
-        if (!foreignKeys.has(excludedKey)) newForeignEvidence = true;
-        foreignKeys.add(excludedKey);
-        contributions.delete(excludedKey);
-        const incumbent = events.get(excludedKey);
-        if (incumbent !== undefined) {
-          events.delete(excludedKey);
-          sorted = null;
-          changes.push({ event: null, replaced: incumbent });
+        // #374: the copy competes for its key (`offerExcluded`); a loser
+        // excludes nothing and evicts nothing.
+        const incumbent = offerExcluded(
+          dedupKey(record.messageId, record.requestId),
+          fleetDedupTokenTotal(record),
+          organizationUuid as string,
+          changes,
+        );
+        if (incumbent !== undefined) newForeignEvidence = true;
+        if (incumbent !== undefined && incumbent !== null) {
           changed += 1;
+          // #370: an own copy admitted from ANOTHER walked transcript (a resume
+          // pair's original) may already be archived or pushed, so its pair
+          // joins the forget list, as it would had the walk read it second.
+          const holder = sessionKey(incumbent.projectSlug, incumbent.sessionId);
+          if (incumbent.machineId === selfMachineId && holder !== key && walkedPairs.has(holder)) {
+            const pair = { projectSlug: incumbent.projectSlug, sessionId: incumbent.sessionId };
+            foreignSessions.set(holder, pair);
+            evictedPairs.set(holder, pair);
+          }
         }
         continue;
+      }
+      if (dormantRow(sessionId, organizationUuid, true)) {
+        dormantPairsSeen.set(key, { projectSlug, sessionId });
+        continue;
+      }
+      // #370, #374 (ADR-0103 §5): a copy of a key an excluded copy holds is
+      // refused here too, tagged or not, unless it supersedes the holder, so
+      // the verdict cannot depend on walk order. A resume or fork copy repeats
+      // its original's rows below its own Owner record: tagged there,
+      // owner-less here. A refused copy's session joins the forget list,
+      // because an earlier build may have archived or pushed this copy, and
+      // when that lists the pair for the first time the evidence listener is
+      // told below, so a repair that already completed the pair runs again. A
+      // copy that supersedes the holder takes the key back. After the dormant
+      // test, so a dormant session's copy stays dormant and never foreign
+      // (ADR-0107 §12).
+      if (excludedHolders.size > 0) {
+        const recordKey = dedupKey(record.messageId, record.requestId);
+        if (!beatsExcludedHolder(recordKey, record, organizationUuid)) {
+          foreignSessions.set(key, { projectSlug, sessionId });
+          continue;
+        }
+        excludedHolders.delete(recordKey);
       }
       if (
         upsert(
@@ -609,16 +998,24 @@ export function createEventStore(opts: {
       }
     }
     if (changes.some((change) => change.event === null)) {
-      // Exclusion is the only removal path. Rebuild once per batch so models
-      // belonging only to removed events cannot linger in pricing discovery.
-      modelsSeen.clear();
-      for (const event of events.values()) modelsSeen.add(event.model);
+      // Exclusion is the only removal path on this feeder. Rebuild once per
+      // batch, never per removed row.
+      rebuildDerivedSets();
     }
     emitChanges(changes);
-    if (newForeignEvidence) {
+    // A newly excluded key, or a refusal that put this pair on the forget list
+    // for the first time (#370 review), tells the repair, with every pair an
+    // eviction listed. A pair already listed stays silent, so re-reading a
+    // transcript (a rescan, the watcher's first read from byte 0) never
+    // re-invalidates it. No listener is attached during a boot or rebuild
+    // walk: main() installs a store only after that walk has run, so it lists
+    // its pairs silently and the boot-gate repair reads them against its done
+    // lists. A rescan of the live store re-presents pairs already listed.
+    if (newForeignEvidence || (!listedBefore && foreignSessions.has(key))) {
+      const sessions = [{ projectSlug, sessionId }, ...evictedPairs.values()];
       for (const listener of foreignListeners) {
         try {
-          listener([{ projectSlug, sessionId }]);
+          listener(sessions);
         } catch (err) {
           console.error("[store] foreign evidence listener threw:", err);
         }
@@ -626,7 +1023,7 @@ export function createEventStore(opts: {
     }
     for (const listener of localAppendListeners) {
       try {
-        listener({ records: batch, projectSlug, sessionId });
+        listener({ records: batch, projectSlug, sessionId, isSubagent });
       } catch (err) {
         console.error("[store] onLocalAppend listener threw:", err);
       }
@@ -634,23 +1031,87 @@ export function createEventStore(opts: {
     return changed;
   }
 
-  function append(records: UsageRecord[], projectSlug: string, sessionId: string): void {
-    appendInternal(records, projectSlug, sessionId);
+  function append(
+    records: UsageRecord[],
+    projectSlug: string,
+    sessionId: string,
+    isSubagent = false,
+  ): void {
+    appendInternal(records, projectSlug, sessionId, isSubagent);
   }
 
   // The fleet feeder (ADR-0041): project a wire FleetEvent onto StoredEvent —
   // the engine keeps only the fields it interprets (the REPLICA is the
   // verbatim persistence layer; RAM projection is lossy by design) — and
-  // upsert through the one merge rule. Returns how many rows changed RAM
-  // (new + replaced), the caller's poke-worthiness signal. ONE change-feed emit
-  // per call — i.e. per applied replica page.
+  // upsert through the one merge rule. The row's Organization evidence is one
+  // of those fields (ADR-0103): the tag its producer resolved, kept as-is.
+  // Returns how many rows changed RAM (new + replaced), the caller's
+  // poke-worthiness signal. ONE change-feed emit per call — i.e. per applied
+  // replica page.
   function appendFleet(rows: FleetEvent[], source?: "archive"): number {
     const changes: StoreChange[] = [];
     let changed = 0;
+    // Walked pairs an archive line evicted an admitted copy from (#374).
+    const evictedPairs = new Map<string, ForgetSessionRef>();
     for (const row of rows) {
-      // ADR-0098: an untagged copy of a record the walk excluded (archive,
-      // replica, hub) never re-enters.
-      if (foreignKeys.has(dedupKey(row.messageId, row.requestId))) continue;
+      // This machine's own rows: the archive, or a replica row carrying its id.
+      const own = source === "archive" || row.machineId === selfMachineId;
+      // `organizationsSeen` is every Organization any record named, kept or
+      // excluded, so a tag counts here before any refusal below. Own rows are
+      // "seen on this machine"; any other machine's are "seen on the fleet",
+      // the roster's word for a tag only the replica carries.
+      if (row.organizationUuid !== undefined) {
+        (own ? organizationsSeen.machine : organizationsSeen.fleet).add(row.organizationUuid);
+      }
+      const rowKey = dedupKey(row.messageId, row.requestId);
+      // The Local archive is this machine's own feeder, so the admission
+      // boundary covers it too, by the evidence its line carries (#280): a line
+      // tagged with an Excluded organization is refused, and stays on disk
+      // untouched, so the refusal is reversible. It still competes for its key
+      // as a walked excluded copy does (#374), so a smaller copy from another
+      // feeder cannot win the key only because the Organization is excluded.
+      // No walk read its pair, so its own pair is never listed. Replica rows
+      // are never filtered by their tag — exclusion is producer-side.
+      if (source === "archive" && outsideTrackedSet(row.organizationUuid)) {
+        const incumbent = offerExcluded(
+          rowKey,
+          fleetDedupTokenTotal(row),
+          row.organizationUuid as string,
+          changes,
+        );
+        if (incumbent !== undefined && incumbent !== null) {
+          changed += 1;
+          // As the walk's eviction does (#370): a walked pair's admitted copy
+          // may already be archived or pushed, so the pair joins the forget list.
+          const holder = sessionKey(incumbent.projectSlug, incumbent.sessionId);
+          if (
+            incumbent.machineId === selfMachineId &&
+            walkedPairs.has(holder) &&
+            !foreignSessions.has(holder)
+          ) {
+            const pair = { projectSlug: incumbent.projectSlug, sessionId: incumbent.sessionId };
+            foreignSessions.set(holder, pair);
+            evictedPairs.set(holder, pair);
+          }
+        }
+        continue;
+      }
+      // ADR-0098, #374: a copy of a key an excluded copy holds (archive,
+      // replica, hub; tagged or not) enters only when it supersedes the holder.
+      if (excludedHolders.size > 0 && !beatsExcludedHolder(rowKey, row, row.organizationUuid))
+        continue;
+      // #311: a dormant row is refused from every feeder; only the archive's
+      // pair is recorded, because only the archive (of the fleet feeders) is
+      // locally backed. Another machine's row is never dormant here.
+      if (dormantRow(row.sessionId, row.organizationUuid, own)) {
+        if (source === "archive") {
+          dormantPairsSeen.set(sessionKey(row.projectSlug, row.sessionId), {
+            projectSlug: row.projectSlug,
+            sessionId: row.sessionId,
+          });
+        }
+        continue;
+      }
       const stored: StoredEventInput = {
         timestamp: row.timestamp,
         messageId: row.messageId,
@@ -663,14 +1124,29 @@ export function createEventStore(opts: {
         cacheCreation: row.cacheCreation,
         costUSD: row.costUSD,
         cwd: row.cwd,
-        organizationUuid: undefined,
+        organizationUuid: row.organizationUuid,
         projectSlug: row.projectSlug,
         sessionId: row.sessionId,
         machineId: row.machineId,
       };
+      if (excludedHolders.size > 0) excludedHolders.delete(rowKey);
       if (upsert(stored, changes, source === "archive")) changed += 1;
     }
+    // An archive line's eviction is a removal (#374): rebuild once per page.
+    if (changes.some((change) => change.event === null)) rebuildDerivedSets();
     emitChanges(changes);
+    // A walked pair an archive line's eviction listed for the first time tells
+    // the repair, as a walked eviction does (#370).
+    if (evictedPairs.size > 0) {
+      const sessions = [...evictedPairs.values()];
+      for (const listener of foreignListeners) {
+        try {
+          listener(sessions);
+        } catch (err) {
+          console.error("[store] foreign evidence listener threw:", err);
+        }
+      }
+    }
     return changed;
   }
 
@@ -769,7 +1245,12 @@ export function createEventStore(opts: {
       await Promise.all(Array.from({ length: Math.min(SCAN_CONCURRENCY, files.length) }, worker));
 
       for (const [i, file] of files.entries()) {
-        changed += appendInternal(parsed[i] ?? [], file.projectSlug, file.sessionId);
+        changed += appendInternal(
+          parsed[i] ?? [],
+          file.projectSlug,
+          file.sessionId,
+          parentSessionPath(file.path, roots) !== null,
+        );
       }
     } finally {
       // `ready` resolves even if the scan partially failed — endpoints must
@@ -780,14 +1261,67 @@ export function createEventStore(opts: {
     return changed;
   }
 
+  // Does `selection` cover every Organization the stored events resolve under
+  // RIGHT NOW? `false` for an empty or omitted selection — that is already "no
+  // filter" to `compileAxisMatcher`, so there is nothing to normalise away.
+  // An untagged row whose machine has no Home to presume resolves to nothing,
+  // and nothing is in no selection, so its mere presence ends the no-op.
+  //
+  // An untagged row in an ASSERTED session (#309) resolves to the assertion,
+  // not to its machine's presumption, and `untaggedMachines` cannot say which
+  // sessions its rows sit in. So, conservatively, every asserted Organization
+  // must be selected too — whether or not any stored row is actually in an
+  // asserted session. Answering `false` more often only costs the fast path;
+  // it can never count a row wrongly. A machine with no assertions keeps its
+  // single-Organization fast path untouched.
+  function coversEveryOrganizationPresent(
+    selection: readonly string[] | undefined,
+    presumption: Presumption,
+  ): boolean {
+    if (selection === undefined || selection.length === 0) return false;
+    const selected = new Set(selection);
+    for (const organization of taggedOrganizations) if (!selected.has(organization)) return false;
+    for (const machineId of untaggedMachines) {
+      const organization = presumedOrganization(presumption, machineId);
+      if (organization === undefined || !selected.has(organization)) return false;
+    }
+    for (const organization of presumption.assertedBySession.values()) {
+      if (!selected.has(organization)) return false;
+    }
+    return true;
+  }
+
   function query(q: StoreQuery = {}): StoredEvent[] {
     const { since, until } = q;
     // The zone the date bounds are interpreted in (ADR-0015). Only used on the
     // date-filtered path; defaults to the host zone for a query that omits it.
     const timeZone = q.timeZone ?? defaultTimeZone();
+    // The Presumed organization rule, read ONCE per query from the store's one
+    // source — so the no-op below and the matcher it then compiles cannot
+    // disagree about the Home in force even if a settings change lands between
+    // the two statements.
+    const presumption = getPresumption();
+    // THE "covers everything present" no-op (#261/#262), taken PER CALL and
+    // only here. When every Organization currently present is in the selection
+    // the axis predicate would accept every stored event, so dropping the axis
+    // is provably an identity — and dropping it is what keeps the unfiltered
+    // fast path below alive on a single-Organization machine, which is the
+    // whole purpose of the rule.
+    //
+    // PER CALL, because the present set GROWS. A matcher that took this no-op
+    // and was then RETAINED — the report cache keeps one per entry, ADR-0057 —
+    // would go on answering "everything belongs" after a second Organization's
+    // first row landed, silently counting it under the first Organization's
+    // scope for the life of the entry. So `compileAxisMatcher` never takes it
+    // and this call site re-reads the present set every query: the two agree at
+    // every instant, and the only copy that could go stale is recomputed
+    // immediately before each use.
+    const axes: StoreAxisQuery = coversEveryOrganizationPresent(q.organizations, presumption)
+      ? { ...q, organizations: undefined }
+      : q;
     // The non-date axes as ONE compiled predicate; `null` = every one of them
     // is unfiltered (see `compileAxisMatcher`).
-    const matches = compileAxisMatcher(q);
+    const matches = compileAxisMatcher(axes, presumption);
 
     // Unfiltered fast path — every axis is "no filter", so the result IS the
     // shared sorted snapshot (f27). Return it DIRECTLY rather than copying it
@@ -871,8 +1405,7 @@ export function createEventStore(opts: {
       }
       if (changes.length === 0) return;
       sorted = null;
-      modelsSeen.clear();
-      for (const event of events.values()) modelsSeen.add(event.model);
+      rebuildDerivedSets();
       emitChanges(changes);
     },
     appendFleet,
@@ -883,9 +1416,17 @@ export function createEventStore(opts: {
       ),
     replaceContributions: (rows) => {
       contributions.clear();
-      for (const row of rows)
-        if (!foreignKeys.has(dedupKey(row.messageId, row.requestId)))
-          contributions.set(dedupKey(row.messageId, row.requestId), row);
+      for (const row of rows) {
+        const key = dedupKey(row.messageId, row.requestId);
+        // #374: a contribution of a key an excluded copy holds is withheld
+        // unless it supersedes the holder, as every feeder's copy is.
+        if (excludedHolders.size > 0 && !beatsExcludedHolder(key, row, row.organizationUuid))
+          continue;
+        // #311: a dormant row is withheld from push, whatever store offers it.
+        if (dormantRow(row.sessionId, row.organizationUuid, row.machineId === selfMachineId))
+          continue;
+        contributions.set(key, row);
+      }
     },
     removeFleetKeys: (rows) => {
       const changes: StoreChange[] = [];
@@ -904,8 +1445,7 @@ export function createEventStore(opts: {
       }
       if (changes.length > 0) {
         sorted = null;
-        modelsSeen.clear();
-        for (const row of events.values()) modelsSeen.add(row.model);
+        rebuildDerivedSets();
         emitChanges(changes);
       }
     },
@@ -919,18 +1459,8 @@ export function createEventStore(opts: {
     },
     size: () => events.size,
     models: () => modelsSeen,
-    foreignSessions: () =>
-      [...foreignSessions.values()].sort((a, b) =>
-        a.projectSlug === b.projectSlug
-          ? a.sessionId < b.sessionId
-            ? -1
-            : a.sessionId > b.sessionId
-              ? 1
-              : 0
-          : a.projectSlug < b.projectSlug
-            ? -1
-            : 1,
-      ),
+    foreignSessions: () => [...foreignSessions.values()].sort(byPair),
+    isExcludedKey: (messageId, requestId) => excludedHolders.has(dedupKey(messageId, requestId)),
     organizationsSeen: () => organizationsSeen,
     organizationSessionCounts: () => {
       const counts = new Map<string, number>();
@@ -947,6 +1477,15 @@ export function createEventStore(opts: {
         foreignListeners.delete(listener);
       };
     },
-    homeOrganization: () => homeOrganization,
+    dormantSessions: () => dormant,
+    dormantPairs: () => [...dormantPairsSeen.values()].sort(byPair),
+    isDormant: (row) =>
+      dormantRow(row.sessionId, row.organizationUuid, row.machineId === selfMachineId),
+    isWithheld: (row) =>
+      row.machineId === selfMachineId &&
+      (dormantRow(row.sessionId, row.organizationUuid, true) ||
+        outsideTrackedSet(row.organizationUuid)),
+    trackedOrganizations: () => trackedOrganizations,
+    presumption: getPresumption,
   };
 }

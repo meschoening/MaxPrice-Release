@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import type { HubMachine } from "@maxprice/shared";
 import { useHubMachines } from "@/state/use-hub-machines";
+import { useHubOrganizations } from "@/state/use-hub-organizations";
 import { useMergeMachine, usePurgeMachine, useRenameMachine } from "@/state/use-machine-mutations";
 import { useNowTick } from "@/state/use-now-tick";
 import { dotVariant } from "@/lib/dot-variant";
 import { showToast } from "@/lib/toast";
 import {
   formatCount,
+  homeLineLabels,
+  machineHomeLine,
   machineStateDot,
   machineSubline,
   resolveMergeTargetName,
@@ -21,12 +24,15 @@ import {
 // the 404 probe). The kebab opens a floating glass leaf (T1: the .kmenu
 // recipe re-anchored to the row; outside click closes it); flows open as
 // insets under the row, one at a time. The purge inset carries the
-// merge-source and still-sharing warnings and a type-the-name confirm.
+// merge-source and still-sharing warnings and a type-the-name confirm. Once the
+// console knows more than one Organization, each row also reads its machine's
+// published Home (#294), read-only.
 
 type Flow = { machineId: string; kind: "menu" | "rename" | "merge" | "purge" };
 
 export function MachinesCard(): React.ReactElement {
   const { data, isError, isPending } = useHubMachines();
+  const { data: organizations } = useHubOrganizations();
   const now = useNowTick();
   const rename = useRenameMachine();
   const merge = useMergeMachine();
@@ -37,6 +43,7 @@ export function MachinesCard(): React.ReactElement {
   const [purgeConfirm, setPurgeConfirm] = useState("");
 
   const machines = data !== undefined && data !== null ? sortMachines(data.machines) : [];
+  const homeLabels = homeLineLabels(organizations?.organizations, machines);
 
   const openFlow = (next: Flow, m: HubMachine): void => {
     setFlow(next);
@@ -103,6 +110,7 @@ export function MachinesCard(): React.ReactElement {
                   </button>
                 </div>
                 <p className="msub">{machineSubline(m, now, machines)}</p>
+                <MachineHomeLine machine={m} labels={homeLabels} />
 
                 {active?.kind === "menu" ? (
                   <div className="kmenu" role="menu">
@@ -281,6 +289,20 @@ export function MachinesCard(): React.ReactElement {
       </div>
     </section>
   );
+}
+
+// The machine's published Home, a second secondary line. `labels` is the
+// card's gate (homeLineLabels): null hides every line; a machine that
+// published no Home gets none either.
+export function MachineHomeLine({
+  machine,
+  labels,
+}: {
+  machine: HubMachine;
+  labels: Map<string, string> | null;
+}): React.ReactElement | null {
+  const line = labels === null ? null : machineHomeLine(machine, labels);
+  return line === null ? null : <p className="msub">{line}</p>;
 }
 
 // The glass select's soft caret (the .select-wrap overlay).

@@ -6,6 +6,10 @@ import type { StoredEvent } from "./engine/store";
 // consumers: event-sync's hub push (fleet.ts) and the local archive's append
 // (local-archive.ts, ADR-0069) — both feed createFleetEventStore.push, which
 // re-mints machineId, so the projection deliberately drops it.
+//
+// `organizationUuid` is the store's RESOLVED tag — owner evidence only, never a
+// presumption (ADR-0103) — and rides LAST, so an untagged row's JSON is
+// byte-identical to the pre-v5 projection (organization-wire.test.ts pins it).
 export function storedEventToWire(e: StoredEvent): StoredEventWire {
   return {
     timestamp: e.timestamp,
@@ -21,5 +25,6 @@ export function storedEventToWire(e: StoredEvent): StoredEventWire {
     ...(e.cwd !== undefined ? { cwd: e.cwd } : {}),
     projectSlug: e.projectSlug,
     sessionId: e.sessionId,
+    ...(e.organizationUuid !== undefined ? { organizationUuid: e.organizationUuid } : {}),
   };
 }

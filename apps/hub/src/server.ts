@@ -7,17 +7,27 @@ import { streamSSE } from "hono/streaming";
 import { FleetRecoveryRequired, FleetUploadConflict, streamSSEPump } from "@maxprice/usage-core";
 import {
   EVENT_PULL_LIMIT_MAX,
+  HUB_ORGANIZATIONS_PATH,
   HUB_SSE_EVENT,
   HUB_PROTOCOL_VERSION,
+  ORGANIZATION_ASSERTION_DIRECTORY_PATH,
+  ORGANIZATION_DIRECTORY_PATH,
+  ORGANIZATION_LABEL_MAX,
+  checkOrganizationLabel,
   hubPurgeRequestSchema,
   PROJECT_IDENTITY_PATH,
   hubEventsForgetRequestSchema,
   hubEventsPushRequestSchema,
   hubMachineMergeRequestSchema,
   hubMachineRenameRequestSchema,
+  hubMachineSelfUpdateRequestSchema,
+  hubOrganizationAssertionDirectorySchema,
+  hubOrganizationDirectorySchema,
   hubPasswordSetRequestSchema,
   hubProjectIdentityPushRequestSchema,
   hubSamplesPushRequestSchema,
+  organizationRenameRequestSchema,
+  organizationUuidKeySchema,
   sessionPairKey,
   usageCredentialSchema,
   type CredentialAck,
@@ -26,6 +36,9 @@ import {
   type HubEventsForgetResponse,
   type HubEventsPushResponse,
   type HubMachinesResponse,
+  type HubOrganizationAssertionDirectory,
+  type HubOrganizationDirectory,
+  type HubOrganizationsResponse,
   type HubProjectIdentityResponse,
   type HubSamplesResponse,
   type HubSamplesPushResponse,
@@ -37,6 +50,10 @@ import type { FleetEventStore, IdentityDirectory } from "@maxprice/usage-core";
 import { createClientRegistry, type ClientRegistry } from "./clients";
 import type { HubFanout } from "./fanout";
 import type { MachineDirectory } from "./machine-directory";
+import type { OrganizationAssertionDirectory } from "./organization-assertion-directory";
+import type { OrganizationDirectory } from "./organization-directory";
+import { hubOrganizationRows, type HubRosterEntry } from "./organization-rows";
+import type { HubPollSet } from "./poll-set";
 
 // The hub's HTTP surface (ADR-0035). Optional-password gated (ADR-0037) except
 // /healthz — transport encryption + machine identity come from the tailnet
@@ -62,6 +79,9 @@ export type BuildHubAppDeps = {
     setCredential: (c: UsageCredential | null) => void;
     pollOnce: () => Promise<void>;
   };
+  // What the poller reads (#283): the Organizations the key lists. A credential
+  // push re-lists; a clear empties it.
+  pollSet: Pick<HubPollSet, "refresh" | "clear">;
   // Writes through the credstore (OS keychain via the Rust helper). Failures
   // surface as a 500 — the caller (a Settings push) should see them.
   persistCredential: (c: UsageCredential | null) => Promise<void>;
@@ -117,6 +137,17 @@ export type BuildHubAppDeps = {
   // is broken". Only the machine-purge cascade needs the difference, and only to
   // log it. Absent ⇒ not degraded, i.e. genuinely capability-free.
   identityDegraded?: () => boolean;
+  // Organization directory (#288). Optional like machineDirectory — absent ⇒
+  // the routes 404 and a client keeps its labels local.
+  organizationDirectory?: OrganizationDirectory;
+  // The Hub roster (organization-roster.ts): each Organization its key last
+  // listed, with its hints and last Limits answer. Read by GET
+  // /api/organizations and the operator rename's uniqueness check. Absent ⇒
+  // an empty roster.
+  organizationRoster?: () => ReadonlyArray<HubRosterEntry>;
+  // Organization assertion directory (#310). Optional like organizationDirectory —
+  // absent ⇒ the routes 404 and a client keeps its assertions local.
+  organizationAssertionDirectory?: OrganizationAssertionDirectory;
   // Wall-clock for the lastPushAt stamps (M7). Injectable for tests; the
   // stamps are in-memory since-daemon-start, the roster's exact posture.
   nowImpl?: () => string;
@@ -152,14 +183,18 @@ function remoteAddrOf(c: Context): string | null {
   }
 }
 
-// Shared by the self-rename PUT and the console rename POST: trim, reject
+// Shared by the self-update PUT and the console rename POST: trim, reject
 // empty, cap at cleanHostname's 63-char registration ceiling. Returns the
 // cleaned name or null (⇒ 400).
-function parseRenameName(raw: unknown): string | null {
-  const parsed = hubMachineRenameRequestSchema.safeParse(raw);
-  const name = parsed.success ? parsed.data.name.trim() : "";
+function cleanRenameName(raw: string): string | null {
+  const name = raw.trim();
   if (name === "" || name.length > 63) return null;
   return name;
+}
+// The console rename POST's body: `{ name }` only.
+function parseRenameName(raw: unknown): string | null {
+  const parsed = hubMachineRenameRequestSchema.safeParse(raw);
+  return parsed.success ? cleanRenameName(parsed.data.name) : null;
 }
 
 export function buildHubApp(deps: BuildHubAppDeps): Hono {
@@ -192,7 +227,9 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
       "/api/*",
       cors({
         origin: allowedOrigins,
-        allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
+        // PUT: the console's Organization rename (#288). The CSRF guard below
+        // still refuses a PUT from any origin outside the allowlist.
+        allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allowHeaders: [
           "Authorization",
           "content-type",
@@ -370,7 +407,8 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
   });
 
   // Push-up merge (ADR-0035 M2): the client's half of the two-way sync. The
-  // store dedups on capturedAt, so replays and overlaps are harmless.
+  // store keys a sample by (organizationUuid, capturedAt), a stamped copy
+  // superseding an unstamped one, so replays and overlaps are harmless.
   // Deliberately NOT fanned out to live SSE clients: pushed batches are
   // historical (each machine's own fallback samples cover the same wall-clock
   // period its peers covered for themselves), and a large seed push would blow
@@ -605,10 +643,15 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
       return c.json(body);
     });
 
-    // Self-rename (ADR-0041): a machine renames only ITSELF — the hub
-    // enforces :id = the connection's x-maxprice-machine (console rename-any
-    // is M7's POST /api/machines/:id/name). Uniqueness is write-time and
-    // case-insensitive → 409 pinned envelope on collision.
+    // Self-update (ADR-0041, #261 item 2): a machine updates only ITSELF — its
+    // name and its published Home — and the hub enforces :id = the
+    // connection's x-maxprice-machine (console rename-any is M7's POST
+    // /api/machines/:id/name). Name uniqueness is write-time and
+    // case-insensitive → 409 pinned envelope on collision, and a colliding
+    // body applies nothing. The Home is stored verbatim and never interpreted;
+    // an unchanged Home writes nothing and pokes no one, because every client
+    // re-publishes on every connect. Not gated on archive health: this is
+    // directory metadata a machine writes about itself.
     app.put("/api/machines/:id", async (c) => {
       const machineId = c.req.header("x-maxprice-machine");
       const id = c.req.param("id");
@@ -616,37 +659,67 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
         const body: ErrorResponse = { error: "forbidden: not this connection's machine" };
         return c.json(body, 403);
       }
-      // Trim + empty/63-char ceiling via the shared helper (cleanHostname's
-      // registration cap) — one source of truth with the console rename POST.
-      // The wire schema stays a locked z.string().min(1); the ceiling lives here.
-      const name = parseRenameName(await c.req.json().catch(() => null));
-      if (name === null) {
-        const body: ErrorResponse = { error: "invalid rename payload" };
+      const parsed = hubMachineSelfUpdateRequestSchema.safeParse(
+        await c.req.json().catch(() => null),
+      );
+      if (!parsed.success) {
+        const body: ErrorResponse = { error: "invalid self-update payload" };
         return c.json(body, 400);
       }
-      const result = machineDirectory.rename(id, name);
-      if (result === "collision") {
-        const body: ErrorResponse = { error: `name already in use: ${name}` };
-        return c.json(body, 409);
+      const { name: rawName, homeOrganization } = parsed.data;
+      let changed = false;
+      if (rawName !== undefined) {
+        // Trim + empty/63-char ceiling via the shared helper (cleanHostname's
+        // registration cap) — one source of truth with the console rename
+        // POST. The wire schema stays a locked z.string().min(1); the ceiling
+        // lives here.
+        const name = cleanRenameName(rawName);
+        if (name === null) {
+          const body: ErrorResponse = { error: "invalid rename payload" };
+          return c.json(body, 400);
+        }
+        const result = machineDirectory.rename(id, name);
+        if (result === "collision") {
+          const body: ErrorResponse = { error: `name already in use: ${name}` };
+          return c.json(body, 409);
+        }
+        if (result === "unknown") {
+          // Defensive — the registration middleware enrolled this machine on
+          // this very request, so this is unreachable in practice.
+          const body: ErrorResponse = { error: "unknown machine" };
+          return c.json(body, 404);
+        }
+        changed = true;
       }
-      if (result === "unknown") {
-        // Defensive — the registration middleware enrolled this machine on
-        // this very request, so this is unreachable in practice.
-        const body: ErrorResponse = { error: "unknown machine" };
-        return c.json(body, 404);
+      if (homeOrganization !== undefined) {
+        const result = machineDirectory.setHome(id, homeOrganization);
+        if (result === "unknown") {
+          // Defensive, as above.
+          const body: ErrorResponse = { error: "unknown machine" };
+          return c.json(body, 404);
+        }
+        if (result === "invalid") {
+          // Defensive too: the body schema carries the directory's own field,
+          // so a value it refuses never gets here. A name applied above still
+          // pokes.
+          if (changed) deps.fanout.emitMachinesPoke();
+          const body: ErrorResponse = { error: "invalid self-update payload" };
+          return c.json(body, 400);
+        }
+        if (result === "ok") changed = true;
       }
-      deps.fanout.emitMachinesPoke();
+      if (changed) deps.fanout.emitMachinesPoke();
       return c.json({ ok: true } satisfies CredentialAck);
     });
 
     // Console rename (M7): rename ANY machine — the operator surface (the PUT
-    // above stays the client SELF-rename). Same validation ceiling.
+    // above stays the client SELF-update). Same validation ceiling.
     //
     // The M7 OPERATOR mutations below (rename, merge, and the purge/compact in
     // the next block) all 503 while the archive is unusable (F3): the console's
     // Machines card is a directory ∪ ARCHIVE join, so with no archive loaded the
     // operator would be acting on rows whose event counts all read zero. The M4
-    // client self-rename PUT above is deliberately NOT gated — it is directory
+    // client self-update PUT above is deliberately NOT gated — it is directory
     // metadata a machine writes about itself, with no archive in the loop.
     app.post("/api/machines/:id/name", async (c) => {
       if (!eventsUsable()) return c.json(ARCHIVE_UNAVAILABLE, 503);
@@ -748,6 +821,181 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     });
   }
 
+  // The Hub's roster as the console reads it (#294): what its key last listed,
+  // then the Organizations only the directory names, each with its label and
+  // Limits answer (organization-rows.ts). Mounted with or without a directory:
+  // without one, nothing is renamed.
+  const organizationRoster = deps.organizationRoster ?? (() => []);
+  app.get(HUB_ORGANIZATIONS_PATH, (c) => {
+    const body: HubOrganizationsResponse = {
+      organizations: hubOrganizationRows(
+        organizationRoster(),
+        deps.organizationDirectory?.labels() ?? {},
+        deps.fanout.getStatus().organizations,
+      ),
+    };
+    return c.json(body);
+  });
+
+  // Organization directory (#288, ADR-0105 §8): the fleet's union of
+  // Organization labels, newest `editedAt` winning. Only a write that changed
+  // the union pokes hub:organizations, so a push of what is already held
+  // echoes nowhere. An edit that would take the union past
+  // ORGANIZATION_DIRECTORY_MAX is refused whole (409), so every answer fits
+  // the wire's cap. Needs no machine header and no archive: labels are
+  // user-authored presentation, fleet-wide whenever a Hub is configured.
+  const organizationDirectory = deps.organizationDirectory;
+  if (organizationDirectory !== undefined) {
+    const directoryBody = (): HubOrganizationDirectory => ({
+      labels: organizationDirectory.labels(),
+    });
+    // The store restored the previous union before throwing.
+    const writeFailed = (c: Context, error: unknown) => {
+      console.error("[hub] organization directory write failed:", error);
+      const body: ErrorResponse = { error: "organization directory write failed" };
+      return c.json(body, 500);
+    };
+    // The edit would take the union past ORGANIZATION_DIRECTORY_MAX: refused
+    // whole, nothing written, no poke.
+    const directoryFull = (c: Context) => {
+      const body: ErrorResponse = { error: "organization directory is full" };
+      return c.json(body, 409);
+    };
+
+    app.get(ORGANIZATION_DIRECTORY_PATH, (c) => c.json(directoryBody()));
+
+    // A client's push of its whole local map. The answer is the union after
+    // the merge, which the client adopts: push and pull in one round trip.
+    app.post(ORGANIZATION_DIRECTORY_PATH, async (c) => {
+      const parsed = hubOrganizationDirectorySchema.safeParse(await c.req.json().catch(() => null));
+      if (!parsed.success) {
+        const body: ErrorResponse = {
+          error: "invalid organization directory",
+          issues: parsed.error.issues.map(({ code, path, message }) => ({ code, path, message })),
+        };
+        return c.json(body, 400);
+      }
+      let result: ReturnType<OrganizationDirectory["merge"]>;
+      try {
+        result = organizationDirectory.merge(parsed.data.labels);
+      } catch (error) {
+        return writeFailed(c, error);
+      }
+      if (result === "full") return directoryFull(c);
+      if (result === "ok") deps.fanout.emitOrganizationsPoke();
+      return c.json(directoryBody());
+    });
+
+    // The operator's rename (#294's console), with the sidecar's rules and
+    // words (ADR-0105 §4). Uniqueness is checked here, on the machine that
+    // edits, against every OTHER row GET /api/organizations answers — each
+    // roster entry and each live directory label — resolved from its label,
+    // else its roster hints, else its short id. A merge never refuses a label.
+    app.put(`${ORGANIZATION_DIRECTORY_PATH}/:uuid`, async (c) => {
+      const parsed = organizationRenameRequestSchema.safeParse(
+        await c.req.json().catch(() => null),
+      );
+      if (!parsed.success) {
+        const body: ErrorResponse = {
+          error: "invalid organization rename",
+          issues: parsed.error.issues.map(({ code, path, message }) => ({ code, path, message })),
+        };
+        return c.json(body, 400);
+      }
+      const uuid = c.req.param("uuid");
+      const roster = organizationRoster();
+      const labels = organizationDirectory.labels();
+      // A roster id no directory key could hold is unknown too: stored, it
+      // would fail every client's parse of the union.
+      if (
+        (!roster.some((entry) => entry.id === uuid) && !Object.hasOwn(labels, uuid)) ||
+        !organizationUuidKeySchema.safeParse(uuid).success
+      ) {
+        const body: ErrorResponse = { error: "unknown organization" };
+        return c.json(body, 404);
+      }
+      let label: string | null = null;
+      if (parsed.data.label !== null) {
+        const check = checkOrganizationLabel(parsed.data.label);
+        if (!check.ok) {
+          const body: ErrorResponse = {
+            error:
+              check.reason === "empty"
+                ? "label is empty"
+                : `label is longer than ${ORGANIZATION_LABEL_MAX} characters`,
+          };
+          return c.json(body, 400);
+        }
+        const folded = check.label.toLowerCase();
+        // A label never reads a Limits answer, so no status map.
+        const taken = hubOrganizationRows(roster, labels, {}).some(
+          (row) => row.uuid !== uuid && row.label.toLowerCase() === folded,
+        );
+        if (taken) {
+          const body: ErrorResponse = { error: "another organization already uses that label" };
+          return c.json(body, 409);
+        }
+        label = check.label;
+      }
+      let result: ReturnType<OrganizationDirectory["rename"]>;
+      try {
+        result = organizationDirectory.rename(uuid, label);
+      } catch (error) {
+        return writeFailed(c, error);
+      }
+      if (result === "full") return directoryFull(c);
+      if (result === "ok") deps.fanout.emitOrganizationsPoke();
+      return c.json(directoryBody());
+    });
+  }
+
+  // Organization assertion directory (#310, ADR-0107 §11): the fleet's union of
+  // Organization assertions, newest `editedAt` winning — the Organization
+  // directory's mechanics (above) without its operator edit. Only a write that
+  // changed the union pokes hub:organization-assertions, so a push of what is
+  // already held echoes nowhere; a push that would take the union past
+  // ORGANIZATION_ASSERTION_DIRECTORY_MAX is refused whole (409). Needs no
+  // machine header and no archive, and is gated on neither sharing toggle: any
+  // machine may assert any session, fleet-wide whenever a Hub is configured.
+  const organizationAssertionDirectory = deps.organizationAssertionDirectory;
+  if (organizationAssertionDirectory !== undefined) {
+    const assertionDirectoryBody = (): HubOrganizationAssertionDirectory => ({
+      assertions: organizationAssertionDirectory.assertions(),
+    });
+
+    app.get(ORGANIZATION_ASSERTION_DIRECTORY_PATH, (c) => c.json(assertionDirectoryBody()));
+
+    // A client's push of its whole local map, answered with the union after
+    // the merge, which the client adopts: push and pull in one round trip.
+    app.post(ORGANIZATION_ASSERTION_DIRECTORY_PATH, async (c) => {
+      const parsed = hubOrganizationAssertionDirectorySchema.safeParse(
+        await c.req.json().catch(() => null),
+      );
+      if (!parsed.success) {
+        const body: ErrorResponse = {
+          error: "invalid organization assertion directory",
+          issues: parsed.error.issues.map(({ code, path, message }) => ({ code, path, message })),
+        };
+        return c.json(body, 400);
+      }
+      let result: ReturnType<OrganizationAssertionDirectory["merge"]>;
+      try {
+        result = organizationAssertionDirectory.merge(parsed.data.assertions);
+      } catch (error) {
+        // The store kept the previous union.
+        console.error("[hub] organization assertion directory write failed:", error);
+        const body: ErrorResponse = { error: "organization assertion directory write failed" };
+        return c.json(body, 500);
+      }
+      if (result === "full") {
+        const body: ErrorResponse = { error: "organization assertion directory is full" };
+        return c.json(body, 409);
+      }
+      if (result === "ok") deps.fanout.emitOrganizationAssertionsPoke();
+      return c.json(assertionDirectoryBody());
+    });
+  }
+
   // Operator deletion commits exact keys plus a durable action receipt.
   // Directory cleanup finishes that receipt; compaction preserves replay history.
   if (fleetEvents !== undefined && machineDirectory !== undefined) {
@@ -791,9 +1039,10 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
   }
 
   // Key custody (ADR-0035): persist to the OS keychain via the credstore, then
-  // arm the poller — mirroring the sidecar's POST /api/usage/credential
-  // (immediate pollOnce for fast first sample). Write-only: the hub never
-  // serves the key back out.
+  // arm the poller. Every push — the console's, or a client's heal — re-lists
+  // the Organizations the key can see and polls all of them before the ack, for
+  // a fast first sample (#283): nothing in the body decides what the Hub polls.
+  // Write-only: the hub never serves the key back out.
   app.post("/api/credential", async (c) => {
     // Parse explicitly so an UNPARSEABLE body (a truncated / proxy-mangled
     // request) is a 400 — NOT folded into the same `null` the documented clear
@@ -809,17 +1058,23 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     }
     if (raw === null) {
       await deps.persistCredential(null);
+      // The poll set first: its clear resets the discovery flag while the
+      // poller still reads the old key, so no frame pairs "no key" with
+      // `error` (#284). The roster file is kept.
+      deps.pollSet.clear();
       deps.usage.setCredential(null);
-      // A clear resets provenance AND orgId — there is no longer a key to
-      // attribute or an org to show (overview §8).
+      deps.fanout.patchStatus({ usageCurrent: {}, usageWeeklyResetAt: {} });
+      // A clear resets provenance — there is no longer a key to attribute
+      // (overview §8).
       deps.fanout.patchStatus({
         credentialPresent: false,
         credentialUpdatedAt: null,
         credentialSource: null,
-        orgId: null,
       });
       return c.json({ ok: true } satisfies CredentialAck);
     }
+    // Strict (ADR-0104): a body carrying `orgId` is a caller still holding the
+    // retired shape, refused rather than narrowed to its key.
     const parsed = usageCredentialSchema.safeParse(raw);
     if (!parsed.success) {
       const body: ErrorResponse = { error: "invalid credential" };
@@ -830,8 +1085,7 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     // running on a credential that didn't persist.
     await deps.persistCredential(parsed.data);
     deps.usage.setCredential(parsed.data);
-    // Provenance + display (ADR-0036, overview §8): WHO set/healed the key and
-    // WHEN, plus the org (non-secret) for the console to SHOW and prefill. The
+    // Provenance (ADR-0036, overview §8): WHO set/healed the key and WHEN. The
     // console's own POST carries no machine header ⇒ "local"; a sidecar
     // auto-heal POST carries its machineId ⇒ that machine is the healer. The
     // session key value is never stored or echoed — write-only stays intact.
@@ -839,8 +1093,11 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
       credentialPresent: true,
       credentialUpdatedAt: new Date().toISOString(),
       credentialSource: c.req.header("x-maxprice-machine") ?? "local",
-      orgId: parsed.data.orgId,
     });
+    // A changed set is polled as the listing installs it; the explicit poll
+    // then covers an unchanged one (a new key for the same Organizations) and
+    // coalesces with the former.
+    await deps.pollSet.refresh(parsed.data.sessionKey);
     await deps.usage.pollOnce();
     return c.json({ ok: true } satisfies CredentialAck);
   });

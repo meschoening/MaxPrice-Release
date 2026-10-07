@@ -14,9 +14,11 @@ import { dirname } from "node:path";
 import { setImmediate as yieldToLoop } from "node:timers/promises";
 import { z } from "zod";
 import {
+  fleetCopySupersedes,
   fleetDedupKey,
   fleetDedupTokenTotal,
   fleetEventSchema,
+  internRowStrings,
   type FleetEvent,
   type HubEventStamp,
   type StoredEventWire,
@@ -227,11 +229,11 @@ export type FleetEventStore = {
   compact: () => Promise<{ droppedLines: number; freedBytes: number }>;
 };
 
-// The ONE merge rule (dedup key + tie-breaker), defined once in
-// `@maxprice/shared` (fleet-dedup.ts) and shared byte-for-byte with the engine
-// store's private copy (apps/sidecar/src/engine/store.ts). Re-exported under
-// these local names for event-sync's stamp predicate (Tasks 5/6) and the tests;
-// the cross-store parity tests pin the invariant.
+// The ONE merge rule (dedup key + `fleetCopySupersedes`, ADR-0103), defined
+// once in `@maxprice/shared` (fleet-dedup.ts) and shared byte-for-byte with the
+// engine store's private copy (apps/sidecar/src/engine/store.ts). The key and
+// token total are re-exported under these local names for event-sync and the
+// tests; the cross-store parity tests pin the invariant.
 export const fleetEventKey = fleetDedupKey;
 export const fleetTokenTotal = fleetDedupTokenTotal;
 
@@ -344,13 +346,17 @@ export function createFleetEventStore(opts: {
   // Apply one already-stamped row to RAM (load replay + push apply share it).
   // Runtime writers collect winning lines here, after the shared merge check;
   // replay passes no collector and does no serialization while unmeasured.
+  // The merge check is the one rule (ADR-0103): a larger total, or an equal
+  // total gaining a tag or a smaller one (#374), so replay ends on the same
+  // copy in either line order.
   // Returns "new" | "replaced" | "lost".
   function applyRow(candidate: FleetEvent, appendLines?: string[]): "new" | "replaced" | "lost" {
     const key = fleetEventKey(candidate.messageId, candidate.requestId);
     const incumbent = byKey.get(key);
-    if (incumbent !== undefined && fleetTokenTotal(incumbent) >= fleetTokenTotal(candidate))
-      return "lost";
+    if (incumbent !== undefined && !fleetCopySupersedes(candidate, incumbent)) return "lost";
     if (appendLines !== undefined) appendLines.push(serializeAccountedLine(candidate));
+    // Resident from here on: one instance per repeated value (#361).
+    internRowStrings(candidate);
     byKey.set(key, candidate);
     if (incumbent !== undefined) {
       const idx = firstIndexAbove(incumbent.seq) - 1;
@@ -573,7 +579,7 @@ export function createFleetEventStore(opts: {
     for (const row of rows) {
       const key = fleetEventKey(row.messageId, row.requestId);
       const incumbent = byKey.get(key);
-      if (incumbent !== undefined && fleetTokenTotal(incumbent) >= fleetTokenTotal(row)) {
+      if (incumbent !== undefined && !fleetCopySupersedes(row, incumbent)) {
         stamps.push(
           row.requestId === undefined
             ? { messageId: row.messageId, seq: incumbent.seq }

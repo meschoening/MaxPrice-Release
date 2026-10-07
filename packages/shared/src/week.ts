@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { tzClockParts, zonedInstant } from "./tz-clock";
 
-// The Week (CONTEXT.md; ADR-0083): what "this week" means app-wide.
+// The Week (GLOSSARY.md; ADR-0083): what "this week" means app-wide.
 export const WEEK_MS = 7 * 86_400_000;
 export const weekModeSchema = z.enum(["rolling", "limitReset", "custom"]);
 export type WeekMode = z.infer<typeof weekModeSchema>;

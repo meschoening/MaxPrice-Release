@@ -350,7 +350,8 @@ fn write_settings(
     require_main_window(window.label(), "write_settings")?;
     write_settings_at(&settings_path(&app)?, &next)?;
     // Kick the ambient readout poller (map #168 M3; T5 decision 3): the poller
-    // re-reads settings.json per poll, so this makes a costMode/timezone flip
+    // re-reads settings.json per poll, so this makes a costMode/timezone flip,
+    // or an Organization scope flip (`organizationScope`, ADR-0106 §11),
     // update the tray readout immediately instead of up-to-60s later.
     ambient::kick(&app.state::<ambient::AmbientState>());
     Ok(())

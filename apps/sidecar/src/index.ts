@@ -7,14 +7,22 @@ import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { stream, streamSSE } from "hono/streaming";
 import {
+  ALL_ORGANIZATIONS,
   costModeSchema,
+  displayOrganizationLabels,
   hubConfigSchema,
   MAX_INTRADAY_BUCKETS,
   nativeBucketMs,
+  ORGANIZATION_ASSERTIONS_PATH,
+  ORGANIZATION_LABEL_MAX,
   ORGANIZATIONS_PATH,
+  organizationAssertRequestSchema,
+  organizationRenameRequestSchema,
   PROJECT_IDENTITY_PATH,
   PROJECT_MERGE_PATH,
   projectMergeMutationRequestSchema,
+  resolveOrganizationLabel,
+  resolveOrganizationScope,
   spanSchema,
   SPAN_WINDOW_MS,
   WEEK_BUCKET_MS,
@@ -26,13 +34,16 @@ import {
   STORAGE_FORGET_PATH,
   STORAGE_PATH,
   storageForgetRequestSchema,
-  usageCredentialSchema,
+  storedUsageCredentialSchema,
   type CostMode,
   type CredentialAck,
+  type DiscoveredOrg,
   type DiscoverOrgsResponse,
   type ErrorResponse,
   type ForgetSessionRef,
   type IntradayResponse,
+  type OrganizationAssertionsResponse,
+  type OrganizationAssertResponse,
   type OrganizationsResponse,
   type PricingRefreshResponse,
   type ProjectMergeMutationRequest,
@@ -59,10 +70,15 @@ import {
 import { createLiveHub, type LiveHub } from "./live-hub";
 import { createWatcher, type CreateWatcherOptions, type Watcher } from "./watcher";
 import { resolveWatchRoots } from "./watch-roots";
-import { readClaudePathsFromSettings, readSettingsFile } from "./settings-file";
+import {
+  readClaudePathsFromSettings,
+  readSettingsFile,
+  resolveTrackedOrganizations,
+} from "./settings-file";
 import { createFleetSync, type FleetForgetResult } from "./fleet";
 import {
   createStorageReporter,
+  forgetOrganizationOf,
   parseWebviewProfileDirs,
   STORAGE_FILE,
   type StorageSnapshot,
@@ -71,28 +87,60 @@ import { createIdentityProber } from "./identity-probe";
 import { createLocalArchive } from "./local-archive";
 import {
   createOrganizationRegistry,
+  createOrganizationRename,
   listOrganizations,
-  readCurrentLogin,
+  readCurrentLogins,
   readRemoteControlAtStartup,
+  type LearnedOrg,
+  type OrganizationRenameResult,
 } from "./organizations";
+import { createKeyListing } from "./key-listing";
+import { createOrganizationLabels } from "./organization-labels";
+import {
+  createOrganizationAssert,
+  createOrganizationAssertions,
+  presumptionWithAssertions,
+  type OrganizationAssertResult,
+} from "./organization-assertions";
 import { gateOrganizationWatcher, prepareOrganizationStore } from "./organization-boot";
 import { createOrganizationRepair } from "./organization-repair";
+import {
+  createOrganizationScope,
+  quotaOrganization,
+  quotaSampleScope,
+  scopeOrganizations,
+  type OrganizationScopeState,
+} from "./organization-scope";
+import { createLiveUsagePoller } from "./usage-poller";
+import {
+  createOrganizationSettingsDriver,
+  createReingestState,
+  dormantChange,
+} from "./organization-lifecycle";
 import { createSettingsWatch, type SettingsWatch } from "./settings-watch";
 import { mintRescanWalkKey, scanGate } from "./scan-gate";
 import { createScanCache, type ScanCache } from "./engine/scan-cache";
 import { createEventStore, type EventStore, type ScanProgress } from "./engine/store";
 import {
+  createPresumption,
+  dormantSessions,
+  NO_DORMANT,
+  withPublishedHomes,
+  withSelfHome,
+  type Presumption,
+} from "./engine/presumption";
+import {
   constantTimeEqual,
   createDeferredShutdown,
   createHubClient,
   createSampleStore,
-  createUsagePoller,
-  discoverOrg,
+  discoverOrgs,
   installParentWatchdog,
   libcGetppid,
   monotonicClock,
   streamSSEPump,
   type DiscoverOrgResult,
+  type SampleScope,
   type UsagePollerCurrent,
 } from "@maxprice/usage-core";
 import { loadOrCreateMachineId } from "./machine-id";
@@ -146,13 +194,20 @@ export type BuildAppDeps = {
   // POST /api/usage/discover-orgs proxies org discovery (CORS workaround).
   usage: {
     // INTERNAL poller state — the WIRE shape of GET /api/usage/current is
-    // narrower (`{ sample }`, f10): the handler projects just `sample` off
-    // this. `connection` / `lastSampleAt` stay on the internal type for the
-    // poller's own bookkeeping and the status snapshot.
-    getCurrent: () => UsagePollerCurrent;
+    // narrower (`{ sample, weeklyResetAt }`, f10): the handler projects those
+    // off this. `connection` / `lastSampleAt` stay on the internal type for the
+    // poller's own bookkeeping and the status snapshot. One Organization's
+    // state: the handlers pass the Quota organization, and `null` (no Home) is
+    // the answer that names none.
+    getCurrent: (organization?: string | null) => UsagePollerCurrent;
     setCredential: (c: UsageCredential | null) => void;
     pollOnce: () => Promise<void>;
     discoverOrgs: (sessionKey: string) => Promise<DiscoverOrgResult>;
+    // Stamps every unstamped usage-history line with a legacy pushed blob's
+    // `orgId` (#279) — the sample store's stampUnstamped: resolves the
+    // number stamped (0, with no file I/O, once nothing is left), rejects when
+    // the rewrite fails.
+    stampHistory: (organizationUuid: string) => Promise<number>;
   };
   // Bearer token EVERY POST endpoint enforces when present (f22) — the two
   // usage endpoints, the hub config, and the manual rescan: a request must
@@ -160,10 +215,13 @@ export type BuildAppDeps = {
   // (MAXPRICE_AUTH_TOKEN unset) → no auth enforced, preserving the
   // Vite/standalone path; set to the env var at construction otherwise.
   authToken: string | null;
-  // The usage-history samples — /api/blocks reads them for observed-window
-  // formation + the 5h limit % (ADR-0028). An accessor (not a snapshot) so the
-  // handler reads whatever the poller has appended at request time.
-  samples: () => UsageSample[];
+  // The usage-history samples — /api/blocks and the `block` span read them for
+  // observed-window formation + the 5h limit % (ADR-0028). No scope is every
+  // sample held (no Home); a scope is the Quota organization's, unstamped lines
+  // counting as its `home`'s — the sample store's `all(scope)`. An accessor
+  // (not a snapshot) so the handler reads whatever the poller has appended at
+  // request time.
+  samples: (scope?: SampleScope) => readonly UsageSample[];
   // Hub opt-in (ADR-0035/0037): the renderer pushes {url, password} (password
   // nullable — open hub) or url:null (hub off) via POST /api/hub/config;
   // main() wires this to the hub-client.
@@ -233,8 +291,42 @@ export type BuildAppDeps = {
     clean: () => Promise<StorageCleanResponse>;
     forget: (sessions: readonly ForgetSessionRef[]) => Promise<FleetForgetResult>;
   };
-  // ADR-0098: Settings' Home organization select.
-  organizations: { list: () => Promise<OrganizationsResponse> };
+  // ADR-0098 / #287: the Settings roster, which the Home organization select
+  // also reads. `rename` applies PUT /api/organizations/:uuid's rules
+  // (`createOrganizationRename`) and answers the fresh roster or a refusal.
+  // `recordDiscovery` seeds the roster with what Connect's discovery answered
+  // (#283) — POST /api/usage/discover-orgs calls it on every success.
+  // `rememberOrganization` keeps one Organization in that roster: POST
+  // /api/usage/credential records a legacy blob's `orgId` there (#283). It is
+  // the Organization the history was stamped with, which the key may no longer
+  // list. The key's other Organizations arrive by `learnFromKey` on a client
+  // with no Hub, or by the Hub's roster on a hub-connected one (#366).
+  organizations: {
+    list: () => Promise<OrganizationsResponse>;
+    rename: (uuid: string, label: string | null) => Promise<OrganizationRenameResult>;
+    recordDiscovery: (orgs: readonly DiscoveredOrg[]) => Promise<void>;
+    rememberOrganization: (uuid: string) => Promise<void>;
+    // #366: a key arrived; a client with no Hub lists that key's Organizations
+    // into the roster (key-listing.ts). Fire-and-forget: never gates the ack.
+    learnFromKey?: (sessionKey: string) => void;
+  };
+  // What the `organization` query param resolves against (#278): the effective
+  // Home and the resolved tracked set, as a LIVE accessor — a settings edit
+  // moves either in-session, and the next request must resolve under it.
+  // `scopeOrganizations` turns the param plus this into the store's
+  // `organizations` axis; `{ home: null, tracked: null }` narrows nothing.
+  organizationScope: () => OrganizationScopeState;
+  // #310: the Organization assertions. GET /api/organization-assertions reads
+  // this machine's resolved claims; PUT sets or clears them in bulk under
+  // `createOrganizationAssert`'s rules. Optional: absent ⇒ neither route is
+  // mounted (the test apps that wire no assertion store).
+  organizationAssertions?: {
+    list: () => Promise<OrganizationAssertionsResponse>;
+    assert: (
+      sessionIds: readonly string[],
+      organizationUuid: string | null,
+    ) => Promise<OrganizationAssertResult>;
+  };
   // Live Loop-lag summary (issue #116 / F4). GET /api/status composes this
   // over the hub-held snapshot: verdict-edge frames + the saturated heartbeat
   // keep the hub's copy only flip-fresh, but one status read must answer "is
@@ -423,6 +515,10 @@ type CommonQuery = {
   // Machine ids to include (ADR-0041 M5) — repeated `machine=` params, exact
   // match on the event's machineId. An empty array means "no filter".
   machines: string[];
+  // The Organization scope (#278) — the one `organization=` param resolved by
+  // `scopeOrganizations`: Home's uuid when the param is absent or stale, the
+  // tracked set under `all`, and `[]` (no narrowing) on a machine with no Home.
+  organizations: string[];
 };
 
 // Parse + validate the shared `mode` query param. Returns the parsed CostMode,
@@ -490,7 +586,13 @@ function withEngineErrors(
 // Validate the query params every report endpoint accepts. Returns a Response
 // on validation failure so handlers can early-return. The shape matches the
 // pinned ErrorResponse envelope from packages/shared/src/error.ts.
-function parseCommonQuery(c: Context): CommonQuery | Response {
+//
+// `scope` is the live Organization scope state (`deps.organizationScope()`),
+// read once per request. The `organization` param never 400s: a value that
+// names nothing tracked resolves to Home (#262 items 2 and 11) — a scope left
+// stale by an exclusion or a shrunken set is answered as Home, the same rule
+// the renderer's `parseSettings` applies, rather than refused.
+function parseCommonQuery(c: Context, scope: OrganizationScopeState): CommonQuery | Response {
   // Empty since/until (?until=) coerce to absent — an empty bound must not
   // reach the store, where `date.ymd > ""` is true for every date (a silent
   // empty report). Consistent with the empty-array-means-no-filter convention.
@@ -537,7 +639,8 @@ function parseCommonQuery(c: Context): CommonQuery | Response {
     return c.json(body, 400);
   }
 
-  return { since, until, mode, tz, projects, models, machines };
+  const organizations = scopeOrganizations(c.req.query("organization"), scope);
+  return { since, until, mode, tz, projects, models, machines, organizations };
 }
 
 export function buildApp(deps: BuildAppDeps): Hono {
@@ -639,9 +742,15 @@ export function buildApp(deps: BuildAppDeps): Hono {
   //
   // Every filter axis — date window, project, AND model — is a store-query
   // axis (ADR-0017): the aggregator receives already-filtered events, so every
-  // row total and the `totals` block are model-scoped. `aggregateDaily` does
-  // the date grouping and returns `{ daily, totals? }` — `totals` is omitted
-  // on the 2+-project path per the E1 golden.
+  // row total and the `totals` block are model-scoped. The Organization scope
+  // (#278, `parseCommonQuery`) is one more such axis on every money endpoint,
+  // the readout's `todayCost` included. The quota-shaped reads —
+  // /api/usage/current, the readout's utilization half, /api/blocks and the
+  // intraday `block` span — answer the Quota organization alone
+  // (`quotaOrganization`): Blocks form from that one Organization's events and
+  // samples.
+  // `aggregateDaily` does the date grouping and returns `{ daily, totals? }` —
+  // `totals` is omitted on the 2+-project path per the E1 golden.
   //
   // UNBOUNDED queries serve from the dirty-bucket cache (#113 / ADR-0057):
   // per-date buckets, only the touched dates refolded. `projectFilterCount` is
@@ -650,7 +759,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
   app.get(
     "/api/daily",
     withEngineErrors("/api/daily", async (c) => {
-      const q = parseCommonQuery(c);
+      const q = parseCommonQuery(c, deps.organizationScope());
       if (q instanceof Response) return q;
       await deps.engineReady();
       if (q.since === undefined && q.until === undefined) {
@@ -660,12 +769,15 @@ export function buildApp(deps: BuildAppDeps): Hono {
           projects: q.projects,
           models: q.models,
           machines: q.machines,
+          organizations: q.organizations,
           projectFilterCount: q.projects.length,
         });
         return c.json(body);
       }
       // Bounded queries stay on the direct path: the store's date filter makes
       // them O(window) already, and a moving `until` would churn cache keys.
+      // The Organization scope narrows here too (#278) — the direct path is the
+      // one every bounded Date range takes.
       const events = reportStore().query({
         since: q.since,
         until: q.until,
@@ -673,6 +785,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         projects: q.projects,
         models: q.models,
         machines: q.machines,
+        organizations: q.organizations,
       });
       const body = aggregateDaily(events, q.mode, {
         projectFilterCount: q.projects.length,
@@ -697,7 +810,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
   app.get(
     "/api/daily-by-project",
     withEngineErrors("/api/daily-by-project", async (c) => {
-      const q = parseCommonQuery(c);
+      const q = parseCommonQuery(c, deps.organizationScope());
       if (q instanceof Response) return q;
       await deps.engineReady();
       if (q.since === undefined && q.until === undefined) {
@@ -707,6 +820,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
           projects: q.projects,
           models: q.models,
           machines: q.machines,
+          organizations: q.organizations,
         });
         return c.json(body);
       }
@@ -719,6 +833,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         projects: q.projects,
         models: q.models,
         machines: q.machines,
+        organizations: q.organizations,
       });
       return c.json(aggregateDailyByProject(events, q.mode, q.tz));
     }),
@@ -738,7 +853,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
   app.get(
     "/api/daily-by-machine",
     withEngineErrors("/api/daily-by-machine", async (c) => {
-      const q = parseCommonQuery(c);
+      const q = parseCommonQuery(c, deps.organizationScope());
       if (q instanceof Response) return q;
       const includeProjects = c.req.query("byProject") === "1";
       await deps.engineReady();
@@ -749,6 +864,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
           projects: q.projects,
           models: q.models,
           machines: q.machines,
+          organizations: q.organizations,
           includeProjects,
         });
         return c.json(body);
@@ -762,6 +878,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         projects: q.projects,
         models: q.models,
         machines: q.machines,
+        organizations: q.organizations,
       });
       return c.json(aggregateDailyByMachine(events, q.mode, q.tz, includeProjects));
     }),
@@ -787,10 +904,11 @@ export function buildApp(deps: BuildAppDeps): Hono {
   //
   // `span=block` (ADR-0031): the active 5-hour quota block's growing frame
   // (`[block start → now]`). The handler resolves the frame server-side via
-  // `resolveBlockSpanWindow` (all-model/all-project — ADR-0017/0028) and
-  // passes it to the engine. No active block ⇒ 200 with empty buckets and
-  // `blockWindow: null`. `bucketMs` is optional for `block` — the engine picks
-  // the adaptive block-dividing rung (ADR-0031) when omitted.
+  // `blockReports.span` over the Quota organization's formation (never
+  // project/model/machine-filtered — ADR-0017/0028; every row with no Home —
+  // ADR-0108) and passes it to the engine. No active block ⇒ 200 with empty
+  // buckets and `blockWindow: null`. `bucketMs` is optional for `block` — the
+  // engine picks the adaptive block-dividing rung (ADR-0031) when omitted.
   //
   // `span=week` (ADR-0083): the anchored Week's growing frame
   // (`[weekStart → now]`). The renderer resolves the anchor (`resolveWeekWindow`
@@ -884,6 +1002,13 @@ export function buildApp(deps: BuildAppDeps): Hono {
       const mode = parseMode(c);
       if (mode instanceof Response) return mode;
       const { projects, models, machines } = readFilters(c);
+      // The Organization scope (#278), resolved exactly as `parseCommonQuery`
+      // resolves it. Every span but `block` narrows by it; `block` answers the
+      // Quota organization instead (see the block branch).
+      const organizations = scopeOrganizations(
+        c.req.query("organization"),
+        deps.organizationScope(),
+      );
       // The IANA zone — REQUIRED for the `today` calendar-day span (ADR-0020),
       // which anchors its window to local midnight in this zone; the other
       // spans ignore it. Same validation + host-zone default as
@@ -901,10 +1026,11 @@ export function buildApp(deps: BuildAppDeps): Hono {
 
       await deps.engineReady();
 
-      // span=block (ADR-0031): resolve the active block's frame over the
-      // UNFILTERED store — boundaries are all-model/all-project, the
-      // ADR-0017/0028 invariant — then aggregate the FILTERED events inside
-      // it. One `now` for both so the frame and the rung can't disagree.
+      // span=block (ADR-0031): resolve the active block's frame from the Quota
+      // organization's formation — its events and samples alone, never
+      // project/model/machine-filtered (the ADR-0017/0028 invariant) — then
+      // aggregate that Organization's FILTERED events inside it. One `now` for
+      // both so the frame and the rung can't disagree.
       if (span === "block") {
         // ACCEPTED now() skew (ADR-0031): the block frame's active state is
         // sampled from `deps.now()` per request, and `/api/blocks` samples its
@@ -914,7 +1040,11 @@ export function buildApp(deps: BuildAppDeps): Hono {
         // next `block:tick` refetch (which re-frames both to the new block or
         // the empty state).
         const now = deps.now();
-        const resolved = blockReports.span(now);
+        // Resolved after the engine is ready, from one scope read, right before
+        // the synchronous formation: the Home that picks Q is the Home that
+        // presumes the store's owner-less rows and Q's unstamped samples.
+        const quota = quotaSampleScope(c.req.query("organization"), deps.organizationScope());
+        const resolved = blockReports.span(now, quota);
         if (resolved === null) {
           const body: IntradayResponse = {
             buckets: [],
@@ -925,7 +1055,16 @@ export function buildApp(deps: BuildAppDeps): Hono {
           };
           return c.json(body);
         }
-        const events = reportStore().query({ projects, models, machines });
+        // The series describes the frame's Organization: Q's events, never the
+        // money scope's (All sums Organizations; a quota cannot). Frame and
+        // series then both describe Q, the ADR-0031 parity with `/api/blocks`
+        // under the same param. No Home is no scope: every event.
+        const events = reportStore().query({
+          projects,
+          models,
+          machines,
+          organizations: quota === null ? undefined : [quota.organization],
+        });
         return c.json(
           aggregateIntraday(events, mode, {
             span: "block",
@@ -939,7 +1078,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         );
       }
 
-      const events = reportStore().query({ projects, models, machines });
+      const events = reportStore().query({ projects, models, machines, organizations });
       if (span === "week") {
         if (weekStartMs === undefined) throw new Error("intraday: span week without weekStart");
         return c.json(
@@ -986,7 +1125,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
   app.get(
     "/api/sessions",
     withEngineErrors("/api/sessions", async (c) => {
-      const q = parseCommonQuery(c);
+      const q = parseCommonQuery(c, deps.organizationScope());
       if (q instanceof Response) return q;
       await deps.engineReady();
       const body = await reportCache.sessions({
@@ -995,6 +1134,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         projects: q.projects,
         models: q.models,
         machines: q.machines,
+        organizations: q.organizations,
         since: q.since,
         until: q.until,
       });
@@ -1018,7 +1158,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
   app.get(
     "/api/projects",
     withEngineErrors("/api/projects", async (c) => {
-      const q = parseCommonQuery(c);
+      const q = parseCommonQuery(c, deps.organizationScope());
       if (q instanceof Response) return q;
       await deps.engineReady();
       const body = await reportCache.projects({
@@ -1027,6 +1167,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         projects: q.projects,
         models: q.models,
         machines: q.machines,
+        organizations: q.organizations,
         since: q.since,
         until: q.until,
       });
@@ -1036,31 +1177,45 @@ export function buildApp(deps: BuildAppDeps): Hono {
 
   // --- /api/blocks --------------------------------------------------------
   //
-  // Cross-project by design — the 5-hour quota window is inherently
-  // cross-project, so the project filter never reaches it and the store query
-  // is unfiltered. The MODEL filter (ADR-0017) is honoured as a sum-narrowing
-  // option: blocks still form from all events (quota truth — boundaries,
-  // isActive, projection are all-model), but each block's cost/token/model
-  // sums count only matching events.
+  // Blocks describe the Quota organization — the one axis that shapes
+  // formation: its events and samples alone form the windows, annulment,
+  // grace evidence, burn rate, projection and limit %, so two Organizations'
+  // overlapping quota windows never meet. Cross-project by design — the 5-hour
+  // quota window is inherently cross-project, so the project filter never
+  // reaches it. The MODEL and MACHINE filters (ADR-0017, ADR-0041) are honoured
+  // as sum-narrowing options inside that formation: boundaries, isActive and
+  // projection stay all-model and all-machine, but each block's
+  // cost/token/model sums count only matching events.
   app.get(
     "/api/blocks",
     withEngineErrors("/api/blocks", async (c) => {
-      const q = parseCommonQuery(c);
+      const q = parseCommonQuery(c, deps.organizationScope());
       if (q instanceof Response) return q;
       await deps.engineReady();
+      // `q.organizations` is the money scope and never reaches formation: All
+      // sums Organizations, a quota cannot. The Quota organization is resolved
+      // here instead — after the engine is ready, from one scope read, right
+      // before the synchronous formation — so the Home that picks Q is the
+      // Home that presumes the store's owner-less rows and Q's unstamped
+      // samples.
+      const quota = quotaSampleScope(c.req.query("organization"), deps.organizationScope());
       // One pass (ADR-0028): observed reset windows from the usage history
       // partition block formation; the heuristic survives only in history
       // holes; fiveHourLimitPct fills from the same samples. With an empty
       // history this is the pure heuristic port.
       return c.json(
-        blockReports.blocks(q.mode, {
-          since: q.since,
-          until: q.until,
-          timeZone: q.tz,
-          models: q.models,
-          machines: q.machines,
-          now: deps.now(),
-        }),
+        blockReports.blocks(
+          q.mode,
+          {
+            since: q.since,
+            until: q.until,
+            timeZone: q.tz,
+            models: q.models,
+            machines: q.machines,
+            now: deps.now(),
+          },
+          quota,
+        ),
       );
     }),
   );
@@ -1098,6 +1253,10 @@ export function buildApp(deps: BuildAppDeps): Hono {
     // store-query axis: only matching events stream, and the summary's
     // `machines` covers exactly the streamed frames.
     const machines = c.req.queries("machine") ?? [];
+    // The Organization scope (#278), resolved as every report resolves it — a
+    // store-query axis too, so a mixed session streams only the scope's events
+    // and the summary covers exactly those.
+    const organizations = scopeOrganizations(c.req.query("organization"), deps.organizationScope());
 
     // The pre-stream phase — the `store.query` + `aggregateSessionEvents` fold
     // — runs before the HTTP 200 header is committed, so a throw here still
@@ -1109,7 +1268,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
     try {
       await deps.engineReady();
       aggregate = aggregateSessionEvents(
-        reportStore().query({ sessions: [id], models, machines }),
+        reportStore().query({ sessions: [id], models, machines, organizations }),
         mode,
         id,
       );
@@ -1210,14 +1369,35 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // are poller-internal bookkeeping surfaced via the status snapshot, not here.
   // `weeklyResetAt` rides beside `sample` (ADR-0083): the Week resolver needs
   // the weekly window even while a poll legitimately reports `sample: null`.
+  //
+  // Both describe ONE Organization, the Quota organization the `organization`
+  // param resolves to (`quotaOrganization`): the scoped Organization, or Home
+  // when the param is absent, `all`, or names nothing tracked — never a 400.
+  // With no live reading yet, the poller answers from that Organization's own
+  // persisted history (unstamped legacy lines count as Home's), so the Week
+  // anchor never borrows another Organization's reset. No Home answers no
+  // Organization. The sample's `organizationUuid` stamp (#279) is stripped: the
+  // request names the Organization, the response does not repeat it, so a
+  // single-Organization machine answers exactly what it did before stamping.
+  // The usage:sample SSE payload carries the stamp.
   app.get("/api/usage/current", (c) => {
-    const cur = deps.usage.getCurrent();
-    return c.json({ sample: cur.sample, weeklyResetAt: cur.weeklyResetAt });
+    const cur = deps.usage.getCurrent(
+      quotaOrganization(c.req.query("organization"), deps.organizationScope()),
+    );
+    let sample = cur.sample;
+    if (sample?.organizationUuid !== undefined) {
+      // A copy: the poller's live sample is shared with the SSE payload.
+      sample = { ...sample };
+      delete sample.organizationUuid;
+    }
+    return c.json({ sample, weeklyResetAt: cur.weeklyResetAt });
   });
 
-  // --- /api/organizations ---  (ADR-0098) the organizations this machine knows
-  // about, for Settings' Home organization select. Labels and ids only — no
-  // count of what is hidden ever rides here.
+  // --- /api/organizations ---  (ADR-0098, #287) the Settings roster: every
+  // Organization this machine knows about, with its resolved label and the
+  // facts Settings shows beside it; the Home organization select reads it too.
+  // Labels and ids only — never the upstream name, and no count of what is
+  // hidden ever rides here. The rename PUT is below, behind the auth guard.
   app.get(ORGANIZATIONS_PATH, async (c) => c.json(await deps.organizations.list()));
 
   // --- /api/readout ---  (map #168 T5/M3; ADR-0076) the tray readout's one
@@ -1225,11 +1405,28 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // the Windows tray tooltip / macOS menu-bar title from it. Composed here, not
   // in Rust, so the tray is penny-exact with Live by construction: `todayCost`
   // is the same store query + `aggregateDaily` fold the Today tile reads
-  // (bounded to today's local date in the requested zone), and `blockLive`
+  // (bounded to today's local date in the requested zone, and narrowed by the
+  // `organization` scope as the tile is — #278), and `blockLive`
   // mirrors the renderer's usage-ring rule — a current sample whose
   // fiveHour.resetAt is still ahead (NaN-guarded, like usageRingState). The
-  // shell supplies `mode`/`tz` from settings.json per poll; the sidecar keeps
-  // its no-ambient-params invariant. GET, unauthenticated like every report.
+  // shell supplies `mode`/`tz` from settings.json per poll, and `organization`
+  // when the `organizationScope` it resolves there names a tracked Organization
+  // other than Home, or All (absent means Home); the sidecar keeps its
+  // no-ambient-params invariant. GET, unauthenticated like every report.
+  //
+  // The one `organization` param answers the two halves by two rules, read off
+  // ONE scope state so they never disagree about Home: `todayCost` is money
+  // and sums the scope (`scopeOrganizations`, so All is every tracked
+  // Organization's today), while `blockLive`, `utilizationPct` and
+  // `hasModelWindow` are quota and describe the Quota organization alone
+  // (`quotaOrganization`, so All is Home's sample), the same Organization
+  // /api/usage/current answers for that param.
+  //
+  // The optional `organizations` field (#291) names that Quota organization by
+  // its roster display label and says whether the scope resolved to All; it is
+  // filled from the roster only on a multi-Organization machine, so a
+  // single-Organization poll reads no roster and its body is unchanged. A
+  // failed roster read falls back to the short-id label, never to a 500.
   app.get(
     "/api/readout",
     withEngineErrors("/api/readout", async (c) => {
@@ -1239,8 +1436,11 @@ export function buildApp(deps: BuildAppDeps): Hono {
       if (tz instanceof Response) return tz;
       await deps.engineReady();
 
+      const organization = c.req.query("organization");
+      const scope = deps.organizationScope();
       const now = deps.now();
-      const sample = deps.usage.getCurrent().sample;
+      const quota = quotaOrganization(organization, scope);
+      const sample = deps.usage.getCurrent(quota).sample;
       const resetMs = sample?.fiveHour == null ? Number.NaN : Date.parse(sample.fiveHour.resetAt);
       const blockLive = !Number.isNaN(resetMs) && resetMs > now;
 
@@ -1256,7 +1456,14 @@ export function buildApp(deps: BuildAppDeps): Hono {
       const today = localDateUncached(now, tz);
       let todayCost = 0;
       if (today !== null) {
-        const events = reportStore().query({ since: today.ymd, until: today.ymd, timeZone: tz });
+        // Money, so the scope narrows it as it narrows `/api/daily` (#278):
+        // absent is Home, which keeps the tray on the Today tile's number.
+        const events = reportStore().query({
+          since: today.ymd,
+          until: today.ymd,
+          timeZone: tz,
+          organizations: scopeOrganizations(organization, scope),
+        });
         const daily = aggregateDaily(events, mode, { projectFilterCount: 0, timeZone: tz });
         todayCost = daily.daily.find((row) => row.date === today.dashed)?.totalCost ?? 0;
       }
@@ -1268,14 +1475,43 @@ export function buildApp(deps: BuildAppDeps): Hono {
         hasData: deps.liveHub.getStatus().hasData,
         hasModelWindow: sample?.weeklyModel !== undefined,
       };
+      const tracked = scope.tracked ?? [];
+      const multi =
+        scope.home !== null &&
+        resolveOrganizationScope(ALL_ORGANIZATIONS, scope.home, tracked) === ALL_ORGANIZATIONS;
+      if (multi && quota !== null) {
+        // The label is display only: a roster read that fails (a registry
+        // write's temp-file rename, say) degrades it to the short id rather
+        // than failing the readout, which would take the tray's numbers with
+        // it (ADR-0076). The key stays, so the shell still names the
+        // Organization.
+        let roster: OrganizationsResponse["organizations"] = [];
+        try {
+          roster = (await deps.organizations.list()).organizations;
+        } catch (err) {
+          console.warn("[sidecar] readout roster read failed:", err);
+        }
+        body.organizations = {
+          quotaLabel:
+            displayOrganizationLabels(roster).get(quota) ??
+            resolveOrganizationLabel({
+              uuid: quota,
+              rename: null,
+              organizationType: null,
+              hints: null,
+            }).label,
+          all: resolveOrganizationScope(organization, scope.home, tracked) === ALL_ORGANIZATIONS,
+        };
+      }
       return c.json(body);
     }),
   );
 
   // Bearer-token guard for EVERY POST endpoint (f22) — the two usage endpoints,
-  // /api/hub/config, POST /api/rescan, and POST /api/pricing/refresh. Enforced
-  // ONLY when `deps.authToken` is set (the Tauri shell passes
-  // MAXPRICE_AUTH_TOKEN); null (standalone dev / tests) means no auth. Returns a 401 Response carrying the pinned error
+  // /api/hub/config, POST /api/rescan, and POST /api/pricing/refresh — and for
+  // the Organization rename PUT (#287). Enforced ONLY when `deps.authToken` is
+  // set (the Tauri shell passes MAXPRICE_AUTH_TOKEN); null (standalone dev /
+  // tests) means no auth. Returns a 401 Response carrying the pinned error
   // envelope on a missing/mismatched `x-maxprice-auth` header, else null so the
   // caller proceeds.
   const usageAuthGuard = (c: Context): Response | null => {
@@ -1287,6 +1523,114 @@ export function buildApp(deps: BuildAppDeps): Hono {
     }
     return null;
   };
+
+  // --- PUT /api/organizations/:uuid ---  (#287) rename one Organization, or
+  // clear its rename (`label: null`) back to the resolved default. The rules —
+  // trimmed, 1 to 40 code points, unique case-insensitively against every
+  // other Organization's resolved label, one rename at a time — are
+  // `deps.organizations.rename`'s (`createOrganizationRename`); this maps its
+  // answer onto HTTP. 200 carries the fresh roster, so the caller renders the
+  // result without a second read. A label is presentation: it moves no number.
+  app.put(
+    `${ORGANIZATIONS_PATH}/:uuid`,
+    withEngineErrors(
+      "PUT /api/organizations/:uuid",
+      async (c) => {
+        const unauthorized = usageAuthGuard(c);
+        if (unauthorized) return unauthorized;
+        const parsed = organizationRenameRequestSchema.safeParse(
+          await c.req.json().catch(() => null),
+        );
+        if (!parsed.success) {
+          const body: ErrorResponse = {
+            error: "invalid organization rename",
+            issues: parsed.error.issues.map(({ code, path, message }) => ({ code, path, message })),
+          };
+          return c.json(body, 400);
+        }
+        // Always present on this route; `Context` is untyped for path params.
+        const uuid = c.req.param("uuid") ?? "";
+        const result = await deps.organizations.rename(uuid, parsed.data.label);
+        switch (result.kind) {
+          case "ok":
+            return c.json(result.body);
+          case "unknown": {
+            const body: ErrorResponse = { error: "unknown organization" };
+            return c.json(body, 404);
+          }
+          case "invalid": {
+            const body: ErrorResponse = {
+              error:
+                result.reason === "empty"
+                  ? "label is empty"
+                  : `label is longer than ${ORGANIZATION_LABEL_MAX} characters`,
+            };
+            return c.json(body, 400);
+          }
+          case "duplicate": {
+            const body: ErrorResponse = { error: "another organization already uses that label" };
+            return c.json(body, 409);
+          }
+        }
+      },
+      "organization rename failed",
+    ),
+  );
+
+  // --- /api/organization-assertions ---  (#310, ADR-0107 §11) the user's
+  // Organization assertions. GET answers the resolved claims: live entries
+  // only, no tombstone, no edit time. PUT claims every listed session for one
+  // Organization, or clears each claim (`organizationUuid: null`), in one
+  // request, behind the auth guard; the rules are `createOrganizationAssert`'s
+  // and this maps its answer onto HTTP. Sessions are opaque: an id need not be
+  // one this machine holds.
+  const organizationAssertions = deps.organizationAssertions;
+  if (organizationAssertions !== undefined) {
+    app.get(ORGANIZATION_ASSERTIONS_PATH, async (c) => c.json(await organizationAssertions.list()));
+    app.put(
+      ORGANIZATION_ASSERTIONS_PATH,
+      withEngineErrors(
+        "PUT /api/organization-assertions",
+        async (c) => {
+          const unauthorized = usageAuthGuard(c);
+          if (unauthorized) return unauthorized;
+          const parsed = organizationAssertRequestSchema.safeParse(
+            await c.req.json().catch(() => null),
+          );
+          if (!parsed.success) {
+            const body: ErrorResponse = {
+              error: "invalid organization assertion",
+              issues: parsed.error.issues.map(({ code, path, message }) => ({
+                code,
+                path,
+                message,
+              })),
+            };
+            return c.json(body, 400);
+          }
+          const result = await organizationAssertions.assert(
+            parsed.data.sessionIds,
+            parsed.data.organizationUuid,
+          );
+          switch (result.kind) {
+            case "ok": {
+              const body: OrganizationAssertResponse = { changed: result.changed };
+              return c.json(body);
+            }
+            case "unknown": {
+              const body: ErrorResponse = { error: "unknown organization" };
+              return c.json(body, 404);
+            }
+            case "full": {
+              const body: ErrorResponse = { error: "organization assertions are full" };
+              return c.json(body, 409);
+            }
+          }
+        },
+        "organization assertions write failed",
+      ),
+    );
+  }
 
   // A local-first identity edit (ADR-0064). The sidecar owns authorship,
   // monotonic version stamping, cycle validation and the durable write; the
@@ -1310,12 +1654,26 @@ export function buildApp(deps: BuildAppDeps): Hono {
     }
   });
 
-  // --- /api/usage/credential ---  the renderer pushes the keychain credential
-  // here so the poller can run (in memory only; never persisted). A literal
-  // `null` body clears it; an UNPARSEABLE body (an empty body included) is a
-  // 400, NOT a clear — the only shipped caller sends the literal "null" (F4).
-  // On a valid credential we set it AND poll immediately so the rings populate
-  // without waiting for the next interval tick.
+  // --- /api/usage/credential ---  the renderer pushes the keychain blob here,
+  // verbatim, so the poller can run (in memory only; never persisted). A
+  // literal `null` body clears it; an UNPARSEABLE body (an empty body
+  // included) is a 400, NOT a clear — the only shipped caller sends the
+  // literal "null" (F4). On a valid blob we arm its key alone (ADR-0104: the
+  // tracked set decides what is polled) AND poll immediately so the rings
+  // populate without waiting for the next interval tick. The key then goes to
+  // the key listing (#366), which lists its Organizations into the roster on a
+  // client with no Hub; it is never awaited, so a claude.ai failure or hang
+  // never reaches the ack. A legacy blob also carries `orgId`, the Organization
+  // the pre-#283 poller read: it stamps the usage history's unstamped (legacy)
+  // lines (#279), the only record of which Organization they were read for. It
+  // is then remembered in the roster, so Settings still offers it once the
+  // keychain forgets it: the key may no longer list it, and the key's other
+  // Organizations arrive by the listing (no Hub) or the Hub's roster (#366).
+  // The ack means the stamp and the record both landed, and it is what lets the
+  // renderer drop that `orgId` from the keychain: a failed stamp or roster
+  // record is a 500, and the credential stays armed either way. When a push
+  // finds nothing unstamped, the stamp does no file I/O. A key-only blob and a
+  // clear stamp and remember nothing, and a clear lists nothing.
   app.post(
     "/api/usage/credential",
     withEngineErrors("/api/usage/credential", async (c) => {
@@ -1336,23 +1694,53 @@ export function buildApp(deps: BuildAppDeps): Hono {
         const body = { ok: true } satisfies CredentialAck;
         return c.json(body);
       }
-      const parsed = usageCredentialSchema.safeParse(raw);
+      const parsed = storedUsageCredentialSchema.safeParse(raw);
       if (!parsed.success) {
         const body: ErrorResponse = { error: "invalid credential" };
         return c.json(body, 400);
       }
-      deps.usage.setCredential(parsed.data);
+      const { sessionKey, orgId } = parsed.data;
+      deps.usage.setCredential({ sessionKey });
       await deps.usage.pollOnce();
+      // #366: list this key's Organizations into the roster (a client with no
+      // Hub only — main() decides). Never awaited: claude.ai can fail or hang
+      // and the ack must not.
+      deps.organizations.learnFromKey?.(sessionKey);
+      if (orgId !== undefined) {
+        try {
+          await deps.usage.stampHistory(orgId);
+        } catch (err) {
+          // Logged server-side only; the fixed message keeps the history path
+          // out of the response, as withEngineErrors does.
+          console.error("[sidecar] usage history stamp failed:", err);
+          const body: ErrorResponse = { error: "usage history stamp failed" };
+          return c.json(body, 500);
+        }
+        try {
+          await deps.organizations.rememberOrganization(orgId);
+        } catch (err) {
+          // Same posture as the stamp: no ack, so the keychain keeps the
+          // `orgId` and the next push retries.
+          console.error("[sidecar] roster record failed:", err);
+          const body: ErrorResponse = { error: "roster record failed" };
+          return c.json(body, 500);
+        }
+      }
       const body = { ok: true } satisfies CredentialAck;
       return c.json(body);
     }),
   );
 
   // --- /api/usage/discover-orgs ---  the renderer can't call claude.ai directly
-  // (CORS), so org discovery routes through here. Returns the orgs (with
-  // capabilities) so the renderer can pick the subscription org. On failure the
-  // `failureKind` field carries the kind (`expired` vs `error`) so the renderer
-  // can tell a bad session key from a transient network/shape failure.
+  // (CORS), so org discovery routes through here. Returns the orgs, each with
+  // its roster hints (never its name, #283) and what its usage endpoint
+  // answered (`limits`, #270). A successful discovery also seeds the roster
+  // with those same orgs (#283), so Settings lists every Organization the key
+  // can see; nothing picks one (ADR-0104). The roster is disposable, so a
+  // failed seed is logged and never fails Connect. On failure the
+  // `failureKind` field carries the kind (`expired` vs `error`) so the
+  // renderer can tell a bad session key from a transient network/shape
+  // failure.
   app.post(
     "/api/usage/discover-orgs",
     withEngineErrors("/api/usage/discover-orgs", async (c) => {
@@ -1365,6 +1753,13 @@ export function buildApp(deps: BuildAppDeps): Hono {
         return c.json(body, 400);
       }
       const result = await deps.usage.discoverOrgs(parsed.data.sessionKey);
+      if (result.ok) {
+        try {
+          await deps.organizations.recordDiscovery(result.orgs);
+        } catch (err) {
+          console.warn("[sidecar] roster seed failed:", err);
+        }
+      }
       const body: DiscoverOrgsResponse = {
         orgs: result.ok ? result.orgs : [],
         failureKind: result.ok ? null : result.kind,
@@ -1774,16 +2169,59 @@ async function main(): Promise<void> {
   const bootHubConfigured =
     Boolean(process.env.MAXPRICE_HUB_URL) || (bootSettings?.hubUrl ?? "") !== "";
 
-  // The Home organization (CONTEXT.md, ADR-0098): the persisted choice. A first
+  // The Home organization (GLOSSARY.md, ADR-0098): the persisted choice. A first
   // launch has none, and its boot walk runs with NO home — nothing excluded — so
   // the corpus itself can say which organization this machine works under
   // (`prepareOrganizationStore`, before public readiness). The boot login is
   // only the seed's tie-break and fallback. Label reads may refresh live; they
   // never select the home, since the login file flips whenever the
-  // user signs in elsewhere. `currentHome` is what every store this process
-  // builds is given; its only writers are the seed and the settings watch.
-  const bootLogin = await readCurrentLogin(watchRoots);
+  // user signs in elsewhere. `currentHome` anchors the tracked set every store
+  // this process builds is given (`trackedNow`, below); its only writers are
+  // the seed and the settings watch.
+  const bootLogin = (await readCurrentLogins(watchRoots))[0] ?? null;
   let currentHome: string | null = bootSettings?.homeOrganization ?? null;
+  // The persisted tracked list (the #260 lifecycle decision, item 1). The SET
+  // every store is built with is this list unioned with `currentHome`. The
+  // union POLICY is single-sourced in `resolveTrackedOrganizations` —
+  // `trackedNow()` is this file's one call of it, and `organization-boot.ts`
+  // calls the same function rather than reimplementing the rule — so Home is
+  // always tracked. Its only writers are the boot snapshot and the settings
+  // watch.
+  let currentTracked: readonly string[] = bootSettings?.trackedOrganizations ?? [];
+  const trackedNow = (): ReadonlySet<string> | null =>
+    resolveTrackedOrganizations(currentHome, currentTracked);
+  // The persisted Organization scope (#278), raw: `null` for Home, "all", or a
+  // uuid. The renderer sends it with every request; the sidecar holds it only
+  // so the status's usage connection can describe its Quota organization
+  // (`quotaOrganization`, resolved live, so a stale value reads as Home). Its
+  // only writers are the boot snapshot and the settings watch.
+  let currentScope: string | null = bootSettings?.organizationScope ?? null;
+  // Which Organizations a settings edit is re-walking into the engine right now
+  // (#276). Declared here, beside the set it describes; the settings driver
+  // below marks it, and the roster (`organizations.list`, #287) reads it into
+  // each row's `reingesting`.
+  const reingest = createReingestState();
+  // The Presumed organization rule in force (#277, `engine/presumption.ts`):
+  // what every store answers `presumption()` with, through the `presumptionNow`
+  // thunk each is built with. ONE cell, deliberately — the thunk returns THIS
+  // VARIABLE and must never mint a fresh `createPresumption` per call: the
+  // report cache compares presumption IDENTITY on every rebind, so a per-call
+  // value would clear every entry on every single query. It has three writers,
+  // one per half: the Home — the seed, and the settings driver through
+  // `installHome` — via `withSelfHome`; the Machine directory — the fleet,
+  // through `installPublishedHomes` — via `withPublishedHomes` (#281); and the
+  // Organization assertions — `installAssertions` below, at boot once
+  // organization-assertions.json has loaded, after a PUT that wrote, and after
+  // the fleet adopts a union that changed a claim — via `withAssertions` (#309,
+  // #310). Each swap carries the other writers' halves unchanged, so none drops
+  // another's. `createPresumption` builds the initial cell only.
+  let currentPresumption: Presumption = createPresumption(currentHome);
+  const presumptionNow = (): Presumption => currentPresumption;
+  // #278: scope and owner-less rows read the same installed presumption. A
+  // requested Home may still be queued behind a tracked-set rebuild, so the
+  // Home this answers is the installed one. The endpoints and the live usage
+  // channel both read it.
+  const organizationScope = createOrganizationScope(presumptionNow, trackedNow);
   // What a null setting falls back to once the seed has run. Null until then,
   // so a settings edit that beats the walk is never overridden.
   let seededHome: string | null = null;
@@ -1838,6 +2276,7 @@ async function main(): Promise<void> {
       hasData: false,
       usageConnection: "disconnected",
       usageLastSampleAt: null,
+      organizations: {},
       hubConnection: "off",
       // Not seeding a fleet replica at boot (ADR-0041 M5) — the pull loop sets
       // this only while draining from cursor 0.
@@ -1901,9 +2340,11 @@ async function main(): Promise<void> {
   const organizationRegistry = createOrganizationRegistry({
     path: join(appDataDir, STORAGE_FILE.organizations),
   });
-  // Serialized, never fire-and-forget: `remember()` persists through one fixed
-  // `${path}.tmp` with no write queue, so it must not overlap itself or `load()`
-  // — every later writer (the /api/organizations handler) awaits this first.
+  // Serialized, never fire-and-forget: the registry's write queue orders its
+  // writes against each other but not against `load()`, and a write that ran
+  // ahead of the load would persist a map missing the file's entries — so every
+  // later writer (the /api/organizations handler, discovery's roster seed)
+  // awaits this first.
   const registryReady: Promise<void> = organizationRegistry
     .load()
     .then(() =>
@@ -1912,6 +2353,72 @@ async function main(): Promise<void> {
         : organizationRegistry.remember(bootLogin.organizationUuid, bootLogin.organizationType),
     )
     .catch((err: unknown) => console.error("[sidecar] organization registry load failed:", err));
+  // Every listing's answer records through here, after the boot load: Connect's
+  // discovery (#283), the Hub's roster and the key listing (#366).
+  const recordIntoRegistry = async (orgs: readonly LearnedOrg[]): Promise<boolean> => {
+    await registryReady;
+    return organizationRegistry.recordDiscovery(orgs);
+  };
+  // #287: the user's renames — durable, unlike the registry above, and under
+  // the same rule: its write queue does not order a write against `load()`, and
+  // a `set` that ran ahead of the load would overwrite the user's file with a
+  // map missing its entries. So every reader and writer awaits this first.
+  const organizationLabels = createOrganizationLabels({
+    path: join(appDataDir, STORAGE_FILE.organizationLabels),
+  });
+  const labelsReady: Promise<void> = organizationLabels
+    .load()
+    .catch((err: unknown) => console.error("[sidecar] organization labels load failed:", err));
+  // #310: the user's Organization assertions — durable and user-authored like
+  // the labels. Its load rides the queue every `set` and `merge` joins, so no
+  // edit or adoption can write ahead of it; readers and writers here still
+  // await `assertionsReady`, which also covers the boot install. `engineReady`
+  // waits for it too, so the first report any reader gets already answers
+  // owner-less rows through the persisted claims.
+  const organizationAssertions = createOrganizationAssertions({
+    path: join(appDataDir, STORAGE_FILE.organizationAssertions),
+  });
+  // The presumption cell's assertion writer: installs the store's resolved
+  // claims when they differ from the installed ones, and says whether it
+  // swapped. The PUT and the fleet's adoption follow a swap with the wholesale
+  // invalidation; the boot install precedes every reader and needs none.
+  const installAssertions = (): boolean => {
+    const next = presumptionWithAssertions(currentPresumption, organizationAssertions.resolved());
+    if (next === null) return false;
+    currentPresumption = next;
+    return true;
+  };
+  const assertionsReady: Promise<void> = organizationAssertions
+    .load()
+    .then(() => {
+      installAssertions();
+    })
+    .catch((err: unknown) => console.error("[sidecar] organization assertions load failed:", err));
+  // #311 (ADR-0107 §12): the sessions whose owner-less rows are dormant here —
+  // asserted to an Organization outside the tracked set — read live from the
+  // installed claims and the live tracked set. The placeholder and every store
+  // the fleet builds take it as their snapshot at construction; the boot walk's
+  // stores compute theirs against the walk's own set.
+  const dormantNow = (): ReadonlySet<string> =>
+    dormantSessions(currentPresumption.assertedBySession, trackedNow());
+  // The dormant set the LAST queued change installs (its `nextDormant`), so a
+  // queued change's `previousDormant` is its predecessor's `nextDormant`, as
+  // with the tracked set. Re-anchored at the boot seed.
+  let queuedDormant: ReadonlySet<string> = NO_DORMANT;
+  // After an assertion install: queue a dormant-only change when the install
+  // moved the dormant set. The driver (declared below) is only reached from
+  // the PUT, the fleet's adoption and the seed, all after it exists.
+  const admitAssertions = (): void => {
+    const change = dormantChange({
+      home: currentHome,
+      tracked: trackedNow(),
+      previousDormant: queuedDormant,
+      nextDormant: dormantNow(),
+    });
+    if (change === null) return;
+    queuedDormant = change.nextDormant;
+    void organizationSettings.apply(change);
+  };
 
   // An empty placeholder while the private selection walk runs. No source
   // feeds this store; prepareOrganizationStore installs the first live corpus
@@ -1919,7 +2426,9 @@ async function main(): Promise<void> {
   let engineStore = createEventStore({
     selfMachineId: machineId,
     scanCache,
-    homeOrganization: currentHome,
+    trackedOrganizations: trackedNow(),
+    dormantSessions: dormantNow(),
+    getPresumption: presumptionNow,
   });
   const getEngineStore = (): EventStore => engineStore;
   let resolveLocalReady!: () => void;
@@ -1981,13 +2490,60 @@ async function main(): Promise<void> {
     swapStore: installStore,
     seedLocalArchive: (store) => localArchive.seedInto(store),
     forgetLocalArchive: (sessions) => localArchive.forgetSessions(sessions),
-    // ADR-0098: a rebuild re-derives under whatever home is current — the
-    // settings watch's home change is exactly a rebuild.
+    // #375: the evidence repair's Local archive half (`repairOrganizations`)
+    // removes only the pairs' excluded keys, and bars nothing.
+    forgetExcludedFromLocalArchive: (sessions) => localArchive.forgetExcludedKeys(sessions),
+    // ADR-0098: a rebuild re-derives under whatever tracked set is current —
+    // the settings watch's tracked-set change is exactly a rebuild — and the
+    // dormant snapshot (#311), both read at construction, so every rebuild and
+    // every contribution walk admits under the live pair. The presumption
+    // rides the same live thunk (#277): a fresh store answers owner-less rows
+    // under whatever Homes are current when it is QUERIED — this machine's and
+    // its peers' published ones — not when it was built.
     createStore: () =>
-      createEventStore({ selfMachineId: machineId, scanCache, homeOrganization: currentHome }),
+      createEventStore({
+        selfMachineId: machineId,
+        scanCache,
+        trackedOrganizations: trackedNow(),
+        dormantSessions: dormantNow(),
+        getPresumption: presumptionNow,
+      }),
+    // The directory half of the presumption cell (#281). Runs synchronously
+    // INSIDE `createFleetSync` when the persisted directory cache already names
+    // peer Homes — safe, because `currentPresumption` is declared above, and it
+    // is how a peer's rows are presumed under its Home offline, before any
+    // connect. The fleet pokes the renderers itself after a refresh's swap.
+    installPublishedHomes: (homes) => {
+      currentPresumption = withPublishedHomes(currentPresumption, homes);
+    },
+    // The user's renames (#288), synced with the Hub's Organization directory:
+    // the store is built above, and nothing is pushed or adopted before its
+    // load. An adopted label change pokes the roster here and the reports
+    // through the fleet's own wholesale invalidation, as a local rename does.
+    organizationLabels: {
+      ready: labelsReady,
+      entries: () => organizationLabels.entries(),
+      merge: (incoming) => organizationLabels.merge(incoming),
+    },
+    // The user's Organization assertions (#310), synced with the Hub's
+    // Organization assertion directory: nothing is pushed or adopted before
+    // the boot load. An adoption that changed some session's claim installs
+    // the new claims here; the fleet's own wholesale invalidation follows.
+    organizationAssertions: {
+      ready: assertionsReady,
+      entries: () => organizationAssertions.entries(),
+      merge: (incoming) => organizationAssertions.merge(incoming),
+    },
+    assertionsAdopted: () => {
+      installAssertions();
+      admitAssertions();
+    },
+    // #366: the Hub's roster seeds this machine's.
+    learnOrganizations: recordIntoRegistry,
     getRoots: () => watchRoots,
     emitMachinesChanged: () => liveHub.emitMachinesChanged(),
     emitIdentityChanged: () => liveHub.emitIdentityChanged(),
+    emitOrganizationsChanged: () => liveHub.emitOrganizationsChanged(),
     initial: {
       shareEvents: bootShareEvents,
       fleetReplica: bootFleetReplica,
@@ -1996,16 +2552,50 @@ async function main(): Promise<void> {
   });
 
   // ADR-0098: the one-shot repair of synced history. Runs after the boot gate
-  // (below), after a Home organization change, and on its own retry timer while
-  // a configured hub is unreachable.
+  // (below), after a settings edit that moved the tracked set (#277 — a Home
+  // change that leaves the set alone excludes nothing new, so there is nothing
+  // to repair), and on its own retry timer while a configured hub is
+  // unreachable.
   const organizationRepair = createOrganizationRepair({
     markerPath: join(appDataDir, STORAGE_FILE.organizationRepair),
-    homeOrganization: () => currentHome,
+    trackedOrganizations: () => trackedNow(),
     foreignSessions: () => getEngineStore().foreignSessions(),
     hubTarget: () => hubTargetNow,
     forgetOnHub: (sessions, target) => fleet.repairOrganizations(sessions, target),
-    forgetLocalArchive: (sessions) => localArchive.forgetSessions(sessions),
+    forgetExcludedFromLocalArchive: (sessions) => localArchive.forgetExcludedKeys(sessions),
     rebuild: () => fleet.rebuildEngine(),
+    // #311 (ADR-0107 §12): the dormant half, from the live engine store: its
+    // snapshot (the marker's key) and its locally backed dormant pairs,
+    // forgotten on the Hub losslessly.
+    dormantSessions: () => getEngineStore().dormantSessions(),
+    dormantPairs: () => getEngineStore().dormantPairs(),
+    forgetDormantOnHub: (sessions, target) =>
+      fleet.repairOrganizations(sessions, target, { keepLocalArchive: true }),
+    // #368 review: a done pair whose archive rows the live store now excludes
+    // is repaired again, whatever build wrote its done entry.
+    archivedExcludedPairs: () => localArchive.excludedPairs(),
+  });
+
+  // The ONE driver of Organization settings edits (#276) — constructed here,
+  // beside the repair it runs, because it owns the queue: the settings hook
+  // below hands it a change per edit and it applies them one at a time, in
+  // arrival order. A fresh driver per edit would be no queue at all.
+  const organizationSettings = createOrganizationSettingsDriver({
+    setPollingOrganizations: (ids, home) => usagePoller.setOrganizations([...(ids ?? [])], home),
+    installHome: (home) => {
+      currentPresumption = withSelfHome(currentPresumption, home);
+      // The status's Quota organization follows the install.
+      usagePoller.republish();
+    },
+    releaseRetainedView: () => fleet.releaseRetainedView(),
+    rebuild: (o) => fleet.rebuildEngine(o),
+    repair: () => organizationRepair.run(),
+    resetRepair: () => organizationRepair.reset(),
+    invalidateReports: () => fleet.invalidateReports(),
+    reingest,
+    rosterChanged: () => liveHub.emitOrganizationsChanged(),
+    trackedNow,
+    dormantNow,
   });
 
   // The Repo identity prober (ADR-0062 §2) — the ONE producer of this
@@ -2055,24 +2645,64 @@ async function main(): Promise<void> {
     // save: bytes reported reclaimed, file back seconds later. `drop()` is sticky
     // and suppresses that pending save.
     dropScanCache: () => scanCache.drop(),
+    // Withheld rows leave the Forget verdict and the archive's left edge:
+    // dormant rows (#311) and Excluded-tagged own rows (#295), whether a walked
+    // session's awaiting the scoped repair or a pruned session's that
+    // ADR-0103's accepted departure keeps on the Hub for good.
+    // The breakdown resolves each unbacked row the way every report does, minus
+    // any Organization the store does not track (`forgetOrganizationOf`). Both
+    // read the store PER CALL: a rebuild swaps it, and with it the tracked set
+    // and the dormant snapshot. The presumption is not swapped by a rebuild —
+    // `installAssertions` replaces it live, ahead of the rebuild it queues.
+    withheld: (row) => getEngineStore().isWithheld(row),
+    organizationOf: (row) => forgetOrganizationOf(getEngineStore(), row),
   });
 
   // engineReady gates every data handler on BOTH local sources — the initial
   // scan AND the replica file load (ADR-0041) — but never the network (the hub
   // pull is background). Both are kicked AFTER the LISTENING handshake (below);
   // until then this holds the scan's own `ready` so a request in the boot window
-  // still waits on the scan, exactly as the pre-fleet app did.
-  let engineReady: Promise<void> = localReady;
+  // still waits on the scan, exactly as the pre-fleet app did — and on the
+  // persisted Organization assertions' install (#310), so no report answers
+  // before them.
+  let engineReady: Promise<void> = Promise.all([localReady, assertionsReady]).then(() => undefined);
+  // Marked handled: this boot-window value is replaced right after the
+  // handshake, so when `localReady` rejects (a failed boot walk) nothing may be
+  // awaiting it, and an unobserved rejection reaches the `unhandledRejection`
+  // handler below, which exits(1). Whatever does await it still sees the
+  // rejection.
+  void engineReady.catch(() => {});
 
   // Usage-limits (ADR-0023/0024). Construction is synchronous and reads no file
   // — the on-disk history is loaded by `sampleStore.loadHistory()` *after* the
   // handshake (below), so a large read can't delay the LISTENING line past the
   // Rust shell's 5s timeout.
   const sampleStore = createSampleStore({ path: usageHistoryPath });
-  const usagePoller = createUsagePoller({
+  const usagePoller = createLiveUsagePoller({
     store: sampleStore,
     liveHub,
+    getQuotaOrganization: () => quotaOrganization(currentScope ?? undefined, organizationScope()),
     baseUrl: process.env.MAXPRICE_CLAUDE_BASE_URL,
+  });
+
+  usagePoller.setOrganizations([...(trackedNow() ?? [])], currentHome);
+
+  // Connect's discovery with a session key, under the same dev/test override
+  // the poller and the Hub's discovery read: what POST /api/usage/discover-orgs
+  // proxies and what the key listing below runs.
+  const discoverWithKey = (sessionKey: string): Promise<DiscoverOrgResult> =>
+    discoverOrgs({ sessionKey, baseUrl: process.env.MAXPRICE_CLAUDE_BASE_URL });
+
+  // #366 (#360's resolution): a client with no Hub configured lists its key's
+  // Organizations into the roster itself — on every key arrival and hourly.
+  // A Hub-configured client never does, even in fallback; the fleet's roster
+  // pull is its source.
+  const keyListing = createKeyListing({
+    hubConfigured: () => hubTargetNow !== null,
+    currentKey: () => usagePoller.getCredential()?.sessionKey ?? null,
+    discover: discoverWithKey,
+    record: recordIntoRegistry,
+    changed: () => liveHub.emitOrganizationsChanged(),
   });
 
   // Hub client (ADR-0035): connect/backfill/stream toward an optional hub;
@@ -2098,6 +2728,84 @@ async function main(): Promise<void> {
         void engineReady.then(() => organizationRepair.run());
       },
     },
+  });
+
+  // The Settings roster (ADR-0098, #287) — GET /api/organizations, and what
+  // every rename checks against. A first launch answers only once the walk has
+  // chosen the home, so the renderer's seed never persists a null or a value
+  // about to change.
+  async function listOrganizationRoster(): Promise<OrganizationsResponse> {
+    await homeSettled;
+    // Every root's live login is display-only here ("(current login)"); the
+    // home itself never follows one.
+    const [logins, remoteControlAtStartup] = await Promise.all([
+      readCurrentLogins(watchRoots),
+      // ADR-0101: display-only, like the logins — the hint in Settings.
+      readRemoteControlAtStartup(watchRoots),
+    ]);
+    // After the boot load, never beside it: the write queue does not order a
+    // write against `load()` (see registryReady).
+    await registryReady;
+    // Every login file seen feeds the plan-word registry (labels decision 2).
+    for (const login of logins) {
+      await organizationRegistry.remember(login.organizationUuid, login.organizationType);
+    }
+    // …and every Organization seen in usage gets a first-seen time, even one
+    // no login or discovery ever named.
+    const seen = getEngineStore().organizationsSeen();
+    await organizationRegistry.observe([...seen.machine, ...seen.fleet]);
+    await labelsReady;
+    return listOrganizations({
+      home: currentHome,
+      currentLogins: logins,
+      remoteControlAtStartup,
+      seen,
+      tracked: trackedNow(),
+      // The poller's published per-Organization answers — a hub-connected
+      // client's status mirrors the Hub's map, which is the answer it shows.
+      pollerOrganizations: liveHub.getStatus().organizations,
+      reingesting: reingest.current(),
+      registry: organizationRegistry.entries(),
+      labels: organizationLabels,
+    });
+  }
+  // PUT /api/organizations/:uuid (#287). A rename that changes the stored
+  // label emits the same wholesale invalidation a Home change does (labels
+  // decision 10), so every window refetches, and the roster's own
+  // organizations:changed poke, so every window rereads the roster. Then it
+  // pushes the label map to the Hub's Organization directory (#288), so every
+  // other machine adopts it.
+  const renameOrganization = createOrganizationRename({
+    list: listOrganizationRoster,
+    labels: {
+      set: async (uuid, label) => {
+        await labelsReady;
+        return organizationLabels.set(uuid, label);
+      },
+    },
+    invalidateReports: () => fleet.invalidateReports(),
+    rosterChanged: () => liveHub.emitOrganizationsChanged(),
+    labelsWritten: () => fleet.organizationLabelsChanged(),
+  });
+  // PUT /api/organization-assertions (#310). The target is checked against the
+  // roster the rename reads; a set that wrote installs the claims, invalidates
+  // every report when the presumption swapped, and pushes the map to the Hub's
+  // Organization assertion directory.
+  const assertOrganizations = createOrganizationAssert({
+    roster: listOrganizationRoster,
+    assertions: {
+      set: async (sessionIds, organizationUuid) => {
+        await assertionsReady;
+        return organizationAssertions.set(sessionIds, organizationUuid);
+      },
+    },
+    install: () => {
+      const swapped = installAssertions();
+      admitAssertions();
+      return swapped;
+    },
+    invalidateReports: () => fleet.invalidateReports(),
+    assertionsWritten: () => fleet.organizationAssertionsChanged(),
   });
 
   // Bind first so we know the port, then wire up host validation against it.
@@ -2134,34 +2842,31 @@ async function main(): Promise<void> {
       clean: () => storageReporter.clean(),
       forget: (sessions) => fleet.forget(sessions),
     },
-    // ADR-0098: Settings' Home organization select.
+    // ADR-0098 / #287: the Settings roster and its renames.
     organizations: {
-      list: async () => {
-        // A first launch answers only once the walk has chosen the home, so the
-        // renderer's seed never persists a null or a value about to change.
-        await homeSettled;
-        // The live login is display-only here ("(current login)" in the select);
-        // the home itself never follows it.
-        const [login, remoteControlAtStartup] = await Promise.all([
-          readCurrentLogin(watchRoots),
-          // ADR-0101: display-only, like the login — the hint in Settings.
-          readRemoteControlAtStartup(watchRoots),
-        ]);
-        // After the boot load+remember, never beside it: the registry persists
-        // through one fixed tmp path with no write queue.
-        await registryReady;
-        if (login !== null) {
-          await organizationRegistry.remember(login.organizationUuid, login.organizationType);
-        }
-        return listOrganizations({
-          home: currentHome,
-          currentLogin: login,
-          trackedLimits: usagePoller.getCredential()?.orgId ?? null,
-          remoteControlAtStartup,
-          seen: getEngineStore().organizationsSeen(),
-          registry: organizationRegistry,
-        });
+      list: listOrganizationRoster,
+      rename: renameOrganization,
+      // #283: Connect's discovery seeds the roster.
+      recordDiscovery: async (orgs) => {
+        await recordIntoRegistry(orgs);
       },
+      // #283: a legacy credential push keeps its Organization in the roster.
+      // `remember` never downgrades a known plan word, so a null here only
+      // adds an Organization the roster did not know.
+      rememberOrganization: async (uuid) => {
+        await registryReady;
+        await organizationRegistry.remember(uuid, null);
+      },
+      learnFromKey: (sessionKey) => void keyListing.keyArrived(sessionKey),
+    },
+    organizationScope,
+    // #310: the Organization assertions, read and edited.
+    organizationAssertions: {
+      list: async () => {
+        await assertionsReady;
+        return { assertions: Object.fromEntries(organizationAssertions.resolved()) };
+      },
+      assert: assertOrganizations,
     },
     // Live accessor, not a snapshot: `watchRoots` is reassigned on a settings
     // `claudePaths` edit (below), and POST /api/rescan must scan whatever is
@@ -2172,13 +2877,15 @@ async function main(): Promise<void> {
       getCurrent: usagePoller.getCurrent,
       setCredential: usagePoller.setCredential,
       pollOnce: usagePoller.pollOnce,
-      discoverOrgs: (sessionKey: string) => discoverOrg({ sessionKey }),
+      discoverOrgs: discoverWithKey,
+      stampHistory: sampleStore.stampUnstamped,
     },
-    // Every POST endpoint requires a matching `x-maxprice-auth` header when
-    // this is set (f22). The Tauri shell passes MAXPRICE_AUTH_TOKEN on
-    // spawn; a standalone dev sidecar leaves it unset → no auth enforced.
+    // Every POST endpoint, and the Organization rename PUT (#287), requires a
+    // matching `x-maxprice-auth` header when this is set (f22). The Tauri
+    // shell passes MAXPRICE_AUTH_TOKEN on spawn; a standalone dev sidecar
+    // leaves it unset → no auth enforced.
     authToken: process.env.MAXPRICE_AUTH_TOKEN ?? null,
-    samples: () => sampleStore.all(),
+    samples: (scope) => (scope === undefined ? sampleStore.all() : sampleStore.all(scope)),
     getSaturation: saturationReporting.snapshot,
     hub: {
       // Fan-out (ADR-0041): the hub-client owns the connection; the fleet's
@@ -2247,10 +2954,26 @@ async function main(): Promise<void> {
   // selected home's walk has established its exclusion keys.
   void prepareOrganizationStore({
     home: currentHome,
+    trackedOrganizations: currentTracked,
     loginOrganization: bootLogin?.organizationUuid ?? null,
     roots: watchRoots,
-    createStore: (homeOrganization) =>
-      createEventStore({ selfMachineId: machineId, scanCache, homeOrganization }),
+    assertionsReady,
+    // The dormant snapshot is the set THIS walk admits under: the claims live
+    // when the store is built against the set the walk is handed. For the
+    // first store those are the claims installed at `assertionsReady`; a first
+    // launch's seeded second walk reads whatever claims are live by then. A
+    // first launch's null set makes nothing dormant.
+    createStore: (trackedOrganizations) =>
+      createEventStore({
+        selfMachineId: machineId,
+        scanCache,
+        trackedOrganizations,
+        dormantSessions: dormantSessions(
+          currentPresumption.assertedBySession,
+          trackedOrganizations,
+        ),
+        getPresumption: presumptionNow,
+      }),
     onProgress: (p) => {
       bootTrace.detail("scan", `${p.filesParsed}/${p.filesTotal} files`);
       bootProgress.onScanProgress(p);
@@ -2258,7 +2981,29 @@ async function main(): Promise<void> {
   }).then(({ home, store }) => {
     if (currentHome === null) seededHome = home;
     currentHome = home;
+    usagePoller.setOrganizations([...(trackedNow() ?? [])], currentHome);
+    // A seeded Home is a Home INSTALL, so it installs the presumption too
+    // (#277): without this, a machine whose Home was just chosen from its own
+    // corpus would presume nothing for the life of the process. Before
+    // `installStore`, so the first store any reader ever sees already answers
+    // owner-less rows under it. `withSelfHome`, never `createPresumption`:
+    // the fleet may already have installed peer Homes from the persisted
+    // directory, and a fresh presumption would drop them.
+    const installedHome = currentPresumption.selfHome;
+    currentPresumption = withSelfHome(currentPresumption, currentHome);
+    // The status's Quota organization follows a Home the seed just chose; a
+    // persisted Home was installed at construction.
+    if (currentHome !== installedHome) usagePoller.republish();
+    // The first publish of this machine's Home (#281). It waits for the seed so
+    // a first launch never publishes a placeholder that every peer would then
+    // presume under, and drop its caches for, only to see it replaced.
+    fleet.setHome(currentHome);
     installStore(store);
+    // #311: the installed store's snapshot is what the engine now admits
+    // under. A claim adopted during the walk queues the change that
+    // reconciles it.
+    queuedDormant = store.dormantSessions();
+    admitAssertions();
     settleHome?.();
     resolveLocalReady();
   }, rejectLocalReady);
@@ -2276,6 +3021,9 @@ async function main(): Promise<void> {
         "archive",
         localReady.then(() => localArchive.loadAtBoot()),
       ),
+      // #310: the persisted Organization assertions, installed in the
+      // presumption cell. Local disk only, and it never rejects.
+      bootTrace.track("assertions", assertionsReady),
     ]).then(() => {
       fleet.notifyLocalChange();
     }),
@@ -2409,6 +3157,9 @@ async function main(): Promise<void> {
   // (POST /api/usage/credential). Standalone interval (not SSE-ref-counted) so
   // history accrues on any page (ADR-0024).
   usagePoller.start();
+  // The hourly key listing (#366) beside it: idle on a Hub-configured client,
+  // and until a key is pushed.
+  keyListing.start();
 
   // Standalone/E2E hub opt-in via env (the packaged app pushes via
   // POST /api/hub/config instead). Configured AFTER start(): the hub-client
@@ -2455,6 +3206,8 @@ async function main(): Promise<void> {
         detachModelWatch?.();
         // Cancel the saturation sample timer + any saturated heartbeat.
         saturationReporting.stop();
+        // Cancel the hourly key listing (#366) so no tick fires post-teardown.
+        keyListing.stop();
         // Drain the poller (await its in-flight poll), THEN flush the sample
         // store's queued disk writes, before stopping the server / exiting —
         // otherwise a queued usage-history appendFile can be truncated by
@@ -2504,10 +3257,10 @@ async function main(): Promise<void> {
   // the events that triggered it.
   const jsonlWatcherOptions = (roots: string[]): CreateWatcherOptions => ({
     roots,
-    onRecords: (records, projectSlug, sessionId) => {
+    onRecords: (records, projectSlug, sessionId, isSubagent) => {
       // Through the live accessor (ADR-0041): a fleet rebuild swaps the store, so
       // a watcher flush must feed whatever store is current, not the boot one.
-      getEngineStore().append(records, projectSlug, sessionId);
+      getEngineStore().append(records, projectSlug, sessionId, isSubagent);
       // A project the app has not probed this process — a brand-new checkout,
       // or a new worktree — gets its Repo identity resolved now (ADR-0062),
       // AFTER the append so the flush's own cwd capture is visible to the
@@ -2652,23 +3405,60 @@ async function main(): Promise<void> {
         onSettingsChanged: () => {
           const s = readSettingsFile(settingsPath);
           if (s !== null) {
+            // The resolved tracked set this edit REPLACES — captured before
+            // either of its two inputs is written below, because that set, not
+            // Home, is what decides whether the engine must be rebuilt (#277,
+            // D8). A combined edit (Home and the list at once) is compared
+            // whole, which is the only comparison that can see the two cancel.
+            const previousTracked = trackedNow();
+            const previousDormant = queuedDormant;
+            // The tracked list (the #260 lifecycle decision, item 1) is
+            // re-read on every settings edit so the NEXT store this process
+            // builds uses it — the fleet's `createStore` closes over
+            // `trackedNow()`, so ANY later rebuild (a replica toggle, an epoch
+            // resync, a tracked-set change) picks up the new list, whatever
+            // triggered it. Assigned FIRST so neither the fleet's settings hook
+            // below nor the set comparison can read a stale list, and so a
+            // combined edit rebuilds under both.
+            currentTracked = s.trackedOrganizations;
+            const scopeChanged = s.organizationScope !== currentScope;
+            currentScope = s.organizationScope;
             fleet.applySettings({
               hubShareEvents: s.hubShareEvents,
               hubFleetReplica: s.hubFleetReplica,
             });
-            // ADR-0098: a Home organization change rebuilds the engine under the
-            // new verdicts, then repairs synced history against them. A null
-            // setting falls back to the SEEDED organization, never the login file.
+            // ADR-0098 as amended by #277 (D8) and #276: a Home change always
+            // installs a new presumption, and the RESOLVED tracked set decides
+            // the work — nothing, an additive re-walk, or a scoped repair. A
+            // null setting falls back to the SEEDED organization, never the
+            // login file. Called UNCONDITIONALLY, because a list-only edit
+            // moves the set without moving Home, and that is exactly the live
+            // exclude/track flow. The driver queues it behind whatever edit is
+            // still being applied, so the six values captured here are the
+            // ones it runs with however long it waits.
             const nextHome = s.homeOrganization ?? seededHome;
-            if (nextHome !== currentHome) {
-              currentHome = nextHome;
-              void fleet
-                .rebuildEngine()
-                .then(() => organizationRepair.run())
-                .catch((err: unknown) =>
-                  console.error("[sidecar] home organization change failed:", err),
-                );
-            }
+            const homeChanged = nextHome !== currentHome;
+            currentHome = nextHome;
+            // Publish a changed Home at ARRIVAL, not in the driver's queue
+            // (#281): it is directory metadata and moves no row here, and the
+            // Hub's answer is idempotent, so nothing it could race with is
+            // waiting in that queue. The Hub's machines poke then carries it
+            // to every peer's directory refresh.
+            if (homeChanged) fleet.setHome(currentHome);
+            // #311: computed after both writes, from the new tracked set and the installed claims.
+            const nextDormant = dormantNow();
+            queuedDormant = nextDormant;
+            void organizationSettings.apply({
+              home: currentHome,
+              homeChanged,
+              previousTracked,
+              nextTracked: trackedNow(),
+              previousDormant,
+              nextDormant,
+            });
+            // A scope change moves only which Organization the status's usage
+            // connection describes: one status patch, no reading.
+            if (scopeChanged) usagePoller.republish();
           }
         },
         // A restart that failed leaves the PREVIOUS watcher installed on the

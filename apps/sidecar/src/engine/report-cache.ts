@@ -21,6 +21,7 @@ import {
 } from "./daily";
 import { localDate } from "./local-date";
 import type { ModelRollup } from "./model-rollup";
+import { NO_PRESUMPTION, type Presumption } from "./presumption";
 import type { ProjectBucket } from "./projects";
 import { assembleProjects, foldProjectEvent } from "./projects";
 import type { SessionBucket } from "./sessions";
@@ -42,9 +43,9 @@ import { defaultTimeZone } from "./timezone";
 // from the memoized rest. Entries live per FAMILY (one per report kind —
 // sessions, projects, and the three unbounded dailies: daily, daily-by-project,
 // daily-by-machine), keyed on the JSON-encoded canonicalized filter axes
-// (mode, tz, projects, models, machines — see `familyKey` for why JSON) plus
-// an optional family-specific `extra` component. A per-family LRU (delete+set
-// touch) caps entries at MAX_ENTRIES.
+// (mode, tz, projects, models, machines, organizations — see `familyKey` for
+// why JSON) plus an optional family-specific `extra` component. A per-family
+// LRU (delete+set touch) caps entries at MAX_ENTRIES.
 //
 // WHERE THE DATE WINDOW LIVES differs by family, BY DESIGN — don't unify:
 //   - sessions: NOT in the key. Windowing is a whole-session row post-filter
@@ -140,6 +141,44 @@ import { defaultTimeZone } from "./timezone";
 // next query's rebind sees the new identity and drops the entry — the same
 // "stale at most once" caveat as an evicted or orphaned entry.
 //
+// THE PRESUMPTION RULE. The Organization an owner-less event counts under is
+// answered AT QUERY TIME by the Presumed organization rule (./presumption.ts),
+// never stored on the row — so every entry bakes in whichever presumption was
+// in force when its matcher compiled and its buckets partitioned, and a clean
+// bucket is never re-resolved. A Home change swaps that rule in-session, and
+// so does a peer's published Home arriving through the Machine directory (the
+// fleet's `installPublishedHomes` → `withPublishedHomes`, #281), and so does a
+// changed set of Organization assertions (`withAssertions`, #309 — the claims
+// ride in the same value); each swap mints a NEW object identity
+// (`withSelfHome` / `withPublishedHomes` / `withAssertions`, all through
+// `createPresumption`) — so the same `rebind()` that follows store
+// identity and pricing identity follows presumption identity too:
+// `store.presumption()` is compared to `boundPresumption`, and a change clears
+// ALL family entries — the corpus is untouched (a Home change, ours or a
+// peer's, moves no row and re-walks nothing), but every owner-less row may now
+// resolve under a different Organization — while the store subscription and
+// the seq stamps stay (neither depends on the presumption). The value comes
+// from the STORE, which is its ONE source: the cache takes no injectable of
+// its own, so an entry's retained axis matcher and the cold build's
+// `store.query` resolve through the same rule rather than two copies of it.
+// One source, not one instant: the matcher compiles from the
+// `boundPresumption` this `rebind` snapshotted while the cold build re-reads
+// the live thunk, and the single-flight chain can put a real macrotask between
+// them (only behind a REJECTED prior build, which parks a cold entry on a
+// non-trivial chain). A swap landing in that window partitions under the new
+// Home behind a matcher compiled under the old one — and is cleared by the
+// very next `rebind`, so it is the same "stale at most once" residual the
+// pricing rule already declares below, not a second class of bug.
+// The clear is deliberately WHOLESALE rather than "entries whose `organizations`
+// is non-empty": the axis is not the only dependence — the sessions and projects
+// folds REPORT an Organization (`SessionRow.organizationUuid`,
+// `ProjectRow.organizations`, #278), so an unscoped entry kept warm would go on
+// naming the old Home. No presumption generation rides the entry key, for the
+// reason no pricing generation does: a keyed generation would keep the old-Home
+// entries alive under the LRU until evicted, for zero reuse. Same accepted
+// residual, too — a query whose refold straddles a swap answers under the old
+// rule at most once.
+//
 // THE SINGLE-FLIGHT WORK CHAIN. Each entry serializes its cold build, refolds,
 // and assembly on `entry.work` — a promise chain every query appends to — so
 // two concurrent queries against one entry never interleave their fold work,
@@ -207,6 +246,12 @@ export type ReportFilters = {
   projects: string[];
   models: string[];
   machines: string[];
+  // Organization uuids to scope to — exact matches on each event's
+  // resolved-or-presumed Organization (store.ts's `organizations` axis).
+  // `[]` = every Organization. The handlers fill it from the `organization`
+  // query param through `scopeOrganizations` (#278). REQUIRED, not optional,
+  // so a call site cannot silently forget the scope.
+  organizations: string[];
 };
 
 export type ReportCache = {
@@ -256,18 +301,22 @@ const yieldToLoop = (): Promise<void> => new Promise<void>((resolve) => setImmed
 // Canonical query + family key
 // ---------------------------------------------------------------------------
 
-// The canonicalized query: tz resolved, projects/machines sorted+deduped,
-// models sorted+deduped+LOWERCASED (`matchesModelFilter` is case-insensitive,
-// so lowercasing is semantics-preserving and folds spelling variants of the
-// same filter onto one cache entry). `since`/`until` ride along — never part
-// of the BASE key, but a window-in-key family (projects) encodes them via the
-// `extra` component and reads them at fold time (module header).
+// The canonicalized query: tz resolved, projects/machines/organizations
+// sorted+deduped, models sorted+deduped+LOWERCASED (`matchesModelFilter` is
+// case-insensitive, so lowercasing is semantics-preserving and folds spelling
+// variants of the same filter onto one cache entry). Machine ids and
+// Organization uuids are opaque and matched EXACTLY, so neither is case-folded
+// — two spellings there are two different selections, not one. `since`/`until`
+// ride along — never part of the BASE key, but a window-in-key family
+// (projects) encodes them via the `extra` component and reads them at fold time
+// (module header).
 type Canon = {
   mode: CostMode;
   timeZone: string;
   projects: string[];
   models: string[];
   machines: string[];
+  organizations: string[];
   since?: string;
   until?: string;
   // The by-machine nesting flag — rides along like the window fields: only
@@ -285,6 +334,7 @@ function canonicalize(
     projects: [...new Set(q.projects)].sort(),
     models: [...new Set(q.models.map((m) => m.toLowerCase()))].sort(),
     machines: [...new Set(q.machines)].sort(),
+    organizations: [...new Set(q.organizations)].sort(),
     since: q.since,
     until: q.until,
     includeProjects: q.includeProjects,
@@ -302,7 +352,14 @@ function canonicalize(
 // never contribute on their own — a family that keys on the window says so
 // explicitly through `extra`.
 function familyKey(c: Canon, extra?: string): string {
-  const base = JSON.stringify([c.mode, c.timeZone, c.projects, c.models, c.machines]);
+  const base = JSON.stringify([
+    c.mode,
+    c.timeZone,
+    c.projects,
+    c.models,
+    c.machines,
+    c.organizations,
+  ]);
   return extra === undefined ? base : `${base}|${extra}`;
 }
 
@@ -436,6 +493,11 @@ export function createReportCache(opts: {
 
   let boundStore: EventStore | null = null;
   let boundPricing: unknown = null;
+  // The Presumed organization rule every live entry was compiled under (THE
+  // PRESUMPTION RULE). Seeded with `NO_PRESUMPTION` — the store's OWN default
+  // identity — so a cache over a store that presumes nothing never sees a
+  // phantom swap on its first rebind.
+  let boundPresumption: Presumption = NO_PRESUMPTION;
   let unsubscribe: (() => void) | null = null;
 
   // The seq stamps (see THE SEQ-STAMPING RULE). WeakMap keyed on the exact
@@ -467,8 +529,17 @@ export function createReportCache(opts: {
       // Fresh tmp map per refold — NEVER a retained acc (module header:
       // REFOLDS BUILD A FRESH ACCUMULATOR).
       const tmp = new Map<string, SessionBucket>();
+      // The row's `organizationUuid`, `organizationResolution` and
+      // `organizationSplit` (#312) all resolve through the presumption
+      // `rebind` bound (#278, THE PRESUMPTION RULE), which carries the
+      // Organization assertions beside the Homes (#309).
+      // Entries are cleared on a presumption swap, so a bucket never mixes two
+      // presumptions (Homes or assertion sets) — and it is read ONCE per
+      // refold rather than per event, so a swap landing during a chunk yield
+      // cannot split one bucket's fold across two presumptions either.
+      const presumption = boundPresumption;
       return {
-        fold: (e) => foldSessionEvent(tmp, e, q.mode, q.timeZone),
+        fold: (e) => foldSessionEvent(tmp, e, q.mode, q.timeZone, presumption),
         // Every event in the bucket shares its sessionId, so the fold lands in
         // exactly one tmp slot; `?? null` covers the empty fold.
         finish: (bucketKey) => tmp.get(bucketKey) ?? null,
@@ -493,8 +564,11 @@ export function createReportCache(opts: {
       // REFOLDS BUILD A FRESH ACCUMULATOR; `flushRow`'s modelBreakdowns alias
       // the bucket's live ModelBreakdown objects, like sessions').
       const tmp = new Map<string, ProjectBucket>();
+      // `organizations` resolves through the bound presumption, read once per
+      // refold — see the sessions family above (#278).
+      const presumption = boundPresumption;
       return {
-        fold: (e) => foldProjectEvent(tmp, e, q.mode, q.timeZone, q.since, q.until),
+        fold: (e) => foldProjectEvent(tmp, e, q.mode, q.timeZone, q.since, q.until, presumption),
         // Every event in the bucket shares its slug, so the fold lands in
         // exactly one tmp slot; `?? null` covers the empty fold. An
         // all-out-of-window bucket still yields a non-null acc (all-time
@@ -590,7 +664,7 @@ export function createReportCache(opts: {
     dailyByMachineFamily,
   ];
 
-  // --- rebind (THE REBIND RULE, THE PRICING RULE) --------------------------
+  // --- rebind (THE REBIND RULE, THE PRICING RULE, THE PRESUMPTION RULE) ----
 
   function rebind(): void {
     // Pricing first: a swapped snapshot drops every entry but keeps the store
@@ -603,6 +677,20 @@ export function createReportCache(opts: {
       boundPricing = pricing;
     }
     const store = opts.getStore();
+    // Then the presumption, read from the store — the ONE source of it (THE
+    // PRESUMPTION RULE) — and likewise before the store early-return, because
+    // a Home change that leaves the tracked set alone lands with the store
+    // UNCHANGED: it moves no row and re-walks nothing, so the store identity it
+    // arrives on is the only one it will ever have and an early return would
+    // never see it. (A Home change that DOES move the tracked set rebuilds the
+    // engine moments later and clears these entries a second time, by store
+    // identity. Harmless: the presumption is installed ahead of either effect,
+    // so neither ordering can leave an entry folded under the abandoned Home.)
+    const presumption = store.presumption();
+    if (presumption !== boundPresumption) {
+      for (const family of families) family.entries.clear();
+      boundPresumption = presumption;
+    }
     if (store === boundStore) return;
     unsubscribe?.();
     // A swapped store is a different corpus — every entry is invalid.
@@ -673,10 +761,19 @@ export function createReportCache(opts: {
 
   // Does `e` belong to this entry's corpus? This IS the store-query filter
   // predicate (`compileAxisMatcher`), compiled at entry creation from the same
-  // axes the cold build hands `store.query` — so the built corpus and the
-  // incrementally-fed one cannot drift apart. `null` = unfiltered, everything
-  // belongs. No date axis appears: cached families are unbounded at the store
-  // level (module header: WHERE THE DATE WINDOW LIVES).
+  // axes — and the same presumption — the cold build hands `store.query`, so
+  // the built corpus and the incrementally-fed one cannot drift apart. `null` =
+  // unfiltered, everything belongs. No date axis appears: cached families are
+  // unbounded at the store level (module header: WHERE THE DATE WINDOW LIVES).
+  //
+  // The Organization axis is the ONE place the two compile differently, on
+  // purpose: `query` may normalise away a selection that covers every
+  // Organization present RIGHT NOW (that is what keeps its unfiltered fast path
+  // alive on a single-Organization machine), while this RETAINED matcher never
+  // does. The two agree at every instant — normalising is an identity exactly
+  // when it is taken — and only the retained one has to still be right after a
+  // second Organization's first row lands (store.ts,
+  // `coversEveryOrganizationPresent`).
   function entryMatches<Acc>(entry: Entry<Acc>, e: StoredEvent): boolean {
     return entry.matches === null || entry.matches(e);
   }
@@ -740,7 +837,18 @@ export function createReportCache(opts: {
       // every query hitting this entry shares the bounds and the fold reads
       // them (Entry.q comment).
       q: family.windowInKey ? { ...c } : { ...c, since: undefined, until: undefined },
-      matches: compileAxisMatcher({ projects: c.projects, models: c.models, machines: c.machines }),
+      // Compiled against the presumption `rebind` just bound — the STORE's, so
+      // this matcher and the cold build's `store.query` resolve every
+      // owner-less row's Organization the same way (THE PRESUMPTION RULE).
+      matches: compileAxisMatcher(
+        {
+          projects: c.projects,
+          models: c.models,
+          machines: c.machines,
+          organizations: c.organizations,
+        },
+        boundPresumption,
+      ),
       buckets: new Map(),
       built: false,
       building: false,
@@ -771,6 +879,7 @@ export function createReportCache(opts: {
         projects: entry.q.projects,
         models: entry.q.models,
         machines: entry.q.machines,
+        organizations: entry.q.organizations,
       });
       let sinceYield = 0;
       for (const e of events) {

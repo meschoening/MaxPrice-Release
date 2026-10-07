@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { DEFAULT_WEEK, resolveWeekWindow, type WeekWindow } from "@maxprice/shared";
 import { useNowTick } from "./use-now-tick";
 import { useSettings } from "./use-settings";
+import { useOrganizationScope } from "./use-organization-scope";
 import { useUsageCurrent } from "./use-usage-current";
 
 // The resolved Week (ADR-0083): the Settings `week` + the latest weekly-limit
@@ -12,7 +13,10 @@ import { useUsageCurrent } from "./use-usage-current";
 // touches another field re-resolves to a reference-equal answer anyway.
 export function useWeekWindow(): WeekWindow {
   const { data: settings } = useSettings();
-  const { data: usage } = useUsageCurrent();
+  // The limit-reset Week anchors on the Quota organization's weekly reset
+  // (ADR-0106 §8): the scoped uuid's, or Home's under Home and All.
+  const { quotaOrganization } = useOrganizationScope();
+  const { data: usage } = useUsageCurrent(quotaOrganization);
   const now = useNowTick(60_000);
   const week = settings?.week ?? DEFAULT_WEEK;
   const tz = settings?.timezone;

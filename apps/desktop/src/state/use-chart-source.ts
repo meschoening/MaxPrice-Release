@@ -9,6 +9,7 @@ import {
 import type { GroupByAxis } from "@/lib/group-by";
 import { useFilters, type ChartStyle, type Span } from "./filters";
 import { useSettings, useTimeDisplay } from "./use-settings";
+import { useOrganizationScope } from "./use-organization-scope";
 import { useChartWindow } from "./use-chart-window";
 import { useDailyByProject } from "./use-daily-by-project";
 import { useDailyByMachine } from "./use-daily-by-machine";
@@ -47,6 +48,9 @@ export function useChartSource(input: {
   const { data: settings } = useSettings();
   const costMode = settings?.costMode ?? "auto";
   const tz = settings?.timezone;
+  // ADR-0106: the Organization scope rides all three gated queries beside
+  // `mode` and `tz`, and the assembly memo below deps on it.
+  const { organization } = useOrganizationScope();
   // ADR-0060. The while-loading fallback (`?? DEFAULT_SETTINGS.timeFormat`) is
   // stated ONCE, in `useTimeDisplay` — writing it a second time here is exactly
   // the divergence that hook exists to prevent. Its internal `useSettings()`
@@ -93,6 +97,7 @@ export function useChartSource(input: {
       span,
       mode: costMode,
       tz,
+      organization,
       weekStart: request.intraday.weekStart,
       projects,
       models,
@@ -114,6 +119,7 @@ export function useChartSource(input: {
       until: request.window.chartUntil,
       mode: costMode,
       tz,
+      organization,
       projects,
       models,
       machines: machineAxis.machineParams,
@@ -126,6 +132,7 @@ export function useChartSource(input: {
       until: request.window.chartUntil,
       mode: costMode,
       tz,
+      organization,
       projects,
       models,
       machines: machineAxis.machineParams,
@@ -161,6 +168,9 @@ export function useChartSource(input: {
       span,
       ghostOverlay,
       tz,
+      // ADR-0106: `organization` re-keys the three queries beside `mode`/`tz`;
+      // listed so a scope flip is an explicit dep, never an incidental one.
+      organization,
       // ADR-0060. The exhaustive-deps rule is DISABLED on this hook, so nothing
       // but this line makes the chart re-label when the user flips the setting;
       // omit it and every bucket keeps its mount-time format until an unrelated

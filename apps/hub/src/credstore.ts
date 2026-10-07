@@ -1,6 +1,10 @@
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { usageCredentialSchema, type UsageCredential } from "@maxprice/shared";
+import {
+  storedUsageCredentialSchema,
+  type StoredUsageCredential,
+  type UsageCredential,
+} from "@maxprice/shared";
 
 // TS face of the Rust keyring helper (see credstore/src/main.rs). The secret
 // crosses process boundaries via stdin/stdout only. The helper inherits this
@@ -30,8 +34,10 @@ export function resolveCredstorePath(
   return null;
 }
 
+// `get` reads what the keychain holds — a pre-#283 entry still carries the
+// `orgId` the boot stamp needs (ADR-0104); `set` only ever writes the key.
 export type Credstore = {
-  get: () => Promise<UsageCredential | null>;
+  get: () => Promise<StoredUsageCredential | null>;
   set: (cred: UsageCredential | null) => Promise<void>;
 };
 
@@ -108,7 +114,7 @@ export function createCredstore(
       if (code === 3) return null; // NoEntry
       if (code !== 0) throw new Error(`credstore get failed (exit ${code})`);
       try {
-        const parsed = usageCredentialSchema.safeParse(JSON.parse(stdout));
+        const parsed = storedUsageCredentialSchema.safeParse(JSON.parse(stdout));
         return parsed.success ? parsed.data : null;
       } catch {
         return null; // corrupt keychain value — treat as not configured
@@ -120,7 +126,8 @@ export function createCredstore(
         if (code !== 0) throw new Error(`credstore delete failed (exit ${code})`);
         return;
       }
-      const { code } = await run(["set"], JSON.stringify(cred));
+      const value: UsageCredential = { sessionKey: cred.sessionKey };
+      const { code } = await run(["set"], JSON.stringify(value));
       if (code !== 0) throw new Error(`credstore set failed (exit ${code})`);
     },
   };
@@ -129,12 +136,13 @@ export function createCredstore(
 // Fallback when no helper binary is found (a dev box without cargo): the hub
 // still runs, the credential is memory-only — exactly ADR-0035's rejected-as-
 // end-state but acceptable-as-degraded mode (a client re-push re-arms it).
-export function createMemoryCredstore(): Credstore {
-  let held: UsageCredential | null = null;
+// `initial` seeds it (tests: a pre-#283 entry for the boot migration).
+export function createMemoryCredstore(initial: StoredUsageCredential | null = null): Credstore {
+  let held: StoredUsageCredential | null = initial;
   return {
     get: () => Promise.resolve(held),
     set: (cred) => {
-      held = cred;
+      held = cred === null ? null : { sessionKey: cred.sessionKey };
       return Promise.resolve();
     },
   };

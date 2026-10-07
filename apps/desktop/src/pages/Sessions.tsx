@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import { Check, Copy } from "lucide-react";
 import {
   deriveProjectName,
@@ -11,14 +12,45 @@ import {
 import { resolveDateRange, useFilters } from "@/state/filters";
 import { useWeekWindow } from "@/state/use-week";
 import { useSettings } from "@/state/use-settings";
+import { useOrganizationScope } from "@/state/use-organization-scope";
+import { useOrganizationLabels, useOrganizations } from "@/state/use-organizations";
+import {
+  organizationAssertionsQueryKey,
+  putOrganizationAssertions,
+} from "@/state/use-organization-assertions";
 import { useSessions } from "@/state/use-sessions";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useProjectAxis } from "@/state/use-project-axis";
 import { useCorpusEmpty } from "@/state/use-corpus-empty";
 import { useEscapeToDeselect } from "@/state/use-escape-deselect";
 import { machineName } from "@/lib/machines";
+import {
+  chooserOptions,
+  groupOwnerless,
+  isOwnerless,
+  organizationCellLabels,
+  pruneSelection,
+  selectionSummary,
+  shownSessionIds,
+  type ChooserOption,
+} from "@/lib/session-assignment";
+import {
+  clearWrite,
+  runAssertionWrite,
+  runAssignPick,
+  type AssertionWrite,
+  type AssertionWriteDeps,
+} from "@/lib/assignment-writes";
+import { showToast } from "@/lib/toast";
 import { EmptyState } from "@/components/EmptyState";
 import { DataTable, type Column } from "@/components/data-table";
+import { SessionCell, SessionOrganizationCell } from "@/components/session-attribution";
+import {
+  OwnerlessReviewContent,
+  OwnerlessSwitch,
+  SelectionBarContent,
+} from "@/components/owner-less-review";
+import { AssignExcludedConfirm } from "@/components/assign-excluded-confirm";
 import { MachineChip } from "@/components/machine-chip";
 import { StripPage } from "@/components/strip-page";
 import { DetailStrip, StripIdentity, StripSection, StripStat } from "@/components/detail-strip";
@@ -31,7 +63,9 @@ import { aggregateSessions, type SessionsAggregate } from "@/lib/aggregate";
 import { formatCost, RANGE_LABEL } from "@/lib/list-format";
 import { abbreviate } from "@/lib/active-block";
 import {
+  isOwnerlessView,
   selectedIdFromParams,
+  withOwnerlessParam,
   withoutSelectedParam,
   withSelectedParam,
 } from "@/lib/session-selection";
@@ -41,6 +75,10 @@ function cacheHitPct(s: SessionRow): number {
   const denom = s.inputTokens + s.cacheCreationTokens + s.cacheReadTokens;
   return denom === 0 ? 0 : (s.cacheReadTokens / denom) * 100;
 }
+
+// The empty selection (and no groups opened), shared so an unchanged empty
+// state keeps its identity.
+const NONE: ReadonlySet<string> = new Set();
 
 // Stable row-id accessor. Hoisted to module scope so its identity never
 // changes — DataTable's `processed` memo keys on `rowId`, so an inline arrow
@@ -52,10 +90,20 @@ const sessionRowId = (s: SessionRow): string => s.sessionId;
 // project list needed, so this can never disagree with a row that hasn't loaded.
 const sessionProjectName = (s: SessionRow): string => deriveProjectName(parentProjectPath(s.path));
 
+// What the All-scope Organization cell prints, as search keys: its label (""
+// for the em dash, as before #312) and a partly owned session's owner-less half.
+function organizationSearchKeys(s: SessionRow, labels: ReadonlyMap<string, string>): string[] {
+  const { label, ownerlessLabel } = organizationCellLabels(s, labels);
+  return [label ?? "", ...(ownerlessLabel === undefined ? [] : [ownerlessLabel])];
+}
+
 export function SessionsPage(): React.ReactElement {
   const dateRange = useFilters((s) => s.dateRange);
   const { data: settings } = useSettings();
   const tz = settings?.timezone;
+  // ADR-0106: the Organization scope rides beside `mode` and `tz`.
+  const { organization, isAll, multi } = useOrganizationScope();
+  const labels = useOrganizationLabels();
   // ADR-0062: closure-expanded across Repo identity before it reaches the wire —
   // a repo's sessions from every machine's checkout answer one selection.
   const projects = useProjectAxis().projectParams;
@@ -69,6 +117,7 @@ export function SessionsPage(): React.ReactElement {
     until,
     mode: settings?.costMode ?? "auto",
     tz,
+    organization,
     projects,
     models,
     machines: machineAxis.machineParams,
@@ -100,12 +149,9 @@ export function SessionsPage(): React.ReactElement {
         // truncates instead.
         width: "minmax(0,2fr)",
         sortValue: (s: SessionRow) => s.sessionId,
-        cell: (s: SessionRow) => (
-          <span className="lead">
-            <b>{s.sessionId.slice(0, 8)}</b>
-            <small className="num">{s.sessionId}</small>
-          </span>
-        ),
+        // Past one tracked Organization, an owner-less session's id carries
+        // its `presumed` / `assigned` tag (#312); otherwise the shipped cell.
+        cell: (s: SessionRow) => <SessionCell row={s} labels={labels} multi={multi} />,
       },
       {
         id: "project",
@@ -128,6 +174,22 @@ export function SessionsPage(): React.ReactElement {
               width: "minmax(0,110px)",
               sortValue: (s: SessionRow) => machineName(s.machineId, machineAxis.directory),
               cell: (s: SessionRow) => <MachineChip id={s.machineId} machineAxis={machineAxis} />,
+            } satisfies Column<SessionRow>,
+          ]
+        : []),
+      // The Organization column (#268 item 11): only under All organizations, where
+      // rows from several Organizations share one list. Scoped to one, the chip
+      // already names it. A partly owned session names both halves (#312), and
+      // sorts by the one it leads with.
+      ...(isAll
+        ? [
+            {
+              id: "organization",
+              header: "Organization",
+              width: "minmax(0,140px)",
+              sortValue: (s: SessionRow) => organizationCellLabels(s, labels).label ?? "",
+              isEmpty: (s: SessionRow) => s.organizationUuid === undefined,
+              cell: (s: SessionRow) => <SessionOrganizationCell row={s} labels={labels} />,
             } satisfies Column<SessionRow>,
           ]
         : []),
@@ -171,7 +233,7 @@ export function SessionsPage(): React.ReactElement {
         ),
       },
     ],
-    [machineAxis, wide, barMax],
+    [machineAxis, isAll, multi, labels, wide, barMax],
   );
   const rows = useMemo(() => query.data?.sessions ?? [], [query.data]);
 
@@ -189,8 +251,10 @@ export function SessionsPage(): React.ReactElement {
       deriveProjectName(s.path),
       ...s.modelsUsed,
       ...(machineAxis.enabled ? [machineName(s.machineId, machineAxis.directory)] : []),
+      // Every label the Organization cell prints, both halves of a split.
+      ...(isAll ? organizationSearchKeys(s, labels) : []),
     ],
-    [machineAxis],
+    [machineAxis, isAll, labels],
   );
 
   // Selection lives in the URL so it survives the round-trip through
@@ -220,6 +284,23 @@ export function SessionsPage(): React.ReactElement {
   // Filter totals for the strip's no-selection state (ADR-0016).
   const aggregate = useMemo(() => aggregateSessions(rows), [rows]);
 
+  // The owner-less view (#312 ruling 8): `?ownerless=1` swaps the table for the
+  // review list, past one tracked Organization only — a single-Organization
+  // machine renders no switch and ignores a stale param.
+  const reviewing = isOwnerlessView(searchParams, multi);
+  const ownerlessCount = useMemo(
+    () => (multi ? rows.reduce((n, s) => (isOwnerless(s) ? n + 1 : n), 0) : 0),
+    [multi, rows],
+  );
+  // A push, not a replace, so Back leaves the view the switch entered.
+  const setOwnerless = useCallback(
+    (on: boolean) => setSearchParams((prev) => withOwnerlessParam(prev, on)),
+    [setSearchParams],
+  );
+  const ownerlessSwitch = multi ? (
+    <OwnerlessSwitch ownerless={reviewing} count={ownerlessCount} onChange={setOwnerless} />
+  ) : undefined;
+
   // First-launch empty state: the engine holds no usage data at all. An empty
   // result while the corpus is non-empty is merely a filtered-out date range —
   // that keeps the inline "No sessions in this range." message below.
@@ -231,35 +312,51 @@ export function SessionsPage(): React.ReactElement {
     );
   }
 
+  const strip = selected ? (
+    <SessionDetailStrip session={selected} />
+  ) : query.isPending ? (
+    // The sessions query hasn't resolved yet. Two flavors of the same
+    // shell: a ?selected= id means the user *did* select a session (e.g.
+    // just landed back from /sessions/:id) — say so; otherwise it's a
+    // cold load, where showing the aggregate would assert a false
+    // "0 sessions · $0.00". Once loading settles, a stale id matching no
+    // row falls through to the genuine filter totals.
+    <DetailStrip selected={false}>
+      <span className="text-sm text-soft">
+        {selectedId !== undefined ? "Loading session…" : "Loading…"}
+      </span>
+    </DetailStrip>
+  ) : query.isError && rows.length === 0 ? (
+    // A failed query with nothing cached: the zero aggregate would
+    // assert a false "0 sessions · $0.00" — say what happened instead
+    // (the table body carries the danger inset).
+    <DetailStrip selected={false}>
+      <span className="text-sm text-soft">Couldn&apos;t load sessions.</span>
+    </DetailStrip>
+  ) : (
+    <SessionsAggregateStrip aggregate={aggregate} rangeLabel={RANGE_LABEL[dateRange]} />
+  );
+
+  if (reviewing) {
+    return (
+      <OwnerlessReview
+        rows={rows}
+        loaded={query.data !== undefined}
+        labels={labels}
+        home={settings?.homeOrganization ?? null}
+        searchKeys={searchKeys}
+        strip={strip}
+        headerAction={ownerlessSwitch}
+        emptyMessage={query.isPending ? "Loading…" : undefined}
+        error={query.error}
+      />
+    );
+  }
+
   return (
     <StripPage
       onBackgroundClick={deselect}
-      strip={
-        selected ? (
-          <SessionDetailStrip session={selected} />
-        ) : query.isPending ? (
-          // The sessions query hasn't resolved yet. Two flavors of the same
-          // shell: a ?selected= id means the user *did* select a session (e.g.
-          // just landed back from /sessions/:id) — say so; otherwise it's a
-          // cold load, where showing the aggregate would assert a false
-          // "0 sessions · $0.00". Once loading settles, a stale id matching no
-          // row falls through to the genuine filter totals.
-          <DetailStrip selected={false}>
-            <span className="text-sm text-soft">
-              {selectedId !== undefined ? "Loading session…" : "Loading…"}
-            </span>
-          </DetailStrip>
-        ) : query.isError && rows.length === 0 ? (
-          // A failed query with nothing cached: the zero aggregate would
-          // assert a false "0 sessions · $0.00" — say what happened instead
-          // (the table body carries the danger inset).
-          <DetailStrip selected={false}>
-            <span className="text-sm text-soft">Couldn&apos;t load sessions.</span>
-          </DetailStrip>
-        ) : (
-          <SessionsAggregateStrip aggregate={aggregate} rangeLabel={RANGE_LABEL[dateRange]} />
-        )
-      }
+      strip={strip}
       table={
         <section className="panel table-panel h-full" aria-label="Sessions table">
           <DataTable
@@ -272,20 +369,184 @@ export function SessionsPage(): React.ReactElement {
             // 332px of fixed columns + 96px models minimum + ≥264px shared by
             // the session / project name columns. Below this the table scrolls
             // horizontally instead of crushing them. The Machine column adds
-            // 120px to the floor when the axis is enabled (ADR-0041 M6). At
-            // narrow the row wraps and the floor is dropped entirely — nothing
-            // is off-screen there, so keeping it would leave a phantom scrollbar
+            // 120px to the floor when the axis is enabled (ADR-0041 M6), and the
+            // Organization column 140px under All organizations. Past one
+            // tracked Organization the session column must also hold a tag
+            // (#312): at the plain floor its widest, `presumed · part` after an
+            // all-digit short id, overran the cell by 32px, and the session
+            // column takes 2/3.4 of each added pixel, so 56px more. At narrow
+            // the row wraps and the floor is dropped entirely — nothing is
+            // off-screen there, so keeping it would leave a phantom scrollbar
             // under a row that fits (globals.css `.table-scroll`).
-            minWidth={machineAxis.enabled ? 812 : 692}
+            minWidth={692 + (machineAxis.enabled ? 120 : 0) + (isAll ? 140 : 0) + (multi ? 56 : 0)}
             defaultSort={{ columnId: "lastActivity", dir: "desc" }}
             searchKeys={searchKeys}
             searchPlaceholder="Search sessions…"
             emptyMessage={query.isPending ? "Loading…" : "No sessions in this range."}
             error={query.error}
+            headerAction={ownerlessSwitch}
           />
         </section>
       }
     />
+  );
+}
+
+// An Excluded pick waiting on its confirm: the write as the selection stood at
+// the pick, which is what the dialog's count describes.
+interface ExcludedPick {
+  write: AssertionWrite;
+  label: string;
+}
+
+// The owner-less view: the review list in the table's place, and the selection
+// bar in the strip's while anything is selected (else the page's own strip).
+// Its state lives here, mounted only while the view shows, so leaving it — the
+// switch, Back, or the machine dropping to one tracked Organization — unmounts
+// it, and that is what clears the selection, the search and the open groups.
+function OwnerlessReview({
+  rows,
+  loaded,
+  labels,
+  home,
+  searchKeys,
+  strip,
+  headerAction,
+  emptyMessage,
+  error,
+}: {
+  rows: SessionRow[];
+  // The sessions query holds data. Only loaded data prunes the selection.
+  loaded: boolean;
+  labels: ReadonlyMap<string, string>;
+  // The settings Home: the chooser's first option, marked "(home)".
+  home: string | null;
+  // The table's search keys, so the review search finds what the table's does.
+  searchKeys: (s: SessionRow) => string[];
+  strip: React.ReactNode;
+  headerAction: React.ReactNode;
+  emptyMessage: string | undefined;
+  error: Error | null;
+}): React.ReactElement {
+  // Selected sessionIds, the PUT's key.
+  const [selection, setSelection] = useState<ReadonlySet<string>>(NONE);
+  const [search, setSearch] = useState("");
+  const [open, setOpen] = useState<ReadonlySet<string>>(NONE);
+
+  // Review Focus 2: a write — or any refresh — can move a selected session out
+  // of the result (assigned from Home scope to B) or leave nothing owner-less
+  // in it, so the selection follows the sessions query's data. Adjusted during
+  // render rather than in an effect, so the bar never paints a stale count
+  // (React's "adjusting state when a prop changes"). Only loaded data prunes:
+  // a filter change refetches with no rows in hand, and pruning against those
+  // would drop the whole selection before the new result lands.
+  const live = useMemo(
+    () => (loaded ? pruneSelection(selection, rows) : selection),
+    [loaded, rows, selection],
+  );
+  if (live !== selection) setSelection(live);
+
+  const groups = useMemo(
+    () => groupOwnerless(rows, { search, projectName: sessionProjectName, labels, searchKeys }),
+    [rows, search, labels, searchKeys],
+  );
+  const shownIds = useMemo(() => shownSessionIds(groups), [groups]);
+  const selectedRows = useMemo(() => rows.filter((s) => live.has(s.sessionId)), [rows, live]);
+  const summary = useMemo(() => selectionSummary(selectedRows, sessionProjectName), [selectedRows]);
+  const clearSelection = useCallback(() => setSelection(NONE), []);
+  // Esc clears the selection, as it clears the table's (ADR-0016) — except an
+  // Esc that closes the chooser or the Excluded confirm, which Radix has
+  // already handled: it closes that alone. (The page's own Esc handler still
+  // drops a `?selected=` param, a no-op here without one.)
+  useEscapeToDeselect(clearSelection, { skipHandled: true });
+
+  // The writes (#312). A tracked pick writes at once and an Excluded one
+  // confirms first; either way a success clears the selection and toasts with
+  // Undo, and a failure keeps the selection and toasts the error.
+  const { data: roster } = useOrganizations();
+  const options = useMemo(() => chooserOptions(roster?.organizations ?? [], home), [roster, home]);
+  const [pending, setPending] = useState(false);
+  const [excludedPick, setExcludedPick] = useState<ExcludedPick | null>(null);
+  const qc = useQueryClient();
+  const writeDeps = useMemo<AssertionWriteDeps>(
+    () => ({
+      put: putOrganizationAssertions,
+      invalidate: () => void qc.invalidateQueries({ queryKey: organizationAssertionsQueryKey() }),
+      toast: showToast,
+      setPending,
+      clearSelection,
+    }),
+    [qc, clearSelection],
+  );
+  // The chooser has closed itself by now. Picking its checked target changes
+  // nothing, so it writes nothing and keeps the selection.
+  const assign = (option: ChooserOption): void => {
+    if (pending) return;
+    runAssignPick(option, selectedRows, summary.sharedTarget, {
+      ...writeDeps,
+      confirm: (write, label) => setExcludedPick({ write, label }),
+    });
+  };
+  const clear = (): void => {
+    if (pending) return;
+    const write = clearWrite(selectedRows);
+    if (write.sessionIds.length > 0) void runAssertionWrite(write, writeDeps);
+  };
+
+  return (
+    <>
+      <StripPage
+        onBackgroundClick={clearSelection}
+        strip={
+          selectedRows.length > 0 ? (
+            <SelectionBarContent
+              summary={summary}
+              selected={live}
+              shownIds={shownIds}
+              options={options}
+              onSelectionChange={setSelection}
+              onAssign={assign}
+              onClear={clear}
+              pending={pending}
+            />
+          ) : (
+            strip
+          )
+        }
+        table={
+          <section className="panel table-panel h-full" aria-label="Owner-less sessions">
+            <OwnerlessReviewContent
+              groups={groups}
+              labels={labels}
+              selected={live}
+              open={open}
+              search={search}
+              now={Date.now()}
+              headerAction={headerAction}
+              emptyMessage={emptyMessage}
+              error={error}
+              onSearch={setSearch}
+              onOpenChange={setOpen}
+              onSelectionChange={setSelection}
+            />
+          </section>
+        }
+      />
+      {/* Beside the strip page, not in it, so a click inside the dialog never
+          reaches the page's dead-space handler. */}
+      {excludedPick === null ? null : (
+        <AssignExcludedConfirm
+          count={excludedPick.write.sessionIds.length}
+          label={excludedPick.label}
+          onConfirm={async () => {
+            if (!(await runAssertionWrite(excludedPick.write, writeDeps))) {
+              throw new Error(excludedPick.write.failure);
+            }
+          }}
+          onClose={() => setExcludedPick(null)}
+        />
+      )}
+    </>
   );
 }
 

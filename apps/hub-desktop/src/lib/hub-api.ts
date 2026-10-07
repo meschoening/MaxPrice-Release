@@ -1,11 +1,15 @@
 import {
+  HUB_ORGANIZATIONS_PATH,
   HUB_PROTOCOL_VERSION,
+  ORGANIZATION_DIRECTORY_PATH,
   hubCompactResponseSchema,
   hubClientsResponseSchema,
   hubMachinesResponseSchema,
+  hubOrganizationsResponseSchema,
   hubStatusSchema,
   type HubClientsResponse,
   type HubMachinesResponse,
+  type HubOrganizationsResponse,
   type HubStatus,
 } from "@maxprice/shared";
 import { getOperatorToken, getHubUrl } from "./tauri";
@@ -67,6 +71,23 @@ export async function fetchHubMachines(signal?: AbortSignal): Promise<HubMachine
   return hubMachinesResponseSchema.parse(await res.json());
 }
 
+// --- /api/organizations: ADR-0004 four-piece (#294). The Hub's roster joined
+// with the Organization directory's labels and the live Limits answers. No 404
+// degrade: the console ships in its daemon's artifact, so the route is there.
+export function hubOrganizationsQueryKey(): readonly ["hub-organizations"] {
+  return ["hub-organizations"] as const;
+}
+export function buildHubOrganizationsUrl(): string {
+  return HUB_ORGANIZATIONS_PATH;
+}
+export async function fetchHubOrganizations(
+  signal?: AbortSignal,
+): Promise<HubOrganizationsResponse> {
+  const res = await hubFetch(buildHubOrganizationsUrl(), { signal });
+  if (!res.ok) throw new Error(`${HUB_ORGANIZATIONS_PATH} ${res.status}: ${await res.text()}`);
+  return hubOrganizationsResponseSchema.parse(await res.json());
+}
+
 // --- operator mutations (M7). A non-2xx throws the pinned envelope's `error`
 // string when parseable (the card renders "name already in use: X" inline),
 // else a status-code fallback.
@@ -102,6 +123,14 @@ export async function purgeMachine(machineId: string): Promise<void> {
     method: "DELETE",
   });
   localStorage.removeItem(key);
+}
+// The operator's rename through the Organization directory (#294); a null label
+// clears it back to the resolved default. The Hub's refusals carry its words.
+export function renameOrganization(uuid: string, label: string | null): Promise<void> {
+  return mutate(`${ORGANIZATION_DIRECTORY_PATH}/${encodeURIComponent(uuid)}`, {
+    ...jsonPost({ label }),
+    method: "PUT",
+  });
 }
 export async function compactStore(): Promise<{ freedBytes: number }> {
   const response = await hubFetch("/api/store/compact", { method: "POST" });

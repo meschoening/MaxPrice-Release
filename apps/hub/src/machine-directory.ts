@@ -4,15 +4,17 @@ import { z } from "zod";
 import { hubMachineSchema, type HubMachine } from "@maxprice/shared";
 
 // The hub-persisted machine directory (ADR-0041): machineId → {name,
-// registeredAt, mergedInto}, its own small file beside events.jsonl, atomic
-// whole-file rewrite. Events never carry names — ids resolve at render time
-// (the project-slug pattern). Registration is implicit on any authenticated
-// contact; the default name is the self-reported hostname FROZEN at
-// registration (lightly cleaned; machine-<prefix> fallback), never silently
-// re-adopted (a replacement machine must not swallow another's history).
-// Names are unique, enforced case-insensitively at write time: registration
-// collisions get a numeric suffix, renames get a 409 upstream. `mergedInto`
-// stays null until M7's merge route; it persists now so M7 is additive.
+// registeredAt, mergedInto, homeOrganization}, its own small file beside
+// events.jsonl, atomic whole-file rewrite. Events never carry names — ids
+// resolve at render time (the project-slug pattern). Registration is implicit
+// on any authenticated contact; the default name is the self-reported hostname
+// FROZEN at registration (lightly cleaned; machine-<prefix> fallback), never
+// silently re-adopted (a replacement machine must not swallow another's
+// history). Names are unique, enforced case-insensitively at write time:
+// registration collisions get a numeric suffix, renames get a 409 upstream.
+// `mergedInto` stays null until M7's merge route; it persists now so M7 is
+// additive. `homeOrganization` is the machine's own published Home (#281),
+// written only by its self PUT and stored verbatim; absent = never published.
 
 const directoryFileSchema = z.object({ machines: z.array(hubMachineSchema) }).passthrough();
 
@@ -36,6 +38,12 @@ export type MachineDirectory = {
     machineId: string,
     into: string,
   ) => "ok" | "self" | "cycle" | "unknown-source" | "unknown-target";
+  // Absent and null are the same "nothing published": re-setting either, or
+  // the value already stored, is "unchanged" and rewrites nothing. "invalid"
+  // is a value this directory's own loader would reject (`""`, over the
+  // schema's cap): refused untouched, because one entry that fails
+  // `hubMachineSchema` sends the whole file to `.bak` at the next boot.
+  setHome: (machineId: string, home: string | null) => "ok" | "unchanged" | "unknown" | "invalid";
   remove: (machineId: string) => boolean;
   has: (machineId: string) => boolean;
   list: () => HubMachine[];
@@ -144,6 +152,16 @@ export function createMachineDirectory(opts: {
       }
       const entry = machines.get(machineId)!;
       machines.set(machineId, { ...entry, mergedInto: into });
+      persist();
+      return "ok";
+    },
+    setHome: (machineId, home) => {
+      // The loader's own field, so the two can never disagree.
+      if (!hubMachineSchema.shape.homeOrganization.safeParse(home).success) return "invalid";
+      const entry = machines.get(machineId);
+      if (entry === undefined) return "unknown";
+      if ((entry.homeOrganization ?? null) === home) return "unchanged";
+      machines.set(machineId, { ...entry, homeOrganization: home });
       persist();
       return "ok";
     },

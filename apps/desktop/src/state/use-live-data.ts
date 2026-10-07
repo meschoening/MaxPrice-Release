@@ -3,6 +3,7 @@ import type { BlockRow, DailyRow, ProjectRow, SessionRow } from "@maxprice/share
 import { isoFromYmd, ymdShift } from "@/lib/dates";
 import { resolveDateRange, useFilters } from "./filters";
 import { useSettings } from "./use-settings";
+import { useOrganizationScope } from "./use-organization-scope";
 import { useNowTick } from "./use-now-tick";
 import { useWeekWindow } from "./use-week";
 import { useChartWindow } from "./use-chart-window";
@@ -66,6 +67,9 @@ export function useLiveData(): LiveData {
   const { data: settings } = useSettings();
   const costMode = settings?.costMode ?? "auto";
   const tz = settings?.timezone;
+  // ADR-0106: the Organization scope rides every Live query beside `mode` and
+  // `tz` — absent under Home, so a single-Organization machine's keys stay put.
+  const { organization } = useOrganizationScope();
   // ADR-0062: the project filter reaches the wire closure-expanded across Repo
   // identity — selecting one checkout of a repo queries every checkout of it —
   // and `index` folds the Top-projects rail the same way the Projects table
@@ -99,6 +103,7 @@ export function useLiveData(): LiveData {
     until: today,
     mode: costMode,
     tz,
+    organization,
     projects,
     models,
     machines,
@@ -114,6 +119,7 @@ export function useLiveData(): LiveData {
       since: anchored ? new Date(week.startMs).toISOString() : undefined,
       mode: costMode,
       tz,
+      organization,
       projects,
       models,
       machines,
@@ -146,6 +152,7 @@ export function useLiveData(): LiveData {
       until: anchored ? new Date(week.prevStartMs + elapsedMs).toISOString() : undefined,
       mode: costMode,
       tz,
+      organization,
       projects,
       models,
       machines,
@@ -170,6 +177,7 @@ export function useLiveData(): LiveData {
     until: railUntil,
     mode: costMode,
     tz,
+    organization,
     models,
     machines,
   });
@@ -178,6 +186,7 @@ export function useLiveData(): LiveData {
     until: railUntil,
     mode: costMode,
     tz,
+    organization,
     projects,
     models,
     machines,
@@ -187,6 +196,7 @@ export function useLiveData(): LiveData {
     until: railUntil,
     mode: costMode,
     tz,
+    organization,
     projects,
     models,
     machines,

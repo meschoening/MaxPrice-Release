@@ -56,6 +56,9 @@ export type IntradayHookInput = {
   // The machine filter axis (ADR-0041 M6) — raw machine ids, serialized as
   // repeated `machine=` params (same passthrough as `models`).
   machines?: string[];
+  // The resolved Organization scope (#278) — a tracked uuid or "all"; absent =
+  // the Home organization, and no `organization=` param is emitted.
+  organization?: string;
 };
 
 // Collapse the loose hook input into the canonical `IntradayQueryInput` used
@@ -75,6 +78,7 @@ function normalize(opts: IntradayHookInput): IntradayQueryInput {
     projects: opts.projects,
     models: opts.models,
     machines: opts.machines,
+    organization: opts.organization,
   };
 }
 

@@ -41,6 +41,13 @@ const projectRowSchema = z.object({
   // Machines that contributed IN-WINDOW events, first-seen order (ADR-0041 M5)
   // — range-scoped, parallel to modelsUsed.
   machines: z.array(z.string()),
+  // Organizations the IN-WINDOW events count under — each one's Owner record
+  // evidence, else its Presumed organization — first-seen order (#278).
+  // Range-scoped like `machines`; an event that resolves to no Organization
+  // adds nothing, so `[]` is a real answer. The engine stays one row per
+  // directory: one worked in under two Organizations never splits and names
+  // both (#262 item 5).
+  organizations: z.array(z.string()),
   // Distinct sessions with at least one in-window event (ADR-0068).
   sessions: z.number(),
   // The one all-time field (ADR-0068). Optional per ADR-0006's additive rule.

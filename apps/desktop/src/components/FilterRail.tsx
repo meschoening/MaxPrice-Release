@@ -6,6 +6,7 @@ import { isOptionSelected, selectedOptionCount, toggleOption } from "@/lib/multi
 import { useFilters, type DateRangePreset, resolveDateRange } from "@/state/filters";
 import { corpusExtent, ymdShift } from "@/lib/dates";
 import { useSettings, useTimeDisplay } from "@/state/use-settings";
+import { useOrganizationScope } from "@/state/use-organization-scope";
 import { useWeekWindow } from "@/state/use-week";
 import { weekReadout } from "@/lib/week-copy";
 import { useProjects } from "@/state/use-projects";
@@ -45,6 +46,8 @@ export function FilterRail() {
   const machineAxis = useMachineAxis();
   const { data: settings } = useSettings();
   const tz = settings?.timezone;
+  // ADR-0106: the project options come from the scope's rows, like every table.
+  const { organization } = useOrganizationScope();
 
   // ADR-0083: the `week` preset follows the Week setting — an anchored week
   // resolves to an instant `since` and its own readout below.
@@ -56,6 +59,7 @@ export function FilterRail() {
     until,
     mode: settings?.costMode ?? "auto",
     tz,
+    organization,
   });
 
   // Options come from the rows the rail's range actually has data for — never

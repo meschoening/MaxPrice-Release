@@ -8,6 +8,8 @@ export type TableHeadBarProps = {
   // Row count shown beside the title (post-filter).
   count?: number;
   searchPlaceholder?: string;
+  // The search input's accessible name; `Search <title>` by default.
+  searchLabel?: string;
   className?: string;
   action?: React.ReactNode;
 };
@@ -21,6 +23,7 @@ export function TableHeadBar({
   onSearch,
   count,
   searchPlaceholder = "Search…",
+  searchLabel = `Search ${title.toLowerCase()}`,
   className,
   action,
 }: TableHeadBarProps): React.ReactElement {
@@ -37,7 +40,7 @@ export function TableHeadBar({
           value={search}
           onChange={(e) => onSearch(e.target.value)}
           placeholder={searchPlaceholder}
-          aria-label={`Search ${title.toLowerCase()}`}
+          aria-label={searchLabel}
         />
       </div>
     </div>

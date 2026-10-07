@@ -8,7 +8,10 @@ import { useLiveStatus, type ConnectionState } from "@/state/use-live-status";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useSessionRow } from "@/state/use-session-row";
 import { liveSubtitle, machineName } from "@/lib/machines";
+import { blocksSubtitleSuffix } from "@/lib/organization-scope-view";
+import { useQuotaSurface } from "@/state/use-quota-surface";
 import { RefreshPill } from "@/components/refresh-pill";
+import { TopbarScopeChip } from "@/components/topbar-scope-chip";
 import { cn } from "@/lib/utils";
 import { RANGE_LABEL } from "@/lib/list-format";
 
@@ -21,10 +24,11 @@ const TITLES: Record<string, string> = {
 };
 
 // The floating pill topbar (Glass, ADR-0043): page title + streaming badge +
-// subtitle on the left; refresh chip (with the connection-dot slot) and the
-// theme chip on the right. The old topbar's separate reconnecting indicator
-// is absorbed by the badge and the refresh chip's dot (the mock's
-// connection-dot slot).
+// subtitle on the left; the Organization scope chip (only while two or more
+// Organizations are tracked — ADR-0106), refresh chip (with the connection-dot
+// slot) and the theme chip on the right. The old topbar's separate
+// reconnecting indicator is absorbed by the badge and the refresh chip's dot
+// (the mock's connection-dot slot).
 //
 // The mock's other three right-hand chips are gone, each duplicating a
 // surface that already owns it: the gear (the sidebar's /settings nav item —
@@ -64,6 +68,9 @@ export function Topbar() {
     : isSettings
       ? "Durable app configuration, stored in settings.json."
       : RANGE_LABEL[dateRange];
+  // Every block on the Blocks page is the Quota organization's (ADR-0108), so
+  // under All its subtitle says whose.
+  const { tag: quotaTag } = useQuotaSurface();
 
   return (
     <header className={cn("topbar panel shrink-0", detailSessionId && "has-back")}>
@@ -76,11 +83,14 @@ export function Topbar() {
               <h1>{title}</h1>
               {isLive ? <StreamingBadge /> : null}
             </div>
-            <p className="subtitle truncate">{subtitle}</p>
+            <p className="subtitle truncate">
+              {subtitle + blocksSubtitleSuffix(location.pathname, quotaTag)}
+            </p>
           </div>
         )}
       </div>
       <div className="tb-right">
+        <TopbarScopeChip />
         <RefreshPill />
         <ThemeChip />
       </div>

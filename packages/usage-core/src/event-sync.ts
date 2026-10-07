@@ -8,11 +8,14 @@ import {
   EVENT_PULL_LIMIT_MAX,
   hubStatusSchema,
   HUB_PROTOCOL_VERSION,
+  fleetCopySupersedes,
+  fleetDedupTokenTotal,
+  fleetFullnessPartsExceed,
   type FleetDeletion,
   type FleetEvent,
   type StoredEventWire,
 } from "@maxprice/shared";
-import { fleetEventKey, fleetTokenTotal } from "./fleet-event-store";
+import { fleetEventKey } from "./fleet-event-store";
 import { FleetRecoveryRequired, type FleetEventStore } from "./fleet-sync-store";
 
 export type EventSyncConnection = {
@@ -22,10 +25,11 @@ export type EventSyncConnection = {
 };
 
 // The structural subset of an engine row the stamp predicate (and the prune
-// below) read — (messageId, requestId) identity + the four token totals. Both
-// the raw engine `StoredEvent` and the wire `StoredEventWire` satisfy it, so
-// the push pass scans RAW store rows and projects ONLY the survivors onto the
-// wire shape via `toWire` (no full-corpus wire allocation per push trigger).
+// below) read — (messageId, requestId) identity + the four token totals + the
+// Organization evidence (ADR-0103). Both the raw engine `StoredEvent` and the
+// wire `StoredEventWire` satisfy it, so the push pass scans RAW store rows and
+// projects ONLY the survivors onto the wire shape via `toWire` (no full-corpus
+// wire allocation per push trigger).
 export type StampableRow = {
   messageId: string;
   requestId?: string;
@@ -33,6 +37,7 @@ export type StampableRow = {
   outputTokens: number;
   cacheCreationTokens: number;
   cacheReadTokens: number;
+  organizationUuid?: string;
 };
 
 export type EventSyncDeps<Row extends StampableRow = StoredEventWire> = {
@@ -90,6 +95,49 @@ export type EventSync = {
   stop: () => Promise<void>;
 };
 
+// The acknowledged fullness per key, held as a token total per key and the
+// Organization of each key acknowledged tagged: one number and at most one map
+// entry per pushed row, never one `FleetFullness` object each (#361). The tag
+// is the row's own string, held by reference, because the tag order (#374)
+// compares its value. Read only through `fleetFullnessPartsExceed`, the one
+// fullness order.
+function createAckedFullness() {
+  const totals = new Map<string, number>();
+  const tags = new Map<string, string>();
+  return {
+    /** `row` is strictly fuller than the acknowledged copy of `key`, or none was acknowledged. */
+    exceededBy(key: string, row: StampableRow): boolean {
+      const total = totals.get(key);
+      return (
+        total === undefined ||
+        fleetFullnessPartsExceed(
+          fleetDedupTokenTotal(row),
+          row.organizationUuid,
+          total,
+          tags.get(key),
+        )
+      );
+    },
+    record(key: string, row: StampableRow): void {
+      totals.set(key, fleetDedupTokenTotal(row));
+      if (row.organizationUuid !== undefined) tags.set(key, row.organizationUuid);
+      else tags.delete(key);
+    },
+    delete(key: string): void {
+      totals.delete(key);
+      tags.delete(key);
+    },
+    /** Forgets every key `live` does not hold. */
+    keepOnly(live: ReadonlySet<string>): void {
+      for (const key of totals.keys()) if (!live.has(key)) this.delete(key);
+    },
+    clear(): void {
+      totals.clear();
+      tags.clear();
+    },
+  };
+}
+
 export function createEventSync<Row extends StampableRow = StoredEventWire>(
   deps: EventSyncDeps<Row>,
 ): EventSync {
@@ -113,7 +161,9 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
   let timer: unknown = null;
   let malformed = 0;
   const requests = new Set<AbortController>();
-  const acked = new Map<string, number>();
+  // Per key, the fullness of the copy the Hub last acknowledged from this push
+  // loop — accepted or stamped a loser, either way the Hub holds at least that.
+  const acked = createAckedFullness();
   function invalidateRequests(): void {
     for (const request of requests) request.abort();
   }
@@ -313,16 +363,23 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
       sourceGeneration = fence.deletionGeneration;
     }
     const rows = deps.localEvents();
-    const live = new Set(rows.map((row) => fleetEventKey(row.messageId, row.requestId)));
-    for (const key of acked.keys()) if (!live.has(key)) acked.delete(key);
-    const unstamped = rows.filter((row) => {
-      const held = deps.replica()?.get(row.messageId, row.requestId);
-      return (
-        Math.max(
-          held ? fleetTokenTotal(held) : -Infinity,
-          acked.get(fleetEventKey(row.messageId, row.requestId)) ?? -Infinity,
-        ) < fleetTokenTotal(row)
-      );
+    // Each row's key, built once and read three times below: a pass runs on
+    // every watcher flush, and the keys are most of what it allocates (#361).
+    const keys = rows.map((row) => fleetEventKey(row.messageId, row.requestId));
+    acked.keepOnly(new Set(keys));
+    const replica = deps.replica();
+    // A row is unstamped only while it is strictly fuller (ADR-0103: a larger
+    // total; at an equal total a tag against none, or a smaller tag against a
+    // larger one, #374) than both the replica's held copy and the acked copy —
+    // so a tag gained at an equal total is sent once, and a copy held tagged is
+    // never re-sent untagged.
+    // Fuller than both is fuller than the better of the two, so the pass
+    // builds no object per row beyond its key (#361).
+    const unstamped = rows.filter((row, i) => {
+      const key = keys[i]!;
+      const held = replica?.getByKey(key);
+      if (held !== undefined && !fleetCopySupersedes(row, held)) return false;
+      return acked.exceededBy(key, row);
     });
     const size = deps.pushBatchSize ?? EVENT_PUSH_BATCH_MAX;
     for (let i = 0; i < unstamped.length; i += size) {
@@ -347,8 +404,7 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
       if (!current(g)) return;
       if (receipt.epoch !== fence.epoch || receipt.deletionGeneration !== fence.deletionGeneration)
         throw new FleetRecoveryRequired("Contribution receipt fence changed");
-      for (const row of batch)
-        acked.set(fleetEventKey(row.messageId, row.requestId), fleetTokenTotal(row));
+      for (const row of batch) acked.record(fleetEventKey(row.messageId, row.requestId), row);
     }
   }
   function kick(): void {

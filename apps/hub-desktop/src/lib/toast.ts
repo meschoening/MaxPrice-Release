@@ -1,8 +1,9 @@
 // The toast imperative (T7) — module-level so any surface can land a
 // confirmation on the glass pill without context plumbing. The pill itself is
 // components/toast.tsx's ToastHost, which registers the live emitter on
-// mount; a call with no host mounted is a silent no-op (boot, tests). Kept in
-// lockstep with apps/desktop/src/lib/toast.ts.
+// mount; a call with no host mounted is a silent no-op (boot, tests). A
+// message-only subset of apps/desktop/src/lib/toast.ts, which also takes an
+// action (#312's Undo) the hub has no use for.
 
 type Emit = (message: string) => void;
 

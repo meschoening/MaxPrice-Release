@@ -1,4 +1,5 @@
 import { rename, rm, stat, writeFile } from "node:fs/promises";
+import { internRowStrings } from "@maxprice/shared";
 import { collectUsageRecords } from "./jsonl";
 import { SCAN_CACHE_VERSION, type UsageRecord } from "./types";
 
@@ -170,6 +171,12 @@ async function loadFromDisk(path: string): Promise<Map<string, ScanCacheEntry>> 
     // bounded by the full-rescan fallback", not per-record proof.
     for (const entry of map.values()) {
       if (!sniffsAsEntry(entry)) return new Map();
+    }
+    // Every record stays resident for the process lifetime, and a session's
+    // records all repeat the same model, cwd and Organization: hold each once
+    // (#361), as a fresh parse does (jsonl.ts).
+    for (const entry of map.values()) {
+      for (const record of entry.records) internRowStrings(record);
     }
     return map;
   } catch {

@@ -1,53 +1,56 @@
 import {
   completeUsageSample,
+  type HubStatus,
+  type OrganizationUsageStatus,
   type UsageConnection,
   type UsageCredential,
+  type UsageOrganizations,
   type UsageReading,
 } from "@maxprice/shared";
 import { fetchUsage, type FetchUsageResult } from "./usage-client";
 import type { SampleStore } from "./sample-store";
 
-// Drives the 1/min usage poll (ADR-0023/0024). Holds the credential in memory
-// only (renderer pushes it). The interval is a standalone setInterval — NOT
-// ref-counted on SSE subscribers — so history accrues on any page. Best-effort:
-// a failed poll updates connection status, never throws.
-
-// The hub methods the poller needs. emitUsageSample is added to LiveHub in Task 7; patchStatus already exists.
-export type PollerHub = {
-  // A successful poll can authoritatively report that no account window is in
-  // flight. Broadcast that null just like a sample so live consumers can clear
-  // stale current state without touching the append-only history.
-  emitUsageSample: (sample: UsageReading | null) => void;
-  patchStatus: (partial: {
-    usageConnection: UsageConnection;
-    usageLastSampleAt: string | null;
-  }) => void;
+export type PollerStatus = {
+  usageConnection: UsageConnection;
+  usageLastSampleAt: string | null;
+  organizations: UsageOrganizations;
 };
 
-// The poller's full internal current-state. Distinct from the wire
-// `UsageCurrent` ({ sample } only, ADR-0023/review f10): connection +
-// lastSampleAt feed the status snapshot (zustand) separately, so they live on
-// the poller's internal state, not the narrowed /api/usage/current response.
+export type PollerHub = {
+  // Even null carries its Organization at this internal adapter seam.
+  emitUsageSample: (organization: string, sample: UsageReading | null) => void;
+  patchStatus: (partial: PollerStatus) => void;
+};
+
 export type UsagePollerCurrent = {
   connection: UsageConnection;
   sample: UsageReading | null;
   lastSampleAt: string | null;
-  // The last-known weekly reset, INDEPENDENT of `sample` (ADR-0083): a
-  // successful poll with no weekly window still leaves its cadence known.
   weeklyResetAt: string | null;
 };
 
+type RemoteState = Pick<
+  HubStatus,
+  "usageConnection" | "organizations" | "usageCurrent" | "usageWeeklyResetAt"
+>;
+
 export type UsagePoller = {
   setCredential: (cred: UsageCredential | null) => void;
-  // The auto-heal read seam (ADR-0035): the hub-client reads this machine's
-  // key to push it to a hub whose own credential died. In-memory only, same
-  // lifecycle as the rest of the credential.
+  // The key refused outside a read (the Hub's listing): reads stop until it changes.
+  expireCredential: () => void;
   getCredential: () => UsageCredential | null;
+  // Home is getCurrent()'s default and owns unstamped history; set equality
+  // alone controls re-polling.
+  setOrganizations: (organizations: readonly string[], home: string | null) => void;
+  // The current poll set, as `setOrganizations` last gave it, sorted — the
+  // Organizations this poller answers for, whoever owns polling. Never the
+  // Hub's map.
+  getOrganizations: () => readonly string[];
   pollOnce: () => Promise<void>;
-  getCurrent: () => UsagePollerCurrent;
-  // While a remote Hub owns polling, mirror its authoritative current value
-  // into the loopback /api/usage/current endpoint. This never mutates history.
-  setCurrentSample: (sample: UsageReading | null) => void;
+  getCurrent: (organization?: string | null) => UsagePollerCurrent;
+  // A remote snapshot owns live state while the Hub owns polling. History
+  // replication is independent and never makes an absent entry an answer.
+  setRemoteState: (state: RemoteState | null) => void;
   start: (intervalMs?: number) => void;
   stop: () => Promise<void>;
 };
@@ -55,170 +58,318 @@ export type UsagePoller = {
 export type CreateUsagePollerOptions = {
   store: SampleStore;
   liveHub: PollerHub;
-  // Injected in tests; defaults to the real client. The `signal` is the
-  // per-poll abort seam (F8) — stop() aborts it to cancel an in-flight fetch.
   fetchUsageImpl?: (
     opts: { sessionKey: string; orgId: string },
     signal: AbortSignal,
   ) => Promise<FetchUsageResult>;
-  // Claude API base override — threaded to fetchUsage; the fake-claude rig sets it.
   baseUrl?: string;
-  // Injected in tests to drive the poll cadence deterministically — Bun's
-  // setSystemTime does not fake setInterval, so this DI seam is the only way to
-  // step ticks without real-time waits. Defaults to the global timers.
-  setIntervalImpl?: (cb: () => void, ms: number) => ReturnType<typeof setInterval>;
-  clearIntervalImpl?: (handle: ReturnType<typeof setInterval>) => void;
+  now?: () => number;
+  setTimeoutImpl?: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clearTimeoutImpl?: (handle: ReturnType<typeof setTimeout>) => void;
 };
 
+type Entry = {
+  status?: OrganizationUsageStatus;
+  // undefined: never answered; null: successfully read no window.
+  current?: UsageReading | null;
+  weeklyResetAt?: string;
+  nextAt: number;
+};
+type Flight = { epoch: number; abort: AbortController; promise: Promise<void> };
+const FORBIDDEN_RETRY_MS = 60 * 60_000;
+
+// One key, one scheduler, independent Organization reads (ADR-0104). Each
+// ordinary pass takes a minute, evenly staggered. Explicit refreshes fan out
+// concurrently, then establish a fresh stagger. No timer depends on viewers.
 export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
   const fetchUsageImpl =
-    opts.fetchUsageImpl ??
-    ((c, signal) =>
-      fetchUsage({ sessionKey: c.sessionKey, orgId: c.orgId, baseUrl: opts.baseUrl, signal }));
-  const setIntervalImpl =
-    opts.setIntervalImpl ?? ((cb: () => void, ms: number) => setInterval(cb, ms));
-  const clearIntervalImpl =
-    opts.clearIntervalImpl ?? ((handle: ReturnType<typeof setInterval>) => clearInterval(handle));
+    opts.fetchUsageImpl ?? ((c, signal) => fetchUsage({ ...c, baseUrl: opts.baseUrl, signal }));
+  const now = opts.now ?? Date.now;
+  const setTimer = opts.setTimeoutImpl ?? ((cb, ms) => setTimeout(cb, ms));
+  const clearTimer = opts.clearTimeoutImpl ?? ((handle) => clearTimeout(handle));
   let credential: UsageCredential | null = null;
-  let connection: UsageConnection = "disconnected";
-  // undefined means no poll (local or Hub-owned) has established live state in
-  // this process yet, so first paint may fall back to persisted history. Once a
-  // successful poll says sample OR null, that authoritative value wins.
-  let currentSample: UsageReading | null | undefined;
-  let lastWeeklyResetAt: string | null = null;
-  function setCurrentSample(sample: UsageReading | null): void {
-    currentSample = sample;
-    lastWeeklyResetAt = sample?.weekly?.resetAt ?? lastWeeklyResetAt;
-  }
-  let timer: ReturnType<typeof setInterval> | null = null;
-  // Monotonic credential epoch: bumped on EVERY setCredential() call (set or clear).
-  // runPoll() captures it before the await and bails after, so a Disconnect or a
-  // credential swap mid-flight discards the now-stale resolved sample (f1).
+  let home: string | null = null;
+  let entries = new Map<string, Entry>();
+  let remote: RemoteState | null = null;
+  const remoteWeekly = new Map<string, string>();
+  let expired = false;
+  let running = false;
+  // Initial explicit polls are allowed before start (Hub boot). stop fences
+  // even explicit polls until start returns ownership to this poller.
+  let suspended = false;
+  let intervalMs = 60_000;
+  let timer: ReturnType<typeof setTimeout> | null = null;
   let epoch = 0;
-  // Epoch-aware shared single-flight (f19): one in-flight poll backs BOTH the
-  // interval ticks and the public pollOnce(). A caller coalesces onto it only
-  // while the epoch is unchanged; a credential swap bumps the epoch, so the next
-  // pollOnce() starts a FRESH fetch instead of returning a poll of the previous
-  // credential (the credential endpoint must observe the NEW credential). The
-  // superseded poll's post-await epoch check discards its own result.
-  let inFlight: Promise<void> | null = null;
-  let inFlightEpoch = -1;
-  // Per-poll abort controller (F8): threaded into the fetch so stop() can cancel
-  // an in-flight poll. A black-holed claude.ai would otherwise keep the fetch
-  // parked until its 10s timeout, and the parent-death watchdog awaits stop()
-  // inside shutdown() — that stall would blow the "orphan dies within ~1s"
-  // guarantee (CLAUDE.md). Mirrors hub-client's connectAbort.
-  let pollAbort: AbortController | null = null;
+  const flights = new Map<string, Flight>();
+  const draining = new Set<Promise<void>>();
+  let batch: { epoch: number; promise: Promise<void> } | null = null;
 
-  function setStatus(next: UsageConnection): void {
-    connection = next;
+  function clearSchedule(): void {
+    if (timer !== null) clearTimer(timer);
+    timer = null;
+  }
+  function fence(): void {
+    epoch += 1;
+    clearSchedule();
+    for (const f of flights.values()) f.abort.abort();
+    flights.clear();
+    batch = null;
+  }
+  function organizations(): UsageOrganizations {
+    if (remote !== null) return remote.organizations;
+    return Object.fromEntries(
+      [...entries].flatMap(([id, entry]) =>
+        entry.status === undefined ? [] : [[id, entry.status]],
+      ),
+    );
+  }
+  // The key's state, from which getCurrent derives one Organization's. The Hub
+  // composes a failed or empty discovery on top of this: with no answer it
+  // reads `error`, not `disconnected` (apps/hub/src/usage-status.ts).
+  function keyConnection(): UsageConnection {
+    if (remote !== null) return remote.usageConnection;
+    if (credential === null) return "disconnected";
+    if (expired) return "expired";
+    const answers = Object.values(organizations());
+    if (answers.some((s) => s.limits === "windows" || s.limits === "none")) return "connected";
+    return answers.length === 0 ? "disconnected" : "error";
+  }
+  function publishStatus(): void {
     opts.liveHub.patchStatus({
-      usageConnection: next,
+      usageConnection: keyConnection(),
       usageLastSampleAt: opts.store.latest()?.capturedAt ?? null,
+      organizations: organizations(),
     });
   }
-
-  async function runPoll(): Promise<void> {
-    if (credential === null) return;
-    const myEpoch = epoch;
-    const abort = new AbortController();
-    pollAbort = abort;
-    let result: FetchUsageResult;
-    try {
-      result = await fetchUsageImpl(credential, abort.signal);
-    } finally {
-      // Release our slot once the fetch settles, unless a newer poll claimed it.
-      if (pollAbort === abort) pollAbort = null;
+  function getCurrent(organization = home): UsagePollerCurrent {
+    const latest = organization === null ? null : opts.store.latest({ organization, home });
+    const entry = organization === null ? undefined : entries.get(organization);
+    const status = organization === null ? undefined : organizations()[organization];
+    const remoteCurrent = organization === null ? undefined : remote?.usageCurrent[organization];
+    // Omission is not a new answer. Retain even an authoritative null/partial
+    // from local polling or an earlier remote snapshot before using history.
+    const current = remoteCurrent === undefined ? entry?.current : remoteCurrent;
+    const remoteReset = organization === null ? undefined : remoteWeekly.get(organization);
+    const sample = current === undefined ? latest : current;
+    const key = keyConnection();
+    const connection =
+      key === "expired" || key === "disconnected"
+        ? key
+        : status?.limits === "windows" || status?.limits === "none"
+          ? "connected"
+          : "error";
+    return {
+      connection,
+      sample,
+      lastSampleAt: latest?.capturedAt ?? null,
+      weeklyResetAt:
+        sample?.weekly?.resetAt ??
+        (remoteCurrent === undefined
+          ? entry?.weeklyResetAt
+          : (remoteReset ?? entry?.weeklyResetAt)) ??
+        latest?.weekly.resetAt ??
+        null,
+    };
+  }
+  function canPoll(): boolean {
+    return !suspended && remote === null && credential !== null && !expired;
+  }
+  function stagger(preserveSingleton = false): void {
+    const readable = [...entries.values()].filter((e) => e.status?.limits !== "forbidden");
+    const at = now();
+    if (preserveSingleton && readable.length === 1) {
+      const entry = readable[0]!;
+      if (entry.nextAt <= at)
+        entry.nextAt += (Math.floor((at - entry.nextAt) / intervalMs) + 1) * intervalMs;
+      return;
     }
-    // The credential was cleared (Disconnect) or swapped while this fetch was in
-    // flight — drop the now-stale sample without any side effects (f1). A
-    // stop()-driven abort surfaces as a fetch error here (real fetchUsage
-    // catches it), so the result simply flows through as an "error" status — a
-    // no-op patch on the way down; a fetch that completed normally before the
-    // abort still lands (f17 store-flush ordering preserved).
-    if (credential === null || epoch !== myEpoch) return;
-    if (result.ok) {
-      // `sample: null` = successful poll, no window in flight (ADR-0029).
-      // Preserve history, but replace and broadcast the separate live-current
-      // state so a prior reset cannot survive as a phantom active window.
-      setCurrentSample(result.sample);
-      const historical = completeUsageSample(result.sample);
-      if (historical !== null) opts.store.append(historical);
-      opts.liveHub.emitUsageSample(result.sample);
-      setStatus("connected");
-    } else {
-      setStatus(result.kind === "expired" ? "expired" : "error");
-    }
+    readable.forEach((entry, i) => {
+      entry.nextAt = at + (intervalMs * (i + 1)) / readable.length;
+    });
+  }
+  function schedule(): void {
+    clearSchedule();
+    if (!running || !canPoll() || batch !== null || entries.size === 0) return;
+    const at = Math.min(...[...entries.values()].map((e) => e.nextAt));
+    timer = setTimer(
+      () => {
+        timer = null;
+        const due = now();
+        for (const [id, entry] of entries) {
+          if (entry.nextAt > due) continue;
+          entry.nextAt =
+            due + (entry.status?.limits === "forbidden" ? FORBIDDEN_RETRY_MS : intervalMs);
+          void pollOrganization(id);
+        }
+        schedule();
+      },
+      Math.max(0, at - now()),
+    );
   }
 
+  async function runPoll(id: string, myEpoch: number, abort: AbortController): Promise<void> {
+    const polled = credential!;
+    // Resolve the wrapper on abort even if a test/upstream ignores the signal.
+    // The actual fetch has no side effects here and its late result is fenced.
+    let onAbort!: () => void;
+    const cancelled = new Promise<null>((resolve) => {
+      onAbort = () => resolve(null);
+      abort.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    let result: FetchUsageResult | null;
+    try {
+      result = await Promise.race([
+        fetchUsageImpl({ sessionKey: polled.sessionKey, orgId: id }, abort.signal),
+        cancelled,
+      ]);
+    } catch {
+      result = { ok: false, kind: "error" };
+    } finally {
+      abort.signal.removeEventListener("abort", onAbort);
+    }
+    const entry = entries.get(id);
+    if (result === null || myEpoch !== epoch || abort.signal.aborted || entry === undefined) return;
+    if (!result.ok && result.kind === "expired") {
+      expired = true;
+      fence();
+      publishStatus();
+      return;
+    }
+    const previousLimits = entry.status?.limits;
+    const latest = opts.store.latest({ organization: id, home });
+    if (result.ok) {
+      const reading = result.sample === null ? null : { ...result.sample, organizationUuid: id };
+      entry.current = reading;
+      entry.weeklyResetAt = reading?.weekly?.resetAt ?? entry.weeklyResetAt;
+      const historical = completeUsageSample(reading);
+      if (historical !== null) opts.store.append(historical);
+      entry.status = {
+        limits: reading === null ? "none" : "windows",
+        lastReadAt: new Date(now()).toISOString(),
+        lastSampleAt: opts.store.latest({ organization: id, home })?.capturedAt ?? null,
+      };
+      opts.liveHub.emitUsageSample(id, reading);
+    } else {
+      entry.status = {
+        limits: result.kind === "forbidden" ? "forbidden" : "error",
+        lastReadAt: entry.status?.lastReadAt ?? null,
+        lastSampleAt: latest?.capturedAt ?? null,
+      };
+      if (result.kind === "forbidden") entry.nextAt = now() + FORBIDDEN_RETRY_MS;
+    }
+    // A readability change changes the number of minute slots. Keep the
+    // hourly deadlines independent; re-space only the ordinary readers.
+    if ((previousLimits === "forbidden") !== (entry.status?.limits === "forbidden")) stagger();
+    publishStatus();
+    schedule();
+  }
+
+  function pollOrganization(id: string): Promise<void> {
+    if (!canPoll()) return Promise.resolve();
+    const held = flights.get(id);
+    if (held?.epoch === epoch) return held.promise;
+    const abort = new AbortController();
+    const myEpoch = epoch;
+    const promise = runPoll(id, myEpoch, abort).finally(() => {
+      if (flights.get(id)?.promise === promise) flights.delete(id);
+      draining.delete(promise);
+    });
+    flights.set(id, { epoch: myEpoch, abort, promise });
+    draining.add(promise);
+    return promise;
+  }
   function pollOnce(): Promise<void> {
-    // Coalesce onto the in-flight poll only when it started under the current
-    // epoch; otherwise (a credential swap) start a fresh fetch (f19).
-    if (inFlight !== null && inFlightEpoch === epoch) return inFlight;
-    const startedEpoch = epoch;
-    const p = runPoll()
-      .catch((e) => console.warn("[usage-core] usage poll failed:", e))
-      .finally(() => {
-        // Release the slot only if a newer poll has not already claimed it.
-        if (inFlight === p) {
-          inFlight = null;
-          inFlightEpoch = -1;
-        }
-      });
-    inFlight = p;
-    inFlightEpoch = startedEpoch;
-    return p;
+    if (!canPoll()) return Promise.resolve();
+    if (batch?.epoch === epoch) return batch.promise;
+    clearSchedule();
+    const myEpoch = epoch;
+    const promise = Promise.all([...entries.keys()].map(pollOrganization)).then(() => {
+      if (myEpoch !== epoch) return;
+      batch = null;
+      stagger(true);
+      schedule();
+    });
+    batch = { epoch: myEpoch, promise };
+    return promise;
   }
 
   return {
     setCredential: (cred) => {
+      fence();
       credential = cred;
-      // Bump on EVERY call (set or clear) so any in-flight poll captured under
-      // the previous epoch discards its resolved sample (f1) and the next
-      // pollOnce() refuses to coalesce onto it (f19).
-      epoch++;
-      if (cred === null) setStatus("disconnected");
-      // No immediate poll here — callers (Task 7 wiring) call pollOnce() explicitly
-      // right after setCredential() for immediate feedback. Firing it here creates an
-      // unresolvable async race with any subsequent explicit pollOnce() call in tests
-      // and production alike (double-append, double-broadcast). The interval set by
-      // start() handles all subsequent periodic polls.
+      expired = false;
+      stagger(true);
+      publishStatus();
+      schedule();
+    },
+    // The key was refused outside a read — the Hub's listing answered 401/403
+    // (ADR-0104). The same state a 401 on a read leaves: every read stops until
+    // the credential changes.
+    expireCredential: () => {
+      if (credential === null || expired) return;
+      expired = true;
+      fence();
+      publishStatus();
     },
     getCredential: () => credential,
-    pollOnce,
-    setCurrentSample,
-    getCurrent: () => {
-      const latest = opts.store.latest();
-      const sample = currentSample === undefined ? latest : currentSample;
-      return {
-        connection,
-        sample,
-        lastSampleAt: latest?.capturedAt ?? null,
-        weeklyResetAt:
-          sample?.weekly?.resetAt ?? lastWeeklyResetAt ?? latest?.weekly.resetAt ?? null,
-      };
-    },
-    start: (intervalMs = 60_000) => {
-      // pollOnce() owns the single-flight coalescing, so a tick that lands while
-      // a poll is still running fires no second fetch (f7/f19).
-      timer ??= setIntervalImpl(() => {
-        void pollOnce();
-      }, intervalMs);
-    },
-    stop: () => {
-      if (timer !== null) {
-        clearIntervalImpl(timer);
-        timer = null;
+    setOrganizations: (ids, nextHome) => {
+      const unique = [...new Set(ids)].sort();
+      const changed = unique.length !== entries.size || unique.some((id) => !entries.has(id));
+      const homeChanged = home !== nextHome;
+      home = nextHome;
+      if (changed) {
+        fence();
+        entries = new Map(
+          unique.map((id) => [id, { ...entries.get(id), nextAt: now() + intervalMs }]),
+        );
+        if (canPoll()) void pollOnce();
       }
-      // Abort any in-flight fetch (F8) so a black-holed claude.ai can't park
-      // the poll on its 10s timeout — shutdown() awaits this drain before
-      // process.exit, and the parent-death watchdog's "orphan dies within ~1s"
-      // can't survive a 10s stall. The aborted fetch rejects → runPoll resolves
-      // at once. A fetch already completing normally is unaffected (f17).
-      pollAbort?.abort();
-      // Resolve once any in-flight poll has settled so shutdown can drain the
-      // poller before flushing the sample store (f17). Safe to call repeatedly.
-      return inFlight ?? Promise.resolve();
+      if (changed || homeChanged) publishStatus();
+    },
+    getOrganizations: () => [...entries.keys()],
+    pollOnce,
+    getCurrent,
+    setRemoteState: (state) => {
+      // A Home/set edit can add an Organization after the last remote frame;
+      // copy its authoritative value before relinquishing Hub ownership too.
+      const held = state ?? remote;
+      if (held !== null) {
+        for (const [id, entry] of entries) {
+          if (Object.hasOwn(held.usageCurrent, id)) {
+            entry.current = held.usageCurrent[id]!;
+            entry.weeklyResetAt =
+              entry.current?.weekly?.resetAt ??
+              held.usageWeeklyResetAt[id] ??
+              remoteWeekly.get(id) ??
+              entry.weeklyResetAt;
+          }
+        }
+      }
+      remote = state;
+      if (state !== null) {
+        fence();
+        for (const [id, reset] of Object.entries(state.usageWeeklyResetAt)) {
+          remoteWeekly.set(id, reset);
+        }
+        for (const [id, reading] of Object.entries(state.usageCurrent)) {
+          if (reading?.weekly != null) remoteWeekly.set(id, reading.weekly.resetAt);
+        }
+      }
+      publishStatus();
+    },
+    start: (ms = 60_000) => {
+      if (running && !suspended) return;
+      intervalMs = ms;
+      running = true;
+      suspended = false;
+      stagger();
+      schedule();
+    },
+    stop: async () => {
+      running = false;
+      suspended = true;
+      fence();
+      await Promise.all([...draining]);
     },
   };
 }

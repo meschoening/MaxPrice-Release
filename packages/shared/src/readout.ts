@@ -31,5 +31,13 @@ export const readoutResponseSchema = z.object({
   // window before showing it (windows are shell-owned; ADR-0050/0076), so the
   // shell learns the row's presence here rather than from the webview.
   hasModelWindow: z.boolean(),
+  // Present only while more than one Organization is tracked (ADR-0106 §11,
+  // #291): the Quota organization's display label — the rename, plan word or
+  // short id, collision-suffixed across the roster, never the upstream name —
+  // and whether the request's scope resolved to All organizations. The shell
+  // names the Organization in the Windows tooltip from it and never resolves a
+  // label itself. Absent, not null, on a single-Organization machine, so its
+  // body is byte-identical to before.
+  organizations: z.object({ quotaLabel: z.string(), all: z.boolean() }).optional(),
 });
 export type ReadoutResponse = z.infer<typeof readoutResponseSchema>;

@@ -1,15 +1,19 @@
 import { useMemo } from "react";
 import type { DailyRow, TimeDisplay, WeekWindow } from "@maxprice/shared";
 import { formatRemainingLong } from "@/lib/active-block";
+import type { NoLimits } from "@/lib/organization-scope-view";
 import { usageRingState } from "@/lib/usage-ring";
 import { useLiveStatus } from "@/state/use-live-status";
 import { useNowTick } from "@/state/use-now-tick";
+import { useOrganizationScope } from "@/state/use-organization-scope";
+import { useQuotaSurface } from "@/state/use-quota-surface";
 import { useUsageCurrent } from "@/state/use-usage-current";
 import { useBump } from "@/state/use-bump";
+import { NoLimitsNote } from "@/components/no-limits-note";
 import { UsageExpiredHint } from "@/components/usage-expired-hint";
 import { DeltaChip } from "./delta-chip";
 import { UnpricedChip } from "./unpriced-chip";
-import { weekEyebrowTag, weekRefLabel, weekTag } from "@/lib/week-copy";
+import { weekEyebrowTag, weekRefLabel, weekSubLine } from "@/lib/week-copy";
 import { cn } from "@/lib/utils";
 
 export type ThisWeekTileProps = {
@@ -28,7 +32,9 @@ export type ThisWeekTileProps = {
 // window tag ("Mon Jul 13 → now"), and the delta chip vs last week. The
 // weekly usage limit — the old weekly ring — relocated to a meter row
 // wearing the same Aurora gradient + glow as the 5-hour tracker: both are
-// live polled-limit readings (Glass, ADR-0043).
+// live polled-limit readings (Glass, ADR-0043). The meter is the Quota
+// organization's: under All its label names it, and an Organization with no
+// readable limits gets a note in its place (ADR-0106 §10).
 export function ThisWeekTile({
   rows,
   prevRows,
@@ -38,14 +44,14 @@ export function ThisWeekTile({
 }: ThisWeekTileProps): React.ReactElement {
   const total = useMemo(() => rows.reduce((s, r) => s + r.totalCost, 0), [rows]);
   const prevTotal = useMemo(() => prevRows.reduce((s, r) => s + r.totalCost, 0), [prevRows]);
-  const delta = total - prevTotal;
-  const pct = prevTotal === 0 ? null : (delta / prevTotal) * 100;
-  const valueText = `$${total.toFixed(2)}`;
-  const bumping = useBump(valueText);
+  const bumping = useBump(weekValueText(total));
   const weekModels = useMemo(() => rows.flatMap((r) => r.modelsUsed), [rows]);
 
   const now = useNowTick(60_000);
-  const { data: usage } = useUsageCurrent();
+  // The weekly meter reads the Quota organization's reading (ADR-0106 §8).
+  const { quotaOrganization } = useOrganizationScope();
+  const { data: usage } = useUsageCurrent(quotaOrganization);
+  const { tag: quotaTag, noLimits } = useQuotaSurface();
   const usageConnection = useLiveStatus((s) => s.usageConnection);
   const ring = usageRingState(
     usageConnection === "connected" ? (usage?.sample?.weekly ?? null) : null,
@@ -57,6 +63,58 @@ export function ThisWeekTile({
       ? Math.round(usage.sample.weekly.utilizationPct)
       : null;
 
+  return (
+    <ThisWeekTileContent
+      total={total}
+      prevTotal={prevTotal}
+      models={weekModels}
+      bumping={bumping}
+      rollingStart={rollingStart}
+      week={week}
+      display={display}
+      weeklyPct={weeklyPct}
+      usageExpired={usageConnection === "expired"}
+      quotaTag={quotaTag}
+      noLimits={noLimits}
+    />
+  );
+}
+
+export type ThisWeekTileContentProps = Pick<
+  ThisWeekTileProps,
+  "rollingStart" | "week" | "display"
+> & {
+  total: number;
+  prevTotal: number;
+  // The week's raw model names — the unpriced chip's join input (#110).
+  models: readonly string[];
+  bumping: boolean;
+  // The weekly limit's rounded utilization, or null without a live reading.
+  weeklyPct: number | null;
+  usageExpired: boolean;
+  // The Quota organization's label, set only under All organizations.
+  quotaTag: string | null;
+  // Set when the Quota organization reports no limits, or they can't be read.
+  noLimits: NoLimits | null;
+};
+
+// Pure rendering seam: every live reading and the quota surface arrive as
+// props, so the markup is testable under static rendering.
+export function ThisWeekTileContent({
+  total,
+  prevTotal,
+  models,
+  bumping,
+  rollingStart,
+  week,
+  display,
+  weeklyPct,
+  usageExpired,
+  quotaTag,
+  noLimits,
+}: ThisWeekTileContentProps): React.ReactElement {
+  const delta = total - prevTotal;
+  const pct = prevTotal === 0 ? null : (delta / prevTotal) * 100;
   const eyebrowTag = weekEyebrowTag(week);
 
   return (
@@ -66,18 +124,33 @@ export function ThisWeekTile({
         {eyebrowTag !== null ? <span className="eyebrow-tag"> · {eyebrowTag}</span> : null}
       </span>
       <span className={cn("value num", bumping && "bump")}>
-        {valueText}
-        <UnpricedChip models={weekModels} />
+        {weekValueText(total)}
+        <UnpricedChip models={models} />
       </span>
-      <span className="tile-sub num">{weekTag(week, rollingStart, display)}</span>
-      {week.kind === "rolling" && week.fallback ? (
+      <span className="tile-sub num">
+        {weekSubLine(week, rollingStart, display, noLimits !== null)}
+      </span>
+      {/* An Organization with no readable limits has no weekly reset to wait
+          for, so the fallback is no warning: the sub-line says what it shows. */}
+      {week.kind === "rolling" && week.fallback && noLimits === null ? (
         <span className="inline-flex items-center gap-1 text-[11px] text-warn">
           ⚠ weekly reset unknown — showing last 7 days
         </span>
       ) : null}
-      {weeklyPct !== null ? (
+      {/* An Organization with no readable limits shows no meter, whatever the
+          reading says, and its note sits where the meter would. Under All the
+          meter's label names whose limit it is; the tile's width is the grid's,
+          so a long label ellipsizes, titled in full, and the meter and the
+          percentage keep their room. */}
+      {weeklyPct !== null && noLimits === null ? (
         <div className="limit-row">
-          <label>weekly limit used</label>
+          {quotaTag !== null ? (
+            <label className="min-w-0 truncate" title={`weekly limit used · ${quotaTag}`}>
+              {`weekly limit used · ${quotaTag}`}
+            </label>
+          ) : (
+            <label>weekly limit used</label>
+          )}
           <span
             className="limit-meter"
             role="meter"
@@ -91,10 +164,15 @@ export function ThisWeekTile({
           <b className="num">{weeklyPct}%</b>
         </div>
       ) : null}
+      {noLimits !== null ? <NoLimitsNote noLimits={noLimits} what="weekly" /> : null}
       {/* "prior 7d" / "prior week to date", not the mock's "last week": the
           copy stays honest about which window the delta compares. */}
       <DeltaChip delta={delta} pct={pct} refLabel={weekRefLabel(week)} refValue={prevTotal} />
-      {usageConnection === "expired" ? <UsageExpiredHint /> : null}
+      {usageExpired ? <UsageExpiredHint /> : null}
     </div>
   );
+}
+
+function weekValueText(total: number): string {
+  return `$${total.toFixed(2)}`;
 }

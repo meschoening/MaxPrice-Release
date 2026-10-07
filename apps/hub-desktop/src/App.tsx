@@ -3,6 +3,7 @@ import { ClaudeAccountCard } from "@/components/ClaudeAccountCard";
 import { AccessCard } from "@/components/AccessCard";
 import { ClientsRosterCard } from "@/components/ClientsRosterCard";
 import { MachinesCard } from "@/components/MachinesCard";
+import { OrganizationsCard } from "@/components/OrganizationsCard";
 import { UpdatesCard } from "@/components/UpdatesCard";
 import { ToastHost } from "@/components/toast";
 import { useHubMachines } from "@/state/use-hub-machines";
@@ -47,6 +48,7 @@ export function App(): React.ReactElement {
       <main className="cards">
         <HubStatusCard />
         <ClaudeAccountCard />
+        <OrganizationsCard />
         <AccessCard />
         {machines.data === null ? <ClientsRosterCard /> : <MachinesCard />}
         <UpdatesCard />

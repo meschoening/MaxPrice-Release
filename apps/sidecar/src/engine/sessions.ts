@@ -6,6 +6,13 @@ import { defaultTimeZone } from "./timezone";
 import type { ModelRollup } from "./model-rollup";
 import { byTimestamp, emptyModelRollup, foldModelUsage } from "./model-rollup";
 import {
+  eventOrganization,
+  eventOrganizationResolution,
+  NO_PRESUMPTION,
+  type OrganizationResolution,
+  type Presumption,
+} from "./presumption";
+import {
   capturePath,
   emptyPathCapture,
   resolveProjectPath,
@@ -121,6 +128,26 @@ export type SessionBucket = ModelRollup & {
   // the event's own timestamp so a same-day migration still flips it).
   machineId: string;
   latestTimestamp: string;
+  // The Organization the LATEST event counts under (#278) — evidence first,
+  // an Organization assertion second, the Presumed organization third
+  // (`eventOrganization`), advanced in the same latest-timestamp branch as
+  // `machineId`. `undefined` = that event resolves to no Organization
+  // (untagged, unasserted, nothing presumed), and the row then omits the key.
+  // A session that crosses Organizations still folds into this ONE bucket and
+  // names its latest one — the engine never splits a session (#262 item 5).
+  organizationUuid: string | undefined;
+  // The highest-ranked source any folded event resolved through (#309, see
+  // `RESOLUTION_RANK`) — a SESSION summary, advanced on every fold rather than
+  // in the latest-event branch. `undefined` = no folded event resolved at all,
+  // and the row then omits the key.
+  organizationResolution: OrganizationResolution | undefined;
+  // The LATEST owner-less event (resolved `presumed` or `assigned`) and the
+  // LATEST evidence event, each with the Organization it resolved to (#312) —
+  // advanced by the same `>=` string-timestamp rule as `organizationUuid`, but
+  // per half. `undefined` = no folded event of that kind resolved. The row
+  // carries `organizationSplit` only when both are set.
+  latestOwnerless: OrganizationAtTimestamp | undefined;
+  latestOwned: OrganizationAtTimestamp | undefined;
   // The session's real directory, recovered from its events' `cwd` (ADR-0009)
   // — the `cwd` that encodes back to the project slug, falling back to the
   // first one seen. A session that opens in a repo and switches into a worktree
@@ -129,6 +156,10 @@ export type SessionBucket = ModelRollup & {
   cwd: PathCapture;
 };
 
+// One half of a session's split: the raw ISO timestamp of the latest event of
+// that kind, and the Organization that event resolved to.
+type OrganizationAtTimestamp = { ts: string; org: string };
+
 function emptyBucket(projectSlug: string): SessionBucket {
   return {
     ...emptyModelRollup(),
@@ -136,18 +167,38 @@ function emptyBucket(projectSlug: string): SessionBucket {
     lastActivity: "",
     machineId: "",
     latestTimestamp: "",
+    organizationUuid: undefined,
+    organizationResolution: undefined,
+    latestOwnerless: undefined,
+    latestOwned: undefined,
     cwd: emptyPathCapture(),
   };
 }
 
+// The session summary's precedence (#309): an assertion out-ranks a
+// presumption, which out-ranks evidence. Owner-less rows are what the summary
+// is about — an assertion names a whole session, so they are all assigned or
+// all presumed — and evidence answers only when the session has none. A rank,
+// not a last-fold-wins overwrite, so the answer cannot depend on whether the
+// owned rows come before or after the owner-less ones.
+const RESOLUTION_RANK: Record<OrganizationResolution, number> = {
+  evidence: 1,
+  presumed: 2,
+  assigned: 3,
+};
+
 // Fold one event into a bucket: delegate its four token counts + cost + model
 // breakdown to the shared `foldModelUsage`, capture the first non-empty `cwd`
-// for the later `path` resolution, and advance `lastActivity`.
+// for the later `path` resolution, raise the session's resolution summary,
+// advance the latest event of its half (owner-less or owned), and advance
+// `lastActivity` and the latest-event attribution (machine, resolved
+// Organization).
 function foldEvent(
   bucket: SessionBucket,
   event: StoredEvent,
   mode: CostMode,
   dashed: string,
+  presumption: Presumption,
 ): void {
   const cost = computeCostBreakdown(
     event.model,
@@ -164,6 +215,35 @@ function foldEvent(
   // Events fold in timestamp order, so the fallback is still the first
   // non-empty `cwd`; a `cwd` that encodes to the session's project slug wins.
   capturePath(bucket.cwd, event.projectSlug, event.cwd);
+  // #309: EVERY event raises the summary, not only the latest — the same
+  // bound presumption `organizationUuid` resolves through below, so the two
+  // fields of one row can never have been answered under different rules.
+  const resolution = eventOrganizationResolution(event, presumption);
+  // #278: resolved through THE rule, never read off `event.organizationUuid` —
+  // an owner-less event names its session's asserted Organization, else its
+  // Presumed organization. Defined exactly when `resolution` is.
+  const organization = eventOrganization(event, presumption);
+  if (
+    resolution !== undefined &&
+    (bucket.organizationResolution === undefined ||
+      RESOLUTION_RANK[resolution] > RESOLUTION_RANK[bucket.organizationResolution])
+  ) {
+    bucket.organizationResolution = resolution;
+  }
+  // #312: each half of the split advances on its own latest event, by the
+  // same `>=` STRING compare as the latest-event branch below (ADR-0089: never
+  // by `ms`). Mutated in place — a refold always starts from a fresh bucket,
+  // and `flushRow` copies the two Organizations out.
+  if (resolution !== undefined && organization !== undefined) {
+    const half = resolution === "evidence" ? "latestOwned" : "latestOwnerless";
+    const latest = bucket[half];
+    if (latest === undefined) {
+      bucket[half] = { ts: event.timestamp, org: organization };
+    } else if (event.timestamp >= latest.ts) {
+      latest.ts = event.timestamp;
+      latest.org = organization;
+    }
+  }
   // Events are folded in timestamp order, so the last fold wins — but compare
   // anyway so the field is correct even if a caller passes unsorted events.
   if (dashed > bucket.lastActivity) bucket.lastActivity = dashed;
@@ -172,6 +252,9 @@ function foldEvent(
   if (event.timestamp >= bucket.latestTimestamp) {
     bucket.latestTimestamp = event.timestamp;
     bucket.machineId = event.machineId;
+    // Overwritten even with `undefined`: the latest event decides, not the
+    // last defined one.
+    bucket.organizationUuid = organization;
   }
 }
 
@@ -198,6 +281,24 @@ function flushRow(sessionId: string, bucket: SessionBucket): SessionRow {
     projectPath: bucket.projectSlug,
     path: resolveProjectPath(bucket.projectSlug, bucket.cwd.path),
     machineId: bucket.machineId,
+    // Omitted, never `undefined`/`null`/`""`, when the latest event resolves to
+    // no Organization — so a machine with no Home serves the pre-#278 row.
+    ...(bucket.organizationUuid !== undefined ? { organizationUuid: bucket.organizationUuid } : {}),
+    // Omitted the same way when no event resolved (#309) — so a Home-less,
+    // tag-less machine (the golden corpus) serves the pre-#309 row.
+    ...(bucket.organizationResolution !== undefined
+      ? { organizationResolution: bucket.organizationResolution }
+      : {}),
+    // Present only for a partly owned session (#312): both halves folded, each
+    // resolved. Omitted the same way otherwise, so no pre-#312 row changes.
+    ...(bucket.latestOwnerless !== undefined && bucket.latestOwned !== undefined
+      ? {
+          organizationSplit: {
+            ownerless: bucket.latestOwnerless.org,
+            owned: bucket.latestOwned.org,
+          },
+        }
+      : {}),
   };
 }
 
@@ -232,11 +333,17 @@ function applyWindow(bucket: SessionBucket, since?: string, until?: string): boo
 // a single dirty bucket from its own events with byte-identical arithmetic.
 // Callers must present events in store sort order (ascending timestamp, ties
 // by store insertion order); an unparseable timestamp is dropped whole.
+//
+// `presumption` is the rule the row's `organizationUuid` and
+// `organizationResolution` resolve an owner-less event through (#278, #309):
+// its session's assertion, else its Presumed organization. The default asserts
+// and presumes nothing, so an untagged session's row carries neither field.
 export function foldSessionEvent(
   buckets: Map<string, SessionBucket>,
   event: StoredEvent,
   mode: CostMode,
   timeZone: string,
+  presumption: Presumption = NO_PRESUMPTION,
 ): void {
   const date = localDate(event.timestamp, timeZone);
   // An unparseable timestamp is dropped — the established invariant (see
@@ -247,7 +354,7 @@ export function foldSessionEvent(
     bucket = emptyBucket(event.projectSlug);
     buckets.set(event.sessionId, bucket);
   }
-  foldEvent(bucket, event, mode, date.dashed);
+  foldEvent(bucket, event, mode, date.dashed, presumption);
 }
 
 // Flush finished buckets into the wire response — the exact assembly tail of
@@ -293,6 +400,11 @@ export type AggregateSessionsOptions = {
   // (ADR-0015) — the request's `tz`. Only consulted via `localDate`; omitted =
   // the host zone.
   timeZone?: string;
+  // The rule each row's `organizationUuid` and `organizationResolution` resolve
+  // an owner-less event through (#278, #309) — the store's own `presumption()`
+  // when the oracle is compared against the report cache; omitted = assert and
+  // presume nothing.
+  presumption?: Presumption;
 };
 
 // TEST-ONLY ORACLE — production-dead (ADR-0057). The shipped path is
@@ -322,7 +434,7 @@ export function aggregateSessions(
   // Group timestamp-sorted events into session-keyed buckets.
   const buckets = new Map<string, SessionBucket>();
   for (const event of byTimestamp(events)) {
-    foldSessionEvent(buckets, event, mode, timeZone);
+    foldSessionEvent(buckets, event, mode, timeZone, options.presumption);
   }
 
   return assembleSessions(buckets, options.since, options.until);

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { UsageReading } from "@maxprice/shared";
+import type { DiscoveredOrg, ListedOrg, OrgLimitsAnswer, UsageReading } from "@maxprice/shared";
 
 // Outbound client for Anthropic's undocumented subscription-usage endpoint
 // (ADR-0023). Best-effort, mirrors pricing-refresh.ts: injected fetch, timeout,
@@ -17,21 +17,31 @@ export const DEFAULT_CLAUDE_BASE_URL = "https://claude.ai/api";
 // `resets_at` (ISO, +00:00 offset). `.passthrough()` keeps the many other
 // upstream fields (seven_day_opus, seven_day_sonnet, extra_usage, …) from
 // failing validation — we read only two. `resets_at` tolerates null
-// (ADR-0029): a plausible no-window-in-flight state right after an
-// out-of-band reset — never yet observed, but it must not fail the whole
-// poll into a misleading "error" connection state.
-const upstreamWindowSchema = z.object({
-  utilization: z.number(),
-  resets_at: z.string().nullable(),
-});
-// The newer `limits[]` list (observed 2026-08-26) restates the two windows and
-// adds the model-scoped weekly one — `kind: "weekly_scoped"` with
-// `scope.model.display_name` naming the family ("Fable"; `scope.model.id` was
-// null, so the display name is the only handle). `five_hour`/`seven_day` keep
-// being read from their proven top-level fields; only the scoped window comes
-// from here, and the whole list is optional so an older payload still parses.
-// Entries are `.passthrough()` + `.catch` so one unexpected entry shape drops
-// that entry rather than the poll.
+// (ADR-0029): the no-window-in-flight state, observed for real on an
+// Enterprise org's `five_hour` (2026-09-17). The WHOLE window tolerates null
+// too (#270): the same org's `seven_day` is the literal `null`, and that is
+// "answered, no weekly window", never a shape mismatch — a tracked Enterprise
+// org used to poll into a permanent "error" over it. Nullable is not optional:
+// a payload missing the key outright is still the shape change ADR-0023's
+// firebreak exists for.
+const upstreamWindowSchema = z
+  .object({
+    utilization: z.number(),
+    resets_at: z.string().nullable(),
+  })
+  .nullable();
+// The `limits[]` list (observed 2026-08-26; kinds re-confirmed by the
+// 2026-09-17 probe): one entry per limit — `session` and `weekly_all` restate
+// the two top-level windows, and `weekly_scoped` carries the scoped weekly
+// one — each with `group`, `severity`, `is_active` beside the fields read
+// here. The model-scoped entry names the family via `scope.model.display_name`
+// ("Fable"; `scope.model.id` was null, so the display name is the only
+// handle); an Enterprise org's `weekly_scoped` is SURFACE-scoped instead
+// (`scope.model: null`, `scope.surface.display_name` set) and is skipped.
+// `five_hour`/`seven_day` keep being read from their proven top-level fields;
+// only the scoped window comes from here, and the whole list is optional so an
+// older payload still parses. Entries are `.passthrough()` + `.catch` so one
+// unexpected entry shape drops that entry rather than the poll.
 const upstreamLimitSchema = z
   .object({
     kind: z.string(),
@@ -67,20 +77,31 @@ export function modelScopedWindow(
   return undefined;
 }
 
-// Orgs carry `capabilities` so the caller can pick the SUBSCRIPTION org, not an
-// API-only org (the spike showed the user has both; the API org does not return
-// subscription limits). `.catch([])` tolerates an org missing the field.
+// Orgs carry `capabilities` and four more fields a label may use (#268's
+// resolver): roster hints. Readability is never judged from them — an
+// Enterprise org carries `chat` too, so `discoverOrgs` below asks each org's
+// usage endpoint (#270). The free-text `name` is never read: it can embed the
+// account email (ADR-0098 §6). `.catch` makes every hint tolerate an org that
+// omits it or sends another type.
+const upstreamHintSchema = z.string().nullable().optional().catch(null);
 const upstreamOrgsSchema = z.array(
   z
     .object({
       uuid: z.string(),
-      name: z.string(),
       capabilities: z.array(z.string()).catch([]),
+      rate_limit_tier: upstreamHintSchema,
+      billing_type: upstreamHintSchema,
+      raven_type: upstreamHintSchema,
+      analytics_subscription_plan: upstreamHintSchema,
     })
     .passthrough(),
 );
 
-export type UsageFailKind = "expired" | "error";
+// `expired` — 401, the session key is dead; `forbidden` — 403, this key may
+// not read THIS org's usage (an API-only org answers so, with
+// `x-should-retry: false`), which says nothing about the key (#270); `error` —
+// everything else.
+export type UsageFailKind = "expired" | "forbidden" | "error";
 // Each window survives independently; null means none has a reset in flight.
 export type FetchUsageResult =
   | { ok: true; sample: UsageReading | null }
@@ -132,7 +153,8 @@ export async function fetchUsage(opts: FetchUsageOptions): Promise<FetchUsageRes
         ? AbortSignal.any([opts.signal, AbortSignal.timeout(timeoutMs)])
         : AbortSignal.timeout(timeoutMs),
     });
-    if (res.status === 401 || res.status === 403) return { ok: false, kind: "expired" };
+    if (res.status === 401) return { ok: false, kind: "expired" };
+    if (res.status === 403) return { ok: false, kind: "forbidden" };
     if (!res.ok) return { ok: false, kind: "error" };
     const parsed = upstreamUsageSchema.safeParse(await res.json());
     if (!parsed.success) {
@@ -143,14 +165,14 @@ export async function fetchUsage(opts: FetchUsageOptions): Promise<FetchUsageRes
     const sample: UsageReading = {
       capturedAt: nowIso(),
       fiveHour:
-        u.five_hour.resets_at === null
+        u.five_hour?.resets_at == null
           ? null
           : {
               utilizationPct: u.five_hour.utilization,
               resetAt: u.five_hour.resets_at,
             },
       weekly:
-        u.seven_day.resets_at === null
+        u.seven_day?.resets_at == null
           ? null
           : {
               utilizationPct: u.seven_day.utilization,
@@ -172,17 +194,30 @@ export async function fetchUsage(opts: FetchUsageOptions): Promise<FetchUsageRes
   }
 }
 
-export type DiscoveredOrg = { id: string; name: string; capabilities: string[] };
+// The listing's failure kinds. A 403 on GET /organizations is not a per-org
+// refusal — the key cannot enumerate orgs at all — so it stays `expired` here.
+export type DiscoverFailKind = "expired" | "error";
+export type ListOrgsResult =
+  | { ok: true; orgs: ListedOrg[] }
+  | { ok: false; kind: DiscoverFailKind };
+// One org with what its usage endpoint answered — the wire shape of
+// POST /api/usage/discover-orgs and what Connect seeds the roster with.
 export type DiscoverOrgResult =
   | { ok: true; orgs: DiscoveredOrg[] }
-  | { ok: false; kind: UsageFailKind };
+  | { ok: false; kind: DiscoverFailKind };
 
-export async function discoverOrg(opts: {
+export type DiscoverOrgOptions = {
   sessionKey: string;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
   baseUrl?: string;
-}): Promise<DiscoverOrgResult> {
+};
+
+// The bare listing — GET /organizations, one request, no probing: each org's
+// id and roster hints. It is what the Hub's poll set uses (#283), since the
+// poller then observes every Organization's Limits answer on its own reads;
+// Connect's `discoverOrgs` below adds the per-Organization probe.
+export async function discoverOrg(opts: DiscoverOrgOptions): Promise<ListOrgsResult> {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const base = opts.baseUrl ?? DEFAULT_CLAUDE_BASE_URL;
@@ -198,7 +233,18 @@ export async function discoverOrg(opts: {
     if (!parsed.success || parsed.data.length === 0) return { ok: false, kind: "error" };
     return {
       ok: true,
-      orgs: parsed.data.map((o) => ({ id: o.uuid, name: o.name, capabilities: o.capabilities })),
+      orgs: parsed.data.map(
+        (o): ListedOrg => ({
+          id: o.uuid,
+          hints: {
+            capabilities: o.capabilities,
+            rateLimitTier: o.rate_limit_tier ?? null,
+            billingType: o.billing_type ?? null,
+            ravenType: o.raven_type ?? null,
+            analyticsSubscriptionPlan: o.analytics_subscription_plan ?? null,
+          },
+        }),
+      ),
     };
   } catch (err) {
     console.warn(
@@ -207,4 +253,38 @@ export async function discoverOrg(opts: {
     );
     return { ok: false, kind: "error" };
   }
+}
+
+function limitsAnswer(result: FetchUsageResult): OrgLimitsAnswer {
+  if (result.ok) return result.sample === null ? "none" : "windows";
+  // A 401 here after a 200 listing is the key dying between two requests;
+  // there is no better word for that org than "error", and the next poll will
+  // say `expired` on its own.
+  return result.kind === "forbidden" ? "forbidden" : "error";
+}
+
+// Connect's discovery (#270): list the orgs, then ask every one's usage
+// endpoint what it answers, concurrently — one extra GET per org, which the
+// probe found no rate-limit signal against. Connect runs it when the user
+// pastes a key; a client with no Hub configured also runs it on every key
+// arrival and hourly (#366, the sidecar's key-listing.ts): four requests an
+// hour for a three-org key, beside the 60+ its polls already send.
+// The listing's failure is discovery's failure; a single org's probe failing
+// is that org's `limits: "error"` and never fails the whole discovery.
+export async function discoverOrgs(opts: DiscoverOrgOptions): Promise<DiscoverOrgResult> {
+  const listed = await discoverOrg(opts);
+  if (!listed.ok) return listed;
+  const orgs = await Promise.all(
+    listed.orgs.map(async (o): Promise<DiscoveredOrg> => {
+      const probe = await fetchUsage({
+        sessionKey: opts.sessionKey,
+        orgId: o.id,
+        fetchImpl: opts.fetchImpl,
+        timeoutMs: opts.timeoutMs,
+        baseUrl: opts.baseUrl,
+      });
+      return { ...o, limits: limitsAnswer(probe) };
+    }),
+  );
+  return { ok: true, orgs };
 }

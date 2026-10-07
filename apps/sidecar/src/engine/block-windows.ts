@@ -12,11 +12,12 @@ import type { BlockRow, UsageSample } from "@maxprice/shared";
 // row's peak query is a binary search + in-window scan.
 
 // PRECONDITION — sorted sample store. The `samples` arrays consumed here are
-// the sample store's `all()` (packages/usage-core/src/sample-store.ts), kept capturedAt-ascending
-// by contract: loadHistory sorts the persisted history and append pushes in
-// capturedAt order. The latest-sample reads (`latestSampleWindow` and
-// precomputeSamples' `latestUtil`, both `samples[samples.length - 1]`) depend
-// on it.
+// the sample store's `all()` or a Quota organization's `all(scope)`
+// (packages/usage-core/src/sample-store.ts), kept capturedAt-ascending by
+// contract: loadHistory sorts the persisted history, append pushes in
+// capturedAt order, and a scoped read merges sorted halves. The latest-sample
+// reads (`latestSampleWindow` and precomputeSamples' `latestUtil`, both
+// `samples[samples.length - 1]`) depend on it.
 
 // The 5-hour session-block / usage-window span.
 export const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
@@ -64,7 +65,7 @@ function roundToMinute(ms: number): number {
 
 // The util>0-gated, minute-rounded, deduped observed windows, ascending by
 // `end`. Unparseable resetAt instants are skipped.
-export function deriveObservedWindows(samples: UsageSample[]): ObservedWindow[] {
+export function deriveObservedWindows(samples: readonly UsageSample[]): ObservedWindow[] {
   const ends = new Set<number>();
   for (const s of samples) {
     if (s.fiveHour.utilizationPct <= 0) continue; // speculative while idle — never a window
@@ -78,7 +79,7 @@ export function deriveObservedWindows(samples: UsageSample[]): ObservedWindow[] 
 // live-window-grace candidate (ADR-0028): a freshly-started real window's
 // integer utilization can read 0 for its first minutes, and local events
 // inside it (checked by the caller) prove it is real rather than speculative.
-export function latestSampleWindow(samples: UsageSample[]): ObservedWindow | null {
+export function latestSampleWindow(samples: readonly UsageSample[]): ObservedWindow | null {
   const last = samples[samples.length - 1];
   if (last === undefined) return null;
   const r = Date.parse(last.fiveHour.resetAt);
@@ -120,7 +121,10 @@ export type ResolvedWindow = {
 //
 // The result is pairwise disjoint and ascending — sorted by end IS sorted by
 // start — which is what makes the blocks partition walk containment-unique.
-export function resolveWindows(samples: UsageSample[], eventTimes: number[]): ResolvedWindow[] {
+export function resolveWindows(
+  samples: readonly UsageSample[],
+  eventTimes: number[],
+): ResolvedWindow[] {
   const base = deriveObservedWindows(samples);
   const windows: ResolvedWindow[] = base.map((w, i) => {
     const next = base[i + 1];
@@ -145,7 +149,7 @@ export function resolveWindows(samples: UsageSample[], eventTimes: number[]): Re
 // sorted, but the binary search below must not silently break (only a
 // hand-built input falls through to the sort). Unparseable capturedAt instants
 // are skipped.
-export function precomputeSamples(samples: UsageSample[]): SampleView {
+export function precomputeSamples(samples: readonly UsageSample[]): SampleView {
   const points: Array<{ c: number; u: number }> = [];
   for (const s of samples) {
     const c = Date.parse(s.capturedAt);

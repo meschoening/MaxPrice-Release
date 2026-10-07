@@ -4,6 +4,8 @@
 // NOT re-exported here: it is a test/dev fixture, reachable only via the
 // "./fake-claude" subpath so compiled binaries never bundle it.
 export * from "./usage-client";
+// The listing's element, which `ListOrgsResult` carries (#283).
+export type { ListedOrg } from "@maxprice/shared";
 export * from "./poller";
 export * from "./sample-store";
 export {
@@ -13,6 +15,13 @@ export {
   fleetRowBytes,
   type FleetEventStore as LocalEventArchiveStore,
 } from "./fleet-event-store";
+// The merge rule's fullness predicate (ADR-0103), beside the key and total.
+export {
+  fleetCopySupersedes,
+  fleetDedupFullness,
+  fleetFullnessExceeds,
+  type FleetFullness,
+} from "@maxprice/shared";
 export * from "./fleet-sync-store";
 export * from "./identity-directory";
 export * from "./event-sync";

@@ -14,6 +14,7 @@ import {
   createIdentityDirectory,
   createSampleStore,
   createUsagePoller,
+  discoverOrg,
   installParentWatchdog,
   installStdinWatchdog,
   libcGetppid,
@@ -23,11 +24,16 @@ import {
 } from "@maxprice/usage-core";
 import { defaultDataDir, loadOrInitConfig, savePasswordHash } from "./config";
 import { createMachineDirectory } from "./machine-directory";
+import { createOrganizationAssertionDirectory } from "./organization-assertion-directory";
+import { createOrganizationDirectory } from "./organization-directory";
 import { createHubAuth, mintOperatorSecret } from "./auth";
 import { startBindReconciler } from "./rebind";
 import { createClientRegistry } from "./clients";
 import { createHubFanout, type HubFanout } from "./fanout";
+import { createHubPollSet, type HubPollSet } from "./poll-set";
+import { createOrganizationRoster, type OrganizationRoster } from "./organization-roster";
 import { buildHubApp, fleetEventsStatus } from "./server";
+import { createHubUsageStatus } from "./usage-status";
 import {
   createCredstore,
   createMemoryCredstore,
@@ -70,12 +76,19 @@ export function createMergeSamples(
 // so serve()'s status-patch wiring lives in one testable place.
 export function createEmitUsageSample(
   store: Pick<SampleStore, "all">,
-  fanout: Pick<HubFanout, "emitSample" | "patchStatus">,
-): (sample: UsageReading | null) => void {
-  return (sample) => {
+  fanout: Pick<HubFanout, "emitSample" | "patchStatus" | "getStatus">,
+): (organization: string, sample: UsageReading | null) => void {
+  return (organization, sample) => {
     const historical = completeUsageSample(sample);
     if (historical !== null) fanout.emitSample(historical);
-    fanout.patchStatus({ sampleCount: store.all().length, usageCurrentSample: sample });
+    fanout.patchStatus({
+      sampleCount: store.all().length,
+      usageWeeklyResetAt: {
+        ...fanout.getStatus().usageWeeklyResetAt,
+        ...(sample?.weekly ? { [organization]: sample.weekly.resetAt } : {}),
+      },
+      usageCurrent: { ...fanout.getStatus().usageCurrent, [organization]: sample },
+    });
   };
 }
 
@@ -101,6 +114,15 @@ export function createBindStatusPatcher(
 // createMergeSamples is: the test drives THIS closure rather than a hand-copied
 // double.
 //
+// Boot is also where the Hub stamps its usage history (#279): a credstore entry
+// written before #283 still carries the orgId this Hub polled with, the
+// Organization of every unstamped (legacy) line. The same orgId enters the
+// Hub's roster (#284), so this boot polls it even if the listing fails. Only a
+// successful stamp AND roster write let the entry lose that evidence — it is
+// then rewritten `{ sessionKey }`, so a failure of either retries on the next
+// boot (ADR-0104). Boot only — POST /api/credential never stamps: its body is
+// the key alone, and a heal is no evidence of this Hub's history.
+//
 // FOUR INDEPENDENT STEPS, each with its OWN try (F20). They used to be nested
 // inside one outer try, which made an early failure skip every later step: a
 // usage-history read error suppressed the `events` status patch — and the
@@ -114,14 +136,15 @@ export function createBindStatusPatcher(
 // (`ready` in buildHubApp) awaits this promise and a rejection would 500 every
 // /api/* request for the daemon's lifetime.
 export type ReadySequenceDeps = {
-  sampleStore: Pick<SampleStore, "loadHistory" | "all" | "latest">;
+  sampleStore: Pick<SampleStore, "loadHistory" | "all" | "latest" | "stampUnstamped">;
   fleetEvents: FleetEventStore;
-  credstore: Pick<Credstore, "get">;
+  credstore: Pick<Credstore, "get" | "set">;
   poller: {
     setCredential: (c: UsageCredential | null) => void;
-    pollOnce: () => Promise<void>;
     start: () => void;
   };
+  roster: Pick<OrganizationRoster, "remember">;
+  pollSet: Pick<HubPollSet, "boot">;
   fanout: Pick<HubFanout, "patchStatus">;
   // Fired when the archive load throws. serve() flips its `eventsUsable` flag,
   // which makes the event + archive-mutation routes 503 (F3) — the on-disk log
@@ -130,7 +153,7 @@ export type ReadySequenceDeps = {
 };
 
 export async function runReadySequence(deps: ReadySequenceDeps): Promise<void> {
-  const { sampleStore, fleetEvents, credstore, poller, fanout } = deps;
+  const { sampleStore, fleetEvents, credstore, poller, roster, pollSet, fanout } = deps;
   try {
     // Resolves the store's own `ready` too (F6) — harmless overlap.
     await sampleStore.loadHistory();
@@ -163,14 +186,48 @@ export async function runReadySequence(deps: ReadySequenceDeps): Promise<void> {
     console.warn("[hub] fleet-event archive load failed:", err);
   }
   try {
-    const cred = await credstore.get();
-    if (cred !== null) {
+    const stored = await credstore.get();
+    if (stored !== null) {
+      const cred: UsageCredential = { sessionKey: stored.sessionKey };
+      if (stored.orgId !== undefined) {
+        // A pre-#283 entry: its orgId is what this Hub polled with. It stamps
+        // the legacy lines (#279) and enters the roster (#284) BEFORE the seed,
+        // so boot polls it even if the listing fails — whatever the stamp's
+        // outcome; only when both landed may the entry lose that evidence.
+        // Each in its own try — none may cost the seed, the listing or
+        // poller.start() (F20). A failed roster write throws after memory holds
+        // the id, so this boot still polls it; only the rewrite waits for a
+        // later boot.
+        let stamped = false;
+        try {
+          await sampleStore.stampUnstamped(stored.orgId);
+          stamped = true;
+        } catch (err) {
+          console.warn("[hub] usage-history stamp failed:", err);
+        }
+        let remembered = false;
+        try {
+          roster.remember(stored.orgId);
+          remembered = true;
+        } catch (err) {
+          console.warn("[hub] organization roster write failed:", err);
+        }
+        if (stamped && remembered) {
+          try {
+            await credstore.set(cred);
+          } catch (err) {
+            console.warn("[hub] credstore rewrite failed:", err);
+          }
+        }
+      }
       poller.setCredential(cred);
-      // Seed orgId from the stored credential (non-secret) — the console SHOWS
-      // it and prefills the replace form. The session key itself is never read
-      // back out (write-only).
-      fanout.patchStatus({ credentialPresent: true, orgId: cred.orgId });
-      void poller.pollOnce();
+      fanout.patchStatus({ credentialPresent: true });
+      // Boot polls the persisted roster at once and lists in the background
+      // (#284): each minute while the listing fails and nothing is polled,
+      // hourly otherwise. A listing that refuses the key expires it and
+      // schedules nothing. Not awaited: neither `ready` nor poller.start()
+      // waits on the network.
+      void pollSet.boot(cred.sessionKey);
     }
   } catch (err) {
     console.warn("[hub] credstore read failed:", err);
@@ -244,6 +301,18 @@ async function serve(): Promise<void> {
   const machineDirectory = createMachineDirectory({
     path: join(dataDir, "machine-directory.json"),
   });
+  // Organization directory (#288): the fleet union of Organization labels.
+  // Loads synchronously beside the machine directory, a small file too.
+  const organizationDirectory = createOrganizationDirectory({
+    path: join(dataDir, "organization-directory.json"),
+  });
+  // Organization assertion directory (#310): the fleet union of Organization
+  // assertions. Loads synchronously beside the Organization directory — one
+  // read, at its 20,000-session cap ~2.7 MB with UUID session ids and ~5.1 MB
+  // with every key at its schema limit.
+  const organizationAssertionDirectory = createOrganizationAssertionDirectory({
+    path: join(dataDir, "organization-assertion-directory.json"),
+  });
 
   // Identity directory (ADR-0062): the fleet union of "which repo is this
   // machine's project directory a checkout of". Loads synchronously beside the
@@ -259,7 +328,9 @@ async function serve(): Promise<void> {
     protocolVersion: HUB_PROTOCOL_VERSION,
     usageConnection: "disconnected",
     usageLastSampleAt: null,
-    usageCurrentSample: null,
+    usageWeeklyResetAt: {},
+    usageCurrent: {},
+    organizations: {},
     sampleCount: 0,
     credentialPresent: false,
     // Seeded EMPTY on purpose (ADR-0074). The bind reconciler's first pass runs
@@ -280,26 +351,39 @@ async function serve(): Promise<void> {
     // it live so the console's Access card re-renders on set/clear.
     passwordProtected: config.passwordHash !== null,
     // Provenance/display start empty (ADR-0036). POST /api/credential fills
-    // credentialUpdatedAt/credentialSource/orgId; the credstore seed below
-    // backfills orgId on boot. `startedAt` is stamped ONCE here — this is daemon
-    // runtime, not pure tested logic, so a direct new Date() is fine — and the
-    // console renders real uptime from it.
+    // credentialUpdatedAt/credentialSource. `startedAt` is stamped ONCE here —
+    // this is daemon runtime, not pure tested logic, so a direct new Date() is
+    // fine — and the console renders real uptime from it.
     credentialUpdatedAt: null,
     credentialSource: null,
-    orgId: null,
     startedAt: new Date().toISOString(),
   };
   const fanout = createHubFanout({ initialStatus });
+
+  // The Hub's discovered roster (#284): what its key last listed.
+  const roster = createOrganizationRoster({ path: join(dataDir, "organization-roster.json") });
+  // The key-level usageConnection (#267 item 2); each poller publish records
+  // its Limits answers in the roster.
+  const usageStatus = createHubUsageStatus(fanout, { roster });
 
   // PollerHub adapter: poller broadcasts → fanout; sampleCount rides along.
   const poller = createUsagePoller({
     store: sampleStore,
     liveHub: {
       emitUsageSample: createEmitUsageSample(sampleStore, fanout),
-      patchStatus: (partial) => fanout.patchStatus(partial),
+      patchStatus: usageStatus.patchStatus,
     },
     // Fake-claude seam (ADR-0035); unset in production → real claude.ai.
     baseUrl: process.env.MAXPRICE_CLAUDE_BASE_URL,
+  });
+  // The Organizations the poller reads: whatever the key lists (#283), booted
+  // from the roster (#284).
+  const pollSet = createHubPollSet({
+    list: (sessionKey) =>
+      discoverOrg({ sessionKey, baseUrl: process.env.MAXPRICE_CLAUDE_BASE_URL }),
+    poller,
+    roster,
+    onDiscoveryFailed: usageStatus.setDiscoveryFailed,
   });
 
   const credstorePath = resolveCredstorePath();
@@ -349,6 +433,8 @@ async function serve(): Promise<void> {
     fleetEvents,
     credstore,
     poller,
+    roster,
+    pollSet,
     fanout,
     onEventsUnusable: () => {
       eventsUsable = false;
@@ -368,7 +454,11 @@ async function serve(): Promise<void> {
     fanout,
     samples: () => sampleStore.all(),
     mergeSamples: createMergeSamples(sampleStore, fanout),
-    usage: { setCredential: poller.setCredential, pollOnce: poller.pollOnce },
+    usage: {
+      setCredential: poller.setCredential,
+      pollOnce: poller.pollOnce,
+    },
+    pollSet,
     persistCredential: (cred) => credstore.set(cred),
     registry,
     fleetEvents,
@@ -382,6 +472,10 @@ async function serve(): Promise<void> {
     // must be able to tell a capability-free hub from a broken one so it can say
     // out loud that the identity half of the purge did not happen.
     identityDegraded: () => !identityStore.usable(),
+    organizationDirectory,
+    organizationAssertionDirectory,
+    // The console's roster route and the operator rename read it as it stands.
+    organizationRoster: () => roster.list(),
     allowedOrigins,
     ready,
   });
@@ -436,6 +530,8 @@ async function serve(): Promise<void> {
   const shutdown = (exitCode = 0): Promise<void> => {
     shutdownPromise ??= (async () => {
       try {
+        // First, so no late listing or retry installs a set behind the stop.
+        pollSet.stop();
         await poller.stop();
         await sampleStore.flush();
         await fleetEvents.close();

@@ -1,4 +1,5 @@
 import { QueryClient } from "@tanstack/react-query";
+import { usageCurrentQueryKey } from "@/state/use-usage-current";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -10,3 +11,7 @@ export const queryClient = new QueryClient({
     },
   },
 });
+
+// The per-Organization usage readings are a small resident map: an entry
+// nobody displays must still be there when the scope flips to it.
+queryClient.setQueryDefaults(usageCurrentQueryKey(), { gcTime: Infinity });

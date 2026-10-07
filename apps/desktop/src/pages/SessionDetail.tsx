@@ -10,6 +10,7 @@ import {
 } from "@maxprice/shared";
 import { useFilters, type Metric } from "@/state/filters";
 import { useSettings, useTimeDisplay } from "@/state/use-settings";
+import { useOrganizationScope } from "@/state/use-organization-scope";
 import { useNowTick } from "@/state/use-now-tick";
 import { useSessionEvents, type SessionEventsData } from "@/state/use-session-events";
 import { useSessionRow } from "@/state/use-session-row";
@@ -48,6 +49,9 @@ export function SessionDetailPage(): React.ReactElement {
   // through here.
   const { data: settings } = useSettings();
   const costMode = settings?.costMode ?? "auto";
+  // The Organization scope (ADR-0106) rides beside `mode`: a flip re-keys and
+  // re-streams the session's in-scope events.
+  const { organization } = useOrganizationScope();
   // The rail's model filter narrows the timeline + totals (ADR-0017): only
   // matching messages stream, and the summary covers exactly those.
   const models = useFilters((s) => s.models);
@@ -59,19 +63,26 @@ export function SessionDetailPage(): React.ReactElement {
   const [splitMetric, setSplitMetric] = useState<Metric>("cost");
 
   const sessionId = id ?? "";
-  const query = useSessionEvents(sessionId, costMode, models, machineAxis.machineParams);
+  const query = useSessionEvents(
+    sessionId,
+    costMode,
+    models,
+    machineAxis.machineParams,
+    organization,
+  );
   const data: SessionEventsData | undefined = query.data;
 
   // Arrival flash (T6): a re-stream (SSE invalidation) fully rebuilds the
   // timeline; rows beyond the PREVIOUS settled count are genuinely new and
   // enter on the arrive rise + accent flash. The first pour of a key has no
   // settled baseline, so nothing flashes; a key change (cost mode / filters /
-  // another session) resets the baseline the same way.
+  // Organization scope / another session) resets the baseline the same way.
   const streamIdentity = [
     sessionId,
     costMode,
     models.join("\0"),
     machineAxis.machineParams.join("\0"),
+    organization ?? "",
   ].join("|");
   const settledCount = useRef<number | null>(null);
   const [freshFrom, setFreshFrom] = useState<number | null>(null);

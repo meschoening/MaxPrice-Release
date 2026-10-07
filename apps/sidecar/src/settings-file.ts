@@ -38,3 +38,27 @@ export function readClaudePathsFromSettings(path: string): string[] | null {
   const s = readSettingsFile(path);
   return s === null ? null : s.claudePaths.map(expandTilde);
 }
+
+// The tracked set (the #260 lifecycle decision, items 1 and 2): the
+// Organizations whose usage this machine counts, as the persisted
+// `trackedOrganizations` list UNION the Home organization. This generalises
+// ADR-0098's single Home organization (#275); #299 is the slice that records
+// it in the ADR. Computed fresh on every settings read — boot and the settings
+// watch — so the union is enforced against a hand-edited file rather than
+// trusted from it.
+//
+// Returns `null` exactly when `home` is null, and `null` means NOTHING is
+// excluded. That is today's no-Home behaviour, the mode the golden corpus runs
+// in, and the mode the first-launch selection walk needs. A non-empty list with
+// no Home is null too: Home anchors the set, Home is null only before the
+// first-launch seed, and that walk has to see the whole corpus to choose one
+// (`prepareOrganizationStore`).
+export function resolveTrackedOrganizations(
+  home: string | null,
+  tracked: readonly string[],
+): ReadonlySet<string> | null {
+  if (home === null) return null;
+  const set = new Set<string>([home]);
+  for (const uuid of tracked) if (uuid !== "") set.add(uuid);
+  return set;
+}

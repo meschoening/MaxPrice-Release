@@ -40,6 +40,20 @@ export function weekTag(
   return `${WEEKDAYS[day.getUTCDay()]} ${MONTHS[m - 1]} ${d} → now`;
 }
 
+// The tile's sub-line. A limitReset Week falls back to rolling when there is no
+// weekly reset reading; when the Quota organization has no readable limits
+// (`noLimits`) there is no reading to wait for, so the fallback reads as what
+// it is, "last 7 days". A Week chosen as rolling or custom keeps its window tag.
+export function weekSubLine(
+  w: WeekWindow,
+  rollingStart: string | undefined,
+  display: TimeDisplay,
+  noLimits: boolean,
+): string {
+  if (noLimits && w.kind === "rolling" && w.fallback) return "last 7 days";
+  return weekTag(w, rollingStart, display);
+}
+
 // The eyebrow's suffix: the Week MODE beside "This week", so the sub-line can
 // stay a bare range where it sits (next to the weekly limit meter in the wide
 // row). Rolling weeks carry no suffix.

@@ -7,8 +7,8 @@ import { logClientEvent } from "@/lib/client-log";
 import { showToast } from "@/lib/toast";
 
 // useSettings — the renderer's single read/write surface for the durable
-// settings.json (ADR-0014). Settings travel to the engine as `mode`/`tz`
-// query params; the renderer is the sole writer of the file.
+// settings.json (ADR-0014). Settings travel to the engine as `mode`/`tz`/
+// `organization` query params; the renderer is the sole writer of the file.
 //
 // This honors the ADR-0004 four-piece split in spirit — a query key, a fetch,
 // a wrapper — but has no URL builder: it talks to Rust via Tauri IPC
@@ -22,15 +22,40 @@ export const settingsQueryKey = ["settings"] as const;
 // hubFleetReplica (ADR-0041 M6) — actually function on the Playwright/Vite
 // rig. Session-scoped, never persisted; the packaged (insideTauri) path is
 // untouched. Exported reset is test-only.
+//
+// It starts from `VITE_DEV_SETTINGS` when set: a JSON object laid over the
+// defaults and resolved by `parseSettings`, so the rig can hold a Home and a
+// tracked set (ADR-0106's scope chip needs two tracked) that no Settings
+// control writes yet, e.g.
+//   VITE_DEV_SETTINGS='{"homeOrganization":"<uuid>","trackedOrganizations":["<uuid>"]}'
+// Malformed JSON is logged and reads as the defaults.
 let devSettings: Settings | null = null;
 export function __resetDevSettings(): void {
   devSettings = null;
 }
 
+function devSettingsSeed(): Settings {
+  const raw = import.meta.env.VITE_DEV_SETTINGS;
+  if (raw === undefined || raw === "") return DEFAULT_SETTINGS;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("not a JSON object");
+    }
+    return parseSettings({ ...DEFAULT_SETTINGS, ...parsed });
+  } catch (e) {
+    logClientEvent(`VITE_DEV_SETTINGS ignored, using defaults: ${String(e)}`);
+    return DEFAULT_SETTINGS;
+  }
+}
+
 export async function fetchSettings(): Promise<Settings> {
   // Standalone Vite dev: no Tauri host, so `read_settings`/`write_settings`
-  // would throw. Fall back to the in-memory dev seam (defaults until written).
-  if (!insideTauri()) return devSettings ?? DEFAULT_SETTINGS;
+  // would throw. Fall back to the in-memory dev seam, seeded once.
+  if (!insideTauri()) {
+    devSettings ??= devSettingsSeed();
+    return devSettings;
+  }
 
   const raw = await invoke<unknown>("read_settings");
   // An empty object means "no settings.json to read yet". `read_settings`
@@ -87,24 +112,39 @@ export function useTimeDisplay(): TimeDisplay {
 }
 
 // Serialize settings writes through a module-level promise chain. The body is a
-// non-atomic read-modify-write (read cache → merge patch → write → setQueryData),
-// so two quick `update()` calls would otherwise both read the same stale cache
-// snapshot and the second would clobber the first's field. Each link recomputes
-// `next` from the FRESHEST cache value at the moment it runs, so concurrent
-// patches merge instead of overwrite.
+// non-atomic read-modify-write (read cache → merge patch → resolve → write →
+// setQueryData), so two quick `update()` calls would otherwise both read the
+// same stale cache snapshot and the second would clobber the first's field.
+// Each link recomputes `next` from the FRESHEST cache value at the moment it
+// runs, so concurrent patches merge instead of overwrite.
 let writeChain: Promise<void> = Promise.resolve();
+
+// A patch of one or more settings fields, or an updater that builds its patch
+// from the current settings and returns null when it has nothing to write.
+export type SettingsUpdate = Partial<Settings> | ((current: Settings) => Partial<Settings> | null);
 
 // Patch one or more settings fields. After writing, set the settings cache then
 // invalidate the settings query to reconcile with disk; report views refetch
-// automatically because `mode` and `tz` are part of their query keys, so a
-// costMode/timezone change re-reads with the new value once the settings data
-// updates.
-export function useUpdateSettings(): (patch: Partial<Settings>) => Promise<void> {
+// automatically because `mode`, `tz` and `organization` are part of their query
+// keys, so a costMode/timezone/Organization scope change re-reads with the new
+// value once the settings data updates.
+//
+// An edit derived from a list — track, exclude, `Make Home` — passes an
+// updater: it runs inside the chain on the settings as the write queued before
+// it left them, where a patch built at render time would drop that write's
+// change. An updater's null skips the write, the cache and the invalidation.
+export function useUpdateSettings(): (update: SettingsUpdate) => Promise<void> {
   const qc = useQueryClient();
-  return (patch) => {
+  return (update) => {
     const run = writeChain.then(async () => {
       const current = qc.getQueryData<Settings>(settingsQueryKey) ?? DEFAULT_SETTINGS;
-      const next = { ...current, ...patch };
+      const patch = typeof update === "function" ? update(current) : update;
+      if (patch === null) return;
+      // Resolve before caching or writing, so the Organization scope in the cache
+      // and on disk is the one every query reads (ADR-0106 §1): a pick of the Home
+      // uuid is `null`, and a write that stops tracking the scoped Organization
+      // resets the scope in that same write.
+      const next = parseSettings({ ...current, ...patch });
       await writeSettings(next);
       qc.setQueryData(settingsQueryKey, next);
       await qc.invalidateQueries({ queryKey: settingsQueryKey });

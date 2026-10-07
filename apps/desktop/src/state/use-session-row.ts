@@ -2,6 +2,7 @@ import type { SessionRow } from "@maxprice/shared";
 import { resolveDateRange, useFilters } from "@/state/filters";
 import { useWeekWindow } from "./use-week";
 import { useSettings } from "@/state/use-settings";
+import { useOrganizationScope } from "@/state/use-organization-scope";
 import { useSessions } from "@/state/use-sessions";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useProjectAxis } from "@/state/use-project-axis";
@@ -18,6 +19,9 @@ export function useSessionRow(sessionId: string): SessionRow | undefined {
   const dateRange = useFilters((s) => s.dateRange);
   const { data: settings } = useSettings();
   const tz = settings?.timezone;
+  // ADR-0106 — the same Organization scope the list page sends, for the same
+  // one cache entry.
+  const { organization } = useOrganizationScope();
   // ADR-0062 — the same closure-expanded params the list page builds, so the
   // two stay ONE cache entry (the whole point of this hook).
   const projects = useProjectAxis().projectParams;
@@ -31,6 +35,7 @@ export function useSessionRow(sessionId: string): SessionRow | undefined {
     until,
     mode: settings?.costMode ?? "auto",
     tz,
+    organization,
     projects,
     models,
     machines: machineAxis.machineParams,

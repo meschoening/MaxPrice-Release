@@ -2,10 +2,12 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useLiveStatus } from "@/state/use-live-status";
 import {
+  credentialForConnect,
   discoverOrgsViaSidecar,
   readCredential,
   writeCredential,
   pushCredentialToSidecar,
+  syncCredential,
 } from "@/lib/usage-credential";
 import {
   formatWallClock,
@@ -16,30 +18,32 @@ import {
 } from "@maxprice/shared";
 import { useSettings, useTimeDisplay, useUpdateSettings } from "@/state/use-settings";
 import { organizationsQueryKey, useOrganizations } from "@/state/use-organizations";
+import { useOrganizationScope } from "@/state/use-organization-scope";
 import { useUsageCurrent } from "@/state/use-usage-current";
+import { useSettingsLastOpened } from "@/state/use-settings-last-opened";
+import { keyStatusLine, showOrganizationList } from "@/lib/organization-list-view";
 import { HomeOrganizationSelect } from "./home-organization-select";
+import { OrganizationList } from "./organization-list";
 import { isStale, STALE_USAGE_LINE } from "@/lib/stale-status";
 import { cn } from "@/lib/utils";
 import { dotVariant } from "@/lib/dot-variant";
 
-// Settings → Claude account (ADR-0023). Paste a claude.ai sessionKey cookie;
-// we discover the org, pick the subscription org by capability, store
-// { sessionKey, orgId } in the OS keychain, and push it to the sidecar.
-// Live connection state comes from the `status:changed` SSE snapshot, which
-// the sidecar updates on every poll — success AND failure.
+// Settings → Claude account (ADR-0023 → ADR-0104). Paste a claude.ai
+// sessionKey cookie; the sidecar discovers the orgs, asks each one's usage
+// endpoint what it answers, and seeds the roster with them — nothing picks one:
+// the tracked set decides what this machine polls. We store { sessionKey } in
+// the OS keychain and push it to the sidecar (a legacy `orgId` not yet
+// acknowledged rides along to be stamped — `credentialForConnect`). Live
+// connection state comes from the `status:changed` SSE snapshot, which the
+// sidecar updates on every poll — success AND failure.
 //
 // M6 (T7): the status line is a triad dot + the frozen labels from
 // usage-status.ts — including the deliberate `expired` divergence (amber dot,
 // red text); inputs/buttons are the T1 glass pieces; validation errors stay
-// bare `--bad` text lines under their control.
-
-// Capabilities that mark a subscription org (vs an API-only org). A FIRST
-// connect picks the first org that has any of these; a RECONNECT keeps the org
-// already tracked when discovery still lists it (ADR-0098), so a second
-// subscription org appearing on the same login — the #228 shape — can never
-// silently move the rings and the observed block windows. The full picker is
-// the multi-organization follow-up.
-const SUBSCRIPTION_CAPS = ["claude_max", "claude_pro", "chat"];
+// bare `--bad` text lines under their control. Past one Organization the line
+// describes the key instead (`keyStatusLine`): the same dot and text mapping,
+// applied to the key's state; its own phrasing; and a tracked count in place
+// of the last reading.
 
 // Format an ISO 8601 capturedAt as a clock time for the status line ("last
 // reading 3:42 PM"). An unparseable value falls back to the raw string rather
@@ -75,13 +79,11 @@ export function UsageConnectionSection(): React.ReactElement {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const qc = useQueryClient();
-  const organizations = useOrganizations().data;
-  const tracked = organizations?.trackedLimits ?? null;
-  const trackedLabel =
-    tracked === null
-      ? null
-      : (organizations?.organizations.find((o) => o.uuid === tracked)?.label ??
-        `Organization ${tracked.slice(0, 8)}`);
+  // Past one Organization the list replaces the Home select. This section is
+  // always on the Settings page, so it stamps each visit and hands the list
+  // the previous one for its `New` tag.
+  const { data: roster } = useOrganizations();
+  const lastOpenedAt = useSettingsLastOpened();
 
   async function connect(): Promise<void> {
     setBusy(true);
@@ -96,16 +98,11 @@ export function UsageConnectionSection(): React.ReactElement {
         );
         return;
       }
-      const existing = await readCredential().catch(() => null);
-      const kept = existing === null ? undefined : orgs.find((o) => o.id === existing.orgId);
-      // orgs.length > 0 is proven by the guard above; orgs[0]! is safe.
-      const pick =
-        kept ??
-        orgs.find((o) => o.capabilities.some((c) => SUBSCRIPTION_CAPS.includes(c))) ??
-        orgs[0]!;
-      const cred = { sessionKey: key.trim(), orgId: pick.id };
-      await writeCredential(cred);
-      await pushCredentialToSidecar(cred);
+      // The keychain first, so a failed push keeps the new key for the next
+      // boot; an unacknowledged legacy `orgId` rides along to be stamped.
+      const stored = credentialForConnect(key.trim(), await readCredential().catch(() => null));
+      await writeCredential(stored);
+      await syncCredential(stored);
       setKey("");
       void qc.invalidateQueries({ queryKey: organizationsQueryKey() });
     } catch (e) {
@@ -136,34 +133,51 @@ export function UsageConnectionSection(): React.ReactElement {
   // `bg-*` class into it, so the frozen constant's `variant` drops straight in.
   // Stale OUTRANKS `expired`, exactly as in the foot, and takes the deliberate
   // `expired` dot/text divergence (amber dot, red text — usage-status.ts:56-59)
-  // with it; that divergence is untouched on the non-stale path.
+  // with it; that divergence is untouched on the non-stale path. Past one
+  // Organization the key's line takes the non-stale path's place.
+  const keyLine =
+    roster !== undefined && showOrganizationList(roster) ? keyStatusLine(connection, roster) : null;
   const line = stale
     ? {
         variant: STALE_USAGE_LINE.variant,
         textClass: STALE_USAGE_LINE.textClass,
         label: STALE_USAGE_LINE.title,
       }
-    : {
-        variant: dotVariant(usageConnectionDot(connection)),
-        textClass: usageConnectionTextClass(connection),
-        label: usageConnectionLabel(connection),
-      };
+    : keyLine !== null
+      ? {
+          variant: dotVariant(usageConnectionDot(keyLine.connection)),
+          textClass: usageConnectionTextClass(keyLine.connection),
+          label: keyLine.text,
+        }
+      : {
+          variant: dotVariant(usageConnectionDot(connection)),
+          textClass: usageConnectionTextClass(connection),
+          label: usageConnectionLabel(connection),
+        };
+  // Past one Organization each row carries its own read time, so the key's
+  // line shows no last reading; its count is a claim about now, which the
+  // stale line withdraws with the rest.
+  const keyDetail = keyLine !== null && !stale ? keyLine.detail : null;
 
   return (
     <>
-      <HomeOrganizationSelect />
+      {showOrganizationList(roster) ? (
+        <OrganizationList lastOpenedAt={lastOpenedAt} />
+      ) : (
+        <HomeOrganizationSelect />
+      )}
 
       <div className="status-line">
         <span className={cn("dot", line.variant)} aria-hidden />
         <span className={line.textClass}>{line.label}</span>
+        {keyDetail !== null ? <span className="when">{keyDetail}</span> : null}
         {/* Kept when stale, unlike the foot's relative "sampled Nm ago": an
             ABSOLUTE last-reading time is a fact about the past that a dropped
             channel doesn't invalidate, so it stays true beside "state unknown"
             — and it is the one thing on this line still worth knowing. */}
-        {lastSampleAt !== null ? (
+        {keyLine === null && lastSampleAt !== null ? (
           <span className="when">— last reading {formatSampleTime(lastSampleAt, display)}</span>
         ) : null}
-        {trackedLabel !== null ? <span className="when">— {trackedLabel}</span> : null}
       </div>
 
       <div className="row-line">
@@ -205,7 +219,7 @@ export function UsageConnectionSection(): React.ReactElement {
   );
 }
 
-// The Model-scoped weekly limit opt-in (CONTEXT.md): a switch that renders
+// The Model-scoped weekly limit opt-in (GLOSSARY.md): a switch that renders
 // ONLY while the current sample carries a scoped window — an account without
 // one would otherwise see an inert toggle — and, on, adds a "<Model> limit"
 // row to the tray popout beneath the weekly limit. The label names the model
@@ -214,7 +228,10 @@ export function UsageConnectionSection(): React.ReactElement {
 // resizes the next open with no further wiring. Same switch recipe as the
 // Background section.
 function ModelLimitSwitch(): React.ReactElement | null {
-  const { data: usage } = useUsageCurrent();
+  // The Quota organization's reading, the one the status line describes
+  // (ADR-0106 §8).
+  const { quotaOrganization } = useOrganizationScope();
+  const { data: usage } = useUsageCurrent(quotaOrganization);
   const { data: settings } = useSettings();
   const update = useUpdateSettings();
   const window = usage?.sample?.weeklyModel;

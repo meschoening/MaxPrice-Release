@@ -3,6 +3,7 @@ import type { BlockRow, TimeDisplay } from "@maxprice/shared";
 import { resolveDateRange, useFilters } from "@/state/filters";
 import { useWeekWindow } from "@/state/use-week";
 import { useSettings, useTimeDisplay } from "@/state/use-settings";
+import { useOrganizationScope } from "@/state/use-organization-scope";
 import { useBlocks } from "@/state/use-blocks";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useCorpusEmpty } from "@/state/use-corpus-empty";
@@ -84,6 +85,9 @@ export function BlocksPage(): React.ReactElement {
   const machineAxis = useMachineAxis();
   const { data: settings } = useSettings();
   const tz = settings?.timezone;
+  // ADR-0106/ADR-0108: the Organization scope rides beside `mode` and `tz`; the
+  // sidecar forms Blocks for its Quota organization.
+  const { organization } = useOrganizationScope();
   const display = useTimeDisplay();
   const week = useWeekWindow();
   const { since, until } = resolveDateRange(dateRange, tz, week);
@@ -94,6 +98,7 @@ export function BlocksPage(): React.ReactElement {
     until,
     mode: settings?.costMode ?? "auto",
     tz,
+    organization,
     models,
     machines: machineAxis.machineParams,
   });

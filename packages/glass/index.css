@@ -515,10 +515,11 @@ kbd {
 }
 
 /* The toast pill — bottom-center, one at a time, auto-dismissed by the
-   caller (~2.2s dwell). Both apps' ToastHost mounts the pill permanently and
-   hides it with opacity alone, so unlike every other floating leaf (the menus
-   unmount when closed) this element is always in the tree — which makes it the
-   one place where ADR-0075's per-state rule has to be spelled out: the frost
+   caller (~2.2s dwell; 8s for the action variant below). Both apps'
+   ToastHost mounts the pill permanently and hides it with opacity alone, so
+   unlike every other floating leaf (the menus unmount when closed) this
+   element is always in the tree — which makes it the one place where
+   ADR-0075's per-state rule has to be spelled out: the frost
    lives on .show, so a hidden pill asks the compositor for no backdrop work at
    all. The blur is in the transition list beside opacity for a reason — drop
    .show with the frost on the element and the backdrop snaps sharp under a
@@ -554,6 +555,31 @@ kbd {
   transform: translate(-50%, 0);
   -webkit-backdrop-filter: var(--frost-toast);
   backdrop-filter: var(--frost-toast);
+}
+/* The action variant (#312's Undo; the look is the #308 prototype's undo
+   pill, on the toast's own material): the message, then one accent-tinted
+   button. That button is the pill's ONLY hit target — the body keeps
+   pointer-events: none, so the pill never takes a click meant for the page
+   under it — and only while .show: the hidden pill stays in the tree, and an
+   unscoped rule would leave an invisible button just above the window's
+   bottom edge eating clicks on whatever sits there (toast.test.ts pins
+   both). No motion of its own; it fades with the pill, under the
+   reduced-motion kill like the pill. */
+.toast:has(> .toast-action) {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 10px 8px 16px;
+}
+.toast .toast-action {
+  padding: 3px 11px;
+  border-radius: 999px;
+  font-weight: 600;
+  color: var(--accent);
+  background: color-mix(in oklch, var(--accent) 12%, transparent);
+}
+.toast.show .toast-action {
+  pointer-events: auto;
 }
 
 /* ================= in-app identity ================= */

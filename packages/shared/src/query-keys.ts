@@ -20,7 +20,11 @@ export type FilterSubset = { projects?: string[]; models?: string[]; machines?: 
 // `tz` (Part 6, ADR-0015) — the IANA zone reports bucket local days into,
 // carried alongside `mode`. Optional: an omitted `tz` defaults to the host
 // zone sidecar-side, preserving the pre-Part-6 behaviour.
-export type QueryInput = DateWindow & FilterSubset & { mode: CostMode; tz?: string };
+// `organization` (#278) — the resolved Organization scope: a tracked uuid or
+// "all". Absent = the Home organization, so a single-Organization machine's
+// keys stay byte-identical (an undefined property drops out of the hash).
+export type QueryInput = DateWindow &
+  FilterSubset & { mode: CostMode; tz?: string; organization?: string };
 
 // Drop empty arrays to `undefined` and sort the surviving ones so the TanStack
 // cache key is identical regardless of the order the user picked filters in.
@@ -38,6 +42,7 @@ function normalize(input: QueryInput): QueryInput {
     projects: normalizeList(input.projects),
     models: normalizeList(input.models),
     machines: normalizeList(input.machines),
+    organization: input.organization,
   };
 }
 
@@ -105,6 +110,8 @@ export type IntradayQueryInput = {
   // body, so it must re-key. Omitted/false → the byMachine-free (pre-M6,
   // byte-identical) payload.
   includeByMachine?: boolean;
+  // The resolved Organization scope (#278), as on `QueryInput`: absent = Home.
+  organization?: string;
 } & FilterSubset;
 
 // Normalize the intraday input the same way `normalize` does for the daily
@@ -123,6 +130,7 @@ function normalizeIntraday(input: IntradayQueryInput): IntradayQueryInput {
     projects: normalizeList(input.projects),
     models: normalizeList(input.models),
     machines: normalizeList(input.machines),
+    organization: input.organization,
   };
 }
 

@@ -1,4 +1,5 @@
 import type { CostMode, UsageSample } from "@maxprice/shared";
+import type { SampleScope } from "@maxprice/usage-core";
 import {
   aggregateFormedBlocks,
   formPendingBlocks,
@@ -10,6 +11,7 @@ import {
 import { FIVE_HOURS_MS, resolveWindows, type ResolvedWindow } from "./block-windows";
 import { createBlockFlushCache } from "./block-flush-cache";
 import { byTimestamp } from "./model-rollup";
+import { eventOrganization, type Presumption } from "./presumption";
 import type { EventStore, StoredEvent } from "./store";
 
 // Test-only work counter, like report-cache's foldCounter. Counts events sent
@@ -83,13 +85,22 @@ function extendFormation(state: BlockFormation, events: StoredEvent[]): void {
 }
 
 // One membership cache for BOTH block consumers, constructed inside buildApp
-// over its live store accessor. Filter/pricing keys belong to the separate
-// flush cache; timed wire fields are always freshly assembled. No await inside
-// a query or change listener: a response uses one coherent store + samples
-// snapshot. Store swaps drop the old subscription.
+// over its live store accessor. A request may name a Quota organization: its
+// Blocks then form from that Organization's rows alone (the store's
+// Organization axis: evidence, then assertion, then presumption) and from its
+// samples alone, so windows, annulment and grace evidence never cross
+// Organizations. No quota is the unscoped formation over every row and every
+// sample. ONE slot: the Quota organization is a formation input, and so is the
+// store's presumption for a scoped slot. A change of Organization always
+// rebuilds it; a presumption change rebuilds only a scoped slot. Filter/pricing
+// keys belong to the separate flush cache; timed wire fields are always freshly
+// assembled. No await inside a query or change listener: a response uses one
+// coherent store + samples snapshot. Store swaps drop the old subscription.
 export function createBlockReports(deps: {
   getStore: () => EventStore;
-  getSamples: () => UsageSample[];
+  // No scope: every sample held. A scope: that Organization's samples,
+  // unstamped lines counting as `home`'s — the sample store's `all(scope)`.
+  getSamples: (scope?: SampleScope) => readonly UsageSample[];
 }) {
   const flushCache = createBlockFlushCache();
   let store: EventStore | null = null;
@@ -100,8 +111,12 @@ export function createBlockReports(deps: {
   let eventTimes: number[] = [];
   let last: StoredEvent | undefined;
   let monotone = true;
+  // The slot's Quota organization (`null` = none: every row) and the
+  // presumption its rows were resolved under.
+  let boundOrganization: string | null = null;
+  let boundPresumption: Presumption | null = null;
 
-  function formation(samples: UsageSample[]): BlockFormation {
+  function formation(samples: readonly UsageSample[], organization: string | null): BlockFormation {
     const current = deps.getStore();
     if (current !== store) {
       unsubscribe?.();
@@ -114,6 +129,8 @@ export function createBlockReports(deps: {
         for (const { event, replaced } of changes) {
           // Whole-row replacement can change any field and inherit an earlier
           // map tie rank. Refuse it even when its new timestamp looks recent.
+          // That holds whatever Organization either copy resolves to: a tag
+          // gain is a replacement, and it can move a row out of the slot.
           if (replaced !== null || event === null) {
             dirty = true;
             additions = [];
@@ -121,10 +138,39 @@ export function createBlockReports(deps: {
           }
           // Pure formation drops NaN rows, so they cannot affect either order
           // or grace evidence. They remain stored for the other reports.
-          if (!Number.isNaN(event.ms)) additions.push(event);
+          if (Number.isNaN(event.ms)) continue;
+          // Another Organization's row is not in the slot's stream, so it
+          // neither extends nor dirties it. Resolved exactly as the scoped
+          // query resolves it; a presumption swap since binding rebuilds at
+          // the next request anyway.
+          if (
+            boundOrganization !== null &&
+            boundPresumption !== null &&
+            eventOrganization(event, boundPresumption) !== boundOrganization
+          ) {
+            continue;
+          }
+          additions.push(event);
         }
       });
     }
+    // The Quota organization is a formation INPUT (#265 item 6), and so is the
+    // presumption for a scoped slot: either moving means another
+    // Organization's rows, so rebuild. The presumption is compared by
+    // identity, which every writer (Home, published Homes, assertions) mints
+    // anew. The unscoped formation never reads it, so a swap leaves that slot
+    // alone; the bound value stays current for the listener either way.
+    const presumption = current.presumption();
+    if (
+      organization !== boundOrganization ||
+      (organization !== null && presumption !== boundPresumption)
+    ) {
+      state = null;
+      additions = [];
+      dirty = true;
+    }
+    boundOrganization = organization;
+    boundPresumption = presumption;
 
     const tail = byTimestamp(additions);
     let prev = last;
@@ -152,7 +198,8 @@ export function createBlockReports(deps: {
 
     // The pure path is also the fallback for offset-bearing streams whose
     // string order regresses in epoch time. Never normalize or re-sort by ms.
-    const events = current.query();
+    const events =
+      organization === null ? current.query() : current.query({ organizations: [organization] });
     state = formPendingBlocks(events, samples);
     formationCounter.count += events.length;
     eventTimes = [];
@@ -169,22 +216,36 @@ export function createBlockReports(deps: {
     return state;
   }
 
+  // `quota` absent or `null`: no Quota organization, the unscoped formation.
+  function quotaSamples(quota: SampleScope | null): readonly UsageSample[] {
+    return quota === null ? deps.getSamples() : deps.getSamples(quota);
+  }
+
   return {
-    blocks(mode: CostMode, options: Omit<AggregateBlocksOptions, "samples"> = {}) {
+    blocks(
+      mode: CostMode,
+      options: Omit<AggregateBlocksOptions, "samples"> = {},
+      quota: SampleScope | null = null,
+    ) {
       const now = options.now ?? Date.now();
-      const samples = deps.getSamples();
-      const formed = formation(samples);
+      const samples = quotaSamples(quota);
+      const formed = formation(samples, quota?.organization ?? null);
       const context = flushCache.prepare(
         mode,
         options.models ?? [],
         options.machines ?? [],
+        // The Quota organization keys the totals beside the sum-narrowing
+        // axes, though it narrows no sum: it chose the rows the blocks formed
+        // from. `AggregateBlocksOptions` deliberately has no such field — see
+        // the axis note in `block-flush-cache.ts`.
+        quota === null ? [] : [quota.organization],
         samples,
       );
       return aggregateFormedBlocks(formed, mode, { ...options, now, samples }, context);
     },
-    span(now: number) {
-      const samples = deps.getSamples();
-      return resolveFormedBlockSpan(formation(samples), now);
+    span(now: number, quota: SampleScope | null = null) {
+      const samples = quotaSamples(quota);
+      return resolveFormedBlockSpan(formation(samples, quota?.organization ?? null), now);
     },
   };
 }

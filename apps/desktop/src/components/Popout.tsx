@@ -70,6 +70,8 @@ function PopoutDash(): React.ReactElement {
     todayTokens: data.todayTokens,
     now,
     display,
+    quotaTag: data.quotaTag,
+    allOrganizations: data.allOrganizations,
   });
 
   return (
@@ -82,7 +84,8 @@ function PopoutDash(): React.ReactElement {
   );
 }
 
-function PopoutBody({ view }: { view: PopoutViewState }): React.ReactElement {
+// Exported for its test: pure over the view state, unlike the hook-fed dash.
+export function PopoutBody({ view }: { view: PopoutViewState }): React.ReactElement {
   if (view.kind === "loading") return <div className="pbody" />;
   if (view.kind === "down") {
     return (
@@ -114,7 +117,7 @@ function PopoutBody({ view }: { view: PopoutViewState }): React.ReactElement {
         <LimitRow label={view.modelRow.label} pct={view.modelRow.pct} />
       ) : null}
       <div className="prow">
-        <span className="name">Today</span>
+        <span className="name">{view.todayLabel}</span>
         <span className="state">
           <b className="num">{view.todayText}</b>
           <span className="num">· {view.todayTokensText}</span>
@@ -190,7 +193,12 @@ function PopoutHeadRow({ head }: { head: PopoutHead }): React.ReactElement {
         </span>
       </div>
       <div className="hd">
-        <span className="eyebrow">Active block</span>
+        <span className="eyebrow">
+          Active block
+          {head.eyebrowTag !== null ? (
+            <span className="eyebrow-tag"> · {head.eyebrowTag}</span>
+          ) : null}
+        </span>
         <div className="value num">
           {head.costText}
           <span className="tokens">· {head.tokensText}</span>

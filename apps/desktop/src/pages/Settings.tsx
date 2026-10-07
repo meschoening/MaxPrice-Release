@@ -1,6 +1,8 @@
 import { ChevronDown } from "lucide-react";
 import { DEFAULT_SETTINGS } from "@maxprice/shared";
 import { useSettings, useUpdateSettings } from "@/state/use-settings";
+import { useOrganizations } from "@/state/use-organizations";
+import { ORGANIZATION_LIST_DESCRIPTION, showOrganizationList } from "@/lib/organization-list-view";
 import { PathList } from "@/components/settings/PathList";
 import { TimezoneSelect } from "@/components/settings/TimezoneSelect";
 import { TimeFormatControl } from "@/components/settings/TimeFormatControl";
@@ -75,6 +77,8 @@ export function SettingsPage(): React.ReactElement {
   const { data: settings } = useSettings();
   const current = settings ?? DEFAULT_SETTINGS;
   const update = useUpdateSettings();
+  // Past one Organization, Claude account describes the Organizations list.
+  const { data: roster } = useOrganizations();
 
   // Gates the whole "Start at login" section: hidden until the shell answers
   // (an IPC round trip, so no flash) and hidden for good on "unsupported" —
@@ -177,7 +181,11 @@ export function SettingsPage(): React.ReactElement {
 
         <Section
           title="Claude account"
-          description="Which organization's usage MaxPrice shows, and the claude.ai session key for real 5-hour and weekly limits."
+          description={
+            showOrganizationList(roster)
+              ? ORGANIZATION_LIST_DESCRIPTION
+              : "Which organization's usage MaxPrice shows, and the claude.ai session key for real 5-hour and weekly limits."
+          }
         >
           <UsageConnectionSection />
         </Section>

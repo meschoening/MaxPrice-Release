@@ -12,9 +12,11 @@ import {
   type SseFrame,
   type UsageConnection,
   type UsageCredential,
-  type UsageReading,
+  type UsageSampleEvent,
+  type HubStatus,
 } from "@maxprice/shared";
 import type { SampleStore } from "./sample-store";
+import type { UsagePoller } from "./poller";
 
 // The sidecar's hub connection (ADR-0035/0037): connect → verify
 // HUB_PROTOCOL_VERSION (exact match; mismatch is a terminal-per-attempt state,
@@ -50,6 +52,8 @@ export type HubFleetHooks = {
   onDisconnected: () => void;
   onEventsPoke: (seq: number) => void; // hub:events SSE frame
   onMachinesPoke: () => void; // hub:machines SSE frame
+  onOrganizationsPoke: () => void; // hub:organizations SSE frame
+  onOrganizationAssertionsPoke: () => void; // hub:organization-assertions SSE frame (#310)
   onStatusEvents: (
     events: { epoch: string; seq: number; deletionGeneration: number } | null,
   ) => void; // hub:status frames
@@ -74,7 +78,7 @@ const PUSH_UP_BATCH_SIZE = 5000;
 export type HubClientDeps = {
   store: SampleStore;
   liveHub: {
-    emitUsageSample: (sample: UsageReading | null) => void;
+    emitUsageSample: (event: UsageSampleEvent) => void;
     patchStatus: (
       partial: Partial<{
         hubConnection: HubConnection;
@@ -89,7 +93,9 @@ export type HubClientDeps = {
     start: () => void;
     stop: () => Promise<void>;
     pollOnce: () => Promise<void>;
-    setCurrentSample: (sample: UsageReading | null) => void;
+    setRemoteState: UsagePoller["setRemoteState"];
+    getCurrent: UsagePoller["getCurrent"];
+    getOrganizations: UsagePoller["getOrganizations"];
   };
   machineId: string;
   // Friendly per-machine label for the hub roster (ADR-0036). Emitted as
@@ -117,6 +123,22 @@ export type HubClientHandle = {
   getState: () => HubConnection;
   stop: () => Promise<void>;
 };
+
+// The same key-health rule governs initial connect and live status frames:
+// only a dead key (`expired`) or an absent one (`disconnected` with no
+// credential) is unusable. A Hub holding a key reads `disconnected` only while
+// its first answer is pending, and still owns polling; a discovery that failed
+// or listed nothing reads `error` only while no polled Organization answers —
+// an answering one keeps the Hub `connected` (#284) — and like any `error` the
+// client stays hub-connected.
+function hasUnusableCredential(
+  status: Pick<HubStatus, "usageConnection" | "credentialPresent">,
+): boolean {
+  return (
+    status.usageConnection === "expired" ||
+    (status.usageConnection === "disconnected" && !status.credentialPresent)
+  );
+}
 
 export function createHubClient(deps: HubClientDeps): HubClientHandle {
   const fetchImpl = deps.fetchImpl ?? fetch;
@@ -153,15 +175,16 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
   // and the pre-restart fallback samples then stay local-only unless the hub
   // is empty (the "" cutoff). Bounded, accepted — do not persist it.
   let pushUpFloor: string | null = null;
-  // Auto-heal damping (ADR-0035 M2): the exact credential this client last
+  // Auto-heal damping (ADR-0035 M2): the session key this client last
   // successfully POSTed to the hub. A key we already gave the hub is never
   // re-pushed — if the hub still reports dead with it, the key is bad
-  // everywhere, and re-pushing every retry would hit claude.ai (the hub polls
-  // inside the credential POST) 4×/min. A NEW local key (fresh paste in
-  // Settings) compares unequal and un-damps — "one paste into any machine
-  // heals the fleet". Reset on configure(): a different hub is a different
-  // relationship.
-  let lastPushedCredential: UsageCredential | null = null;
+  // everywhere, and re-pushing every retry would hit claude.ai (the hub lists
+  // and polls inside the credential POST) 4×/min. A NEW local key (fresh paste
+  // in Settings) compares unequal and un-damps — "one paste into any machine
+  // heals the fleet". The key alone decides: a heal hands the Hub a key, never
+  // an Organization; the Hub decides what to poll by listing (ADR-0104). Reset
+  // on configure(): a different hub is a different relationship.
+  let lastPushedKey: string | null = null;
   // fail()'s "transition INTO fallback/mismatch" check must see through the
   // "connecting" state: connect() flips state to "connecting" at the top of
   // EVERY attempt — including the retry-timer attempts fired FROM fallback —
@@ -183,6 +206,15 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
       h["x-maxprice-hostname"] = deps.hostname;
     }
     return h;
+  }
+
+  // One reading per Organization this client polls, as the Hub's snapshot now
+  // answers it — never the Hub's other Organizations, and never Home's alone.
+  function emitCurrent(): void {
+    for (const organizationUuid of deps.localPoller.getOrganizations()) {
+      const { sample, weeklyResetAt } = deps.localPoller.getCurrent(organizationUuid);
+      deps.liveHub.emitUsageSample({ organizationUuid, sample, weeklyResetAt });
+    }
   }
 
   function setState(next: HubConnection): void {
@@ -221,6 +253,7 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
       settled === "unauthorized";
     setState(kind);
     deps.fleet?.onDisconnected();
+    deps.localPoller.setRemoteState(null);
     deps.localPoller.start();
     if (!wasFallenBack) {
       const tip = deps.store.latest()?.capturedAt ?? "";
@@ -239,14 +272,7 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
   function healCandidate(c: HubClientConfig): UsageCredential | null {
     if (!c.autoHeal) return null;
     const cred = deps.getLocalCredential();
-    if (cred === null) return null;
-    if (
-      lastPushedCredential !== null &&
-      lastPushedCredential.sessionKey === cred.sessionKey &&
-      lastPushedCredential.orgId === cred.orgId
-    ) {
-      return null;
-    }
+    if (cred === null || cred.sessionKey === lastPushedKey) return null;
     return cred;
   }
 
@@ -287,8 +313,7 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
     // fallback episode).
     if (state !== "connecting") stateBeforeConnecting = state;
     setState("connecting");
-    let hubUsageConnection: UsageConnection;
-    let hubCurrentSample: UsageReading | null = null;
+    let hubStatus: HubStatus;
     // The hub's event-sync watermark, captured near the status parse (below) so
     // it survives the block-scoped `status` const out to the connected block
     // where onConnected fires — the ADR-0041 seam ([[HubFleetHooks]]). null ⇒ a
@@ -325,7 +350,7 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
       // Version matches → parse the v-current shape from the SAME raw value.
       const status = hubStatusSchema.safeParse(rawStatus);
       if (!status.success) return fail(myEpoch, "fallback");
-      hubCurrentSample = status.data.usageCurrentSample;
+      hubStatus = status.data;
       // Capture the event-sync watermark before the block-scoped `status` const
       // falls out of scope at the connected block ([[hubEvents]]).
       hubEvents = status.data.events ?? null;
@@ -338,11 +363,16 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
       // "error" does NOT trigger fallback — a transient claude.ai outage would
       // fail the local poll identically (churn for nothing).
       //
-      // BOOT-WINDOW EXCEPTION (F16): "disconnected" WITH credentialPresent:true
-      // is the transient window between a just-restarted hub's bind and its
-      // first poll completing — provably NOT a steady-state dead key (a real
-      // dead key reports "expired"; a credential CLEAR sets disconnected +
-      // credentialPresent:FALSE together). Treat it like "error": skip the heal
+      // PENDING-READ EXCEPTION (F16/ADR-0104): the Hub reads "disconnected"
+      // with a held key only while its first answer is pending — boot, or an
+      // Organization replacement awaiting its first poll. A discovery that
+      // failed or listed nothing awaits nothing and reads "error" only while
+      // no polled Organization answers — an answering one keeps the Hub
+      // "connected" (#284) — and like any "error" the client stays
+      // hub-connected. A dead key reports "expired";
+      // a credential CLEAR publishes both disconnected and
+      // credentialPresent:false once the clear settles.
+      // Treat a pending read like "error": skip the heal
       // and proceed to connected, so a hub restart doesn't trigger a thundering
       // herd of redundant keychain writes + upstream polls as every client's
       // retry lands here. If the boot poll then reveals the key expired, the
@@ -350,19 +380,17 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
       // The skip is keyed on credentialPresent===true so disconnected +
       // credentialPresent:false (a hub with NO key — incl. the Windows
       // credstore-read-failure case) still heals below.
-      const bootWindow =
-        status.data.usageConnection === "disconnected" && status.data.credentialPresent === true;
-      if (
-        !bootWindow &&
-        (status.data.usageConnection === "disconnected" ||
-          status.data.usageConnection === "expired")
-      ) {
-        // Mirror the hub's state for visibility while we decide.
+      if (hasUnusableCredential(status.data)) {
+        // The key-dead value is also this client's derived value — a dead or
+        // absent key reads the same for every Organization. Every other
+        // display is getCurrent().connection: the view Organization's state
+        // from the Hub's map (#267 item 2) — the sidecar's Quota organization.
         deps.liveHub.patchStatus({ usageConnection: status.data.usageConnection });
         // Auto-heal (ADR-0035 M2): before failing over, a client holding a key
-        // the hub hasn't seen pushes it and re-runs the attempt — the hub
-        // polls once inside POST /api/credential before acking, so the
-        // re-check reads the healed truth, not a race. One heal per attempt
+        // the hub hasn't seen pushes it and re-runs the attempt — inside POST
+        // /api/credential the hub persists the key, lists the Organizations it
+        // can read and polls them before acking (ADR-0104), so the re-check
+        // reads the healed truth, not a race. One heal per attempt
         // (healBudget): if the pushed key is also dead the re-check lands
         // here again, damped, and falls through to fallback. The frame-time
         // dead-credential path deliberately does NOT heal — it fails to
@@ -378,14 +406,16 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
           const healRes = await fetchImpl(`${c.url}/api/credential`, {
             method: "POST",
             headers: { ...headers(c), "content-type": "application/json" },
-            body: JSON.stringify(cred),
-            // The hub polls claude.ai before acking — this is the slow lane.
-            // Politeness edge: if the hub's persist+pollOnce reliably exceeds
-            // this 30s deadline (a claude.ai brown-out where requests hang
-            // rather than fail), the upstream poll still completes hub-side
-            // but the client sees a throw and never damps (damping is
-            // success-only below) — each ~30s timed-out attempt plus the
-            // retry interval sustains ~1.3 claude.ai polls/min until
+            // The key alone, whatever else the local credential carries: the
+            // hub refuses a body with an `orgId` (ADR-0104).
+            body: JSON.stringify({ sessionKey: cred.sessionKey } satisfies UsageCredential),
+            // The hub lists and polls claude.ai before acking — this is the
+            // slow lane. Politeness edge: if the hub's persist + listing +
+            // poll reliably exceeds this 30s deadline (a claude.ai brown-out
+            // where requests hang rather than fail), the upstream poll still
+            // completes hub-side but the client sees a throw and never damps
+            // (damping is success-only below) — each ~30s timed-out attempt
+            // plus the retry interval sustains ~1.3 claude.ai polls/min until
             // claude.ai recovers. Self-limiting (it requires claude.ai to
             // already be hanging >30s per request), and damping-on-send would
             // mis-damp transient hub 500s — the accepted trade.
@@ -398,7 +428,7 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
           if (healRes.ok) {
             // Damped only on success: a transient hub-side 500 (the keychain
             // write fails BEFORE the hub's upstream poll) retries next cycle.
-            lastPushedCredential = cred;
+            lastPushedKey = cred.sessionKey;
             return connect(healBudget - 1);
           }
           console.warn(`[usage-core] hub credential heal rejected (${healRes.status})`);
@@ -412,7 +442,6 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
         // unreachable" (ADR-0039, the ADR-0037 precedent).
         return fail(myEpoch, "keyless");
       }
-      hubUsageConnection = status.data.usageConnection;
 
       // Backfill everything captured since our latest local sample.
       const since = deps.store.latest()?.capturedAt;
@@ -501,17 +530,17 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
     // stream that failed into "fallback" could be clobbered by a still-running
     // backfill flipping state back to connected.
     state = "connected";
-    deps.localPoller.setCurrentSample(hubCurrentSample);
-    deps.liveHub.emitUsageSample(hubCurrentSample);
+    void deps.localPoller.stop();
+    deps.localPoller.setRemoteState(hubStatus);
+    emitCurrent();
     deps.liveHub.patchStatus({
       hubConnection: "connected",
-      usageConnection: hubUsageConnection,
+      usageConnection: deps.localPoller.getCurrent().connection,
       usageLastSampleAt: deps.store.latest()?.capturedAt ?? null,
     });
     // ADR-0041 seam: hand the event-sync engine the connection context AFTER
     // backfill settled and BEFORE the stream opens — it never opens its own.
     deps.fleet?.onConnected({ url: c.url, headers: headers(c), events: hubEvents });
-    void deps.localPoller.stop();
     void openStream(c, myEpoch);
   }
 
@@ -605,11 +634,14 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
         const { frames, remainder } = splitSseFrames(buffer, decoded);
         buffer = remainder;
         for (const f of frames) {
+          if (epoch !== myEpoch || abort.signal.aborted) return;
           handleFrame(f, myEpoch);
+          // A terminal frame can abort the stream mid-batch. Remaining frames
+          // belong to that dead stream and must not disturb local fallback.
+          if (epoch !== myEpoch || abort.signal.aborted) return;
           // First frame ⇒ subscribed (F7): sweep the snapshot→subscription gap
-          // once. Skip if this frame's handleFrame already fail()ed/aborted the
-          // stream (the fetch would abort immediately and log a spurious error).
-          if (!supplementalDone && epoch === myEpoch && !abort.signal.aborted) {
+          // once, while this stream still owns the connection.
+          if (!supplementalDone) {
             supplementalDone = true;
             void supplementalBackfill();
           }
@@ -650,17 +682,16 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
         const parsed = usageSampleSchema.safeParse(JSON.parse(data));
         if (!parsed.success) return;
         const added = deps.store.merge([parsed.data]);
-        deps.localPoller.setCurrentSample(parsed.data);
-        deps.liveHub.emitUsageSample(parsed.data);
+        // hub:sample replicates ALL history. Live state rides hub:status.
         if (added > 0) {
-          deps.liveHub.patchStatus({ usageLastSampleAt: parsed.data.capturedAt });
+          deps.liveHub.patchStatus({ usageLastSampleAt: deps.store.latest()?.capturedAt ?? null });
         }
       } else if (event === HUB_SSE_EVENT.status) {
         const parsed = hubStatusSchema.safeParse(JSON.parse(data));
         if (!parsed.success) return;
-        deps.localPoller.setCurrentSample(parsed.data.usageCurrentSample);
-        deps.liveHub.emitUsageSample(parsed.data.usageCurrentSample);
-        deps.liveHub.patchStatus({ usageConnection: parsed.data.usageConnection });
+        deps.localPoller.setRemoteState(parsed.data);
+        emitCurrent();
+        deps.liveHub.patchStatus({ usageConnection: deps.localPoller.getCurrent().connection });
         // ADR-0041 seam: forward the hub's live event-sync watermark.
         deps.fleet?.onStatusEvents(parsed.data.events ?? null);
         // The hub's credential died mid-stream — same policy as connect():
@@ -668,10 +699,7 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
         // connected there too). fail() aborts OUR stream from inside its own
         // read loop; the loop's abort.signal.aborted guards unwind it cleanly
         // without double-failing.
-        if (
-          parsed.data.usageConnection === "disconnected" ||
-          parsed.data.usageConnection === "expired"
-        ) {
+        if (hasUnusableCredential(parsed.data)) {
           fail(myEpoch, "keyless");
         }
       } else if (event === HUB_SSE_EVENT.events) {
@@ -682,6 +710,14 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
       } else if (event === HUB_SSE_EVENT.machines) {
         // ADR-0041 poke: a directory-changed signal (empty payload).
         deps.fleet?.onMachinesPoke();
+      } else if (event === HUB_SSE_EVENT.organizations) {
+        // ADR-0105 §8 poke: the Organization directory's union changed (empty
+        // payload) — the fleet pulls it.
+        deps.fleet?.onOrganizationsPoke();
+      } else if (event === HUB_SSE_EVENT.organizationAssertions) {
+        // ADR-0107 §11 poke: the Organization assertion directory's union
+        // changed (empty payload) — the fleet pulls it.
+        deps.fleet?.onOrganizationAssertionsPoke();
       }
     } catch {
       // an unparseable frame is dropped, never fatal
@@ -705,12 +741,13 @@ export function createHubClient(deps: HubClientDeps): HubClientHandle {
       teardownCurrent();
       deps.fleet?.onDisconnected();
       // A different hub is a different relationship — heal damping resets
-      // ([[lastPushedCredential]]).
-      lastPushedCredential = null;
+      // ([[lastPushedKey]]).
+      lastPushedKey = null;
       config = next;
       if (next === null) {
         setState("off");
         // No hub ⇒ the pre-hub app: local poller on duty.
+        deps.localPoller.setRemoteState(null);
         deps.localPoller.start();
         return;
       }

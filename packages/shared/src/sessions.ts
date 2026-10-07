@@ -29,6 +29,39 @@ const sessionRowSchema = z.object({
   // machine-filtered queries narrow the events first, so the latest MATCHING
   // event decides.
   machineId: z.string(),
+  // The Organization the LATEST event counts under (#278) — its Owner record
+  // evidence, else the Organization its session is asserted to (#309), else
+  // its Presumed organization — following the same latest-event rule as
+  // `machineId`. ABSENT when that event resolves to no Organization (no
+  // evidence, no assertion and no Home to presume), never `null` or `""`. The
+  // engine stays one row per session: a session that crosses Organizations
+  // never splits and names its latest one (#262 item 5).
+  organizationUuid: z.string().optional(),
+  // Which source answered, summarised over the SESSION's events rather than
+  // read off the latest one (#309): "assigned" if any event resolved through
+  // an Organization assertion, else "presumed" if any resolved through the
+  // Presumed organization, else "evidence". An assertion names a whole
+  // session, so its owner-less rows are all assigned or all presumed, and this
+  // reads as "how this session's owner-less usage is attributed, else
+  // evidence" — which is what tells a partly owned session (an owned tail
+  // naming `organizationUuid`) from a wholly owned one. ABSENT exactly when no
+  // event resolves to any Organization, so a Home-less, tag-less machine
+  // serves the pre-#309 row.
+  organizationResolution: z.enum(["evidence", "assigned", "presumed"]).optional(),
+  // The two halves of a PARTLY OWNED session (#312): `ownerless` is the
+  // Organization its latest owner-less event (presumed or assigned) counts
+  // under, `owned` the one its latest evidence event names. PRESENT exactly
+  // when the session's folded events hold both kinds and each resolves to an
+  // Organization; ABSENT otherwise, never `null`. The fold runs over the
+  // scope-narrowed events, so under one Organization's scope a partly owned
+  // session usually shows one half and carries no split. The two may name the
+  // same Organization — a tail tagged with the presumption's own is still
+  // partly owned, and only its owner-less half can follow an assertion. A
+  // session's owner-less target is `organizationSplit?.ownerless ??
+  // organizationUuid`.
+  organizationSplit: z
+    .object({ ownerless: z.string().min(1), owned: z.string().min(1) })
+    .optional(),
 });
 
 export const sessionsResponseSchema = z.object({
