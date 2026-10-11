@@ -20,11 +20,11 @@ export type HubRosterEntry = {
 // directory holds a live label for that the roster lacks, in uuid order. Each
 // label resolves as the sidecar's roster resolves it: the directory's rename,
 // else the hints' plan word, else the short id. A row's Limits answer is the
-// live status map's, else the roster's last answer without its times, else
-// null. A listed row also carries its roster hints when it has any (#366), so a
-// client that learns the roster resolves the same default label; a
-// directory-only row carries none. The operator rename checks uniqueness
-// against these same labels.
+// live status map's, else the roster's last answer without its times or
+// Window states (#384), else null. A listed row also carries its roster hints
+// when it has any (#366), so a client that learns the roster resolves the same
+// default label; a directory-only row carries none. The operator rename checks
+// uniqueness against these same labels.
 export function hubOrganizationRows(
   roster: ReadonlyArray<HubRosterEntry>,
   labels: Readonly<Record<string, OrganizationLabelEntry>>,
@@ -47,7 +47,7 @@ export function hubOrganizationRows(
       ? live[uuid]!
       : answer === null
         ? null
-        : { limits: answer, lastReadAt: null, lastSampleAt: null };
+        : { limits: answer, windowStates: null, lastReadAt: null, lastSampleAt: null };
     return { uuid, label, renamed, listed, limits, ...(listed && hints !== null ? { hints } : {}) };
   };
   const rostered = new Set(roster.map((entry) => entry.id));

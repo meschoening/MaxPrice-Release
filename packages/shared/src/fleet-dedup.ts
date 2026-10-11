@@ -1,9 +1,9 @@
 // The ONE fleet merge rule (ADR-0041, ADR-0103), defined ONCE for the stores
 // that MUST agree byte-for-byte: the engine's event store
-// (apps/sidecar/src/engine/store.ts); the Hub and the client replica (both
-// packages/usage-core/src/fleet-sync-store.ts, SQLite — the Hub decides, and
-// the replica mirrors the Hub's decisions and runs no comparison of its own);
-// and the Local archive (packages/usage-core/src/fleet-event-store.ts, JSONL).
+// (apps/sidecar/src/engine/store.ts); and the Hub, the client replica and the
+// Local archive (all packages/usage-core/src/fleet-sync-store.ts, SQLite — the
+// Hub and the archive decide, and the replica mirrors the Hub's decisions and
+// runs no comparison of its own).
 // The push loop's stamp (usage-core event-sync.ts) and the Local archive sweep
 // ask the same question of a copy held elsewhere. Stores that re-export these
 // do so under their own local names; the cross-store parity tests pin the

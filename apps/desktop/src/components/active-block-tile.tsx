@@ -5,7 +5,7 @@ import {
   ringStrokeDasharray,
   type ActiveBlockTileState,
 } from "@/lib/active-block-tile-state";
-import type { NoLimits } from "@/lib/organization-scope-view";
+import type { NoLimit } from "@/lib/organization-scope-view";
 import { NoLimitsNote } from "@/components/no-limits-note";
 import { UsageExpiredHint } from "@/components/usage-expired-hint";
 import { UnpricedChip } from "@/components/unpriced-chip";
@@ -49,7 +49,8 @@ export function ActiveBlockTile({
   // The ring reads the Quota organization's reading (ADR-0106 §8).
   const { quotaOrganization } = useOrganizationScope();
   const { data: usage } = useUsageCurrent(quotaOrganization);
-  const { tag: quotaTag, noLimits } = useQuotaSurface();
+  // The 5-hour window's note: none for an idle limit (#384).
+  const { tag: quotaTag, fiveHourNote: noLimit } = useQuotaSurface();
   const usageConnection = useLiveStatus((s) => s.usageConnection);
   const tileState = activeBlockTileState(
     block,
@@ -69,7 +70,7 @@ export function ActiveBlockTile({
     return (
       <ActiveBlockEmptyInset
         quotaTag={quotaTag}
-        noLimits={noLimits}
+        noLimit={noLimit}
         usageExpired={usageConnection === "expired"}
       />
     );
@@ -85,7 +86,7 @@ export function ActiveBlockTile({
       usageExpired={usageConnection === "expired"}
       models={block?.models ?? []}
       quotaTag={quotaTag}
-      noLimits={noLimits}
+      noLimit={noLimit}
     />
   );
 }
@@ -93,8 +94,9 @@ export function ActiveBlockTile({
 type QuotaSurfaceProps = {
   // The Quota organization's label, set only under All organizations.
   quotaTag: string | null;
-  // Set when the Quota organization reports no limits, or they can't be read.
-  noLimits: NoLimits | null;
+  // Set when the Quota organization has no 5-hour limit, or its limits can't
+  // be read.
+  noLimit: NoLimit | null;
 };
 
 // The eyebrow names whose block this is only under All organizations; scoped to
@@ -111,7 +113,7 @@ function ActiveBlockEyebrow({ quotaTag }: Pick<QuotaSurfaceProps, "quotaTag">): 
 // The tile with no live usage connection: the explicit empty inset.
 export function ActiveBlockEmptyInset({
   quotaTag,
-  noLimits,
+  noLimit,
   usageExpired,
 }: QuotaSurfaceProps & { usageExpired: boolean }): React.ReactElement {
   return (
@@ -120,7 +122,7 @@ export function ActiveBlockEmptyInset({
       <div className="inset dashed my-auto">
         <p>No active block — start a Claude Code session to open one.</p>
       </div>
-      {noLimits !== null ? <NoLimitsNote noLimits={noLimits} what="5-hour" /> : null}
+      {noLimit !== null ? <NoLimitsNote noLimit={noLimit} what="5-hour" /> : null}
       {usageExpired ? <UsageExpiredHint /> : null}
     </div>
   );
@@ -153,7 +155,7 @@ export function ActiveBlockTileContent({
   usageExpired,
   models,
   quotaTag,
-  noLimits,
+  noLimit,
 }: ActiveBlockTileContentProps): React.ReactElement {
   const { accountWindow, active, limitPct, ringCenterLabel, ringFrac } = state;
   const valueText = tileValueText(state);
@@ -211,7 +213,7 @@ export function ActiveBlockTileContent({
           <ActiveBlockEyebrow quotaTag={quotaTag} />
           {tileStartMs !== null && tileEndMs !== null ? (
             <span className="window-chip num">
-              {windowChip(tileStartMs, tileEndMs, display) + (noLimits !== null ? " est." : "")}
+              {windowChip(tileStartMs, tileEndMs, display) + (noLimit !== null ? " est." : "")}
             </span>
           ) : null}
         </div>
@@ -227,9 +229,10 @@ export function ActiveBlockTileContent({
             </span>
           ) : null}
         </div>
-        {/* An Organization with no readable limits shows no meter, whatever the
-            reading says, and its note sits where the meter would. */}
-        {limitPct !== null && noLimits === null ? (
+        {/* An Organization with no 5-hour limit, or none readable, shows no
+            meter, whatever the reading says, and its note sits where the meter
+            would. */}
+        {limitPct !== null && noLimit === null ? (
           <div className="limit-row">
             <label>5-hour limit used</label>
             <span
@@ -245,7 +248,7 @@ export function ActiveBlockTileContent({
             <b className="num">{limitPct}%</b>
           </div>
         ) : null}
-        {noLimits !== null ? <NoLimitsNote noLimits={noLimits} what="5-hour" /> : null}
+        {noLimit !== null ? <NoLimitsNote noLimit={noLimit} what="5-hour" /> : null}
         {active !== null || accountWindow !== null ? (
           <div className="block-foot num">
             <b>

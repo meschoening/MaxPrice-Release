@@ -1,5 +1,5 @@
-import { type FleetEvent, sessionPairKey } from "@maxprice/shared";
-import { fleetRowBytes } from "@maxprice/usage-core";
+import { sessionPairKey } from "@maxprice/shared";
+import type { FleetRecord } from "@maxprice/usage-core";
 import { identityFromPath } from "./identity";
 
 // The unbacked-row classifier and its four guards (map #124, ticket #130).
@@ -60,7 +60,8 @@ export type UnbackedOrganization = { organizationUuid: string; rows: number };
 export type UnbackedReport = {
   unbackedRows: number;
   // The on-disk bytes of those rows, measured through the archive's own line
-  // layout (`fleetRowBytes`). APPROXIMATE in one direction only, and stated so:
+  // layout (`fleetRowBytes`, which each replica record carries as `bytes`,
+  // ADR-0111 §1). APPROXIMATE in one direction only, and stated so:
   // it counts LIVE rows, so the bytes a forget actually frees are >= this — the
   // rewrite drops each row's superseded predecessors too.
   unbackedBytes: number;
@@ -129,8 +130,9 @@ export type UnbackedInput = {
   // Whether the replica exists at all: hub configured AND `hubFleetReplica` on.
   // False ⇒ `forget: null`.
   replicaAttached: boolean;
-  // The replica's live rows — `fleetEventStore.all()` verbatim. Read-only.
-  rows: readonly FleetEvent[];
+  // The replica's records — `replica.records()` verbatim, one per live row
+  // (ADR-0111 §2): the classification reads no row. Read-only.
+  records: Iterable<FleetRecord>;
   // This machine's id. Compared BYTE-EQUAL and never alias-resolved, matching
   // the scoping rule #128 locked for the hub route: a merged-away alias is a
   // display concern, and resolving it here would let one machine's forget reach
@@ -167,16 +169,15 @@ export type UnbackedInput = {
   // the numerator nor the tripwire's denominator, the rule peers' rows already
   // follow, and the verdict is the one the same replica would get without
   // them.
-  withheld?: (row: FleetEvent) => boolean;
+  withheld?: (record: FleetRecord) => boolean;
   // The Organization an unbacked row counts under, for the per-Organization
   // disclosure (#295) — main() wires `eventOrganization` against the live
   // store's presumption, so a row answers here exactly as it does in every
   // report: evidence, then assertion, then presumption. `undefined` = it
   // resolves to none (no Home to presume under), which suppresses the
   // breakdown rather than leaving a row out of it. Omitted = no breakdown.
-  organizationOf?: (row: FleetEvent) => string | undefined;
-  // Test seams. `rowBytes` defaults to the archive's real line layout.
-  rowBytes?: (row: FleetEvent) => number;
+  organizationOf?: (record: FleetRecord) => string | undefined;
+  // Test seams.
   sampleLimit?: number;
   ratioLimit?: number;
 };
@@ -184,14 +185,14 @@ export type UnbackedInput = {
 export function classifyUnbacked(input: UnbackedInput): UnbackedClassification {
   if (!input.replicaAttached) return { forget: null, sessions: [] };
 
-  const rowBytes = input.rowBytes ?? fleetRowBytes;
   const sampleLimit = input.sampleLimit ?? UNBACKED_SAMPLE_LIMIT;
   const ratioLimit = input.ratioLimit ?? UNBACKED_RATIO_LIMIT;
 
-  // One pass over the replica. Rows belonging to other machines are not merely
-  // excluded from the unbacked set — they never enter the arithmetic at all,
-  // including the tripwire's denominator, because this machine cannot forget
-  // them and a peer's history must not dilute a ratio computed about ours.
+  // One pass over the replica's records, one per row. Rows belonging to other
+  // machines are not merely excluded from the unbacked set — they never enter
+  // the arithmetic at all, including the tripwire's denominator, because this
+  // machine cannot forget them and a peer's history must not dilute a ratio
+  // computed about ours.
   let selfRows = 0;
   let unbackedRows = 0;
   let unbackedBytes = 0;
@@ -203,22 +204,26 @@ export function classifyUnbacked(input: UnbackedInput): UnbackedClassification {
   const perOrganization = new Map<string, number>();
   let resolvedAll = organizationOf !== undefined;
 
-  for (const row of input.rows) {
-    if (row.machineId !== input.selfMachineId) continue;
-    if (input.withheld?.(row) === true) continue;
+  for (const record of input.records) {
+    if (record.machineId !== input.selfMachineId) continue;
+    if (input.withheld?.(record) === true) continue;
     selfRows += 1;
-    const key = sessionPairKey(row.projectSlug, row.sessionId);
+    const key = sessionPairKey(record.projectSlug, record.sessionId);
     if (input.backed.has(key)) continue;
     unbackedRows += 1;
-    unbackedBytes += rowBytes(row);
+    unbackedBytes += record.bytes;
     if (resolvedAll && organizationOf !== undefined) {
-      const organization = organizationOf(row);
+      const organization = organizationOf(record);
       if (organization === undefined) resolvedAll = false;
       else perOrganization.set(organization, (perOrganization.get(organization) ?? 0) + 1);
     }
     const seen = perSession.get(key);
     if (seen === undefined) {
-      perSession.set(key, { projectSlug: row.projectSlug, sessionId: row.sessionId, rows: 1 });
+      perSession.set(key, {
+        projectSlug: record.projectSlug,
+        sessionId: record.sessionId,
+        rows: 1,
+      });
     } else {
       seen.rows += 1;
     }

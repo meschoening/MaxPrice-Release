@@ -42,15 +42,18 @@ export async function prepareOrganizationStore(deps: {
 // Start chokidar alongside the walks so a write after a file's scan is not
 // lost to ignoreInitial. Buffer both halves of its append-before-emit contract
 // in order; once the filtered store is installed, replay through its feeders.
+// A failed walk installs none, so from then on the gate drops: the sidecar
+// stays up after one (#340), and a buffer would grow until relaunch.
 export function gateOrganizationWatcher(
   options: CreateWatcherOptions,
   ready: Promise<void>,
 ): CreateWatcherOptions {
   let open = false;
+  let failed = false;
   const pending: Array<() => void> = [];
   const deliver = (action: () => void) => {
     if (open) action();
-    else pending.push(action);
+    else if (!failed) pending.push(action);
   };
   void ready
     .then(() => {
@@ -59,6 +62,7 @@ export function gateOrganizationWatcher(
       pending.length = 0;
     })
     .catch((err: unknown) => {
+      failed = true;
       pending.length = 0;
       console.error("[sidecar] organization watcher handoff failed:", err);
     });

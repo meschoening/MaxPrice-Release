@@ -8,15 +8,14 @@ import {
   EVENT_PULL_LIMIT_MAX,
   hubStatusSchema,
   HUB_PROTOCOL_VERSION,
-  fleetCopySupersedes,
   fleetDedupTokenTotal,
   fleetFullnessPartsExceed,
   type FleetDeletion,
   type FleetEvent,
   type StoredEventWire,
 } from "@maxprice/shared";
-import { fleetEventKey } from "./fleet-event-store";
-import { FleetRecoveryRequired, type FleetEventStore } from "./fleet-sync-store";
+import { fleetEventKey } from "./fleet-sync-store";
+import { FleetRecoveryRequired, type FleetReplicaStore } from "./fleet-sync-store";
 
 export type EventSyncConnection = {
   url: string; // hub base URL, no trailing slash
@@ -52,7 +51,7 @@ export type EventSyncDeps<Row extends StampableRow = StoredEventWire> = {
   // but must never enter a replacement engine after a replica reset/detach.
   applyFleetRows: (rows: FleetEvent[], mayApply: () => boolean) => number | Promise<number>;
   // The replica — null ⇒ contribute-only (replica off / not attached):
-  replica: () => FleetEventStore | null;
+  replica: () => FleetReplicaStore | null;
   // Wiring callbacks (fleet.ts debounces/orchestrates):
   onPagesApplied: (changed: number) => void; // fired per completed page with the engine-changed count
   onSeedProgress: (seed: { cursor: number; target: number } | null) => void;
@@ -374,11 +373,21 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
     // so a tag gained at an equal total is sent once, and a copy held tagged is
     // never re-sent untagged.
     // Fuller than both is fuller than the better of the two, so the pass
-    // builds no object per row beyond its key (#361).
+    // builds no object per row beyond its key (#361). The held copy is the
+    // replica's record of it: its fullness parts (ADR-0111 §2).
     const unstamped = rows.filter((row, i) => {
       const key = keys[i]!;
       const held = replica?.getByKey(key);
-      if (held !== undefined && !fleetCopySupersedes(row, held)) return false;
+      if (
+        held !== undefined &&
+        !fleetFullnessPartsExceed(
+          fleetDedupTokenTotal(row),
+          row.organizationUuid,
+          held.total,
+          held.organizationUuid,
+        )
+      )
+        return false;
       return acked.exceededBy(key, row);
     });
     const size = deps.pushBatchSize ?? EVENT_PUSH_BATCH_MAX;

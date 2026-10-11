@@ -12,7 +12,9 @@ import {
   type OrganizationsResponse,
   type Settings,
   type StatusSnapshot,
+  type UsageOrganizations,
   type UsageWindow,
+  type WindowState,
 } from "@maxprice/shared";
 import { organizationLabel, organizationLabelMap } from "@/lib/organization-scope-view";
 import { sidecarFetch } from "@/lib/sidecar";
@@ -164,6 +166,19 @@ export function popoutQuotaTag(
   return organizationLabel(organizationLabelMap(roster.organizations), quotaOrganization);
 }
 
+// The Quota organization's 5-hour Window state from the status's Organization
+// map (#384): undefined with no Home, before a status frame, or before its
+// first successful read. An own key only: a uuid is never a prototype name.
+// Pure; exported for its test.
+export function quotaWindowState(
+  organizations: UsageOrganizations | undefined,
+  quotaOrganization: string | undefined,
+): WindowState | undefined {
+  if (organizations === undefined || quotaOrganization === undefined) return undefined;
+  if (!Object.hasOwn(organizations, quotaOrganization)) return undefined;
+  return organizations[quotaOrganization]!.windowStates?.fiveHour;
+}
+
 export type PopoutData = {
   anyError: boolean;
   settled: boolean;
@@ -182,6 +197,9 @@ export type PopoutData = {
   quotaTag: string | null;
   // The scope is All organizations.
   allOrganizations: boolean;
+  // The Quota organization's 5-hour Window state (#384), read from the status
+  // the popout already fetches; undefined before a successful read.
+  fiveHourState: WindowState | undefined;
 };
 
 export function usePopoutData(): PopoutData {
@@ -288,6 +306,7 @@ export function usePopoutData(): PopoutData {
     todayTokens: todayRow?.totalTokens ?? 0,
     quotaTag: popoutQuotaTag(multi, quotaOrganization, rosterQ.data),
     allOrganizations: isAll,
+    fiveHourState: quotaWindowState(statusQ.data?.organizations, quotaOrganization),
   };
 }
 

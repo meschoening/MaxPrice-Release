@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { orgLimitsAnswerSchema, type OrganizationRosterHints } from "./usage-limits";
+import {
+  orgLimitsAnswerSchema,
+  windowStatesSchema,
+  type OrganizationRosterHints,
+} from "./usage-limits";
 
 // GET /api/organizations — the Settings roster (#287): every Organization
 // (GLOSSARY.md) this machine knows about, each with its Organization label as
@@ -19,6 +23,10 @@ export function organizationPath(uuid: string): string {
 // The Limits answer (GLOSSARY.md) the roster shows for an Organization.
 export const organizationLimitsSchema = z.object({
   answer: orgLimitsAnswerSchema,
+  // What the last successful poll said about each primary window (#384): the
+  // per-window fact a "no limit" surface reads. null for a Connect seed, which
+  // records the answer alone, and before any successful read.
+  windowStates: windowStatesSchema.nullable(),
   // "poll": this machine's poller (or the Hub's map it mirrors) answered;
   // "connect": the roster's seed from the last Connect discovery ("(at connect)").
   source: z.enum(["poll", "connect"]),

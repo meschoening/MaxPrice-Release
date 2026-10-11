@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import type { DailyRow, TimeDisplay, WeekWindow } from "@maxprice/shared";
 import { formatRemainingLong } from "@/lib/active-block";
-import type { NoLimits } from "@/lib/organization-scope-view";
+import type { NoLimit } from "@/lib/organization-scope-view";
 import { usageRingState } from "@/lib/usage-ring";
 import { useLiveStatus } from "@/state/use-live-status";
 import { useNowTick } from "@/state/use-now-tick";
@@ -34,7 +34,7 @@ export type ThisWeekTileProps = {
 // wearing the same Aurora gradient + glow as the 5-hour tracker: both are
 // live polled-limit readings (Glass, ADR-0043). The meter is the Quota
 // organization's: under All its label names it, and an Organization with no
-// readable limits gets a note in its place (ADR-0106 §10).
+// weekly limit, or none readable, gets a note in its place (ADR-0106 §10).
 export function ThisWeekTile({
   rows,
   prevRows,
@@ -51,7 +51,9 @@ export function ThisWeekTile({
   // The weekly meter reads the Quota organization's reading (ADR-0106 §8).
   const { quotaOrganization } = useOrganizationScope();
   const { data: usage } = useUsageCurrent(quotaOrganization);
-  const { tag: quotaTag, noLimits } = useQuotaSurface();
+  // The weekly window's note: an Enterprise organization has no weekly limit,
+  // while an idle one is a limit like any other (#384).
+  const { tag: quotaTag, weeklyNote: noLimit } = useQuotaSurface();
   const usageConnection = useLiveStatus((s) => s.usageConnection);
   const ring = usageRingState(
     usageConnection === "connected" ? (usage?.sample?.weekly ?? null) : null,
@@ -75,7 +77,7 @@ export function ThisWeekTile({
       weeklyPct={weeklyPct}
       usageExpired={usageConnection === "expired"}
       quotaTag={quotaTag}
-      noLimits={noLimits}
+      noLimit={noLimit}
     />
   );
 }
@@ -94,8 +96,9 @@ export type ThisWeekTileContentProps = Pick<
   usageExpired: boolean;
   // The Quota organization's label, set only under All organizations.
   quotaTag: string | null;
-  // Set when the Quota organization reports no limits, or they can't be read.
-  noLimits: NoLimits | null;
+  // Set when the Quota organization has no weekly limit, or its limits can't be
+  // read.
+  noLimit: NoLimit | null;
 };
 
 // Pure rendering seam: every live reading and the quota surface arrive as
@@ -111,7 +114,7 @@ export function ThisWeekTileContent({
   weeklyPct,
   usageExpired,
   quotaTag,
-  noLimits,
+  noLimit,
 }: ThisWeekTileContentProps): React.ReactElement {
   const delta = total - prevTotal;
   const pct = prevTotal === 0 ? null : (delta / prevTotal) * 100;
@@ -128,21 +131,22 @@ export function ThisWeekTileContent({
         <UnpricedChip models={models} />
       </span>
       <span className="tile-sub num">
-        {weekSubLine(week, rollingStart, display, noLimits !== null)}
+        {weekSubLine(week, rollingStart, display, noLimit !== null)}
       </span>
-      {/* An Organization with no readable limits has no weekly reset to wait
-          for, so the fallback is no warning: the sub-line says what it shows. */}
-      {week.kind === "rolling" && week.fallback && noLimits === null ? (
+      {/* An Organization with no weekly limit, or none readable, has no weekly
+          reset to wait for, so the fallback is no warning: the sub-line says
+          what it shows. */}
+      {week.kind === "rolling" && week.fallback && noLimit === null ? (
         <span className="inline-flex items-center gap-1 text-[11px] text-warn">
           ⚠ weekly reset unknown — showing last 7 days
         </span>
       ) : null}
-      {/* An Organization with no readable limits shows no meter, whatever the
-          reading says, and its note sits where the meter would. Under All the
-          meter's label names whose limit it is; the tile's width is the grid's,
-          so a long label ellipsizes, titled in full, and the meter and the
-          percentage keep their room. */}
-      {weeklyPct !== null && noLimits === null ? (
+      {/* An Organization with no weekly limit, or none readable, shows no
+          meter, whatever the reading says, and its note sits where the meter
+          would. Under All the meter's label names whose limit it is; the
+          tile's width is the grid's, so a long label ellipsizes, titled in
+          full, and the meter and the percentage keep their room. */}
+      {weeklyPct !== null && noLimit === null ? (
         <div className="limit-row">
           {quotaTag !== null ? (
             <label className="min-w-0 truncate" title={`weekly limit used · ${quotaTag}`}>
@@ -164,7 +168,7 @@ export function ThisWeekTileContent({
           <b className="num">{weeklyPct}%</b>
         </div>
       ) : null}
-      {noLimits !== null ? <NoLimitsNote noLimits={noLimits} what="weekly" /> : null}
+      {noLimit !== null ? <NoLimitsNote noLimit={noLimit} what="weekly" /> : null}
       {/* "prior 7d" / "prior week to date", not the mock's "last week": the
           copy stays honest about which window the delta compares. */}
       <DeltaChip delta={delta} pct={pct} refLabel={weekRefLabel(week)} refValue={prevTotal} />

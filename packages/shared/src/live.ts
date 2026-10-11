@@ -276,7 +276,8 @@ export const statusSnapshotSchema = z.object({
   // loopback contract — freely evolvable, the hubSeed channel).
   hubEventsDegraded: z.boolean().optional(),
   // Local-archive degrade (ADR-0069): true while this client's local archive
-  // (`local-archive.jsonl`) could not be loaded or written — the app keeps
+  // (`local-archive.sqlite`) could not be loaded, converted from JSONL
+  // (ADR-0111 §6) or written — the app keeps
   // serving reports archive-less, and new history is NOT being made durable.
   // Display-only: Settings › Storage shows the amber line. Optional,
   // absent-means-false (the hubEventsDegraded channel — monorepo-local

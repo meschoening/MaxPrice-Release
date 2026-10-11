@@ -221,12 +221,13 @@ export function dormantSessions(
 }
 
 // The three fields the resolution reads. Narrower than `StoredEvent` so a wire
-// row (`FleetEvent`) resolves through the SAME rule without a projection:
-// Storage's per-Organization Forget breakdown (#295) asks it of replica rows.
-// The tag is OPTIONAL here rather than `Pick`ed, because a wire row omits the
-// key where a `StoredEvent` carries it as `undefined`, and both mean "no
-// evidence". Type-only — a `StoredEvent` passes exactly as before.
-type OrganizationResolvable = Pick<StoredEvent, "sessionId" | "machineId"> & {
+// row (`FleetEvent`) and a replica record (`FleetRecord`, ADR-0111) resolve
+// through the SAME rule without a projection: Storage's per-Organization
+// Forget breakdown (#295) asks it of replica records. The tag is OPTIONAL here
+// rather than `Pick`ed, because a wire row omits the key where a `StoredEvent`
+// carries it as `undefined`, and both mean "no evidence". Type-only — a
+// `StoredEvent` passes exactly as before.
+export type OrganizationResolvable = Pick<StoredEvent, "sessionId" | "machineId"> & {
   organizationUuid?: string;
 };
 

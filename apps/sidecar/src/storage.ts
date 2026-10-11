@@ -1,14 +1,10 @@
 import { readdir, stat } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
-import type {
-  FleetEvent,
-  StorageCleanResponse,
-  StorageReport,
-  StorageSegment,
-} from "@maxprice/shared";
-import type { FleetEventStore, LocalEventArchiveStore } from "@maxprice/usage-core";
-import { eventOrganization } from "./engine/presumption";
+import type { StorageCleanResponse, StorageReport, StorageSegment } from "@maxprice/shared";
+import type { FleetRecord, FleetReplicaStore, LocalArchiveStore } from "@maxprice/usage-core";
+import { eventOrganization, type OrganizationResolvable } from "./engine/presumption";
 import type { EventStore } from "./engine/store";
+import { JSONL_LOCAL_ARCHIVE_FILE } from "./local-archive-conversion";
 import {
   backedSessionsFromPaths,
   classifyUnbacked,
@@ -49,7 +45,7 @@ import {
 // move a 40 MB file into `other`.
 export const STORAGE_FILE = {
   fleetReplica: "fleet-events.sqlite",
-  localArchive: "local-archive.jsonl",
+  localArchive: "local-archive.sqlite",
   scanCache: "scan-cache.json",
   usageHistory: "usage-history.jsonl",
   // ADR-0098, #287 and #310 — all four land in the storage report's `other`
@@ -286,12 +282,15 @@ export type StorageReporterDeps = {
   // The watched Claude Code roots, live (the settings watcher reassigns them).
   getRoots: () => string[];
   // The fleet replica, or null when no hub is configured / the replica is off.
-  // Null ⇒ `forget: null` — permanently absent from the UI, not disabled.
-  getReplica: () => FleetEventStore | null;
+  // Null ⇒ `forget: null` — permanently absent from the UI, not disabled. Its
+  // records are what Forget's classification reads: the report reads no row
+  // of it (ADR-0111 §2).
+  getReplica: () => FleetReplicaStore | null;
   // The Local archive (ADR-0069), or null while degraded / not yet loaded.
-  // Clean compacts it exactly as it compacts the replica; the preview folds its
-  // superseded lines into the same "duplicated rows" numbers.
-  getLocalArchive: () => LocalEventArchiveStore | null;
+  // Clean runs `VACUUM` on it exactly as on the replica, and the preview folds
+  // its free pages into the same `databaseBytes` (ADR-0111 §5). Its records
+  // answer the earliest-at line: the report reads no row of it (§2).
+  getLocalArchive: () => LocalArchiveStore | null;
   selfMachineId: string;
   // The engine store's `ready`, as a synchronous boolean — guard 1's first
   // half. Read off the live status snapshot, which is the app's own answer to
@@ -310,13 +309,14 @@ export type StorageReporterDeps = {
   // Organization (#295) — a walked session's awaiting the scoped repair, or a
   // pruned session's that ADR-0103's accepted departure keeps for good. They
   // are in neither Forget count and draw no archive edge, but Clean keeps
-  // them: they stay in the file and in the bytes.
-  withheld?: (row: FleetEvent) => boolean;
+  // them: they stay in the file and in the bytes. Asked of a replica record
+  // and of a Local archive row alike.
+  withheld?: (row: OrganizationResolvable) => boolean;
   // The Organization an unbacked row counts under, for Forget's
   // per-Organization disclosure (#295; `UnbackedInput.organizationOf`). Wired
   // to `eventOrganization` over the live store's presumption. Omitted = the
   // report never carries `forget.organizations`.
-  organizationOf?: (row: FleetEvent) => string | undefined;
+  organizationOf?: (record: FleetRecord) => string | undefined;
   concurrency?: number;
   // Test seam, handed to every `walkTree` this snapshot runs. It exists for one
   // assertion the suite could not otherwise make: that a per-file stat failure
@@ -338,7 +338,7 @@ export type StorageReporterDeps = {
 // until its successor lands.
 export function forgetOrganizationOf(
   store: Pick<EventStore, "presumption" | "trackedOrganizations">,
-  row: FleetEvent,
+  row: OrganizationResolvable,
 ): string | undefined {
   const organization = eventOrganization(row, store.presumption());
   const tracked = store.trackedOrganizations();
@@ -393,15 +393,15 @@ export function createStorageReporter(deps: StorageReporterDeps): StorageReporte
 }
 
 /**
- * Drop the parse cache and compact both archives — the "Clean up" action.
+ * Drop the parse cache and compact both databases — the "Clean up" action.
  *
  * WHAT IT MAY TOUCH, exactly. `scan-cache.json` (ADR-0048), which is keyed
- * `(path, size, mtimeMs)` and rebuilt from the corpus on demand, and the
- * SUPERSEDED lines of `fleet-events.jsonl` and `local-archive.jsonl` — the ones
- * a later pull or a fuller re-parse replaced, which each store already accounts
- * as `garbageLines`. Nothing else, and in particular never a LIVE row of either:
- * the map's measurement found only ~1% of the replica literally duplicated, and
- * the live rows are precisely the history worth keeping. The Local archive
+ * `(path, size, mtimeMs)` and rebuilt from the corpus on demand, and the free
+ * pages of `fleet-events.sqlite` and `local-archive.sqlite`, which `VACUUM`
+ * returns to the disk (ADR-0100, ADR-0111 §5). Neither store keeps a superseded
+ * row: a fuller copy replaces its row in place. Nothing else, and in particular
+ * never a LIVE row of either: the live rows are precisely the history worth
+ * keeping. The Local archive
  * (ADR-0069) is the archive that arrived — this machine's own events, durably
  * held past the point Claude Code sweeps the transcripts that produced them —
  * and a replica's live self rows remain untouchable for a second reason of their
@@ -432,38 +432,18 @@ export function createStorageReporter(deps: StorageReporterDeps): StorageReporte
 export async function cleanStorage(deps: StorageReporterDeps): Promise<StorageCleanResponse> {
   const scanCacheBytes = await deps.dropScanCache();
 
-  // The replica half. Absent on a hub-less client, whose `clean` preview showed
-  // the same zeroes — the wire shape does not change, so the renderer's
-  // "and N duplicated rows" clause disappears for the same reason it never
-  // appeared.
-  const replica = deps.getReplica();
-  let duplicateRows = 0;
-  let duplicateBytes = 0;
+  // The replica half. Absent on a hub-less client, whose `clean` preview
+  // showed no replica space either.
   let databaseBytes = 0;
-  if (replica !== null) {
-    const { freedBytes } = await replica.compact();
-    databaseBytes = freedBytes;
-  }
+  const replica = deps.getReplica();
+  if (replica !== null) databaseBytes += (await replica.compact()).freedBytes;
 
-  // The Local archive half (ADR-0069 §9): an epoch-preserving rewrite with no
-  // keep-filter — every live row survives, only superseded/torn lines drop.
-  // freedBytes is read BEFORE the rewrite: reclaimableBytes is defined as
-  // "current size minus what a rewrite would write", so it IS the delta.
+  // The Local archive half (ADR-0069 §9, ADR-0111 §5): `VACUUM`, as on the
+  // replica. Every row survives; only free pages go.
   const localArchive = deps.getLocalArchive();
-  if (localArchive !== null) {
-    const freed = localArchive.reclaimableBytes();
-    const { droppedLines } = await localArchive.rewrite({ newEpoch: false });
-    duplicateRows += droppedLines;
-    duplicateBytes += freed;
-  }
+  if (localArchive !== null) databaseBytes += (await localArchive.compact()).freedBytes;
 
-  return {
-    bytes: scanCacheBytes + duplicateBytes + databaseBytes,
-    scanCacheBytes,
-    duplicateRows,
-    duplicateBytes,
-    databaseBytes,
-  };
+  return { bytes: scanCacheBytes + databaseBytes, scanCacheBytes, databaseBytes };
 }
 
 export async function buildStorageSnapshot(deps: StorageReporterDeps): Promise<StorageSnapshot> {
@@ -501,26 +481,22 @@ export async function buildStorageSnapshot(deps: StorageReporterDeps): Promise<S
   const replica = deps.getReplica();
   const localArchive = deps.getLocalArchive();
   const scanCacheBytes = appData.scanCache?.state === "measured" ? appData.scanCache.bytes : 0;
-  // Each archive's superseded lines and the bytes a compact would drop —
-  // "literally duplicated", exactly. Both come from the store's own accounting
-  // (`garbageLines` = valid lines on disk minus live keys; `reclaimableBytes` =
-  // file size minus what a rewrite would write), so the preview is measured in
-  // the units the archive accounts itself in rather than re-derived here. The
-  // Local archive's numbers FOLD into the replica's (ADR-0069 §9) rather than
-  // earning wire fields: it is the same kind of waste with the same remedy, and
-  // the renderer's one "and N duplicated rows" clause covers both.
-  const duplicateRows = localArchive?.garbageLines() ?? 0;
-  const databaseBytes = replica?.reclaimableBytes() ?? 0;
-  const duplicateBytes = localArchive?.reclaimableBytes() ?? 0;
+  // Each database's free pages, which Clean's `VACUUM` returns: the store's own
+  // figure (`freelist_count × page_size`). The Local archive's FOLD into the
+  // replica's (ADR-0069 §9) rather than earning a wire field: the same kind of
+  // space with the same remedy.
+  const databaseBytes =
+    (replica?.reclaimableBytes() ?? 0) + (localArchive?.reclaimableBytes() ?? 0);
 
   // The archive's left edge (issue #139) — the "Storing history back to <date>" line.
   //
-  // A full pass over the archive's live rows, which is why it sits here rather
+  // A full pass over the archive's records, which is why it sits here rather
   // than on the status snapshot: this endpoint already walks ~3700 directory
-  // entries under a bounded pool, so one RAM scan over rows the store is
-  // already holding is far below its own noise floor. Anywhere cheaper (a
-  // status field patched per append) would need the store to maintain a running
-  // minimum across `rewrite`, which it has no reason to carry for one label.
+  // entries under a bounded pool, so one RAM scan over the records the store
+  // holds (each carries its row's timestamp, ADR-0111 §1) is far below its own
+  // noise floor. Anywhere cheaper (a status field patched per append) would
+  // need the store to maintain a running minimum across forgets, which it has
+  // no reason to carry for one label.
   //
   // Lexicographic `<` on the ISO strings, matching the hub's own per-machine
   // stats join (`server.ts`, `lastEventAt`). Sound because every timestamp
@@ -535,10 +511,10 @@ export async function buildStorageSnapshot(deps: StorageReporterDeps): Promise<S
   // in the file and in its bytes, but no report counts it.
   let localArchiveEarliestAt: string | null = null;
   if (localArchive !== null) {
-    for (const row of localArchive.all()) {
-      if (deps.withheld?.(row) === true) continue;
-      if (localArchiveEarliestAt === null || row.timestamp < localArchiveEarliestAt) {
-        localArchiveEarliestAt = row.timestamp;
+    for (const [, record] of localArchive.entries()) {
+      if (deps.withheld?.(record) === true) continue;
+      if (localArchiveEarliestAt === null || record.timestamp < localArchiveEarliestAt) {
+        localArchiveEarliestAt = record.timestamp;
       }
     }
   }
@@ -547,10 +523,11 @@ export async function buildStorageSnapshot(deps: StorageReporterDeps): Promise<S
   // vouch for the enumeration that produced the set it guards (#130 §1). The
   // backed set likewise comes from the paths we just saw, never from the engine
   // store — whose event set never shrinks, so it would call a deleted session
-  // backed forever and reduce Forget to a permanent no-op.
+  // backed forever and reduce Forget to a permanent no-op. The replica answers
+  // from its records alone (ADR-0111 §2): no row is read, from RAM or SQLite.
   const classification = classifyUnbacked({
     replicaAttached: replica !== null,
-    rows: replica?.all() ?? [],
+    records: replica?.records() ?? [],
     selfMachineId: deps.selfMachineId,
     backed: corpus.backed,
     scan: { ready: deps.engineReady(), fileErrors: corpus.errors },
@@ -571,13 +548,7 @@ export async function buildStorageSnapshot(deps: StorageReporterDeps): Promise<S
         missingRoots: corpus.missingRoots,
       },
       localArchiveEarliestAt,
-      clean: {
-        bytes: scanCacheBytes + duplicateBytes + databaseBytes,
-        scanCacheBytes,
-        duplicateRows,
-        duplicateBytes,
-        databaseBytes,
-      },
+      clean: { bytes: scanCacheBytes + databaseBytes, scanCacheBytes, databaseBytes },
       forget: classification.forget,
     },
     forgetSessions: classification.sessions,
@@ -625,9 +596,20 @@ async function walkAppData(
   const named = new Map<string, keyof AppDataSegments>([
     [STORAGE_FILE.fleetReplica, "fleetReplica"],
     [STORAGE_FILE.localArchive, "localArchive"],
+    // A JSONL archive an older build kept is the archive until its one-time
+    // conversion succeeds (ADR-0111 §6); #397 drops this with the converter.
+    [JSONL_LOCAL_ARCHIVE_FILE, "localArchive"],
     [STORAGE_FILE.scanCache, "scanCache"],
     [STORAGE_FILE.usageHistory, "usageHistory"],
   ]);
+  // A database's WAL and shared-memory companions are part of its segment.
+  const companionOf = (name: string): keyof AppDataSegments | undefined => {
+    for (const id of ["fleetReplica", "localArchive"] as const) {
+      const file = STORAGE_FILE[id];
+      if (name === `${file}-wal` || name === `${file}-shm`) return id;
+    }
+    return undefined;
+  };
 
   const out: AppDataSegments = { ...empty };
   // Everything not named above — settings.json, machine-id, the machine and
@@ -658,12 +640,7 @@ async function walkAppData(
       // and it is one file: skip it rather than failing the whole bar.
       continue;
     }
-    const slot =
-      named.get(dirent.name) ??
-      (dirent.name === STORAGE_FILE.fleetReplica + "-wal" ||
-      dirent.name === STORAGE_FILE.fleetReplica + "-shm"
-        ? "fleetReplica"
-        : undefined);
+    const slot = named.get(dirent.name) ?? companionOf(dirent.name);
     if (slot !== undefined) {
       const prior = out[slot];
       out[slot] = {

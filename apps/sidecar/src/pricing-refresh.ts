@@ -169,6 +169,10 @@ export function wirePricingRefresh(opts: {
   // mirroring `buildPricingStatus`'s clock.
   cooldownMs?: number;
   nowImpl?: () => number;
+  // `false` skips the startup arm's fetch (#353): the cache still loads, and
+  // nothing is attempted until a daily, manual or discovery trigger fires.
+  // Only the acceptance harness turns it off (pricing-startup-seam.ts).
+  startupFetch?: boolean;
 }): PricingRefresher {
   const refreshImpl = opts.refreshImpl ?? (() => refreshPricing({ cachePath: opts.cachePath }));
   const retryBaseMs = opts.retryBaseMs ?? 60_000;
@@ -187,6 +191,25 @@ export function wirePricingRefresh(opts: {
   let nextAutomaticAt = 0;
   let stopped = false;
   let cacheLoaded = !opts.cachePath;
+  // The one cache read, while it runs. Started by the first attempt, or by the
+  // startup arm when its fetch is skipped; an attempt arriving meanwhile waits
+  // for it, so it counts `newModels` from the cache's prices and its status
+  // patch lands after the read's. Discovery waits for it too.
+  let cacheRead: Promise<void> | null = null;
+  const readCache = (cachePath: string): Promise<void> => {
+    cacheLoaded = true;
+    cacheRead = (async () => {
+      try {
+        await loadPricingCache(cachePath);
+        publishedPricing = buildPricingStatus(null, opts.models());
+        opts.patch({ pricing: publishedPricing });
+      } finally {
+        cacheRead = null;
+        scheduleUnknownRefresh();
+      }
+    })();
+    return cacheRead;
+  };
   const cooldownMs = opts.cooldownMs ?? DEFAULT_REFRESH_COOLDOWN_MS;
   const nowImpl = opts.nowImpl ?? Date.now;
 
@@ -203,12 +226,10 @@ export function wirePricingRefresh(opts: {
     }
     let before = new Set(Object.keys(activePricingSnapshot().models));
     const run = async (): Promise<RefreshPricingResult> => {
-      if (!cacheLoaded && opts.cachePath) {
-        cacheLoaded = true;
-        await loadPricingCache(opts.cachePath);
+      const read = !cacheLoaded && opts.cachePath ? readCache(opts.cachePath) : cacheRead;
+      if (read !== null) {
+        await read;
         before = new Set(Object.keys(activePricingSnapshot().models));
-        publishedPricing = buildPricingStatus(null, opts.models());
-        opts.patch({ pricing: publishedPricing });
       }
       return refreshImpl();
     };
@@ -242,10 +263,13 @@ export function wirePricingRefresh(opts: {
 
   // Discovery and retries share the same attempt as startup, manual and daily refresh.
   // Failed or still-unpriced attempts back off globally, including when more models arrive.
+  // A cache read in flight defers the decision to the read's end (`readCache`),
+  // so the cache's prices count: the startup attempt holds it off the same way.
   function scheduleUnknownRefresh(): void {
     if (retryTimer !== null) clearTimeoutImpl(retryTimer);
     retryTimer = null;
-    if (stopped || inFlight !== null || unresolvedModels(opts.models()).length === 0) return;
+    if (stopped || inFlight !== null || cacheRead !== null) return;
+    if (unresolvedModels(opts.models()).length === 0) return;
     const cooldownUntil = lastSettled === null ? 0 : lastSettled.at + cooldownMs;
     const delay = Math.max(0, nextAutomaticAt - nowImpl(), cooldownUntil - nowImpl());
     retryTimer = setTimeoutImpl(() => {
@@ -260,7 +284,10 @@ export function wirePricingRefresh(opts: {
   // The startup arm. `void`ed so it never gates the handshake / scan / any
   // endpoint; its own `.catch` keeps a throwing `patch` away from
   // `unhandledRejection`, which `index.ts` handles by exiting the process.
-  void attempt().catch((err: unknown) => {
+  // With `startupFetch: false` it reads the cache and attempts nothing.
+  const startup =
+    opts.startupFetch === false ? (opts.cachePath ? readCache(opts.cachePath) : null) : attempt();
+  void startup?.catch((err: unknown) => {
     console.warn("[sidecar] pricing refresh status update failed:", err);
   });
 

@@ -4,6 +4,7 @@ import {
   type ModelScopedWindow,
   type TimeDisplay,
   type UsageWindow,
+  type WindowState,
 } from "@maxprice/shared";
 import { abbreviate } from "@/lib/active-block";
 import { activeBlockTileState } from "@/lib/active-block-tile-state";
@@ -51,6 +52,9 @@ export type PopoutViewState =
       head: PopoutHead;
       // The 5-hour limit row: null renders the em-dash at 0.55 opacity (the
       // ADR-0030 rule — a real fresh reading only, never a stale percent).
+      // Under the idle head that em-dash also keeps the meter's empty track
+      // (#320). The head decides it, not the null, which an active block's
+      // stale or unknown reading shares.
       limitPct: number | null;
       // The weekly limit row, the same freshness rule (a connected reading whose
       // reset is still ahead — the This-week tile's gate), else the em-dash.
@@ -71,6 +75,11 @@ export type PopoutViewState =
       // Today's total tokens (the daily row's totalTokens, every token type),
       // abbreviated and drawn to the right of the cost: "41.2M tok".
       todayTokensText: string;
+      // The Quota organization has no 5-hour limit: its last successful read
+      // found `five_hour: null`, an absent Window state (#384). Its idle row
+      // is then the bare em-dash, with no #320 track: there is no limit for a
+      // window to be idle in. An idle limit, or no state yet, is false.
+      noFiveHourLimit: boolean;
     };
 
 export type PopoutViewInput = {
@@ -102,6 +111,9 @@ export type PopoutViewInput = {
   quotaTag: string | null;
   // The scope is All organizations: the Today row spans every tracked one.
   allOrganizations: boolean;
+  // The Quota organization's 5-hour Window state, from /api/status's
+  // Organization map; undefined before a successful read or with no Home.
+  fiveHourState: WindowState | undefined;
 };
 
 export function popoutView(input: PopoutViewInput): PopoutViewState {
@@ -123,6 +135,7 @@ export function popoutView(input: PopoutViewInput): PopoutViewState {
   const todayLabel = input.allOrganizations ? "Today · all" : "Today";
   const todayText = `$${input.todayCost.toFixed(2)}`;
   const todayTokensText = `${abbreviate(input.todayTokens)} tok`;
+  const noFiveHourLimit = input.fiveHourState === "absent";
   const weeklyPct = freshPct(input.weeklyWindow, input.usageConnected, input.now);
   const modelRow =
     input.modelWindow === null || !input.showModelLimit
@@ -145,6 +158,7 @@ export function popoutView(input: PopoutViewInput): PopoutViewState {
       todayLabel,
       todayText,
       todayTokensText,
+      noFiveHourLimit,
     };
   }
 
@@ -170,6 +184,7 @@ export function popoutView(input: PopoutViewInput): PopoutViewState {
     todayLabel,
     todayText,
     todayTokensText,
+    noFiveHourLimit,
   };
 }
 

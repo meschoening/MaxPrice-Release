@@ -8,14 +8,8 @@ export * from "./usage-client";
 export type { ListedOrg } from "@maxprice/shared";
 export * from "./poller";
 export * from "./sample-store";
-export {
-  createFleetEventStore as createLocalEventArchiveStore,
-  fleetEventKey,
-  fleetTokenTotal,
-  fleetRowBytes,
-  type FleetEventStore as LocalEventArchiveStore,
-} from "./fleet-event-store";
-// The merge rule's fullness predicate (ADR-0103), beside the key and total.
+// The merge rule's fullness predicate (ADR-0103), beside the key and total
+// (`fleetEventKey`, `fleetTokenTotal`, from ./fleet-sync-store).
 export {
   fleetCopySupersedes,
   fleetDedupFullness,

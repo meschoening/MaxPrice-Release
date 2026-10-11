@@ -6,7 +6,6 @@ import {
   type UsageCredential,
   type UsageSample,
   type UsageReading,
-  completeUsageSample,
 } from "@maxprice/shared";
 import {
   createDeferredShutdown,
@@ -73,13 +72,15 @@ export function createMergeSamples(
 
 // Poller→fanout sample adapter: broadcast each fresh sample live and ride the
 // running sampleCount along on the status. Exported alongside createMergeSamples
-// so serve()'s status-patch wiring lives in one testable place.
+// so serve()'s status-patch wiring lives in one testable place. The poller
+// hands over the sample it appended to history, so the stream carries exactly
+// what the store kept, an Enterprise organization's five-hour-only line
+// included (#384).
 export function createEmitUsageSample(
   store: Pick<SampleStore, "all">,
   fanout: Pick<HubFanout, "emitSample" | "patchStatus" | "getStatus">,
-): (organization: string, sample: UsageReading | null) => void {
-  return (organization, sample) => {
-    const historical = completeUsageSample(sample);
+): (organization: string, sample: UsageReading | null, historical: UsageSample | null) => void {
+  return (organization, sample, historical) => {
     if (historical !== null) fanout.emitSample(historical);
     fanout.patchStatus({
       sampleCount: store.all().length,

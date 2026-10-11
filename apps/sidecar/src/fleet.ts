@@ -11,7 +11,7 @@ import {
   createFleetEventStore,
   createIdentityDirectory,
   type EventSync,
-  type FleetEventStore,
+  type FleetReplicaStore,
   type HubFleetHooks,
 } from "@maxprice/usage-core";
 import {
@@ -141,11 +141,13 @@ export type FleetSyncDeps = {
   // The Local archive's engine feeder (ADR-0069): rebuildEngine seeds every
   // fresh store from it, exactly as it seeds from the replica — without this, a
   // replica-off toggle or an epoch resync would rebuild an engine that forgot
-  // everything the corpus no longer backs.
-  seedLocalArchive?: (store: EventStore) => void;
-  // A user Forget's propagation (ADR-0069 §8): rewrite the local archive to drop
-  // the sessions whose hub batches LANDED, before the resync's rebuild re-seeds
-  // the engine — otherwise the archive resurrects the forgotten rows immediately.
+  // everything the corpus no longer backs. It reads SQLite in chunks that await
+  // between them (ADR-0111 §3).
+  seedLocalArchive?: (store: EventStore) => Promise<void>;
+  // A user Forget's propagation (ADR-0069 §8): delete from the local archive
+  // the sessions whose hub batches LANDED, before the forget takes the pairs'
+  // own rows out of the engine — otherwise the archive, which every rebuild and
+  // `prepareContributions` seed from, puts the forgotten rows back.
   forgetLocalArchive?: (sessions: readonly ForgetSessionRef[]) => Promise<void>;
   // The evidence repair's propagation (#375, `repairOrganizations`): drop only
   // those sessions' rows whose key the live store excludes, barring nothing, so
@@ -286,11 +288,12 @@ export type FleetSync = {
   // Organization assertion directory. A no-op while disconnected — the next
   // connect pushes anyway.
   organizationAssertionsChanged: () => void;
-  // Test-observability seam (ADR-0041, Task 12 convergence suite): the live
-  // replica store, or null when detached (replica off / hub unconfigured). The
-  // fleet fixed-point asserter reads `.all()` off it to compare the client's
-  // verbatim mirror against the hub log. Read-only — callers MUST NOT mutate.
-  getReplica: () => FleetEventStore | null;
+  // The live replica store, or null when detached (replica off / hub
+  // unconfigured). Settings › Storage reads its records; the fleet fixed-point
+  // asserter (ADR-0041, Task 12 convergence suite) reads its rows to compare
+  // the client's verbatim mirror against the hub log. Read-only — callers MUST
+  // NOT mutate.
+  getReplica: () => FleetReplicaStore | null;
   mayArchiveFleet: (row: StoredEvent) => boolean;
   stop: () => Promise<void>;
 };
@@ -370,7 +373,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // The replica exists (attached) ⇔ fleetReplica AND hubConfigured. `conn` is
   // the live hub connection context (url + headers) used by the directory
   // refresh; null while disconnected.
-  let replica: FleetEventStore | null = null;
+  let replica: FleetReplicaStore | null = null;
   let conn: Conn | null = null;
   // Connection generation (event-sync's house pattern — see its `gen`): bumped
   // on BOTH connection edges, so every fleet-side request can ask whether its
@@ -389,6 +392,12 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   const replicaWanted = (): boolean => fleetReplica && hubConfigured;
   let retainedReportStore: EventStore | null = null;
   let detachReportRelay: (() => void) | null = null;
+  // The fresh store a rebuild is reading the replica into, until it is swapped
+  // in. The read awaits between chunks (ADR-0111 §3), so the pull can commit
+  // a change after a chunk that held its row; the pull's feed reaches this
+  // store too, as it reaches the live one.
+  let seedingStore: EventStore | null = null;
+  let seedingForgetPairs: ForgetSessionRef[] | null = null;
 
   function releaseReportStore(): void {
     detachReportRelay?.();
@@ -407,9 +416,9 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   }
   // Creates the replica store, records it as the live one, AND returns the same
   // ref — callers operate on the returned ref across their awaits so a
-  // concurrent detach (which nulls + wipes it) degrades to an empty `all()`
+  // concurrent detach (which nulls + wipes it) ends a read at its next chunk
   // rather than a null deref.
-  function attachReplica(): FleetEventStore {
+  function attachReplica(): FleetReplicaStore {
     const store = createFleetEventStore({ path: deps.replicaPath, mode: "replica" });
     replica = store;
     return store;
@@ -443,9 +452,19 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       const detach = current.onLocalAppend((batch) => batches.push(batch));
       try {
         await scanGate.run(() => fresh.scan(deps.getRoots()));
-        for (const batch of batches)
-          fresh.append(batch.records, batch.projectSlug, batch.sessionId, batch.isSubagent);
-        deps.seedLocalArchive?.(fresh);
+        let replayed = 0;
+        const replay = (): void => {
+          for (; replayed < batches.length; replayed++) {
+            const batch = batches[replayed]!;
+            fresh.append(batch.records, batch.projectSlug, batch.sessionId, batch.isSubagent);
+          }
+        };
+        replay();
+        await deps.seedLocalArchive?.(fresh);
+        // The archive's read awaits between chunks (ADR-0111 §3), and a watcher
+        // flush that lands meanwhile is already in `current`'s contributions:
+        // replay it too, or the replacement below would drop it.
+        replay();
         if (current === deps.getStore()) {
           current.replaceContributions(fresh.contributions());
           current.appendFleet(
@@ -464,6 +483,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       if (!mayApply()) return;
       deps.getStore().removeFleetKeys(rows);
       retainedReportStore?.removeFleetKeys(rows);
+      seedingStore?.removeFleetKeys(rows);
     },
     toWire: storedEventToWire,
     applyFleetRows: async (rows, mayApply) => {
@@ -475,6 +495,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // New remote usage remains live too; old rows disappear only when the
       // replacement has proved complete. This view NEVER feeds a push.
       retainedReportStore?.appendFleet(rows);
+      seedingStore?.appendFleet(rows);
       return changed;
     },
     replica: () => replica,
@@ -601,14 +622,55 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     // thread exactly as much as they do.
     try {
       await scanGate.run(() => fresh.scan(deps.getRoots()));
-      for (const { records, projectSlug, sessionId, isSubagent } of appended) {
-        fresh.append(records, projectSlug, sessionId, isSubagent);
-      }
+      let replayed = 0;
+      const replay = (): void => {
+        for (; replayed < appended.length; replayed++) {
+          const { records, projectSlug, sessionId, isSubagent } = appended[replayed]!;
+          fresh.append(records, projectSlug, sessionId, isSubagent);
+        }
+      };
+      replay();
       // The Local archive seeds BEFORE the replica (ADR-0069 §6): same rows either
       // way (the one merge rule dedups), but archive-first keeps the first-seen
-      // tie order stable between a boot and a rebuild.
-      deps.seedLocalArchive?.(fresh);
-      if (replica !== null) fresh.appendFleet([...replica.all()]);
+      // tie order stable between a boot and a rebuild. Its read awaits between
+      // chunks (ADR-0111 §3); an archive push committed meanwhile takes a later
+      // seq, which a later chunk reads.
+      await deps.seedLocalArchive?.(fresh);
+      // The replica's rows, read from SQLite a chunk at a time (ADR-0111 §3).
+      // Until the swap, the pull's feed reaches `fresh` as well, so a change
+      // committed after the chunk that held its row is applied to it in order.
+      const source = replica;
+      const forgottenWhileSeeding: ForgetSessionRef[] = [];
+      if (source !== null) {
+        seedingStore = fresh;
+        seedingForgetPairs = forgottenWhileSeeding;
+        try {
+          await source.readRows((rows) => fresh.appendFleet(rows));
+        } finally {
+          seedingStore = null;
+          seedingForgetPairs = null;
+        }
+      }
+      // A watcher flush can land while the read awaits: replay it too, after
+      // the replica's rows, as the live store took it.
+      replay();
+      if (forgottenWhileSeeding.length > 0) {
+        // The pair prune also removed scanned contributions. A completed
+        // deletion-fence preparation may have re-walked surviving transcripts
+        // into the live contribution view meanwhile. Keep those eligible
+        // sources, without restoring any archived-only row from the old seed.
+        const pairs = new Set(
+          forgottenWhileSeeding.map((s) => JSON.stringify([s.projectSlug, s.sessionId])),
+        );
+        fresh.appendFleet(
+          deps
+            .getStore()
+            .contributions()
+            .filter((row) => pairs.has(JSON.stringify([row.projectSlug, row.sessionId])))
+            .map((row) => ({ ...storedEventToWire(row), machineId: row.machineId, seq: 0 })),
+          "archive",
+        );
+      }
       deps.swapStore(fresh);
       relayLocalReports(fresh);
       // A known forget prunes its session from the retained view immediately;
@@ -678,9 +740,12 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // a same-epoch Hub already at the replica's cursor serves a complete change
       // page that applies nothing — without this feed those on-disk rows would
       // never reach the engine (silent under-counting until restart).
-      // ADR-0098: seed after the walk — see loadReplicaAtBoot.
+      // ADR-0098: seed after the walk — see loadReplicaAtBoot. The rows are
+      // read from SQLite a chunk at a time (ADR-0111 §3), each into the live
+      // store, which the pull's feed also reaches, so a change committed
+      // between two chunks lands after the chunk that held its row.
       await deps.getStore().ready;
-      deps.getStore().appendFleet([...attached.all()]);
+      await attached.readRows((rows) => deps.getStore().appendFleet(rows));
       eventSync.kickPull();
     } else if (!want && replica !== null) {
       // on→off: detach, unlink the cache, rebuild the engine local-only, and
@@ -734,22 +799,20 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     scheduleReconcile();
   }
 
-  // Drive the SAME unlink → rebuild → resync the epoch-mismatch path drives, and
-  // await it (map #124, ticket #132).
+  // Run the rebuild through the reconcile chain, without unlinking the
+  // replica, and await it (ADR-0098): a Tracked organization change and the
+  // Organization repair redo the engine's verdicts over a replica that is
+  // still valid. A user's Forget never comes here; it deletes incrementally
+  // and leaves the engine in place (ADR-0100, #378).
   //
-  // Awaited, unlike onEpochMismatch's fire-and-forget, because a user pressed a
-  // button and the response is what tells them it happened. What the await
-  // covers is exactly the local DELETE — unlink drops the replica file and RAM,
-  // rebuildEngine re-reads local disk — and deliberately not the re-pull, which
-  // `resync()` only kicks: that is an unbounded multi-page network drain, and
-  // the response must not be hostage to it (ADR-0059's reasoning on the rescan's
-  // fire-and-forget pull, for the same reason). So by the time the route
-  // answers, the forgotten rows are gone from this machine; what refills behind
-  // it is the pruned archive.
+  // Awaited, unlike onEpochMismatch's fire-and-forget, because the caller's
+  // next step reads the rebuilt store. What the await covers is the local
+  // rebuild — the walk, the archive and replica seeds, the swap — and nothing
+  // on the network.
   //
   // Read `reconcileChain` AFTER scheduling: scheduleReconcile reassigns it, and
   // a request landing on an in-flight reconcile coalesces into that chain's
-  // do/while rather than a new link — so the chain in hand covers our resync
+  // do/while rather than a new link — so the chain in hand covers our rebuild
   // either way.
   async function requestRebuild(opts?: { keepRetainedView?: boolean }): Promise<void> {
     const keep = opts?.keepRetainedView === true;
@@ -966,6 +1029,11 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       if (forgetIntentMode(intent) === "pair") {
         deps.getStore().removeMachineSessions(deps.machineId, forgotten);
         retainedReportStore?.removeMachineSessions(deps.machineId, forgotten);
+        // The archive seed has already finished when a rebuild reads the
+        // replica. Its archived-only rows have no replica delete to relay,
+        // so Forget must prune this fresh store too, before it can be swapped.
+        seedingStore?.removeMachineSessions(deps.machineId, forgotten);
+        seedingForgetPairs?.push(...forgotten);
       }
       const result: FleetForgetResult = {
         ok: true,
@@ -993,15 +1061,18 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
         const pairs = new Set(
           forgotten.map((row) => JSON.stringify([row.projectSlug, row.sessionId])),
         );
-        const restored = replica
-          .all()
-          .filter(
-            (row) =>
-              row.machineId === deps.machineId &&
-              pairs.has(JSON.stringify([row.projectSlug, row.sessionId])),
-          );
-        deps.getStore().appendFleet(restored);
-        retainedReportStore?.appendFleet(restored);
+        // The pairs' own rows the replica still holds, picked by their records
+        // and read from SQLite a chunk at a time (ADR-0111 §3).
+        await replica.readRows(
+          (restored) => {
+            deps.getStore().appendFleet(restored);
+            retainedReportStore?.appendFleet(restored);
+            seedingStore?.appendFleet(restored);
+          },
+          (record) =>
+            record.machineId === deps.machineId &&
+            pairs.has(JSON.stringify([record.projectSlug, record.sessionId])),
+        );
       }
       forgetIntent.write(null);
       pokeNow();
@@ -1737,9 +1808,12 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     // Home organization rule excluded, and `appendFleet` refuses exactly those;
     // a replica row landing first would be presumed home. `rebuildEngine`
     // already walks before it seeds — this makes boot match it. `ready`
-    // resolves even on a partially failed walk, so this cannot hang.
+    // resolves even on a partially failed walk, so this cannot hang. The rows
+    // are read from SQLite a chunk at a time, synchronously, as the boot seed
+    // may (ADR-0111 §3).
     await deps.getStore().ready;
-    deps.getStore().appendFleet([...attached.all()]);
+    const store = deps.getStore();
+    attached.readRowsSync((rows) => store.appendFleet(rows));
   }
 
   function applySettings(s: { hubShareEvents: boolean; hubFleetReplica: boolean }): void {
@@ -1981,12 +2055,13 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       if (!eventSync.isCaughtUp()) return false;
       // An identity test — "this row IS the replica's copy" — so it must match
       // in tag too (ADR-0103): a row fuller or emptier by Organization evidence
-      // alone is a different copy.
+      // alone is a different copy. The replica's copy is its record of it
+      // (ADR-0111 §2).
       const held = replica.get(row.messageId, row.requestId);
       return (
         held !== undefined &&
         held.machineId === row.machineId &&
-        fleetTokenTotal(held) === fleetTokenTotal(row) &&
+        held.total === fleetTokenTotal(row) &&
         held.organizationUuid === row.organizationUuid
       );
     },

@@ -419,6 +419,8 @@ export function accountOrganizationValue(
 
 // The Limits answer in words, with the dot tones of the client's Settings list
 // (apps/desktop/src/lib/organization-list-view.ts). Glass `.dot` variants.
+// `windows` covers an idle limit too, and `none` is an Organization that
+// reports no limit at all (#384).
 export function limitsAnswerText(limits: OrganizationUsageStatus | null): {
   dot: "good" | "warn" | "soft";
   text: string;
@@ -428,7 +430,7 @@ export function limitsAnswerText(limits: OrganizationUsageStatus | null): {
     case "windows":
       return { dot: "good", text: "Reading limits" };
     case "none":
-      return { dot: "good", text: "No limit in flight" };
+      return { dot: "good", text: "No limits" };
     case "forbidden":
       return { dot: "soft", text: "Can't read limits" };
     case "error":

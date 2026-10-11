@@ -25,7 +25,10 @@ import {
 // v5 (ADR-0103/0104): fleet event rows carry Organization evidence, an
 // equal-total tagged copy supersedes an untagged one, and usage live/status
 // maps carry independent Organization answers. One bump across the map.
-export const HUB_PROTOCOL_VERSION = 5;
+// v6 (#384): a Usage sample may omit its weekly window (an Organization with
+// no weekly limit), which a v5 peer's sample schema rejects, and each
+// Organization's status carries its Window states.
+export const HUB_PROTOCOL_VERSION = 6;
 
 // The hub's fixed default port. Unlike the sidecar (ADR-0002's dynamic port +
 // stdout handshake — only possible with a parent process), remote clients must
@@ -85,8 +88,9 @@ export const hubStatusSchema = z.object({
   usageConnection: usageConnectionSchema,
   usageLastSampleAt: z.string().nullable(),
   // Missing key: no authoritative current answer. A present null means a
-  // successful read found no windows for that Organization. A partial reading
-  // keeps each window independently nullable (ADR-0090/0104).
+  // successful read found no window in flight for that Organization; its
+  // status's Window states say whether each is idle or absent (#384). A
+  // partial reading keeps each window independently nullable (ADR-0090/0104).
   usageCurrent: z.record(usageReadingSchema.nullable()),
   // Retained cadence survives partial/none reads, including for a new client.
   usageWeeklyResetAt: z.record(z.string()),

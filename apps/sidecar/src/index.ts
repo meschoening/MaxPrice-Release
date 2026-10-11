@@ -67,6 +67,11 @@ import {
   wirePricingRefresh,
   type PricingRefresher,
 } from "./pricing-refresh";
+import {
+  PRICING_STARTUP_FETCH_ENV,
+  PRICING_STARTUP_FETCH_SKIPPED_LINE,
+  pricingStartupFetch,
+} from "./pricing-startup-seam";
 import { createLiveHub, type LiveHub } from "./live-hub";
 import { createWatcher, type CreateWatcherOptions, type Watcher } from "./watcher";
 import { resolveWatchRoots } from "./watch-roots";
@@ -85,6 +90,7 @@ import {
 } from "./storage";
 import { createIdentityProber } from "./identity-probe";
 import { createLocalArchive } from "./local-archive";
+import { JSONL_LOCAL_ARCHIVE_FILE } from "./local-archive-conversion";
 import {
   createOrganizationRegistry,
   createOrganizationRename,
@@ -387,12 +393,13 @@ export async function scanAndPoke(
  * boot readiness signal (ADR-0047). Extracted from main() (like `scanAndPoke`)
  * so the semantic is testable.
  *
- * Settle, not resolve: neither constituent rejects in practice (the store's
- * scan resolves `ready` in its `finally`; the replica load self-heals a
- * corrupt cache), but if a rejection ever escaped, leaving `ready: false`
- * would hold the boot splash forever on a perfectly healthy SSE connection.
- * The app's per-endpoint error surfaces own the failure story once revealed —
- * the splash owns only pre-ready sidecar/stream failures.
+ * Settle, not resolve: a constituent rarely rejects (the store's scan skips
+ * an unreadable root or file rather than throwing; the replica load
+ * self-heals a corrupt cache), but a boot walk that throws rejects
+ * `localReady` (#340), and leaving `ready: false` would hold the boot splash
+ * forever on a perfectly healthy SSE connection. The app's per-endpoint error
+ * surfaces own the failure story once revealed — the splash owns only
+ * pre-ready sidecar/stream failures.
  *
  * `ready` is never cleared afterwards: a rescan (manual ⇧R, a claudePaths
  * edit) is a data update on a live app, not a boot.
@@ -497,6 +504,29 @@ export function wireIdentityProbe(
         console.error("[sidecar] boot identity probe failed:", err);
       }
     });
+}
+
+/**
+ * Run `work` once a boot promise (`localReady` or `engineReady`) RESOLVES, and
+ * nothing if it rejects. Every `void`ed `.then` main() hangs off either one
+ * goes through here (#340).
+ *
+ * Resolve, not settle: unlike the three wirings above, work wired here never
+ * runs after a failed boot. The rejection is observed here
+ * because main() `void`s the chain — unobserved, it reaches the
+ * `unhandledRejection` handler, which exits(1), and the shell never respawns a
+ * sidecar that has announced its port. It is not logged here:
+ * `wireReadySignal` logs the failed boot once.
+ *
+ * Only the boot promise's rejection is observed. A throw from `work` still
+ * rejects the returned chain, so it still reaches the global handler.
+ *
+ * Returns the chain so tests can await it; main() `void`s it.
+ */
+export function whenBootResolves(ready: Promise<void>, work: () => unknown): Promise<unknown> {
+  return ready.then(work, () => {
+    // Logged by wireReadySignal.
+  });
 }
 
 type CommonQuery = {
@@ -2225,15 +2255,6 @@ async function main(): Promise<void> {
   // What a null setting falls back to once the seed has run. Null until then,
   // so a settings edit that beats the walk is never overridden.
   let seededHome: string | null = null;
-  // Settles once the seed has been decided — at once when a home was persisted
-  // — so /api/organizations never reports a home the walk is about to change.
-  let settleHome: (() => void) | undefined;
-  const homeSettled: Promise<void> =
-    currentHome !== null
-      ? Promise.resolve()
-      : new Promise<void>((resolve) => {
-          settleHome = resolve;
-        });
   // Whether a hub is configured right now — the repair skips the hub half when
   // there is none. Boot value from settings; POST /api/hub/config updates it.
   let hubTargetNow: string | null = process.env.MAXPRICE_HUB_URL ?? (bootSettings?.hubUrl || null);
@@ -2437,6 +2458,11 @@ async function main(): Promise<void> {
     resolveLocalReady = resolve;
     rejectLocalReady = reject;
   });
+  // A persisted Home is settled already. On first launch the seed stays
+  // private until its store is installed; share the walk's gate so a failure
+  // also settles the roster request, through the route's error envelope.
+  // A separate success-only gate would hang forever after a failed walk (#340).
+  const homeSettled = currentHome !== null ? Promise.resolve() : localReady;
   let detachForeignEvidence: (() => void) | null = null;
   // The pricing loop and its unpriced-model watch (#110) are assigned after the
   // handshake, but the fleet's `swapStore` (declared next) must re-attach the
@@ -2448,6 +2474,9 @@ async function main(): Promise<void> {
   // always on. Constructed before the fleet so rebuildEngine can seed from it.
   const localArchive = createLocalArchive({
     path: join(appDataDir, STORAGE_FILE.localArchive),
+    // The JSONL archive a build before #396 kept: converted once, at the first
+    // open (ADR-0111 §6). #397 removes this with the converter.
+    jsonlPath: join(appDataDir, JSONL_LOCAL_ARCHIVE_FILE),
     mayArchiveFleet: (row) => fleet.mayArchiveFleet(row),
     machineId,
     getStore: getEngineStore,
@@ -2464,7 +2493,7 @@ async function main(): Promise<void> {
     localArchive.attachStore(next);
     detachForeignEvidence?.();
     detachForeignEvidence = next.onForeignEvidence((sessions) => {
-      void engineReady.then(() => organizationRepair.invalidate(sessions));
+      void whenBootResolves(engineReady, () => organizationRepair.invalidate(sessions));
     });
     detachModelWatch?.();
     if (pricingRefresher) {
@@ -2725,15 +2754,15 @@ async function main(): Promise<void> {
       ...fleet.hooks,
       onConnected: (context) => {
         fleet.hooks.onConnected(context);
-        void engineReady.then(() => organizationRepair.run());
+        void whenBootResolves(engineReady, () => organizationRepair.run());
       },
     },
   });
 
   // The Settings roster (ADR-0098, #287) — GET /api/organizations, and what
-  // every rename checks against. A first launch answers only once the walk has
-  // chosen the home, so the renderer's seed never persists a null or a value
-  // about to change.
+  // every rename checks against. A first launch lists only once the walk has
+  // installed its Home, so the renderer's seed never persists a null or a
+  // value about to change. A failed walk rejects the request instead.
   async function listOrganizationRoster(): Promise<OrganizationsResponse> {
     await homeSettled;
     // Every root's live login is display-only here ("(current login)"); the
@@ -2896,7 +2925,7 @@ async function main(): Promise<void> {
         // ADR-0098: the repair skips its hub half when no hub is configured.
         hubTargetNow = c?.url ?? null;
         fleet.onHubConfigured(c !== null);
-        void engineReady.then(() => organizationRepair.run());
+        void whenBootResolves(engineReady, () => organizationRepair.run());
       },
     },
     // The rescan handler's push trigger — same poke the watcher's onRecords
@@ -2936,6 +2965,17 @@ async function main(): Promise<void> {
   }
   allowedHosts.add(`127.0.0.1:${server.port}`);
   allowedHosts.add(`localhost:${server.port}`);
+
+  // The acceptance harness's seam (#353): no startup pricing fetch. Said on the
+  // diagnostic stream, awaited before the one-line stdout handshake.
+  const startupPricingFetch = pricingStartupFetch(process.env[PRICING_STARTUP_FETCH_ENV]);
+  if (!startupPricingFetch) {
+    await new Promise<void>((resolve, reject) => {
+      process.stderr.write(`${PRICING_STARTUP_FETCH_SKIPPED_LINE}\n`, (err) =>
+        err ? reject(err) : resolve(),
+      );
+    });
+  }
 
   // Stdout handshake: Rust shell reads exactly this line, then exposes the URL
   // to the renderer via `get_sidecar_url`. ADR-0002.
@@ -3004,7 +3044,6 @@ async function main(): Promise<void> {
     // reconciles it.
     queuedDormant = store.dormantSessions();
     admitAssertions();
-    settleHome?.();
     resolveLocalReady();
   }, rejectLocalReady);
 
@@ -3017,6 +3056,8 @@ async function main(): Promise<void> {
       bootTrace.track("replica", fleet.loadReplicaAtBoot()),
       // The archive's disk load (never rejects — a failure degrades instead,
       // ADR-0069 §3). Local disk only, like the replica: never the network.
+      // After the walk, so a JSONL archive's one-time conversion (ADR-0111 §6)
+      // runs here too: it holds back the first report, yielding as it goes.
       bootTrace.track(
         "archive",
         localReady.then(() => localArchive.loadAtBoot()),
@@ -3033,8 +3074,8 @@ async function main(): Promise<void> {
   // still on the splash. Off `localReady` rather than `engineReady`,
   // because the whole point is the window BETWEEN them — the one a hub client's
   // replica load occupies and a hub-less client's does not (the reporter drops
-  // this frame entirely in the latter case).
-  void localReady.then(() => bootProgress.scanFinished());
+  // this frame entirely in the latter case). A failed walk announces nothing.
+  void whenBootResolves(localReady, () => bootProgress.scanFinished());
 
   // The boot readiness signal (ADR-0047): flip `ready: true` — broadcast as a
   // status:changed frame — when the SAME local gate the data handlers await
@@ -3144,6 +3185,7 @@ async function main(): Promise<void> {
     cachePath: join(appDataDir, "pricing-cache.json"),
     patch: liveHub.patchStatus,
     models: () => getEngineStore().models(),
+    startupFetch: startupPricingFetch,
   });
   // Republish `pricing.unpricedModels` the first time any raw model lands
   // (#110). The boot scan may already have emitted batches before this
@@ -3338,7 +3380,7 @@ async function main(): Promise<void> {
           // bounded by WATCHER_READY_TIMEOUT_MS and covers nothing that worked
           // before: the settings watcher runs `ignoreInitial: true`, so an edit
           // predating its creation was never seen anyway.
-          void engineReady.then(() => wireSettingsWatch());
+          void whenBootResolves(engineReady, () => wireSettingsWatch());
         },
       ),
     )
@@ -3348,7 +3390,7 @@ async function main(): Promise<void> {
       // the same thing rather than dying.
       console.error("[sidecar] watcher creation failed:", err);
       liveHub.patchStatus({ watcherDegraded: true });
-      void engineReady.then(() => wireSettingsWatch());
+      void whenBootResolves(engineReady, () => wireSettingsWatch());
     });
 
   // Every phase is registered — including the watcher above; start the
@@ -3513,7 +3555,7 @@ function armParentWatchdog(): void {
       label: "sidecar",
       onOrphaned: () => deferredShutdown.fire(),
     });
-    console.log(`[sidecar] parent watchdog armed (ppid ${initialPpid})`);
+    console.error(`[sidecar] parent watchdog armed (ppid ${initialPpid})`);
   } catch (err) {
     console.error("[sidecar] parent watchdog unavailable — shell teardown only:", err);
   }
@@ -3531,7 +3573,7 @@ function logMonotonicClock(): void {
     console.error(`[sidecar] saturation clock DEGRADED: ${clock.warning}`);
     return;
   }
-  console.log(`[sidecar] saturation clock: ${clock.source}`);
+  console.error(`[sidecar] saturation clock: ${clock.source}`);
 }
 
 if (import.meta.main) {

@@ -1,5 +1,12 @@
 import { z } from "zod";
-import type { DiscoveredOrg, ListedOrg, OrgLimitsAnswer, UsageReading } from "@maxprice/shared";
+import type {
+  DiscoveredOrg,
+  ListedOrg,
+  OrgLimitsAnswer,
+  UsageReading,
+  WindowState,
+  WindowStates,
+} from "@maxprice/shared";
 
 // Outbound client for Anthropic's undocumented subscription-usage endpoint
 // (ADR-0023). Best-effort, mirrors pricing-refresh.ts: injected fetch, timeout,
@@ -23,7 +30,9 @@ export const DEFAULT_CLAUDE_BASE_URL = "https://claude.ai/api";
 // "answered, no weekly window", never a shape mismatch — a tracked Enterprise
 // org used to poll into a permanent "error" over it. Nullable is not optional:
 // a payload missing the key outright is still the shape change ADR-0023's
-// firebreak exists for.
+// firebreak exists for. The three shapes are three Window states (#384): a
+// null reset is an idle limit, a null window no limit, and `fetchUsage`
+// reports which beside the reading, which keeps only windows in flight.
 const upstreamWindowSchema = z
   .object({
     utilization: z.number(),
@@ -63,15 +72,22 @@ const upstreamUsageSchema = z
   })
   .passthrough();
 
+// The model of a recognized scoped limit, independent of its reset. Surface
+// scopes, unnamed models and malformed entries remain outside this contract.
+function scopedModel(limit: z.infer<typeof upstreamLimitSchema> | null): string | null {
+  if (limit === null || limit.kind !== "weekly_scoped") return null;
+  const model = limit.scope?.model?.display_name;
+  return typeof model === "string" && model !== "" ? model : null;
+}
+
 // The first `weekly_scoped` entry with a model scope and a reset in flight —
 // the Model-scoped weekly limit. Exported for its tests.
 export function modelScopedWindow(
   limits: z.infer<typeof upstreamUsageSchema>["limits"],
 ): UsageReading["weeklyModel"] {
   for (const limit of limits ?? []) {
-    if (limit === null || limit.kind !== "weekly_scoped") continue;
-    const model = limit.scope?.model?.display_name;
-    if (typeof model !== "string" || model === "" || limit.resets_at === null) continue;
+    const model = scopedModel(limit);
+    if (model === null || limit === null || limit.resets_at === null) continue;
     return { model, utilizationPct: limit.percent, resetAt: limit.resets_at };
   }
   return undefined;
@@ -103,9 +119,23 @@ const upstreamOrgsSchema = z.array(
 // everything else.
 export type UsageFailKind = "expired" | "forbidden" | "error";
 // Each window survives independently; null means none has a reset in flight.
+// `windowStates` keeps what `sample` cannot: whether a window not in flight is
+// an idle limit or no limit at all (#384).
 export type FetchUsageResult =
-  | { ok: true; sample: UsageReading | null }
+  | {
+      ok: true;
+      sample: UsageReading | null;
+      windowStates: WindowStates;
+      // Parser-local existence, not utilization: an idle cap has no reading.
+      hasModelScopedLimit: boolean;
+    }
   | { ok: false; kind: UsageFailKind };
+
+// One primary window's Window state, from its shape alone (#384).
+function windowState(window: z.infer<typeof upstreamWindowSchema>): WindowState {
+  if (window === null) return "absent";
+  return window.resets_at === null ? "idle" : "active";
+}
 
 export type FetchUsageOptions = {
   sessionKey: string;
@@ -184,6 +214,8 @@ export async function fetchUsage(opts: FetchUsageOptions): Promise<FetchUsageRes
     return {
       ok: true,
       sample: sample.fiveHour === null && sample.weekly === null && !weeklyModel ? null : sample,
+      windowStates: { fiveHour: windowState(u.five_hour), weekly: windowState(u.seven_day) },
+      hasModelScopedLimit: u.limits?.some((limit) => scopedModel(limit) !== null) ?? false,
     };
   } catch (err) {
     console.warn(
@@ -255,8 +287,19 @@ export async function discoverOrg(opts: DiscoverOrgOptions): Promise<ListOrgsRes
   }
 }
 
-function limitsAnswer(result: FetchUsageResult): OrgLimitsAnswer {
-  if (result.ok) return result.sample === null ? "none" : "windows";
+// The Limits answer a read gives, for discovery and the poller alike. A 200
+// answers `windows` when it reports any limit, a window in flight or an idle
+// one, and `none` only when it reports no limit at all: both primary windows
+// absent and no model-scoped limit reported, idle included (#384/395).
+// Before #384 `none` meant
+// "nothing in flight", which an idle subscription or Enterprise organization
+// answered too.
+export function limitsAnswer(result: FetchUsageResult): OrgLimitsAnswer {
+  if (result.ok) {
+    const { fiveHour, weekly } = result.windowStates;
+    const reportsLimit = fiveHour !== "absent" || weekly !== "absent" || result.hasModelScopedLimit;
+    return reportsLimit ? "windows" : "none";
+  }
   // A 401 here after a 200 listing is the key dying between two requests;
   // there is no better word for that org than "error", and the next poll will
   // say `expired` on its own.

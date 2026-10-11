@@ -12,8 +12,26 @@ export const usageWindowSchema = z.object({
 });
 export type UsageWindow = z.infer<typeof usageWindowSchema>;
 
+// A Window state (GLOSSARY.md, #384): what a successful read said about one of
+// the two primary windows. `active` — an object with a reset, a window in
+// flight; `idle` — an object whose `resets_at` is null, a limit whose window
+// has not started; `absent` — the literal `null`, no such limit (an Enterprise
+// organization's `seven_day`). Only `absent` is "no limit": an idle window is
+// a limit like any other. Keyed off the window's shape, never off
+// `limits[].is_active`, which the organization-limits probe saw `true` on an
+// idle window and `false` on an active one.
+export const windowStateSchema = z.enum(["active", "idle", "absent"]);
+export type WindowState = z.infer<typeof windowStateSchema>;
+export const windowStatesSchema = z.object({
+  fiveHour: windowStateSchema,
+  weekly: windowStateSchema,
+});
+export type WindowStates = z.infer<typeof windowStatesSchema>;
+
 // One timestamped reading — persisted per line of usage-history.jsonl (ADR-0024)
-// with both windows in flight. `capturedAt` is when WE polled, not an upstream field.
+// with every window the Organization has in flight: the five-hour window
+// always, and the weekly one unless the Organization reports no weekly limit
+// (#384). `capturedAt` is when WE polled, not an upstream field.
 //
 // FORWARD-COMPAT (review f8): usage-history.jsonl is the app's first cross-upgrade
 // persistent artifact — it outlives any single app version. `loadHistory` silently
@@ -23,10 +41,18 @@ export type UsageWindow = z.infer<typeof usageWindowSchema>;
 // ADDED to UsageSample MUST be `.optional()` (or `.default(...)`) so old lines stay
 // backward-readable. The current fields stay required — every existing line already
 // has them. See ADR-0024 ("Consequences") for the recorded rule.
+//
+// `weekly` became OPTIONAL in #384, which loosens a field rather than adding
+// one: every older line still parses. Its absence means the Organization
+// reported no weekly limit on that read (an absent Window state, the Enterprise
+// shape), never an idle one — an idle weekly window keeps the reading out of
+// history (`completeUsageSample`). An older build skips such a line on load,
+// by the same rule, and protocol v6 keeps older peers off the Hub wire that
+// carries it (ADR-0024's #384 amendment).
 export const usageSampleSchema = z.object({
   capturedAt: z.string(),
   fiveHour: usageWindowSchema,
-  weekly: usageWindowSchema,
+  weekly: usageWindowSchema.optional(),
   // The Model-scoped weekly limit (GLOSSARY.md): Anthropic's weekly cap on one
   // model family's share, reported beside the all-model weekly limit as a
   // `weekly_scoped` entry of the upstream `limits[]` with a model scope. Which
@@ -52,10 +78,27 @@ export const usageReadingSchema = usageSampleSchema.extend({
 });
 export type UsageReading = z.infer<typeof usageReadingSchema>;
 
-/** Only complete readings enter the block-reconstruction history. */
-export function completeUsageSample(reading: UsageReading | null): UsageSample | null {
-  if (reading?.fiveHour == null || reading.weekly === null) return null;
-  return { ...reading, fiveHour: reading.fiveHour, weekly: reading.weekly };
+// A history line read as live state (the first-paint fallback before a read):
+// a line with no weekly window is a reading with none in flight (#384).
+export function sampleAsReading(sample: UsageSample): UsageReading {
+  return { ...sample, weekly: sample.weekly ?? null };
+}
+
+/**
+ * Only complete readings enter the block-reconstruction history: a five-hour
+ * window in flight, and a weekly window in flight unless the read found the
+ * Organization has none (#384). So an Enterprise organization's live five-hour
+ * window is history, and its Blocks form from observed windows, while a reading
+ * whose weekly window is merely idle stays live-only, as before.
+ */
+export function completeUsageSample(
+  reading: UsageReading | null,
+  windowStates: WindowStates,
+): UsageSample | null {
+  if (reading?.fiveHour == null) return null;
+  const { weekly, ...rest } = reading;
+  if (weekly !== null) return { ...rest, fiveHour: reading.fiveHour, weekly };
+  return windowStates.weekly === "absent" ? { ...rest, fiveHour: reading.fiveHour } : null;
 }
 
 // Connection lifecycle for the subtle status indicator (ADR-0023).
@@ -103,18 +146,24 @@ export const storedUsageCredentialSchema = z.object({
 export type StoredUsageCredential = z.infer<typeof storedUsageCredentialSchema>;
 
 // What one org's usage endpoint answered in discovery or polling (#270/282):
-// `windows` — 200 with at least one window the app reads; `none` — 200 with
-// no such window (the Enterprise shape: `seven_day: null`, idle `five_hour`);
-// `forbidden` — 403, this key may not read that org; `error` — anything else
-// (5xx, shape mismatch, network). Readability is judged from THIS, never from
-// `capabilities`: an Enterprise org carries `chat` too.
+// `windows` — 200 reporting at least one limit, a window in flight or an idle
+// one (the Enterprise shape, an idle `five_hour` beside `seven_day: null`,
+// answers this since #384). A model-scoped limit counts even with no reset
+// and both primary windows absent (#395). `none` — 200 reporting no supported
+// limit at all; `forbidden` — 403, this key may not read that org; `error` —
+// anything else (5xx, shape mismatch, network). Readability is judged from
+// THIS, never from `capabilities`: an Enterprise org carries `chat` too.
 export const orgLimitsAnswerSchema = z.enum(["windows", "none", "forbidden", "error"]);
 export type OrgLimitsAnswer = z.infer<typeof orgLimitsAnswerSchema>;
 
 // Only Organizations whose endpoint has answered appear here. lastReadAt is
 // the last SUCCESSFUL read (windows/none); lastSampleAt is complete history.
+// `windowStates` is what that last successful read said about each primary
+// window (#384), kept like `lastReadAt` across a failed read, and null before
+// any: the per-window fact a "no limit" surface reads.
 export const organizationUsageStatusSchema = z.object({
   limits: orgLimitsAnswerSchema,
+  windowStates: windowStatesSchema.nullable(),
   lastReadAt: z.string().nullable(),
   lastSampleAt: z.string().nullable(),
 });

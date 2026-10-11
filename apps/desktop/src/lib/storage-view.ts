@@ -244,22 +244,17 @@ export const STORAGE_COPY = {
   clean: {
     label: (clean: StorageReport["clean"]): string => `Clean up ${formatStorageBytes(clean.bytes)}`,
     labelEmpty: "Nothing to clean",
-    // The duplicated-rows clause disappears entirely when there are none:
-    // "and 0 duplicated history rows (0 B)" makes a working number look
-    // broken, and a hub-less client has no replica at all.
+    // The database clause disappears entirely when there is no unused space:
+    // "and unused database space (about 0 B)" makes a working number look
+    // broken. The space is the fleet history's and the Local archive's free
+    // pages together (ADR-0111 §5).
     why: (clean: StorageReport["clean"]): string => {
       const parts = [`parse cache (${formatStorageBytes(clean.scanCacheBytes)})`];
-      if (clean.duplicateRows > 0)
-        parts.push(
-          `${clean.duplicateRows.toLocaleString()} duplicated Local archive rows (${formatStorageBytes(clean.duplicateBytes)})`,
-        );
       if (clean.databaseBytes > 0)
-        parts.push(
-          `unused fleet database space (about ${formatStorageBytes(clean.databaseBytes)})`,
-        );
+        parts.push(`unused database space (about ${formatStorageBytes(clean.databaseBytes)})`);
       return `Cleans ${parts.join(" and ")}. Preserves usage history and fleet synchronization history.`;
     },
-    whyEmpty: "The parse cache is empty and there is no unused archive space.",
+    whyEmpty: "The parse cache is empty and there is no unused database space.",
     done: (bytes: number): string => `Cleaned ${formatStorageBytes(bytes)}.`,
   },
 

@@ -35,7 +35,7 @@ export function hubConnectionLabel(conn: HubConnection): string {
     case "keyless":
       return "Hub has no working Claude key — polling locally";
     case "mismatch":
-      return "Hub version mismatch — polling locally";
+      return "Hub version mismatch — update both apps; polling locally";
     case "unauthorized":
       return "Hub password rejected — polling locally";
     case "off":

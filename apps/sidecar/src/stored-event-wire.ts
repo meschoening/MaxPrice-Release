@@ -4,8 +4,9 @@ import type { StoredEvent } from "./engine/store";
 // Project a StoredEvent onto the wire shape, omitting undefined optionals so a
 // push body matches storedEventWireSchema exactly. ONE definition, two
 // consumers: event-sync's hub push (fleet.ts) and the local archive's append
-// (local-archive.ts, ADR-0069) — both feed createFleetEventStore.push, which
-// re-mints machineId, so the projection deliberately drops it.
+// (local-archive.ts, ADR-0069) — both feed a fleet store's `push` (the Hub's,
+// or the archive's), which re-mints machineId, so the projection deliberately
+// drops it.
 //
 // `organizationUuid` is the store's RESOLVED tag — owner evidence only, never a
 // presumption (ADR-0103) — and rides LAST, so an untagged row's JSON is

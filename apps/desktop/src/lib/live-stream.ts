@@ -13,6 +13,7 @@ import {
   usageSampleEventSchema,
   type UsageCurrent,
   type OrganizationsResponse,
+  type WindowStates,
 } from "@maxprice/shared";
 import { queryClient } from "@/lib/query";
 import { getSidecarUrl, resetSidecarUrl, SidecarStartupError } from "@/lib/sidecar";
@@ -343,6 +344,15 @@ export function handleBlockTick(client: QueryClient): void {
   });
 }
 
+// Two reads' Window states, by value; absent and null are one fact (no
+// successful read).
+function sameWindowStates(
+  a: WindowStates | null | undefined,
+  b: WindowStates | null | undefined,
+): boolean {
+  return a?.fiveHour === b?.fiveHour && a?.weekly === b?.weekly;
+}
+
 // `status:changed` — the sidecar's status snapshot. Feeds the live-status store
 // and marks the channel connected (a frame is proof the channel is live).
 //
@@ -364,22 +374,33 @@ export function handleStatusEvent(client: QueryClient, dataText: string): void {
   useLiveStatus.getState().applyStatusSnapshot(snapshot);
   useLiveStatus.getState().setConnectionState("connected");
   // Limits polls emit status, not organizations:changed. Refresh the roster
-  // when an answer moves, including the first frame after reconnect. Compare
-  // cached answers too: a single-flight roster read may predate the transition,
-  // so the next status frame must retry until the roster catches up. Timestamp
-  // churn alone costs no GET, and this narrow poke never holds a report round.
+  // when an answer or a Window state moves (#384: the quota notes read the
+  // states, and an Organization going idle keeps answering `windows`),
+  // including the first frame after reconnect. Compare the cached roster too: a
+  // single-flight roster read may predate the transition, so the next status
+  // frame must retry until the roster catches up. Timestamp churn alone costs
+  // no GET, and this narrow poke never holds a report round.
   const roster = client.getQueryData<OrganizationsResponse>(organizationsQueryKey());
   const organizationUuids = new Set([
     ...Object.keys(previousOrganizations),
     ...Object.keys(snapshot.organizations),
   ]);
   if (
-    [...organizationUuids].some(
-      (uuid) => previousOrganizations[uuid]?.limits !== snapshot.organizations[uuid]?.limits,
-    ) ||
+    [...organizationUuids].some((uuid) => {
+      const before = previousOrganizations[uuid];
+      const after = snapshot.organizations[uuid];
+      return (
+        before?.limits !== after?.limits ||
+        !sameWindowStates(before?.windowStates, after?.windowStates)
+      );
+    }) ||
     roster?.organizations.some((entry) => {
       const status = snapshot.organizations[entry.uuid];
-      return status !== undefined && entry.limits?.answer !== status.limits;
+      return (
+        status !== undefined &&
+        (entry.limits?.answer !== status.limits ||
+          !sameWindowStates(entry.limits?.windowStates, status.windowStates))
+      );
     })
   ) {
     pokeRoster(client);

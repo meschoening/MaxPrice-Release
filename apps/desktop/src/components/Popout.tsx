@@ -72,6 +72,7 @@ function PopoutDash(): React.ReactElement {
     display,
     quotaTag: data.quotaTag,
     allOrganizations: data.allOrganizations,
+    fiveHourState: data.fiveHourState,
   });
 
   return (
@@ -111,7 +112,11 @@ export function PopoutBody({ view }: { view: PopoutViewState }): React.ReactElem
   return (
     <div className="pbody">
       <PopoutHeadRow head={view.head} />
-      <LimitRow label="5-hour limit" pct={view.limitPct} />
+      <LimitRow
+        label="5-hour limit"
+        pct={view.limitPct}
+        emptyTrack={view.head.kind === "idle" && !view.noFiveHourLimit}
+      />
       <LimitRow label="Weekly limit" pct={view.weeklyPct} />
       {view.modelRow !== null ? (
         <LimitRow label={view.modelRow.label} pct={view.modelRow.pct} />
@@ -129,12 +134,28 @@ export function PopoutBody({ view }: { view: PopoutViewState }): React.ReactElem
 
 // One usage-limit row: the mini meter + percent, or the ADR-0030 em-dash at
 // 0.55 row opacity when there is no fresh reading — never a stale percent.
-function LimitRow({ label, pct }: { label: string; pct: number | null }): React.ReactElement {
+// `emptyTrack` is the 5-hour row under the idle head (#320: no active block
+// and no live 5-hour window): its em-dash keeps the meter's track beside it,
+// unfilled and hidden from assistive tech, so the row keeps its bar without
+// the bar reading as a measured 0%. A null pct alone cannot ask for it:
+// beside an active block null means a stale or unknown reading, and that row
+// keeps the bare em-dash. Nor does a Quota organization with no 5-hour limit
+// (#384: its Window state is absent), which has no window to be idle in.
+function LimitRow({
+  label,
+  pct,
+  emptyTrack = false,
+}: {
+  label: string;
+  pct: number | null;
+  emptyTrack?: boolean;
+}): React.ReactElement {
   return (
     <div className={pct === null ? "prow limit dim" : "prow limit"}>
       <span className="name">{label}</span>
       {pct === null ? (
         <span className="state">
+          {emptyTrack ? <span className="limit-meter" aria-hidden /> : null}
           <span className="num">—</span>
         </span>
       ) : (

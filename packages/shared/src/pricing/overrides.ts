@@ -45,13 +45,13 @@ export const PRICING_OVERRIDES: Record<string, ModelPricing> = {
     cache_creation_input_token_cost: 5e-6,
     cache_read_input_token_cost: 2e-7,
   },
-  // claude-sonnet-5-5: Anthropic-published pricing ($2 / $10 / $2.50 / $0.20 per Mtok).
+  // claude-sonnet-5-5: Anthropic-published pricing ($2 / $10 / $2.50 / $0.10 per Mtok).
   // Remove once the bundled snapshot carries the key (blocked by #381).
   "claude-sonnet-5-5": {
     input_cost_per_token: 2e-6,
     output_cost_per_token: 1e-5,
     cache_creation_input_token_cost: 2.5e-6,
-    cache_read_input_token_cost: 2e-7,
+    cache_read_input_token_cost: 1e-7,
   },
 };
 

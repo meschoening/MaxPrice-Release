@@ -466,9 +466,10 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
     }
     const tmp = `${path}.stamp-tmp`;
     try {
-      // Durable before the rename (fleet-event-store's writeCompactSnapshot
-      // barrier): the rename replaces the whole history, the only copy there
-      // is, so a crash in the writeback window must not leave it truncated.
+      // Durable before the rename (the barrier the JSONL fleet store's
+      // compaction kept, until #396 deleted it): the rename replaces the whole
+      // history, the only copy there is, so a crash in the writeback window
+      // must not leave it truncated.
       const file = await open(tmp, "w");
       try {
         await file.writeFile(out.join(""));

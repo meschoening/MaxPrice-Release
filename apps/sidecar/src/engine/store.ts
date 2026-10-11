@@ -327,7 +327,8 @@ export function compileAxisMatcher(
 
 // The dedup key + fullness tie-breaker are the ONE fleet merge rule, defined
 // once in `@maxprice/shared` (fleet-dedup.ts) and shared byte-for-byte with the
-// hub archive + client replica (packages/usage-core/src/fleet-event-store.ts).
+// Hub archive, the client replica and the Local archive
+// (packages/usage-core/src/fleet-sync-store.ts).
 // Aliased to the local names `upsert` calls; the cross-store parity tests pin
 // the invariant. Claude Code writes several rows per assistant message sharing
 // `(messageId, requestId)` — 2–3 byte-identical content-block lines (E1 finding
@@ -460,9 +461,13 @@ export type EventStore = {
   // session's copied lines) whose copies resolve differently is excluded only
   // while the excluded copy wins the merge; an admitted copy that supersedes
   // it takes the key back. An excluded key is never in the event map: the two
-  // are disjoint by construction. The repair asks this of each Local archive
-  // row (`localArchive.excludedPairs()`).
+  // are disjoint by construction.
   isExcludedKey: (messageId: string, requestId?: string) => boolean;
+  // `isExcludedKey` asked by the dedup key itself (`fleetDedupKey`). The Local
+  // archive keys its records by it and keeps no message id (ADR-0111 §1), so
+  // the repair's `localArchive.excludedPairs()` and its key-scoped forget ask
+  // this of each record.
+  isExcludedDedupKey: (key: string) => boolean;
   onForeignEvidence: (listener: (sessions: readonly ForgetSessionRef[]) => void) => () => void;
   // #311 (ADR-0107 §12): the dormant snapshot this store was built with — the
   // sessions whose owner-less own rows it refuses (`dormantSessions` in
@@ -1461,6 +1466,7 @@ export function createEventStore(opts: {
     models: () => modelsSeen,
     foreignSessions: () => [...foreignSessions.values()].sort(byPair),
     isExcludedKey: (messageId, requestId) => excludedHolders.has(dedupKey(messageId, requestId)),
+    isExcludedDedupKey: (key) => excludedHolders.has(key),
     organizationsSeen: () => organizationsSeen,
     organizationSessionCounts: () => {
       const counts = new Map<string, number>();

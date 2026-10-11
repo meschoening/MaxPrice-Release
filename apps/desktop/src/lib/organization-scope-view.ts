@@ -6,7 +6,7 @@ import {
   type OrganizationEntry,
   type OrganizationLimits,
   type Settings,
-  type UsageCurrent,
+  type WindowState,
 } from "@maxprice/shared";
 
 // The Organization scope chip's view (ADR-0106), built from settings and the
@@ -22,14 +22,15 @@ import {
 // fallback.
 //
 // "No limits" marks a Limits answer of `none` or `forbidden`: the last read
-// found no window, or could not read any. A transient `error`, or an
-// Organization that has never been read, still has limits to read, so it
-// carries no marker. The chip reads the answer alone, so an idle subscription
-// Organization, which also answers `none` (ADR-0108 §4), wears the marker too;
-// the quota surfaces refine `none` by its weekly cadence (`quotaSurface`).
+// found no supported limit at all (including idle model-scoped caps), or
+// could not read any. A
+// transient `error`, or an Organization that has never been read, still has
+// limits to read, so it carries no marker. An idle Organization, subscription
+// or Enterprise, answers `windows` (#384), so it wears none; the quota
+// surfaces go further and judge each window by its Window state
+// (`quotaSurface`).
 
-// The answers with no window read, shared by the chip's marker and the quota
-// surfaces' rule.
+// The answers with no limit to read, the chip's marker.
 export function isNoLimitsAnswer(
   answer: OrganizationLimits["answer"] | undefined,
 ): answer is "none" | "forbidden" {
@@ -151,15 +152,18 @@ export function buildScopeView(
 }
 
 // What the quota surfaces say about the Quota organization, whose reading they
-// show under every scope.
-export type NoLimits = { answer: "none" | "forbidden"; label: string };
+// show under every scope. A tile shows no meter for its window, and says why,
+// when the Quota organization has no such limit (`absent`, its Window state)
+// or its limits can't be read (`forbidden`).
+export type NoLimit = { reason: "absent" | "forbidden"; label: string };
 export interface QuotaSurface {
   // The Quota organization's label under All organizations, else null:
   // scoped to one Organization the chip already names it.
   tag: string | null;
-  // Set only when the Quota organization's limits can't be read (`forbidden`),
-  // or it answers `none` with no weekly cadence (`quotaSurface`).
-  noLimits: NoLimits | null;
+  // The Active block tile's note and the This Week tile's, each set only
+  // when that tile's window has no limit to show (`quotaSurface`).
+  fiveHourNote: NoLimit | null;
+  weeklyNote: NoLimit | null;
 }
 
 // An Organization's Limits answer as the roster reports it: undefined for an
@@ -174,24 +178,29 @@ export function rosterLimitsAnswer(
   return roster?.find((entry) => entry.uuid === uuid)?.limits?.answer;
 }
 
-// Whether an Organization's usage-current entry is loaded and carries no weekly
-// reset: no weekly window seen on this machine or the Hub, since the last-known
-// reset (the poller's, else the stored history's) outlives an idle stretch
-// (ADR-0083). An entry not loaded yet is not, so the note never flashes before
-// the data. A boolean, so a memo keyed on it holds across usage reads.
-export function lacksWeeklyCadence(
-  usage: Pick<UsageCurrent, "weeklyResetAt"> | undefined,
-): boolean {
-  return usage !== undefined && usage.weeklyResetAt === null;
+// One window's Window state as the roster reports it (#384): what the
+// Organization's last successful poll said, kept across a failed read.
+// undefined with no such poll (an unread entry, a Connect seed), a uuid the
+// roster lacks or a roster not yet loaded. A string, so a memo keyed on it
+// holds across the roster's per-read churn.
+export function rosterWindowState(
+  roster: ReadonlyArray<Pick<OrganizationEntry, "uuid" | "limits">> | undefined,
+  uuid: string | undefined,
+  window: "fiveHour" | "weekly",
+): WindowState | undefined {
+  if (uuid === undefined) return undefined;
+  return roster?.find((entry) => entry.uuid === uuid)?.limits?.windowStates?.[window];
 }
 
-// The tag follows the scope; the note follows the Quota organization's roster
-// Limits answer (`rosterLimitsAnswer`) and, for `none`, its cadence:
-//   - `forbidden` is no limits: nothing about its limits can be read.
-//   - `none` is no limits only with no weekly cadence (`noWeeklyCadence`). The
-//     poller also answers `none` for a subscription Organization with no window
-//     in flight (ADR-0108 §4), and that one keeps its last weekly reset.
-//   - `windows`, `error` and no answer say nothing, leaving today's rendering.
+// The tag follows the scope; each tile's note follows the Quota organization's
+// roster facts for its own window:
+//   - `forbidden` is unreadable on both: nothing about its limits can be read.
+//   - otherwise a window whose Window state is `absent` has no such limit: an
+//     Enterprise organization's weekly window, or a `five_hour` of null. The
+//     state is the last successful poll's, so a transient `error` keeps it.
+//   - an `active` or `idle` window says nothing: an idle limit renders idle on
+//     every Organization (#384). So does a window with no state yet, a
+//     Connect-seeded `none` included, so no note flashes before a poll.
 // The rule holds under every scope, so a single tracked Organization gains the
 // note too. No Quota organization (no Home) names nothing.
 export function quotaSurface(input: {
@@ -199,15 +208,22 @@ export function quotaSurface(input: {
   quotaOrganization: string | undefined;
   labels: ReadonlyMap<string, string>;
   answer: OrganizationLimits["answer"] | undefined;
-  noWeeklyCadence: boolean;
+  fiveHour: WindowState | undefined;
+  weekly: WindowState | undefined;
 }): QuotaSurface {
-  const { isAll, quotaOrganization, labels, answer, noWeeklyCadence } = input;
-  if (quotaOrganization === undefined) return { tag: null, noLimits: null };
+  const { isAll, quotaOrganization, labels, answer } = input;
+  if (quotaOrganization === undefined) return { tag: null, fiveHourNote: null, weeklyNote: null };
   const label = organizationLabel(labels, quotaOrganization);
-  const noLimits = isNoLimitsAnswer(answer) && (answer === "forbidden" || noWeeklyCadence);
+  const noLimit = (state: WindowState | undefined): NoLimit | null =>
+    answer === "forbidden"
+      ? { reason: "forbidden", label }
+      : state === "absent"
+        ? { reason: "absent", label }
+        : null;
   return {
     tag: isAll ? label : null,
-    noLimits: noLimits ? { answer, label } : null,
+    fiveHourNote: noLimit(input.fiveHour),
+    weeklyNote: noLimit(input.weekly),
   };
 }
 

@@ -467,18 +467,23 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
       rerun = true;
       return inflight;
     }
-    inflight = operations
-      .then(async () => {
+    inflight = operations.then(async () => {
+      try {
         do {
           rerun = false;
           await runInner().catch((err: unknown) =>
             console.error("[sidecar] organization repair failed:", err),
           );
         } while (rerun && !stopped);
-      })
-      .finally(() => {
+      } finally {
+        // In the same synchronous step as the last `rerun` read, as fleet's
+        // serialized refresh clears its flags. A chained `.finally` cleared it
+        // microtasks later, and a call landing in between set a flag nothing
+        // read again: its request waited for the next run(), the retry timer's
+        // if this pass had armed it (found under #304).
         inflight = null;
-      });
+      }
+    });
     operations = inflight;
     return inflight;
   }

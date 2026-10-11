@@ -91,6 +91,10 @@ export function isParseableTimestamp(timestamp: string): boolean {
 // simply does not write to the memo.
 const MAX_ZONES = 4;
 const zoneCaches = new Map<string, Map<string, LocalDate | null>>();
+// The zone `zoneCacheFor` last returned, always `zoneCaches`'s last key. A
+// request folds every event in its one `tz`, so nearly every read is a hit on
+// this zone and returns without touching `zoneCaches` (#382).
+let mostRecent: { zone: string; cache: Map<string, LocalDate | null> } | null = null;
 
 // Test-only visibility (used by local-date.test.ts): how many zones / total
 // entries the memo currently holds. Not for shipping-code use.
@@ -103,22 +107,37 @@ export function localDateCacheStats(): { zones: number; entries: number } {
 // Test-only: drop every cached zone so a test starts from a cold memo.
 export function resetLocalDateCacheForTest(): void {
   zoneCaches.clear();
+  mostRecent = null;
+}
+
+// Test-only: the zone map itself, so local-date.test.ts can hold an iterator
+// over it and see whether a read mints storage (#382).
+export function localDateZoneMapForTest(): ReadonlyMap<string, unknown> {
+  return zoneCaches;
 }
 
 function zoneCacheFor(timeZone: string): Map<string, LocalDate | null> {
+  // The most recent zone is already last in the eviction order, so its hit
+  // leaves the map alone. Touching it anyway (delete+set) left a deleted slot
+  // per read and rehashed `zoneCaches` into a new storage every few reads, and
+  // JSC links each outgrown storage to its successor: one reference to an old
+  // storage held inside the engine kept every later one alive, 7,036 MiB of
+  // 320-byte storages in one of #382's ten-minute budget runs (ADR-0110 §4).
+  if (mostRecent?.zone === timeZone) return mostRecent.cache;
   let m = zoneCaches.get(timeZone);
   if (m !== undefined) {
     // LRU touch: re-insertion moves the zone to the back of the eviction order.
     zoneCaches.delete(timeZone);
     zoneCaches.set(timeZone, m);
-    return m;
+  } else {
+    m = new Map();
+    if (zoneCaches.size >= MAX_ZONES) {
+      const oldest = zoneCaches.keys().next().value;
+      if (oldest !== undefined) zoneCaches.delete(oldest);
+    }
+    zoneCaches.set(timeZone, m);
   }
-  m = new Map();
-  if (zoneCaches.size >= MAX_ZONES) {
-    const oldest = zoneCaches.keys().next().value;
-    if (oldest !== undefined) zoneCaches.delete(oldest);
-  }
-  zoneCaches.set(timeZone, m);
+  mostRecent = { zone: timeZone, cache: m };
   return m;
 }
 

@@ -1,5 +1,5 @@
 // The Identity directory store — ONE implementation for both sides (ADR-0062
-// §3), like fleet-event-store: the client sidecar holds own + mirrored fleet
+// §3), as the JSONL fleet store was (#396 deleted it): the client sidecar holds own + mirrored fleet
 // rows, the hub holds the fleet union. AUTHORITATIVE, not a disposable cache:
 // a dead directory's row is irreplaceable, so this file is never casually
 // wiped. Corrupt-file posture follows the hub machine-directory (.bak + warn +
@@ -86,7 +86,7 @@ export type IdentityDirectory = {
 
 export function createIdentityDirectory(opts: {
   path: string;
-  // Test seam, mirroring fleet-event-store's: the read-fault classification
+  // Test seam, as the JSONL fleet store had: the read-fault classification
   // below is the whole point of #85's fix, so it has to be exercisable without
   // manufacturing a real EACCES.
   readFileImpl?: (path: string) => string;
@@ -110,7 +110,7 @@ export function createIdentityDirectory(opts: {
   // self-heals, so nothing would ever recreate it.
   let contentLost = false;
 
-  // Atomic whole-file rewrite + fsync (the fleet-event-store writeDurable
+  // Atomic whole-file rewrite + fsync (the JSONL fleet store's writeDurable
   // pattern): these rows are authoritative and irreplaceable, so a crash
   // mid-write must never truncate the file. mkdir first — the data dir may not
   // exist yet on a first write.

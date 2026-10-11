@@ -385,12 +385,19 @@ export function listOrganizations(input: {
           polled !== undefined
             ? {
                 answer: polled.limits,
+                windowStates: polled.windowStates,
                 source: "poll",
                 lastReadAt: polled.lastReadAt,
                 lastSampleAt: polled.lastSampleAt,
               }
             : entry?.limits !== undefined && entry.unlisted !== true
-              ? { answer: entry.limits, source: "connect", lastReadAt: null, lastSampleAt: null }
+              ? {
+                  answer: entry.limits,
+                  windowStates: null,
+                  source: "connect",
+                  lastReadAt: null,
+                  lastSampleAt: null,
+                }
               : null,
         seenOn: {
           machine: input.seen.machine.has(uuid) || login !== undefined,

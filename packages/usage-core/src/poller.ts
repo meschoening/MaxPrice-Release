@@ -1,13 +1,15 @@
 import {
   completeUsageSample,
+  sampleAsReading,
   type HubStatus,
   type OrganizationUsageStatus,
   type UsageConnection,
   type UsageCredential,
   type UsageOrganizations,
   type UsageReading,
+  type UsageSample,
 } from "@maxprice/shared";
-import { fetchUsage, type FetchUsageResult } from "./usage-client";
+import { fetchUsage, limitsAnswer, type FetchUsageResult } from "./usage-client";
 import type { SampleStore } from "./sample-store";
 
 export type PollerStatus = {
@@ -18,7 +20,14 @@ export type PollerStatus = {
 
 export type PollerHub = {
   // Even null carries its Organization at this internal adapter seam.
-  emitUsageSample: (organization: string, sample: UsageReading | null) => void;
+  // `historical` is the sample the read appended to history, or null: the
+  // poller decides it once, from the read's Window states (#384), so the
+  // Hub broadcasts exactly what its store kept.
+  emitUsageSample: (
+    organization: string,
+    sample: UsageReading | null,
+    historical: UsageSample | null,
+  ) => void;
   patchStatus: (partial: PollerStatus) => void;
 };
 
@@ -150,7 +159,8 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
     // from local polling or an earlier remote snapshot before using history.
     const current = remoteCurrent === undefined ? entry?.current : remoteCurrent;
     const remoteReset = organization === null ? undefined : remoteWeekly.get(organization);
-    const sample = current === undefined ? latest : current;
+    const sample =
+      current === undefined ? (latest === null ? null : sampleAsReading(latest)) : current;
     const key = keyConnection();
     const connection =
       key === "expired" || key === "disconnected"
@@ -167,7 +177,8 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
         (remoteCurrent === undefined
           ? entry?.weeklyResetAt
           : (remoteReset ?? entry?.weeklyResetAt)) ??
-        latest?.weekly.resetAt ??
+        // A line without `weekly` is an Organization with no weekly limit (#384).
+        latest?.weekly?.resetAt ??
         null,
     };
   }
@@ -241,17 +252,20 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
       const reading = result.sample === null ? null : { ...result.sample, organizationUuid: id };
       entry.current = reading;
       entry.weeklyResetAt = reading?.weekly?.resetAt ?? entry.weeklyResetAt;
-      const historical = completeUsageSample(reading);
+      const historical = completeUsageSample(reading, result.windowStates);
       if (historical !== null) opts.store.append(historical);
       entry.status = {
-        limits: reading === null ? "none" : "windows",
+        limits: limitsAnswer(result),
+        windowStates: result.windowStates,
         lastReadAt: new Date(now()).toISOString(),
         lastSampleAt: opts.store.latest({ organization: id, home })?.capturedAt ?? null,
       };
-      opts.liveHub.emitUsageSample(id, reading);
+      opts.liveHub.emitUsageSample(id, reading, historical);
     } else {
       entry.status = {
-        limits: result.kind === "forbidden" ? "forbidden" : "error",
+        limits: limitsAnswer(result),
+        // The last successful read's, as `lastReadAt` is.
+        windowStates: entry.status?.windowStates ?? null,
         lastReadAt: entry.status?.lastReadAt ?? null,
         lastSampleAt: latest?.capturedAt ?? null,
       };

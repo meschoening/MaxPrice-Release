@@ -95,11 +95,12 @@ export const storageReportSchema = z.object({
   localArchiveEarliestAt: z.string().nullable(),
 
   // Always present: Clean is always safe and always available.
+  // `databaseBytes` is the unused space in the fleet replica's and the Local
+  // archive's SQLite files (their free pages), which Clean's `VACUUM` returns
+  // (ADR-0100, ADR-0111 §5). Neither store holds a superseded row.
   clean: z.object({
-    bytes: z.number().int().nonnegative(), // scanCacheBytes + duplicateBytes
+    bytes: z.number().int().nonnegative(), // scanCacheBytes + databaseBytes
     scanCacheBytes: z.number().int().nonnegative(),
-    duplicateRows: z.number().int().nonnegative(),
-    duplicateBytes: z.number().int().nonnegative(),
     databaseBytes: z.number().int().nonnegative(),
   }),
 
@@ -176,17 +177,14 @@ export type StorageReport = z.infer<typeof storageReportSchema>;
 export const STORAGE_CLEAN_PATH = "/api/storage/clean";
 export const STORAGE_FORGET_PATH = "/api/storage/forget";
 
-// Clean drops the parse cache and compacts the replica's superseded lines.
-// Fields mirror `storageReportSchema.clean` one for one so the preview and the
-// outcome are directly comparable; they will differ whenever the corpus moved
-// between the paint and the click, which is information rather than an error.
-// A hub-less client has no replica, so the two duplicate fields are 0 — the
-// same value the preview showed it.
+// Clean drops the parse cache and runs `VACUUM` on the replica and the Local
+// archive. Fields mirror `storageReportSchema.clean` one for one so the preview
+// and the outcome are directly comparable; they will differ whenever the corpus
+// moved between the paint and the click, which is information rather than an
+// error. `databaseBytes` here is what the two files actually shrank by.
 export const storageCleanResponseSchema = z.object({
-  bytes: z.number().int().nonnegative(), // scanCacheBytes + duplicateBytes
+  bytes: z.number().int().nonnegative(), // scanCacheBytes + databaseBytes
   scanCacheBytes: z.number().int().nonnegative(),
-  duplicateRows: z.number().int().nonnegative(),
-  duplicateBytes: z.number().int().nonnegative(),
   databaseBytes: z.number().int().nonnegative(),
 });
 export type StorageCleanResponse = z.infer<typeof storageCleanResponseSchema>;
