@@ -4,7 +4,6 @@ import type { StorageCleanResponse, StorageReport, StorageSegment } from "@maxpr
 import type { FleetRecord, FleetReplicaStore, LocalArchiveStore } from "@maxprice/usage-core";
 import { eventOrganization, type OrganizationResolvable } from "./engine/presumption";
 import type { EventStore } from "./engine/store";
-import { JSONL_LOCAL_ARCHIVE_FILE } from "./local-archive-conversion";
 import {
   backedSessionsFromPaths,
   classifyUnbacked,
@@ -596,9 +595,6 @@ async function walkAppData(
   const named = new Map<string, keyof AppDataSegments>([
     [STORAGE_FILE.fleetReplica, "fleetReplica"],
     [STORAGE_FILE.localArchive, "localArchive"],
-    // A JSONL archive an older build kept is the archive until its one-time
-    // conversion succeeds (ADR-0111 §6); #397 drops this with the converter.
-    [JSONL_LOCAL_ARCHIVE_FILE, "localArchive"],
     [STORAGE_FILE.scanCache, "scanCache"],
     [STORAGE_FILE.usageHistory, "usageHistory"],
   ]);

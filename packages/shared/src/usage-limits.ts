@@ -105,8 +105,9 @@ export function completeUsageSample(
 export const usageConnectionSchema = z.enum([
   "disconnected", // no credential configured
   "connected", // last poll succeeded
-  "expired", // 401 — session key needs re-pasting
-  // offline / non-auth failure — including a 403 from the tracked org (#270):
+  "expired", // a 401, or a 403 naming a dead session — the key needs re-pasting
+  // offline / non-auth failure — including an Organization refusal (#270),
+  // but excluding a 403 naming a dead session:
   // that org is unreadable with this key, which is not the key expiring, and
   // the reconnect prompt must not fire for it. The organizations status map
   // carries the individual answers; Hub connection health is key-level.
@@ -150,7 +151,8 @@ export type StoredUsageCredential = z.infer<typeof storedUsageCredentialSchema>;
 // one (the Enterprise shape, an idle `five_hour` beside `seven_day: null`,
 // answers this since #384). A model-scoped limit counts even with no reset
 // and both primary windows absent (#395). `none` — 200 reporting no supported
-// limit at all; `forbidden` — 403, this key may not read that org; `error` —
+// limit at all; `forbidden` — an Organization refusal, excluding a dead-session
+// 403 that expires the key; `error` —
 // anything else (5xx, shape mismatch, network). Readability is judged from
 // THIS, never from `capabilities`: an Enterprise org carries `chat` too.
 export const orgLimitsAnswerSchema = z.enum(["windows", "none", "forbidden", "error"]);

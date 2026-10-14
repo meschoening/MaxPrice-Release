@@ -25,11 +25,13 @@ export type EventSyncConnection = {
 
 // The structural subset of an engine row the stamp predicate (and the prune
 // below) read — (messageId, requestId) identity + the four token totals + the
-// Organization evidence (ADR-0103). Both the raw engine `StoredEvent` and the
-// wire `StoredEventWire` satisfy it, so the push pass scans RAW store rows and
+// Organization evidence (ADR-0103), and the timestamp a pass of changed keys
+// sends in (#364). Both the raw engine `StoredEvent` and the wire
+// `StoredEventWire` satisfy it, so the push pass scans RAW store rows and
 // projects ONLY the survivors onto the wire shape via `toWire` (no full-corpus
 // wire allocation per push trigger).
 export type StampableRow = {
+  timestamp: string;
   messageId: string;
   requestId?: string;
   inputTokens: number;
@@ -39,9 +41,34 @@ export type StampableRow = {
   organizationUuid?: string;
 };
 
+// The contribution source's change feed (#364), so that an ordinary push pass
+// re-examines only the keys whose eligible contribution changed. fleet.ts
+// wires it to the Eligible contribution view.
+//
+// Past this many changed keys, a list of them gives way to a full pass. Both
+// holders keep it: the view's list between two takes, and the keys a pass cut
+// short leaves behind. It bounds what either holds while no pass completes
+// (disconnected, sharing off, a pull or a push that keeps failing), and a
+// pass of that many keys costs about what reading the view whole does.
+export const PUSH_CHANGED_KEYS_MAX = 10_000;
+
+export type LocalChanges<Row extends StampableRow> = {
+  // The dedup keys (`fleetEventKey`) whose eligible contribution may have
+  // changed since the previous take, or `null` when the source changed in a
+  // way no key list names (a removal, a wholesale replacement, a swapped
+  // store, an eligibility change): the next pass must read `localEvents`.
+  // Each take starts a new interval; what it returns is the caller's to keep.
+  take: () => Iterable<string> | null;
+  // `key`'s eligible contribution, under the same eligibility as
+  // `localEvents`, or undefined when it has none.
+  get: (key: string) => Row | undefined;
+};
+
 export type EventSyncDeps<Row extends StampableRow = StoredEventWire> = {
   // The engine feed + push source (fleet.ts wires these to the live EventStore):
-  localEvents: () => Row[]; // EVERY engine event as RAW store rows; the stamp predicate filters, toWire projects the survivors
+  localEvents: () => Row[]; // EVERY eligible contribution as RAW store rows, timestamp-sorted; the stamp predicate filters, toWire projects the survivors
+  // Absent ⇒ every pass reads `localEvents` whole, as every pass did before #364.
+  localChanges?: LocalChanges<Row>;
   toWire: (row: Row) => StoredEventWire; // project a surviving row onto the push wire shape
   applyFleetDeletes?: (rows: FleetDeletion[], mayApply: () => boolean) => void | Promise<void>;
   prepareContributions?: () => Promise<void>;
@@ -163,6 +190,17 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
   // Per key, the fullness of the copy the Hub last acknowledged from this push
   // loop — accepted or stamped a loser, either way the Hub holds at least that.
   const acked = createAckedFullness();
+  // What the next push pass examines (#364): the whole Eligible contribution
+  // view while `fullPass` is set, otherwise only `dirty`, the keys
+  // `localChanges` named since a pass consumed them. A pass takes both at its
+  // start and puts back what it could not finish, so a request landing
+  // mid-pass outlives it. The set is replaced, never cleared: a long-lived Set
+  // cleared once per pass is churn (ADR-0110 §4).
+  let fullPass = true;
+  let dirty = new Set<string>();
+  // The replica the last pass stamped against. Another one (attached,
+  // detached, replaced) stamps differently, so the next pass reads the view whole.
+  let pushedReplica: FleetReplicaStore | null | undefined;
   function invalidateRequests(): void {
     for (const request of requests) request.abort();
   }
@@ -358,15 +396,25 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
       if (sourceEpoch !== "") await deps.prepareContributions?.();
       if (!current(g)) return;
       acked.clear();
+      fullPass = true;
       sourceEpoch = fence.epoch;
       sourceGeneration = fence.deletionGeneration;
     }
-    const rows = deps.localEvents();
-    // Each row's key, built once and read three times below: a pass runs on
-    // every watcher flush, and the keys are most of what it allocates (#361).
-    const keys = rows.map((row) => fleetEventKey(row.messageId, row.requestId));
-    acked.keepOnly(new Set(keys));
     const replica = deps.replica();
+    if (replica !== pushedReplica) {
+      pushedReplica = replica;
+      fullPass = true;
+    }
+    // Taken after the preparation above, so its wholesale replacement of the
+    // contributions is reported to this pass, which then reads them whole.
+    const changed = deps.localChanges?.take() ?? null;
+    if (changed === null) fullPass = true;
+    else for (const key of changed) dirty.add(key);
+    if (dirty.size > PUSH_CHANGED_KEYS_MAX) fullPass = true;
+    const full = fullPass;
+    const changedKeys = dirty;
+    fullPass = false;
+    dirty = new Set();
     // A row is unstamped only while it is strictly fuller (ADR-0103: a larger
     // total; at an equal total a tag against none, or a smaller tag against a
     // larger one, #374) than both the replica's held copy and the acked copy —
@@ -375,8 +423,7 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
     // Fuller than both is fuller than the better of the two, so the pass
     // builds no object per row beyond its key (#361). The held copy is the
     // replica's record of it: its fullness parts (ADR-0111 §2).
-    const unstamped = rows.filter((row, i) => {
-      const key = keys[i]!;
+    const isUnstamped = (key: string, row: Row): boolean => {
       const held = replica?.getByKey(key);
       if (
         held !== undefined &&
@@ -389,31 +436,81 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
       )
         return false;
       return acked.exceededBy(key, row);
-    });
-    const size = deps.pushBatchSize ?? EVENT_PUSH_BATCH_MAX;
-    for (let i = 0; i < unstamped.length; i += size) {
-      if (!current(g) || !shareEnabled) return;
-      const batch = unstamped.slice(i, i + size).map(deps.toWire);
-      const response = await request(`${connection.url}/api/events`, connection, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          events: batch,
-          epoch: fence.epoch,
-          deletionGeneration: fence.deletionGeneration,
-        }),
-      });
-      if (!current(g)) return;
-      if (response.status === 409) {
-        sourceGeneration = -1;
-        return;
+    };
+    // The rows this pass sends, in timestamp order; null until examined.
+    let unstamped: Row[] | null = null;
+    // How many of them the Hub has acknowledged.
+    let done = 0;
+    try {
+      if (full) {
+        const rows = deps.localEvents();
+        // Each row's key, built once and read twice below (#361).
+        const rowKeys = rows.map((row) => fleetEventKey(row.messageId, row.requestId));
+        // An acknowledgement of a key that left the view must never suppress
+        // its Re-contribution (ADR-0100).
+        acked.keepOnly(new Set(rowKeys));
+        unstamped = rows.filter((row, i) => isUnstamped(rowKeys[i]!, row));
+      } else {
+        // Only the keys whose contribution changed: no other row's stamp can
+        // have moved since a pass last examined it, because everything else
+        // that could move one makes the pass full (#364). No per-corpus key
+        // array, Set or sorted copy. A key with no eligible contribution
+        // (removed, or written while the view is closed or its pair barred)
+        // is consumed unsent. Its acknowledgement needs no pruning: whatever
+        // made it ineligible asked for a full pass, which pruned it, and
+        // nothing has acknowledged it since.
+        const rows: Row[] = [];
+        for (const key of changedKeys) {
+          const row = deps.localChanges!.get(key);
+          if (row !== undefined && isUnstamped(key, row)) rows.push(row);
+        }
+        unstamped = rows.sort((a, b) =>
+          a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
+        );
       }
-      if (!response.ok) throw new Error(`Contribution rejected (${response.status})`);
-      const receipt = hubEventsPushResponseSchema.parse(await response.json());
-      if (!current(g)) return;
-      if (receipt.epoch !== fence.epoch || receipt.deletionGeneration !== fence.deletionGeneration)
-        throw new FleetRecoveryRequired("Contribution receipt fence changed");
-      for (const row of batch) acked.record(fleetEventKey(row.messageId, row.requestId), row);
+      const size = deps.pushBatchSize ?? EVENT_PUSH_BATCH_MAX;
+      for (let i = 0; i < unstamped.length; i += size) {
+        if (!current(g) || !shareEnabled) return;
+        const batch = unstamped.slice(i, i + size).map(deps.toWire);
+        const response = await request(`${connection.url}/api/events`, connection, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            events: batch,
+            epoch: fence.epoch,
+            deletionGeneration: fence.deletionGeneration,
+          }),
+        });
+        if (!current(g)) return;
+        if (response.status === 409) {
+          sourceGeneration = -1;
+          return;
+        }
+        if (!response.ok) throw new Error(`Contribution rejected (${response.status})`);
+        const receipt = hubEventsPushResponseSchema.parse(await response.json());
+        if (!current(g)) return;
+        if (
+          receipt.epoch !== fence.epoch ||
+          receipt.deletionGeneration !== fence.deletionGeneration
+        )
+          throw new FleetRecoveryRequired("Contribution receipt fence changed");
+        for (const row of batch) acked.record(fleetEventKey(row.messageId, row.requestId), row);
+        done = i + batch.length;
+      }
+    } finally {
+      // A pass cut short (an error, a disconnect, sharing turned off, a 409)
+      // leaves what the Hub did not acknowledge to the next pass, whatever
+      // triggers it: a full pass asks for another, an ordinary one puts its
+      // unsent keys back. A key it found stamped or ineligible, or saw
+      // acknowledged, is consumed; one written again meanwhile waits in the
+      // feed for the next take.
+      if (unstamped === null || done < unstamped.length) {
+        if (full) fullPass = true;
+        else if (unstamped === null) for (const key of changedKeys) dirty.add(key);
+        else
+          for (const row of unstamped.slice(done))
+            dirty.add(fleetEventKey(row.messageId, row.requestId));
+      }
     }
   }
   function kick(): void {
@@ -472,7 +569,12 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
       caughtUpSeq = 0;
       deps.onDegraded?.(degraded);
       if (!degraded) {
-        timer = setTimer(kick, deps.sweepMs ?? 300_000);
+        // The sweep reads the view whole: the convergence safety net
+        // (ADR-0055, ADR-0100) under every pass of changed keys (#364).
+        timer = setTimer(() => {
+          fullPass = true;
+          kick();
+        }, deps.sweepMs ?? 300_000);
         kick();
       }
     },
@@ -497,6 +599,10 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
     },
     notifyLocalChange: kick,
     setShareEnabled: (on) => {
+      // Sharing back on reads the view whole, as #364's triage asked. Nothing
+      // needs it: the view kept every change made meanwhile, and the fence
+      // and the replica are checked first. It costs one full pass per toggle.
+      if (on && !shareEnabled) fullPass = true;
       shareEnabled = on;
       if (on) kick();
     },
@@ -505,6 +611,7 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
       resetGeneration++;
       suspended = false;
       acked.clear();
+      fullPass = true;
       sourceGeneration = -1;
       caughtUpSeq = 0;
       seeding = false;

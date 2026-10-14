@@ -51,6 +51,9 @@ export function forgetIntentMode(intent: FleetForgetIntent): FleetForgetMode {
 export function createForgetIntent(path: string) {
   let value: FleetForgetIntent | null = null;
   let error: unknown = null;
+  // How many writes have landed, so a reader can tell the intent changed
+  // without reading it (the push view's eligibility, #364).
+  let revision = 0;
   try {
     value = intentSchema.nullable().parse(JSON.parse(readFileSync(path, "utf8")));
   } catch (caught) {
@@ -72,6 +75,7 @@ export function createForgetIntent(path: string) {
       }
       renameSync(temporary, path);
       value = structuredClone(next);
+      revision++;
     } finally {
       rmSync(temporary, { force: true });
     }
@@ -80,6 +84,7 @@ export function createForgetIntent(path: string) {
     pending: () => value !== null,
     read: () => structuredClone(value),
     error: () => error,
+    revision: () => revision,
     write,
   };
 }

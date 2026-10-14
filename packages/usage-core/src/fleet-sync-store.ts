@@ -941,29 +941,10 @@ function archiveStore(opts: FleetStoreOptions) {
       return removed;
     });
   }
-  // Writes already-stamped rows verbatim, seqs included, in one transaction.
-  // Only the one-time JSONL conversion writes this way (ADR-0111 §6), and it
-  // goes with the converter (#397). A key or seq already stored fails the batch.
-  function importRows(rows: readonly FleetEvent[]): void {
-    transaction(() => {
-      const insert = database().query("INSERT INTO events(key,seq,body) VALUES (?,?,?)");
-      let last = number("eventSeq");
-      for (const row of rows) {
-        internRowStrings(row); // its strings become resident on commit (#361)
-        const key = fleetEventKey(row.messageId, row.requestId);
-        const json = JSON.stringify(row);
-        insert.run(key, row.seq, json);
-        core.stage(key, row, json);
-        if (row.seq > last) last = row.seq;
-      }
-      set("eventSeq", last);
-    });
-  }
   return {
     ...core.storage,
     push,
     remove,
-    importRows,
     // The record of one key, as this connection sees it (ADR-0110 §2).
     get: (messageId: string, requestId: string | undefined): ArchiveRecord | undefined =>
       core.residentByKey(fleetEventKey(messageId, requestId)),

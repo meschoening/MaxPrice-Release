@@ -407,6 +407,18 @@ export type EventStore = {
   appendFleet: (rows: FleetEvent[], source?: "archive") => number;
   contributions: () => StoredEvent[];
   localContribution: (messageId: string, requestId?: string) => StoredEvent | undefined;
+  // `localContribution` asked by the dedup key itself (`fleetDedupKey`), the
+  // name `onContributionChange` reports (#364).
+  localContributionByKey: (key: string) => StoredEvent | undefined;
+  // #364: the contributions map's change feed, which the push pass reads to
+  // re-examine only what changed. A listener is called with the dedup key of
+  // every contribution written (new, or replaced by a fuller copy: the walk,
+  // the watcher, an archive line), and with `null` whenever a contribution is
+  // removed or the map is replaced wholesale (an exclusion's eviction, Forget's
+  // `removeMachineSessions`, `replaceContributions`). Called synchronously as
+  // each write lands, mid-batch; a listener must not read or write the store.
+  // A throwing listener is caught and logged. Returns an unsubscribe function.
+  onContributionChange: (listener: (key: string | null) => void) => () => void;
   replaceContributions: (rows: StoredEvent[]) => void;
   removeFleetKeys: (rows: readonly { messageId: string; requestId?: string }[]) => void;
   // Query the store. Returns matching events in ascending timestamp order. The
@@ -778,7 +790,7 @@ export function createEventStore(opts: {
       return undefined;
     }
     excludedHolders.set(key, { total, organizationUuid });
-    contributions.delete(key);
+    if (contributions.delete(key)) contributionChanged(null);
     if (incumbent === undefined) return null;
     events.delete(key);
     sorted = null;
@@ -832,6 +844,19 @@ export function createEventStore(opts: {
   // is idempotent; iteration order is registration order.
   const changeListeners = new Set<(changes: readonly StoreChange[]) => void>();
   const localAppendListeners = new Set<(batch: LocalAppend) => void>();
+  const contributionListeners = new Set<(key: string | null) => void>();
+
+  // Report one write to the contributions map (#364): its key, or `null` for a
+  // removal or a wholesale replacement. See `EventStore.onContributionChange`.
+  function contributionChanged(key: string | null): void {
+    for (const listener of contributionListeners) {
+      try {
+        listener(key);
+      } catch (err) {
+        console.error("[store] onContributionChange listener threw:", err);
+      }
+    }
+  }
 
   // Deliver one fully-applied batch. Called AFTER the whole batch has landed in
   // `events`, so a listener that queries the store sees the post-batch RAM, not
@@ -873,6 +898,7 @@ export function createEventStore(opts: {
       if (held === undefined || supersedes(input, held)) {
         derived = withEventMs(input);
         contributions.set(key, derived);
+        contributionChanged(key);
       }
     }
     const existing = events.get(key);
@@ -1398,6 +1424,7 @@ export function createEventStore(opts: {
     removeMachineSessions: (machineId, sessions) => {
       const keys = new Set(sessions.map((s) => sessionKey(s.projectSlug, s.sessionId)));
       const changes: StoreChange[] = [];
+      let removedContribution = false;
       for (const [key, event] of events) {
         if (
           event.machineId !== machineId ||
@@ -1405,9 +1432,10 @@ export function createEventStore(opts: {
         )
           continue;
         events.delete(key);
-        contributions.delete(key);
+        if (contributions.delete(key)) removedContribution = true;
         changes.push({ event: null, replaced: event });
       }
+      if (removedContribution) contributionChanged(null);
       if (changes.length === 0) return;
       sorted = null;
       rebuildDerivedSets();
@@ -1415,6 +1443,11 @@ export function createEventStore(opts: {
     },
     appendFleet,
     localContribution: (messageId, requestId) => contributions.get(dedupKey(messageId, requestId)),
+    localContributionByKey: (key) => contributions.get(key),
+    onContributionChange: (listener) => {
+      contributionListeners.add(listener);
+      return () => contributionListeners.delete(listener);
+    },
     contributions: () =>
       [...contributions.values()].sort((a, b) =>
         a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
@@ -1432,6 +1465,7 @@ export function createEventStore(opts: {
           continue;
         contributions.set(key, row);
       }
+      contributionChanged(null);
     },
     removeFleetKeys: (rows) => {
       const changes: StoreChange[] = [];

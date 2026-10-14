@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-10-11T05:10:48.441Z",
+  "capturedAt": "2026-10-14T04:00:35.028Z",
   "models": {
     "aihubmix/claude-fable-5": {
       "input_cost_per_token": 0.000011,
@@ -397,6 +397,13 @@
       "cache_creation_input_token_cost_above_1hr": 0.00002
     },
     "azure_ai/claude-fable-5-1": {
+      "input_cost_per_token": 0.00001,
+      "output_cost_per_token": 0.00005,
+      "cache_creation_input_token_cost": 0.0000125,
+      "cache_read_input_token_cost": 2.5e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.00002
+    },
+    "azure_ai/claude-fable-5-5": {
       "input_cost_per_token": 0.00001,
       "output_cost_per_token": 0.00005,
       "cache_creation_input_token_cost": 0.0000125,

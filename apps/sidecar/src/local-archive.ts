@@ -13,7 +13,6 @@ import {
   type LocalArchiveStore,
 } from "@maxprice/usage-core";
 import type { EventStore, StoreChange, StoredEvent } from "./engine/store";
-import { openConvertedArchive } from "./local-archive-conversion";
 import { storedEventToWire } from "./stored-event-wire";
 
 // The Local archive (#140, ADR-0069): a durable store of THIS machine's own
@@ -30,9 +29,10 @@ import { storedEventToWire } from "./stored-event-wire";
 // freight. The store's load THROWS on an unreadable or corrupt file and never
 // deletes it; the archive is a backstop, not a dependency, so a failure
 // degrades (onDegraded → the Settings amber line) and the app runs archive-less
-// until a sweep's retry repairs it. A JSONL archive an older build kept is
-// converted once, at the first open (./local-archive-conversion.ts, which #397
-// removes).
+// until a sweep's retry repairs it. A JSONL archive a build before #396 kept
+// is never read, converted or deleted (#397): a file this module cannot read
+// is not its to destroy, and the sweep re-seeds the SQLite archive from the
+// transcripts.
 //
 // Writes converge by RECONCILIATION (the ADR-0055 shape): the engine store's
 // onChanged feed appends promptly; the boot/interval sweep is the guarantee —
@@ -65,9 +65,6 @@ const DEFAULT_SWEEP_MS = 300_000;
 
 export type LocalArchiveDeps = {
   path: string; // <app-data>/local-archive.sqlite
-  // <app-data>/local-archive.jsonl, the archive an older build kept: the first
-  // open converts it (ADR-0111 §6). Absent = no conversion. #397 removes it.
-  jsonlPath?: string;
   machineId: string; // this machine's own id — the ONLY machineId archived
   getStore: () => EventStore; // live engine accessor (the fleet rebuild swaps stores)
   mayArchiveFleet?: (row: StoredEvent) => boolean;
@@ -283,30 +280,20 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
       deps.getStore().isExcludedDedupKey(key);
   }
 
-  // Create and load a store at `path`. The conversion opens one at its fresh
-  // file's path as well.
-  async function open(path: string): Promise<LocalArchiveStore> {
-    const store = createStoreImpl(path);
+  // Create and load the store.
+  async function open(): Promise<LocalArchiveStore> {
+    const store = createStoreImpl(deps.path);
     await store.load();
     return store;
   }
 
-  // Open the store (converting a JSONL archive first, ADR-0111 §6), replay any
-  // pending forget, seed the engine from what survived. Shared by boot, the
-  // sweep's degrade-retry, and a forget that arrives with no archive open.
-  // Throws on any of those failing.
+  // Open the store, replay any pending forget, seed the engine from what
+  // survived. Shared by boot, the sweep's degrade-retry, and a forget that
+  // arrives with no archive open. Throws on any of those failing.
   async function openAndSeedInner(): Promise<void> {
-    const store =
-      deps.jsonlPath === undefined
-        ? await open(deps.path)
-        : await openConvertedArchive({
-            path: deps.path,
-            jsonlPath: deps.jsonlPath,
-            open,
-            log: (line) => console.log(line),
-          });
-    // A conversion can take seconds: a `stop()` that landed meanwhile found no
-    // store to close, so this one must not outlive it.
+    const store = await open();
+    // A `stop()` that landed during the load found no store to close, so this
+    // one must not outlive it.
     if (stopped) {
       await store.close();
       return;

@@ -44,6 +44,10 @@ import {
   type StatusSnapshot,
 } from "@maxprice/shared";
 import type { ZodType } from "zod";
+import {
+  createContributionEligibility,
+  createEligibleContributionView,
+} from "./eligible-contribution-view";
 import { createMachineDirectoryCache } from "./machine-directory-cache";
 import { publishedHomes, samePublishedHomes } from "./engine/presumption";
 import { scanGate } from "./scan-gate";
@@ -424,25 +428,24 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     return store;
   }
 
+  // Upload only independent sources; neither merged reports nor a stale
+  // replica can establish source eligibility after a deletion (ADR-0100). The
+  // view admits nothing before ingestion settles or while the forget intent is
+  // unreadable, and no pair a pending forget bars. A full pass reads it whole;
+  // an ordinary one only the keys whose contribution changed (#364).
+  const contributionView = createEligibleContributionView({
+    getStore: deps.getStore,
+    eligibility: createContributionEligibility({
+      ingestible: () => ingestible,
+      intent: forgetIntent,
+    }),
+  });
+
   // The transport-thin event-sync, created ONCE with accessor-based deps so a
   // store swap / replica re-attach is picked up live.
   const eventSync: EventSync = createEventSync({
-    // Upload only independent sources; neither merged reports nor a stale
-    // replica can establish source eligibility after a deletion (ADR-0100).
-    localEvents: () => {
-      if (!ingestible || forgetIntent.error() !== null) return [];
-      const blocked = new Set(
-        forgetIntent
-          .read()
-          ?.batches.flatMap((batch) =>
-            batch.sessions.map((s) => JSON.stringify([s.projectSlug, s.sessionId])),
-          ) ?? [],
-      );
-      const rows = deps.getStore().contributions();
-      // Nothing pending is the usual case: skip a key built per row per push (#361).
-      if (blocked.size === 0) return rows;
-      return rows.filter((row) => !blocked.has(JSON.stringify([row.projectSlug, row.sessionId])));
-    },
+    localEvents: contributionView.all,
+    localChanges: contributionView,
     prepareContributions: async () => {
       await deps.ingestionReady;
       const current = deps.getStore();

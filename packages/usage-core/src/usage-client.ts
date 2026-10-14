@@ -7,6 +7,7 @@ import type {
   WindowState,
   WindowStates,
 } from "@maxprice/shared";
+import pkg from "../package.json";
 
 // Outbound client for Anthropic's undocumented subscription-usage endpoint
 // (ADR-0023). Best-effort, mirrors pricing-refresh.ts: injected fetch, timeout,
@@ -113,11 +114,24 @@ const upstreamOrgsSchema = z.array(
     .passthrough(),
 );
 
-// `expired` — 401, the session key is dead; `forbidden` — 403, this key may
-// not read THIS org's usage (an API-only org answers so, with
-// `x-should-retry: false`), which says nothing about the key (#270); `error` —
-// everything else.
+// `expired` — the session key is dead: a 401, or a 403 naming the session
+// (`deadSession` below); `forbidden` — any other 403, this key may not read
+// THIS org's usage (an API-only org answers so, with `x-should-retry: false`),
+// which says nothing about the key (#270); `error` — everything else.
 export type UsageFailKind = "expired" | "forbidden" | "error";
+
+// claude.ai answers a dead or wrong session key with a 403, not a 401
+// (observed 2026-10-13), and its error code is all that tells it from an
+// Organization's refusal, whose 403 carries the same `permission_error` and no
+// code. An unreadable body is a refusal: `forbidden` was every 403's reading.
+const deadSessionSchema = z.object({
+  error: z.object({ details: z.object({ error_code: z.literal("account_session_invalid") }) }),
+});
+async function deadSession(res: Response): Promise<boolean> {
+  const body: unknown = await res.json().catch(() => null);
+  return deadSessionSchema.safeParse(body).success;
+}
+
 // Each window survives independently; null means none has a reset in flight.
 // `windowStates` keeps what `sample` cannot: whether a window not in flight is
 // an idle limit or no limit at all (#384).
@@ -150,11 +164,28 @@ export type FetchUsageOptions = {
   signal?: AbortSignal;
 };
 
+// Cloudflare in front of claude.ai answers a generic client User-Agent — Bun's
+// default `Bun/x.y.z`, `node`, `curl/…`, an empty one, and a browser string
+// on a non-browser TLS handshake alike — with a bot challenge, before
+// Anthropic sees the key (observed 2026-10-13; the 2026-09-17 probe saw none).
+// An agent naming the app reaches Anthropic.
+const USER_AGENT = `MaxPrice/${pkg.version}`;
+
 function authHeaders(sessionKey: string): Record<string, string> {
   // Cookie auth confirmed by the spike (ADR-0023): GET with the sessionKey
   // cookie returns 200. Both callers are bodyless GETs, so no content-type
   // header — it's meaningless here and could trip a strict WAF.
-  return { cookie: `sessionKey=${sessionKey}` };
+  return { cookie: `sessionKey=${sessionKey}`, "user-agent": USER_AGENT };
+}
+
+// A Cloudflare challenge is a 403 that Anthropic never sent, so it says
+// nothing about the key or the org: read as one, it called every key expired
+// at Connect and every Organization forbidden at the poller. `cf-mitigated`
+// is the header Cloudflare stamps on a challenge.
+function isChallenge(res: Response): boolean {
+  if (!res.headers.has("cf-mitigated")) return false;
+  console.warn(`[usage-core] claude.ai answered with a Cloudflare challenge (${res.status})`);
+  return true;
 }
 
 // The sessionKey is interpolated into the Cookie header verbatim. Reject any
@@ -183,8 +214,11 @@ export async function fetchUsage(opts: FetchUsageOptions): Promise<FetchUsageRes
         ? AbortSignal.any([opts.signal, AbortSignal.timeout(timeoutMs)])
         : AbortSignal.timeout(timeoutMs),
     });
+    if (isChallenge(res)) return { ok: false, kind: "error" };
     if (res.status === 401) return { ok: false, kind: "expired" };
-    if (res.status === 403) return { ok: false, kind: "forbidden" };
+    if (res.status === 403) {
+      return { ok: false, kind: (await deadSession(res)) ? "expired" : "forbidden" };
+    }
     if (!res.ok) return { ok: false, kind: "error" };
     const parsed = upstreamUsageSchema.safeParse(await res.json());
     if (!parsed.success) {
@@ -259,6 +293,7 @@ export async function discoverOrg(opts: DiscoverOrgOptions): Promise<ListOrgsRes
       headers: authHeaders(opts.sessionKey),
       signal: AbortSignal.timeout(timeoutMs),
     });
+    if (isChallenge(res)) return { ok: false, kind: "error" };
     if (res.status === 401 || res.status === 403) return { ok: false, kind: "expired" };
     if (!res.ok) return { ok: false, kind: "error" };
     const parsed = upstreamOrgsSchema.safeParse(await res.json());
@@ -300,7 +335,7 @@ export function limitsAnswer(result: FetchUsageResult): OrgLimitsAnswer {
     const reportsLimit = fiveHour !== "absent" || weekly !== "absent" || result.hasModelScopedLimit;
     return reportsLimit ? "windows" : "none";
   }
-  // A 401 here after a 200 listing is the key dying between two requests;
+  // A dead session here after a 200 listing is the key dying between two requests;
   // there is no better word for that org than "error", and the next poll will
   // say `expired` on its own.
   return result.kind === "forbidden" ? "forbidden" : "error";

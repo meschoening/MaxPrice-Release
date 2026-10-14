@@ -90,7 +90,6 @@ import {
 } from "./storage";
 import { createIdentityProber } from "./identity-probe";
 import { createLocalArchive } from "./local-archive";
-import { JSONL_LOCAL_ARCHIVE_FILE } from "./local-archive-conversion";
 import {
   createOrganizationRegistry,
   createOrganizationRename,
@@ -2474,9 +2473,6 @@ async function main(): Promise<void> {
   // always on. Constructed before the fleet so rebuildEngine can seed from it.
   const localArchive = createLocalArchive({
     path: join(appDataDir, STORAGE_FILE.localArchive),
-    // The JSONL archive a build before #396 kept: converted once, at the first
-    // open (ADR-0111 §6). #397 removes this with the converter.
-    jsonlPath: join(appDataDir, JSONL_LOCAL_ARCHIVE_FILE),
     mayArchiveFleet: (row) => fleet.mayArchiveFleet(row),
     machineId,
     getStore: getEngineStore,
@@ -3056,8 +3052,6 @@ async function main(): Promise<void> {
       bootTrace.track("replica", fleet.loadReplicaAtBoot()),
       // The archive's disk load (never rejects — a failure degrades instead,
       // ADR-0069 §3). Local disk only, like the replica: never the network.
-      // After the walk, so a JSONL archive's one-time conversion (ADR-0111 §6)
-      // runs here too: it holds back the first report, yielding as it goes.
       bootTrace.track(
         "archive",
         localReady.then(() => localArchive.loadAtBoot()),
