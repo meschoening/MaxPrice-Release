@@ -18,13 +18,17 @@
 import snapshotJson from "./snapshot.json";
 import type { PricingSnapshot } from "./snapshot";
 import { withPricingOverrides } from "./overrides";
+import { carryForwardPricing } from "./carry-forward";
+
+// The raw bundled floor: every key any committed snapshot priced (ADR-0114).
+const bundledSnapshot = snapshotJson as PricingSnapshot;
 
 // The vendored offline-floor snapshot — what ships in the binary, and what the
 // active snapshot is initialised to. Always available, even with no network.
 // Gap-filled with `PRICING_OVERRIDES` (ADR-0027) so a release-day model the
 // vendored LiteLLM slice doesn't carry yet still prices; the raw
-// `snapshot.json` on disk stays a pure upstream mirror.
-export const pricingSnapshot = withPricingOverrides(snapshotJson as PricingSnapshot);
+// `snapshot.json` on disk stays free of overrides.
+export const pricingSnapshot = withPricingOverrides(bundledSnapshot);
 
 // The currently-active snapshot. Mutable module state: `setActivePricingSnapshot`
 // (E11) swaps in a fresher fetch; everything else only reads it.
@@ -44,13 +48,16 @@ let snapshotKeys = new Set(Object.keys(activeSnapshot.models));
 const resolveCache = new Map<string, string | null>();
 
 // Swap the active pricing snapshot. Used by the sidecar's startup
-// pricing-refresh (E11) to install a fresher upstream fetch over the vendored
-// floor. Rebuilds the resolver's key set and clears the resolution cache so a
-// model present only in the new snapshot resolves immediately after the swap.
-// The incoming snapshot is gap-filled with `PRICING_OVERRIDES` (ADR-0027) —
-// snapshot-wins, so an override only survives until upstream prices the model.
+// pricing-refresh (E11) and pricing-cache load (ADR-0096) to install a fresher
+// upstream fetch over the vendored floor. Rebuilds the resolver's key set and
+// clears the resolution cache so a model present only in the new snapshot
+// resolves immediately after the swap.
+// The incoming snapshot is first carried forward over the raw bundled floor
+// (ADR-0114), so a key upstream has retired keeps its bundled price, then
+// gap-filled with `PRICING_OVERRIDES` (ADR-0027) — snapshot-wins, so an
+// override only survives until a snapshot prices the model.
 export function setActivePricingSnapshot(snapshot: PricingSnapshot): void {
-  activeSnapshot = withPricingOverrides(snapshot);
+  activeSnapshot = withPricingOverrides(carryForwardPricing(bundledSnapshot, snapshot));
   snapshotKeys = new Set(Object.keys(activeSnapshot.models));
   resolveCache.clear();
 }
@@ -59,8 +66,8 @@ export function setActivePricingSnapshot(snapshot: PricingSnapshot): void {
 // sidecar reads its `capturedAt` + model count for the status snapshot's
 // `pricing` provenance object (ADR-0053). Its IDENTITY is load-bearing too:
 // `buildPricingStatus` derives `source` from `activePricingSnapshot() ===
-// pricingSnapshot`, which holds because `withPricingOverrides` is
-// identity-preserving once every override key is present.
+// pricingSnapshot`, which holds because `carryForwardPricing` and
+// `withPricingOverrides` are both identity-preserving on the floor itself.
 export function activePricingSnapshot(): PricingSnapshot {
   return activeSnapshot;
 }

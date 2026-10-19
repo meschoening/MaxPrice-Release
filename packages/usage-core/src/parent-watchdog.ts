@@ -7,9 +7,11 @@
 //
 //   installParentWatchdog — polls the live ppid via libc getppid(2). When the
 //   parent disappears ungracefully (SIGKILL, crash) the kernel reparents us to
-//   init (ppid 1); we fire onOrphaned when the ppid changes or hits 1. Bun
-//   caches process.ppid at startup and never updates it, so the real source of
-//   truth is libc's getppid(2) — wired in libcGetppid(). bun:ffi has no
+//   init (ppid 1) or, on Linux, a subreaper such as `systemd --user`; we fire
+//   onOrphaned when the ppid changes or hits 1. Bun 1.3.x was found caching
+//   process.ppid at startup (Linux's 1.3.14 follows a reparent, #433; macOS is
+//   not re-checked), so the source of truth is libc's getppid(2) — wired in
+//   libcGetppid(). bun:ffi has no
 //   libc.<suffix> to dlopen on win32, so this mechanism is macOS/Linux only.
 //   The watchdog is structured so tests can inject a stub getPpid().
 //
@@ -69,8 +71,14 @@ export function installParentWatchdog(opts: WatchdogOptions): WatchdogHandle {
   };
 }
 
+// The libc to dlopen. macOS: `libc.dylib`. Linux: `libc.so.6`, glibc's runtime
+// soname (shipped Linux builds are glibc `.deb`s); `libc.${suffix}` there is
+// `libc.so`, which is absent or, with libc6-dev, a GNU ld linker script, and
+// dlopen rejects both — so the Linux watchdog never armed (#433).
+const LIBC = process.platform === "linux" ? "libc.so.6" : `libc.${suffix}`;
+
 export function libcGetppid(): () => number {
-  const libc = dlopen(`libc.${suffix}`, {
+  const libc = dlopen(LIBC, {
     getppid: { args: [], returns: FFIType.i32 },
   });
   return () => libc.symbols.getppid();

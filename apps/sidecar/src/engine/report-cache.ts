@@ -17,13 +17,16 @@ import {
   foldDailyEvent,
   foldMachineEvent,
   foldSlugEvent,
+  inLocalDateWindow,
   sumDailyTotals,
+  ymdOfDailyKey,
 } from "./daily";
 import { localDate } from "./local-date";
 import type { ModelRollup } from "./model-rollup";
 import { NO_PRESUMPTION, type Presumption } from "./presumption";
 import type { ProjectBucket } from "./projects";
 import { assembleProjects, foldProjectEvent } from "./projects";
+import { isInstantBound } from "./range";
 import type { SessionBucket } from "./sessions";
 import { assembleSessions, foldSessionEvent } from "./sessions";
 import type { EventStore, StoreChange, StoredEvent } from "./store";
@@ -41,7 +44,7 @@ import { defaultTimeZone } from "./timezone";
 // accumulator. The store's change feed (`onChanged`, E4) marks only the touched
 // buckets dirty; a query refolds exactly those and re-assembles the response
 // from the memoized rest. Entries live per FAMILY (one per report kind —
-// sessions, projects, and the three unbounded dailies: daily, daily-by-project,
+// sessions, projects, and the three dailies: daily, daily-by-project,
 // daily-by-machine), keyed on the JSON-encoded canonicalized filter axes
 // (mode, tz, projects, models, machines, organizations — see `familyKey` for
 // why JSON) plus an optional family-specific `extra` component. A per-family
@@ -55,20 +58,36 @@ import { defaultTimeZone } from "./timezone";
 //     happens PER EVENT inside `foldProjectEvent` — each bucket carries a
 //     range rollup AND an all-time rollup side by side — so an acc is only
 //     valid for the window it was folded under; two windows are two entries.
-//   - daily: NO window at all. The cache serves only UNBOUNDED queries (the
-//     handler routes bounded ones to the direct aggregator path — a windowed
-//     daily is a store-level date filter, and caching per window would
-//     fragment entries for no reuse). Its `extra` instead carries the
-//     totals-omission rule: `pfc:multi|single` from the RAW repeated-param
-//     project count — duplicates NOT deduped for this rule, even though
-//     canonicalization dedupes the filter SET — because `project=A&project=A`
-//     omits `totals` today and must keep doing so; assembly omits `totals`
-//     on a `multi` entry.
-//   - daily-by-project / daily-by-machine: unbounded-only, like daily. The
-//     by-project key carries no `extra` at all; by-machine's `extra` is the
-//     `ip:1|ip:0` nesting axis — `includeProjects` changes the FOLD SHAPE
-//     (nested per-slug sub-accs), so unlike daily's assembly-time pfc rule
-//     the two variants can never share an acc.
+//   - daily: NOT in the key (#423, ADR-0116). The entry is always the
+//     unbounded one — its cold build queries the store with no window — and a
+//     bounded query is that entry's date buckets inside `[since, until]`,
+//     kept at the snapshot (`dailyWindowKeep`, `refoldDirty`'s `keep`): a
+//     bucket holds exactly one local date's events, so it is in a
+//     `YYYYMMDD` window exactly when each of its events would pass the
+//     store's date filter (`inLocalDateWindow`). One entry serves every
+//     window, so the renderer's moving `until` (today) churns no key, and the
+//     Today tile is the same entry's today bucket. Each kept row is one fold
+//     of its date's events in (timestamp, seq) order, and `sumDailyTotals`
+//     folds the kept rows in date order — `aggregateDaily`'s own order over
+//     the window's events. Only local-date bounds slice: an instant bound
+//     (ADR-0083) cuts inside a date, so the cache refuses it and the handler
+//     stays direct. Its `extra` instead carries the totals-omission rule:
+//     `pfc:multi|single` from the RAW repeated-param project count —
+//     duplicates NOT deduped for this rule, even though canonicalization
+//     dedupes the filter SET — because `project=A&project=A` omits `totals`
+//     today and must keep doing so; assembly omits `totals` on a `multi`
+//     entry.
+//   - daily-by-project / daily-by-machine: NO window at all. The cache serves
+//     only UNBOUNDED queries, and the handler routes bounded ones to the
+//     direct aggregator path (ADR-0116): their buckets are whole slugs and
+//     machines (THE DAILY-SPLIT BUCKET GRAIN, below), so a window answered
+//     from them would refold the touched slug's or machine's whole history on
+//     every append, and each bucket keeps one all-time `cwd` capture where a
+//     window needs its own. The by-project key carries no `extra` at all;
+//     by-machine's `extra` is the `ip:1|ip:0` nesting axis —
+//     `includeProjects` changes the FOLD SHAPE (nested per-slug sub-accs), so
+//     unlike daily's assembly-time pfc rule the two variants can never share
+//     an acc.
 //
 // THE DAILY-SPLIT BUCKET GRAIN. The by-project family's bucket is the WHOLE
 // slug — never slug×date. The pure path (`aggregateDailyByProject`) folds each
@@ -125,7 +144,7 @@ import { defaultTimeZone } from "./timezone";
 // the feed.
 //
 // THE PRICING RULE. Cost is priced AT FOLD TIME from mutable module state —
-// `computeCostBreakdown` reads `activePricingSnapshot()` — so every memoized
+// `computeCostBreakdownInto` reads `activePricingSnapshot()` — so every memoized
 // acc bakes in whichever snapshot was active when its bucket folded, and a
 // clean bucket is never re-priced. The pricing refresh (ADR-0085) swaps that
 // snapshot in-session, and `setActivePricingSnapshot` installs a NEW object
@@ -254,19 +273,30 @@ export type ReportFilters = {
   organizations: string[];
 };
 
+// The date window a `daily` query may carry: `YYYYMMDD` local dates in the
+// query's zone, either or both, inclusive — the form a date bucket can be
+// sliced at (module header: WHERE THE DATE WINDOW LIVES). An instant bound
+// (ADR-0083) cuts inside a local date, so the cache refuses one and the handler
+// sends it down the direct path.
+export type LocalDateWindow = { since?: string; until?: string };
+
 export type ReportCache = {
   sessions(q: ReportFilters & { since?: string; until?: string }): Promise<SessionsResponse>;
   projects(q: ReportFilters & { since?: string; until?: string }): Promise<{
     projects: ProjectRow[];
   }>;
-  // Unbounded ONLY — no since/until: the handler routes bounded queries to the
-  // direct aggregator path (module header). `projectFilterCount` is the RAW
-  // repeated-param project count, BEFORE canonicalization dedupes the set.
-  daily(q: ReportFilters & { projectFilterCount: number }): Promise<DailyResponse>;
-  // Unbounded ONLY, like daily (module header).
+  // Unbounded, or a local-date window sliced from the unbounded entry (module
+  // header). `projectFilterCount` is the RAW repeated-param project count,
+  // BEFORE canonicalization dedupes the set.
+  daily(
+    q: ReportFilters & LocalDateWindow & { projectFilterCount: number },
+  ): Promise<DailyResponse>;
+  // Unbounded ONLY — no since/until: the handler routes a bounded query to the
+  // direct aggregator path (module header: WHERE THE DATE WINDOW LIVES).
   dailyByProject(q: ReportFilters): Promise<DailyByProjectResponse>;
-  // Unbounded ONLY. `includeProjects` (the machine+project group-by cross) is
-  // a KEY axis — it changes the fold shape, not just assembly (module header).
+  // Unbounded ONLY, like dailyByProject. `includeProjects` (the machine+project
+  // group-by cross) is a KEY axis — it changes the fold shape, not just
+  // assembly (module header).
   dailyByMachine(q: ReportFilters & { includeProjects: boolean }): Promise<DailyByMachineResponse>;
 };
 
@@ -579,12 +609,13 @@ export function createReportCache(opts: {
     },
   };
 
-  // --- the unbounded-daily family ------------------------------------------
+  // --- the daily family ----------------------------------------------------
 
   const dailyFamily: Family<ModelRollup> = {
     entries: new Map(),
-    // No window at all — the cache serves only unbounded `/api/daily` queries
-    // (module header); the key's `extra` is the `pfc:` totals rule instead.
+    // No window in the key — a bounded query keeps the window's date buckets
+    // at assembly (module header); the key's `extra` is the `pfc:` totals rule
+    // instead.
     windowInKey: false,
     // A daily bucket is the event's local calendar date in the entry's zone;
     // an unparseable timestamp has no bucket (`foldDailyEvent` drops it).
@@ -605,7 +636,8 @@ export function createReportCache(opts: {
 
   const dailyByProjectFamily: Family<SlugAcc> = {
     entries: new Map(),
-    // Unbounded-only, like daily (module header) — no window anywhere.
+    // Unbounded-only (module header: WHERE THE DATE WINDOW LIVES) — no window
+    // anywhere.
     windowInKey: false,
     // The bucket is the WHOLE slug — EVERY event of the slug, unparseable
     // timestamps included: no localDate gate, unlike the other families
@@ -633,8 +665,8 @@ export function createReportCache(opts: {
 
   const dailyByMachineFamily: Family<MachineAcc> = {
     entries: new Map(),
-    // Unbounded-only, like daily — the `ip:` extra is the key's only axis
-    // beyond the base filters.
+    // Unbounded-only, like daily-by-project — the `ip:` extra is the key's
+    // only axis beyond the base filters.
     windowInKey: false,
     // The bucket is the whole machineId — unparseable timestamps included, no
     // localDate gate, for the same reason as the by-project family (module
@@ -922,10 +954,15 @@ export function createReportCache(opts: {
   // built synchronously in the same stretch as the clean pass that proved them
   // clean, because the caller assembles after an await and `applyChanges` nulls
   // `bucket.acc` on any membership change: re-reading `entry.buckets` there
-  // would OMIT every row a batch touched in the gap.
+  // would OMIT every row a batch touched in the gap. `keep`, when given, is the
+  // query's local-date window (`dailyWindowKeep`): the snapshot takes only the
+  // buckets inside it, so a bounded query copies its window, not the corpus.
+  // Every dirty bucket still refolds, in the window or not — a later query
+  // will want it, and the clean pass must be total.
   async function refoldDirty<Acc>(
     family: Family<Acc>,
     entry: Entry<Acc>,
+    keep?: (key: string, acc: Acc) => boolean,
   ): Promise<Map<string, Acc>> {
     let sinceYield = 0;
     let passes = 0;
@@ -963,7 +1000,9 @@ export function createReportCache(opts: {
         // produces no row — the assemblers never see it.
         const accs = new Map<string, Acc>();
         for (const [key, bucket] of entry.buckets) {
-          if (bucket.acc !== null) accs.set(key, bucket.acc);
+          if (bucket.acc !== null && (keep === undefined || keep(key, bucket.acc))) {
+            accs.set(key, bucket.acc);
+          }
         }
         return accs;
       }
@@ -980,11 +1019,12 @@ export function createReportCache(opts: {
     family: Family<Acc>,
     entry: Entry<Acc>,
     assemble: (accs: Map<string, Acc>) => T,
+    keep?: (key: string, acc: Acc) => boolean,
   ): Promise<T> {
     let result!: T;
     const run = entry.work.then(async () => {
       if (!entry.built) await coldBuild(family, entry);
-      const accs = await refoldDirty(family, entry);
+      const accs = await refoldDirty(family, entry, keep);
       result = assemble(accs);
     });
     entry.work = run.then(
@@ -1027,23 +1067,48 @@ export function createReportCache(opts: {
     return runQuery(projectsFamily, entry, assembleProjects);
   }
 
-  async function daily(q: ReportFilters & { projectFilterCount: number }): Promise<DailyResponse> {
+  // A `daily` query's window as the snapshot filter `refoldDirty` takes:
+  // `undefined` when unbounded, so every date bucket is kept. Refuses an
+  // instant bound, which no date bucket can be cut at (`LocalDateWindow`); the
+  // handler routes those to the direct path.
+  function dailyWindowKeep(c: Canon): ((key: string) => boolean) | undefined {
+    const { since, until } = c;
+    if (since === undefined && until === undefined) return undefined;
+    if (
+      (since !== undefined && isInstantBound(since)) ||
+      (until !== undefined && isInstantBound(until))
+    ) {
+      throw new Error("report-cache: a daily window takes local dates (YYYYMMDD), not instants");
+    }
+    return (key) => inLocalDateWindow(ymdOfDailyKey(key), since, until);
+  }
+
+  async function daily(
+    q: ReportFilters & LocalDateWindow & { projectFilterCount: number },
+  ): Promise<DailyResponse> {
     rebind();
     const c = canonicalize(q);
+    const keep = dailyWindowKeep(c);
     // The RAW repeated-param count decides the totals rule (module header):
     // canonicalization dedupes the SET, so `project=A&project=A` shares
     // `project=A`'s corpus but must live under its own `pfc:multi` key to
     // keep omitting `totals`.
     const multi = q.projectFilterCount >= 2;
     const entry = getOrCreateEntry(dailyFamily, c, `pfc:${multi ? "multi" : "single"}`);
-    return runQuery(dailyFamily, entry, (accs) => {
-      // `flushDailyRows` sorts by date, so the acc map's iteration order is
-      // irrelevant here.
-      const daily = flushDailyRows(accs);
-      // `sumDailyTotals` folds the date-ascending wire rows, so the float
-      // summation order — artifacts and all — is exactly `aggregateDaily`'s.
-      return multi ? { daily } : { daily, totals: sumDailyTotals(daily) };
-    });
+    return runQuery(
+      dailyFamily,
+      entry,
+      (accs) => {
+        // `flushDailyRows` sorts by date, so the acc map's iteration order is
+        // irrelevant here.
+        const daily = flushDailyRows(accs);
+        // `sumDailyTotals` folds the date-ascending wire rows — the window's
+        // own, when bounded — so the float summation order, artifacts and all,
+        // is exactly `aggregateDaily`'s over the window's events.
+        return multi ? { daily } : { daily, totals: sumDailyTotals(daily) };
+      },
+      keep,
+    );
   }
 
   async function dailyByProject(q: ReportFilters): Promise<DailyByProjectResponse> {

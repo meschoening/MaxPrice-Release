@@ -54,6 +54,12 @@ export type LiveStatusState = {
   // connection opens. Only the boot splash's error card reads it — post-ready
   // connection loss is the StatusBar's story.
   bootFailure: string | null;
+  // Engine stop (ADR-0112): the same Failed message, recorded instead when the
+  // terminal URL failure lands after `ready` has been true — the sidecar
+  // exited mid-session. BootGate swaps the frame for the stopped card on it.
+  // Never cleared: the shell never respawns, so `SidecarStatus` stays Failed
+  // and only a relaunch, which starts a fresh store, ends the stop.
+  engineStop: string | null;
   // Usage-limits connection state (ADR-0023). Mirrors StatusSnapshot fields;
   // updated live on every `status:changed` frame (success AND failure) so the
   // Settings section and future status indicator always reflect the poller.
@@ -91,6 +97,7 @@ export type LiveStatusState = {
   saturation: NonNullable<StatusSnapshot["saturation"]> | null;
   setConnectionState: (state: ConnectionState) => void;
   setBootFailure: (reason: string | null) => void;
+  setEngineStop: (reason: string) => void;
   applyStatusSnapshot: (snapshot: StatusSnapshot) => void;
   markEvent: (at: number) => void;
 };
@@ -107,6 +114,7 @@ export const useLiveStatus = create<LiveStatusState>((set) => ({
   ready: null,
   bootProgress: null,
   bootFailure: null,
+  engineStop: null,
   usageConnection: "disconnected",
   usageLastSampleAt: null,
   organizations: {},
@@ -119,6 +127,7 @@ export const useLiveStatus = create<LiveStatusState>((set) => ({
   saturation: null,
   setConnectionState: (state) => set({ connectionState: state }),
   setBootFailure: (reason) => set({ bootFailure: reason }),
+  setEngineStop: (reason) => set({ engineStop: reason }),
   applyStatusSnapshot: (snapshot) =>
     set((s) => ({
       watchedPaths: snapshot.watchedPaths,

@@ -1,6 +1,7 @@
 import { Row } from "@/components/Rows";
 import { useAutostart } from "@/state/use-autostart";
 import { useFirewallCheck, useFirewallFix } from "@/state/use-firewall";
+import { useHubDaemonExited } from "@/state/use-hub-daemon-exited";
 import { useHubStatus } from "@/state/use-hub-status";
 import { useHubUrl } from "@/state/use-hub-url";
 import { useCompactStore } from "@/state/use-machine-mutations";
@@ -9,6 +10,7 @@ import { formatRelativeTime } from "@maxprice/shared";
 import { formatUptime } from "@/lib/relative-time";
 import { dotVariant } from "@/lib/dot-variant";
 import { showToast } from "@/lib/toast";
+import { relaunchApp } from "@/lib/tauri";
 import {
   autostartRow,
   eventsDown,
@@ -34,7 +36,8 @@ export function HubStatusCard(): React.ReactElement {
   // The chip reports the DAEMON — reachable, serving the network, serving
   // event sync (ADR-0049). claude.ai health belongs to the Claude account card
   // alone; this card used to duplicate it.
-  const daemon = hubDaemonState(isError, status, firewall);
+  const exited = useHubDaemonExited(isError);
+  const daemon = hubDaemonState(isError, status, firewall, exited);
   // Real daemon uptime from the contract's `startedAt` (string | null,
   // optional). Parse to ms at the call site; null/absent → em dash.
   const startedAt = status?.startedAt ?? null;
@@ -100,6 +103,30 @@ export function HubStatusCard(): React.ReactElement {
           </>
         ) : null}
       </div>
+      {/* The daemon exited and the shell holds it as Failed (ADR-0112 §6): the
+          one fault this card can only answer with a door. The shell never
+          respawns the daemon, so Restart hub relaunches the whole tray app;
+          clients reconnect on their own, since the hub's port is fixed. An
+          unreachable daemon the shell still holds as running gets no door:
+          it stays "Not responding", as before. */}
+      {daemon === "stopped" ? (
+        <div className="inset centered danger" role="alert">
+          <p className="lead">The hub&rsquo;s daemon stopped — clients can&rsquo;t reach it.</p>
+          <div className="btns">
+            <button
+              type="button"
+              className="chip"
+              onClick={() =>
+                relaunchApp().catch((err: unknown) => {
+                  console.warn("[hub] relaunch_app failed:", err);
+                })
+              }
+            >
+              Restart hub
+            </button>
+          </div>
+        </div>
+      ) : null}
       {/* The bind resolution's own diagnosis, rendered verbatim (ADR-0049) —
           "no tailnet interface found" (the hub wanted the tailnet and bound
           loopback) or "you bound a public address" (serving, but in the

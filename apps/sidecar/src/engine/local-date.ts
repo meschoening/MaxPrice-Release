@@ -13,7 +13,7 @@
 // lives here once so the store (E4) and all four aggregators (E5–E8) derive
 // day grouping from a single function.
 
-import { msSinceMidnightOf, tzClockParts } from "@maxprice/shared";
+import { msSinceMidnightOf, tzClockParts, tzOffsetMs } from "@maxprice/shared";
 
 // `zonedInstant` (wall clock → instant) now lives beside `tzClockParts` in
 // `packages/shared/src/tz-clock.ts`, where the renderer can reach it too. It is
@@ -186,9 +186,11 @@ export function localDateUncached(
 // `today` is anchored to LOCAL MIDNIGHT in the request `tz` and bins events by
 // their tz-local time-of-day, so the chart's bars reconcile penny-exactly with
 // `/api/daily`'s today row (the Today tile). That needs three things the
-// `localDate` form above doesn't give: an event's local time-of-day, the
+// `localDate` form above doesn't give: an instant's local time-of-day, the
 // previous calendar date, and the UTC instant of a given local wall-clock time
-// (for the bucket `bucketStart` labels). All are DST-correct via `Intl`.
+// (for the bucket `bucketStart` labels). All are DST-correct via `Intl`. An
+// event's time-of-day comes from `wallClockReader` at the end of this file,
+// which reads `Intl` per request rather than per event (ADR-0115).
 // ---------------------------------------------------------------------------
 
 // The full Y/M/D H:M:S wall-clock read comes from the shared `tzClockParts`
@@ -233,4 +235,87 @@ export function shiftYmd(ymd: string, days: number): string {
   const day = Number(ymd.slice(6, 8));
   const d = new Date(Date.UTC(year, month - 1, day) + days * 86_400_000);
   return `${pad4(d.getUTCFullYear())}${pad2(d.getUTCMonth() + 1)}${pad2(d.getUTCDate())}`;
+}
+
+// ---------------------------------------------------------------------------
+// `localClock` by arithmetic, for one request's span of instants (ADR-0115).
+//
+// The `today` classifier needs every event's wall clock, and `localClock` costs
+// an `Intl.formatToParts` call and its parts objects per event. A zone's offset
+// is constant between transitions, so the reader below reads the offsets from
+// `Intl` once across the span and answers each instant with an addition. It is
+// built per request and dropped with it: nothing outlives the request, and no
+// memo grows with the corpus (ADR-0110).
+//
+// The answer is a WALL-MS: the epoch-ms the instant's local Y/M/D h:m:s would
+// have in UTC, which is what `tzOffsetMs` subtracts the instant from. Its UTC
+// date is `localClock`'s `ymd`, and its distance from that date's UTC midnight
+// is `localClock`'s `msSinceMidnight`. Like `localClock`, it drops sub-seconds.
+// ---------------------------------------------------------------------------
+
+// The reader probes the offset at least this often and assumes it did not change
+// between two probes that read the same offset. A zone would have to change its
+// offset and change it back within six hours to break that; none in the
+// time-zone database does (the shortest run of one offset across every zone in
+// 2025-2028 is 35 days, Casablanca's Ramadan suspension).
+const OFFSET_PROBE_STEP_MS = 6 * 3_600_000;
+
+// A reader of `timeZone`'s wall clock for every instant in `[fromMs, toMs)`:
+// `read(ms)` is the instant's wall-ms, `NaN` outside the span. Building it reads
+// `Intl` once per six hours of span plus a bisection of at most 15 reads per
+// offset transition; a read reads none and allocates nothing.
+//
+// The bisection finds each transition to the whole second, which is exact:
+// offsets and transitions are whole seconds in the time-zone database, so an
+// instant's offset is its whole second's.
+export function wallClockReader(
+  fromMs: number,
+  toMs: number,
+  timeZone: string,
+): (ms: number) => number {
+  const first = Math.floor(fromMs / 1000) * 1000;
+  // The whole second holding the span's last instant.
+  const last = Math.floor((toMs - 1) / 1000) * 1000;
+  // Run `i` of one offset starts at whole second `runStarts[i]` and keeps
+  // `runOffsets[i]` until the next run starts.
+  const runStarts = [first];
+  const runOffsets = [tzOffsetMs(first, timeZone)];
+
+  // `offA` is the offset at second `a` and `offB` at second `b`, and they
+  // differ: add a run at every transition in `(a, b]`, in order.
+  const addTransitions = (a: number, offA: number, b: number, offB: number): void => {
+    if (b - a <= 1000) {
+      runStarts.push(b);
+      runOffsets.push(offB);
+      return;
+    }
+    const mid = a + Math.floor((b - a) / 2000) * 1000;
+    const offMid = tzOffsetMs(mid, timeZone);
+    if (offMid !== offA) addTransitions(a, offA, mid, offMid);
+    if (offMid !== offB) addTransitions(mid, offMid, b, offB);
+  };
+
+  let a = first;
+  let offA = runOffsets[0] as number;
+  while (a < last) {
+    const b = Math.min(a + OFFSET_PROBE_STEP_MS, last);
+    const offB = tzOffsetMs(b, timeZone);
+    if (offB !== offA) addTransitions(a, offA, b, offB);
+    a = b;
+    offA = offB;
+  }
+
+  return (ms: number): number => {
+    if (!(ms >= fromMs && ms < toMs)) return NaN;
+    const second = Math.floor(ms / 1000) * 1000;
+    let i = runStarts.length - 1;
+    while (second < (runStarts[i] as number)) i -= 1;
+    return second + (runOffsets[i] as number);
+  };
+}
+
+// The wall-ms of local midnight on `ymd` (dashless `YYYYMMDD`): the calendar
+// date's midnight in UTC, since a wall-ms reads the wall clock as UTC.
+export function wallMidnightMs(ymd: string): number {
+  return Date.UTC(Number(ymd.slice(0, 4)), Number(ymd.slice(4, 6)) - 1, Number(ymd.slice(6, 8)));
 }

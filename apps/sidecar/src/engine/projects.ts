@@ -1,10 +1,9 @@
 import type { CostMode, ProjectRow } from "@maxprice/shared";
-import { computeCostBreakdown } from "@maxprice/shared";
 import { localDate } from "./local-date";
 import { inRange } from "./range";
 import { defaultTimeZone } from "./timezone";
 import type { ModelRollup } from "./model-rollup";
-import { byTimestamp, emptyModelRollup, foldModelUsage } from "./model-rollup";
+import { byTimestamp, emptyModelRollup, priceAndFold } from "./model-rollup";
 import { eventOrganization, NO_PRESUMPTION, type Presumption } from "./presumption";
 import {
   capturePath,
@@ -275,18 +274,7 @@ export function foldProjectEvent(
   if (within) {
     // Pricing moved inside the partition with ADR-0068: with the all-time
     // rollup gone, an out-of-window event has nothing left to price.
-    const cost = computeCostBreakdown(
-      event.model,
-      {
-        inputTokens: event.inputTokens,
-        outputTokens: event.outputTokens,
-        cacheCreationTokens: event.cacheCreationTokens,
-        cacheReadTokens: event.cacheReadTokens,
-      },
-      mode,
-      event.costUSD,
-    );
-    foldModelUsage(bucket.range, event, cost);
+    priceAndFold(bucket.range, event, mode);
     // Range-scoped since ADR-0068, parallel to `machines` below and to the
     // range rollup's `modelsUsed`.
     bucket.sessions.add(event.sessionId);

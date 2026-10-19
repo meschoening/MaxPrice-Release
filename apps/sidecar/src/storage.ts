@@ -111,8 +111,8 @@ export type WalkResult = { bytes: number; files: number; errors: number };
  * `scan.fileErrors` → the `scan-incomplete` block), and there is no portable way
  * to make a real temp-dir entry unstattable: a dangling symlink is skipped
  * before the stat, `chmod 0o000` is POSIX-only and a no-op for root, and a
- * conditionally-skipped test would cover nothing on the Windows primary where
- * releases are built. Injecting the failure is what lets the walk→guard boundary
+ * conditionally-skipped test would cover nothing on the Windows leg of the
+ * release gate. Injecting the failure is what lets the walk→guard boundary
  * be asserted at all.
  */
 export async function walkTree(

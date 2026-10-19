@@ -131,6 +131,7 @@ export function autostartRow(state: AutostartState): { value: string; warn: bool
 export type HubDaemonState =
   | "starting" // no answer yet — the LISTENING handshake can lag window creation
   | "not-responding" // the console can't reach its own daemon
+  | "stopped" // ...because it exited: the shell's record (ADR-0112 §6)
   | "local-only" // alive, but nothing off this machine can reach it
   | "events-down" // reachable, but the fleet-event archive failed to load
   | "online"; // serving both jobs to the fleet
@@ -155,12 +156,21 @@ export function eventsDown(status: HubStatus | undefined): boolean {
 // Precedence is transport-before-capability: if nothing can reach the hub,
 // event-sync health is moot (clients couldn't push either way). Concurrent
 // faults stay visible — the card's insets stack independently of the chip.
+//
+// `exited` is the shell's own record that the daemon process exited
+// (`hubDaemonExited`, ADR-0112 §6). It explains why the console can't reach
+// its daemon and never stands alone: an unreachable daemon the shell still
+// holds as running stays "not-responding", as it always was. And it is a stop
+// only once the daemon has answered this webview (a status was fetched, which
+// the failing query keeps): one that never came up — a port conflict, a spawn
+// failure — failed to start, and Restart hub is no answer to that.
 export function hubDaemonState(
   isError: boolean,
   status: HubStatus | undefined,
   firewall: FirewallVerdict | undefined,
+  exited: boolean,
 ): HubDaemonState {
-  if (isError) return "not-responding";
+  if (isError) return exited && status !== undefined ? "stopped" : "not-responding";
   // Pending, not broken: treating the first load as a fault would flash red on
   // every window open, which is how an operator learns to ignore the chip.
   if (status === undefined) return "starting";
@@ -188,6 +198,8 @@ export function hubDaemonLabel(state: HubDaemonState): string {
       return "Starting…";
     case "not-responding":
       return "Not responding";
+    case "stopped":
+      return "Stopped";
     case "local-only":
       return "Local only";
     case "events-down":
@@ -203,6 +215,7 @@ export function hubDaemonDot(state: HubDaemonState, deliberateLoopback: boolean)
     case "starting":
       return "bg-soft";
     case "not-responding":
+    case "stopped":
       return "bg-bad";
     case "local-only":
       return deliberateLoopback ? "bg-soft" : "bg-warn";
@@ -232,7 +245,7 @@ const KEY_CLAUSE: Record<Exclude<UsageConnection, "connected">, string> = {
 // rows to a soft dot + em-dash (ADR-0050) — a stale claim beside a dead-daemon
 // row would read as a second, unrelated fault.
 export function noFreshReading(state: HubDaemonState): boolean {
-  return state === "starting" || state === "not-responding";
+  return state === "starting" || state === "not-responding" || state === "stopped";
 }
 
 export function trayTooltip(state: HubDaemonState, conn: UsageConnection | undefined): string {

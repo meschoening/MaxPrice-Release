@@ -59,8 +59,9 @@ export function tzClockParts(
   instant: number | string | Date,
   timeZone: string | undefined,
 ): TzClockParts {
-  // Hot path: `aggregateToday` calls this once per event. Iterate `formatToParts`
-  // ONCE into a typed lookup instead of running six separate linear `find` scans.
+  // Iterate `formatToParts` ONCE into a typed lookup instead of running six
+  // separate linear `find` scans. (`aggregateToday` called this once per event
+  // until its classifier read the zone's offsets once per request, ADR-0115.)
   const parts = clockFormatterFor(timeZone).formatToParts(new Date(instant));
   const lookup: Partial<Record<Intl.DateTimeFormatPartTypes, string>> = {};
   for (const p of parts) lookup[p.type] = p.value;

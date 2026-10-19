@@ -7,6 +7,7 @@ mod macos_popout;
 mod popout;
 mod sidecar_log;
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,6 +45,10 @@ struct SidecarState {
     // `std::process::exit(0)` above all.
     #[cfg(windows)]
     job: Mutex<Option<job_object::JobHandle>>,
+    // Set by `kill_sidecar`, under the status lock, before it ends the child:
+    // the app is exiting, so the `Terminated` that follows is the shell's own
+    // doing, never an Engine stop (ADR-0112). See `sidecar_url_answer`.
+    ending: AtomicBool,
 }
 
 /// The renderer's handle on the durable log (issue #115 / F3).
@@ -185,13 +190,30 @@ fn require_main_window(label: &str, command: &str) -> Result<(), String> {
     }
 }
 
+/// What `get_sidecar_url` answers. Pure, for its test.
+///
+/// The Pending sentinel is the renderer's one retryable answer
+/// (`apps/desktop/src/lib/sidecar.ts`). Any other Err is the shell's record
+/// that the process is gone, which after readiness is an Engine stop: the
+/// window swaps its frame for the stopped card and the popout names the stop
+/// (ADR-0112). `ending` is `kill_sidecar`'s latch. Once the shell has begun
+/// ending the sidecar itself, `Terminated` still sets Failed, but a quit is not
+/// a stop, so a renderer still running through teardown keeps hearing Pending
+/// and never flashes the stopped state on the way out.
+fn sidecar_url_answer(status: &SidecarStatus, ending: bool) -> Result<String, String> {
+    match status {
+        SidecarStatus::Ready(port) => Ok(format!("http://127.0.0.1:{port}")),
+        SidecarStatus::Failed(msg) if !ending => Err(msg.clone()),
+        SidecarStatus::Pending | SidecarStatus::Failed(_) => Err("sidecar not ready".into()),
+    }
+}
+
 #[tauri::command]
 fn get_sidecar_url(state: State<'_, SidecarState>) -> Result<String, String> {
-    match &*state.status.lock() {
-        SidecarStatus::Ready(port) => Ok(format!("http://127.0.0.1:{port}")),
-        SidecarStatus::Pending => Err("sidecar not ready".into()),
-        SidecarStatus::Failed(msg) => Err(msg.clone()),
-    }
+    // The latch is read under the status lock it is written under, so an
+    // answer that sees the Failed a kill caused also sees the kill's latch.
+    let status = state.status.lock();
+    sidecar_url_answer(&status, state.ending.load(Ordering::Relaxed))
 }
 
 #[tauri::command]
@@ -642,8 +664,10 @@ fn spawn_sidecar(app: &AppHandle) -> Result<(), String> {
                     // a later death would otherwise leave get_sidecar_url
                     // returning a URL to a dead process forever. Benign on the
                     // intentional-shutdown path (kill_sidecar during
-                    // CloseRequested/ExitRequested) — the app is already
-                    // tearing down. No respawn here by design.
+                    // ExitRequested): its latch keeps get_sidecar_url
+                    // answering Pending. No respawn here by design
+                    // (ADR-0112): after readiness this is an Engine stop, and
+                    // relaunching the whole app is the only way back.
                     let msg = if announced {
                         format!("sidecar exited after announcing port (code={:?})", t.code)
                     } else {
@@ -756,6 +780,12 @@ fn arm_window_show_fallback(app: &AppHandle) {
 
 fn kill_sidecar(app: &AppHandle) {
     let state = app.state::<SidecarState>();
+    // The quit latch (ADR-0112), set before the kill and under the status lock
+    // so no `get_sidecar_url` can see the Failed this kill causes without it.
+    {
+        let _status = state.status.lock();
+        state.ending.store(true, Ordering::Relaxed);
+    }
     let child = state.child.lock().take();
     if let Some(child) = child {
         let _ = child.kill();
@@ -845,6 +875,54 @@ struct LaunchFlags {
     /// 4s force-show fallback is never armed (charter decision 8). The tray is
     /// the only presence; tray Open and a second manual launch still show.
     hidden: bool,
+}
+
+/// A relaunch the user asked for (ADR-0112 §5): `relaunch_app` sets it, and the
+/// app's `RunEvent::Exit` restarts without `--hidden` when it is set.
+#[derive(Default)]
+struct RelaunchRequest {
+    requested: AtomicBool,
+}
+
+/// The arguments a relaunch the user asked for restarts with: the launch's
+/// own, minus `--hidden`, matched exactly as `run()` matches it. Tauri's
+/// `restart()` re-spawns with the launch's arguments, so a login launch would
+/// come back tray-only with the window the user just asked for still hidden.
+/// `args[0]` is the executable and is kept, because `tauri::process::restart`
+/// skips it. Pure, for its test.
+fn relaunch_args(args: &[OsString]) -> Vec<OsString> {
+    let mut rest = args.iter();
+    let exe = rest.next().cloned();
+    exe.into_iter()
+        .chain(rest.filter(|arg| arg.as_os_str() != "--hidden").cloned())
+        .collect()
+}
+
+/// Relaunch the app with its window shown (ADR-0112 §5): the Engine stop card,
+/// the popout's Relaunch and the Boot gate's "Try again". Not main-window-only:
+/// the popout's Relaunch is the stop's one door while the window is hidden, and
+/// it is no more than `quit_app` with a restart behind it. It exits through
+/// `app.exit(0)`, the one teardown chokepoint, so the sidecar dies on
+/// `ExitRequested` as on any quit, and `RunEvent::Exit` does the restart. The
+/// updater's relaunch stays plugin-process's and keeps the launch's arguments.
+#[tauri::command]
+fn relaunch_app(app: AppHandle) {
+    app.state::<RelaunchRequest>()
+        .requested
+        .store(true, Ordering::Relaxed);
+    app.exit(0);
+}
+
+/// Restart with `relaunch_args`, from `RunEvent::Exit`: tauri's own restart
+/// path with the arguments filtered. By `Exit` the plugins have had the event
+/// (single-instance has released its lock, window-state has saved), and
+/// `cleanup_before_exit` is the step tauri runs between the app's callback and
+/// its own restart.
+fn restart_without_hidden(app: &AppHandle) -> ! {
+    let mut env = app.env();
+    env.args_os = relaunch_args(&env.args_os);
+    app.cleanup_before_exit();
+    tauri::process::restart(&env)
 }
 
 /// Read-only: was this process launched with `--hidden`? Callable from any
@@ -1712,6 +1790,7 @@ pub fn run() {
             hidden: hidden_launch,
         })
         .manage(WindowShowFallback::default())
+        .manage(RelaunchRequest::default())
         .invoke_handler(tauri::generate_handler![
             get_sidecar_url,
             get_usage_auth_token,
@@ -1726,6 +1805,7 @@ pub fn run() {
             open_main_window,
             hide_popout,
             quit_app,
+            relaunch_app,
             get_pending_update,
             launched_hidden,
             autostart_status,
@@ -1891,6 +1971,17 @@ pub fn run() {
             // ordinary path calling both is a harmless no-op second time.
             if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
                 kill_sidecar(app_handle);
+            }
+            // A relaunch the user asked for (ADR-0112 §5), after the sidecar
+            // is gone. Only `relaunch_app` sets the request; every other exit,
+            // the updater's relaunch included, leaves it unset.
+            if matches!(event, RunEvent::Exit)
+                && app_handle
+                    .state::<RelaunchRequest>()
+                    .requested
+                    .load(Ordering::Relaxed)
+            {
+                restart_without_hidden(app_handle);
             }
             // Dock click, Spotlight/Finder/`open -a` relaunch — with the main
             // window hidden in the tray, Reopen is the ONLY signal any of them
@@ -2324,6 +2415,88 @@ mod tests {
             tray_rect_px(&secondary),
             popout::Px::new(-1900.0, 1040.0, 24.0, 24.0)
         );
+    }
+
+    // --- relaunch_args: a relaunch the user asked for drops --hidden ---
+    // ADR-0112 §5. Tauri's restart re-passes the launch's arguments, so a
+    // login launch's Relaunch would come back with its window still hidden.
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn a_login_launch_relaunches_without_hidden() {
+        let exe = r"C:\Program Files\MaxPrice\MaxPrice.exe";
+        assert_eq!(relaunch_args(&os(&[exe, "--hidden"])), os(&[exe]));
+    }
+
+    #[test]
+    fn every_hidden_goes_and_every_other_argument_keeps_its_place() {
+        assert_eq!(
+            relaunch_args(&os(&["maxprice", "--hidden", "--verbose", "--hidden", "x"])),
+            os(&["maxprice", "--verbose", "x"])
+        );
+        assert_eq!(
+            relaunch_args(&os(&["maxprice", "--verbose"])),
+            os(&["maxprice", "--verbose"])
+        );
+    }
+
+    #[test]
+    fn only_the_exact_flag_run_matches_is_dropped() {
+        // run() decides a hidden launch by `a == "--hidden"`; anything that
+        // would not have hidden this launch must not vanish from the next one.
+        let lookalikes = os(&["maxprice", "--hidden=1", "--Hidden", "-hidden", "hidden"]);
+        assert_eq!(relaunch_args(&lookalikes), lookalikes);
+    }
+
+    #[test]
+    fn the_executable_is_never_filtered() {
+        // tauri::process::restart skips args[0] as the executable, so dropping
+        // it would shift the first real argument into its place and lose it.
+        assert_eq!(
+            relaunch_args(&os(&["--hidden", "--hidden"])),
+            os(&["--hidden"])
+        );
+        assert_eq!(relaunch_args(&os(&["maxprice"])), os(&["maxprice"]));
+        assert_eq!(relaunch_args(&[]), Vec::<OsString>::new());
+    }
+
+    // --- sidecar_url_answer: a quit is not an Engine stop (ADR-0112) ---
+
+    const EXITED: &str = "sidecar exited after announcing port (code=Some(1))";
+
+    #[test]
+    fn an_exit_the_shell_did_not_cause_is_reported_as_one() {
+        assert_eq!(
+            sidecar_url_answer(&SidecarStatus::Failed(EXITED.into()), false),
+            Err(EXITED.to_string())
+        );
+    }
+
+    #[test]
+    fn a_sidecar_the_shell_is_ending_answers_pending_never_its_exit() {
+        // kill_sidecar's latch: Quit's `Terminated` still sets Failed, but a
+        // renderer alive through teardown must keep retrying, not show a stop.
+        assert_eq!(
+            sidecar_url_answer(&SidecarStatus::Failed(EXITED.into()), true),
+            Err("sidecar not ready".to_string())
+        );
+    }
+
+    #[test]
+    fn ready_and_pending_answer_as_they_always_did() {
+        for ending in [false, true] {
+            assert_eq!(
+                sidecar_url_answer(&SidecarStatus::Ready(4242), ending),
+                Ok("http://127.0.0.1:4242".to_string())
+            );
+            assert_eq!(
+                sidecar_url_answer(&SidecarStatus::Pending, ending),
+                Err("sidecar not ready".to_string())
+            );
+        }
     }
 
     // --- require_main_window: the ACL gap's hand-rolled half ---

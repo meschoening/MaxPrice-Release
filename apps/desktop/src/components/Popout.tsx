@@ -2,6 +2,7 @@ import { Component, useEffect, type ErrorInfo, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
 import { insideTauri } from "../lib/tauri";
+import { relaunchApp } from "../lib/relaunch";
 import { popoutView, type PopoutHead, type PopoutViewState } from "../lib/popout-view";
 import { ringStrokeDasharray } from "../lib/active-block-tile-state";
 import { usePendingUpdate, usePopoutData } from "../state/use-popout-data";
@@ -16,9 +17,9 @@ import { useSettings, useTimeDisplay } from "../state/use-settings";
 // (use-popout-data — T5 decision 8); every window manipulation lives Rust-side
 // (ADR-0050 — blur dismissal never reaches this file; Esc invokes hide_popout).
 //
-// The event this bundle listens for ("popout:shown") and the two commands the
-// buttons invoke are the popout's whole IPC surface, per the ACL note in
-// capabilities/popout.json.
+// The event this bundle listens for ("popout:shown") and the commands the
+// buttons invoke (Open, Quit, and Relaunch after an Engine stop) are the
+// popout's whole IPC surface, per the ACL note in capabilities/popout.json.
 
 // Fire a Tauri command and log its rejection — never `void` it (the hub's
 // rule): the popout is the only UI on screen when it is open, and a dead
@@ -57,6 +58,7 @@ function PopoutDash(): React.ReactElement {
 
   const view = popoutView({
     anyError: data.anyError,
+    engineStopped: data.engineStopped,
     settled: data.settled,
     ready: data.ready,
     hasData: data.hasData,
@@ -80,7 +82,7 @@ function PopoutDash(): React.ReactElement {
       <PopoutBody view={view} />
       <div className="pdivider" aria-hidden />
       {pendingUpdate !== null ? <UpdateRow version={pendingUpdate} /> : null}
-      <PopoutActions />
+      <PopoutActions relaunch={view.kind === "down" && view.stopped} />
     </div>
   );
 }
@@ -93,7 +95,11 @@ export function PopoutBody({ view }: { view: PopoutViewState }): React.ReactElem
       <div className="pbody centered">
         <div className="pinset bad">
           <span className="pdot" aria-hidden />
-          MaxPrice isn&apos;t responding — open the window to retry.
+          {view.stopped ? (
+            "MaxPrice’s engine stopped — relaunch to start it again."
+          ) : (
+            <>MaxPrice isn&apos;t responding — open the window to retry.</>
+          )}
         </div>
       </div>
     );
@@ -254,10 +260,18 @@ function UpdateRow({ version }: { version: string }): React.ReactElement {
 }
 
 // The two doors out — shared verbatim with the error fallback below: whatever
-// else has gone wrong, these must behave identically.
-function PopoutActions(): React.ReactElement {
+// else has gone wrong, these must behave identically. After an Engine stop a
+// third leads them (ADR-0112 §4): Relaunch, the one way back, which restarts
+// the app without `--hidden` so the window comes back even after a login
+// launch. Exported for its test.
+export function PopoutActions({ relaunch = false }: { relaunch?: boolean }): React.ReactElement {
   return (
     <div className="actions-menu">
+      {relaunch ? (
+        <button type="button" onClick={() => run("relaunch_app", relaunchApp)}>
+          Relaunch MaxPrice
+        </button>
+      ) : null}
       <button
         type="button"
         onClick={() => run("open_main_window", () => invoke("open_main_window"))}

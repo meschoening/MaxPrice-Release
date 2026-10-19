@@ -3110,6 +3110,39 @@ a.sb-footrow:hover .sb-label {
   font-size: 11px;
   color: var(--soft);
 }
+/* The Usage hub's fleet-history seed bar (#410): a caption row in the
+   hint-line's ink over a full-width track. Track and fill are the shipped 6px
+   bars (`.limit-meter`, `.boot-track`) on their tokens. The fill's width
+   transition is the only motion, with no sheen, and the Glass reduced-motion
+   kill covers it. */
+.seed-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.seed-progress .caption {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--soft);
+}
+.seed-progress .track {
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--ring-track);
+  box-shadow: var(--panel-inner);
+}
+.seed-progress .fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+  box-shadow: 0 0 8px var(--accent-glow);
+  transition: width 0.45s var(--ease-glass);
+}
 .row-line {
   display: flex;
   align-items: center;

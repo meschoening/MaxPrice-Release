@@ -5,6 +5,7 @@ import {
   type FleetForgetIntent,
   type FleetForgetMode,
 } from "./fleet-forget-intent";
+import { whenBootResolves } from "./when-boot-resolves";
 import {
   createEventSync,
   fleetTokenTotal,
@@ -201,9 +202,11 @@ export type FleetSyncDeps = {
 // for different words and different HTTP: `unavailable` means the precondition
 // evaporated between the guard and the act (the hub disconnected, the replica
 // detached) and is retryable as-is; `failed` means the hub was reached and did
-// not do it. `landed` says whether ANY batch was applied before the failure —
-// the difference between "nothing happened" and "some of it did", which decides
-// whether the local replica still agrees with the archive.
+// not do it. `landed` says whether ANY batch was applied on the connected Hub
+// before the failure — the difference between "nothing happened" and "some of
+// it did", which decides whether the local replica still agrees with the
+// archive. A receipt from a Hub the intent was retargeted away from (#387) is
+// no landing here: that Hub's replica is not the one reconciling.
 // `busy` is a third, and is "not in this state" rather than "try again in a
 // moment": a forget already running on this machine is doing the work the second
 // caller wants done.
@@ -314,6 +317,13 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       ingestible = true;
     })
     .catch(() => {});
+  // What the connect hook's and the directory sweep's resumes of a pending
+  // forget wait on, through whenBootResolves (#389): after a failed walk a
+  // resume does nothing, where a `void`ed forget would carry forgetInner's
+  // rejected await to the `unhandledRejection` handler, which exits the
+  // sidecar. A failure of the forget itself still reaches it. No gate (fleet
+  // tests omit it) resumes at once.
+  const bootIngestion = deps.ingestionReady ?? Promise.resolve();
   const fetchImpl = deps.fetchImpl ?? fetch;
   const debounceMs = deps.debounceMs ?? 500;
   const pokeMaxWaitMs = deps.pokeMaxWaitMs ?? 2_000;
@@ -694,7 +704,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // Toggle changes, the hub-configured gate, and the epoch resync all run
   // through ONE chain so they never overlap; a request landing mid-run coalesces
   // into a single follow-up that re-reads the toggle booleans fresh (last state
-  // wins — the settings-watch do/while pattern).
+  // wins — the watcher-restarts.ts coalescing pattern).
   let reconcileChain: Promise<void> = Promise.resolve();
   let reconciling = false;
   let pendingReconcile = false;
@@ -853,8 +863,26 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // action must settle before a different selection can be accepted.
   let forgetInflight: Promise<FleetForgetResult> | null = null;
 
+  // The connected Hub's events epoch, which a forget's intent is written
+  // against: a new intent's, or a retargeted one's (#387).
+  async function readHubEpoch(connection: Conn): Promise<string> {
+    const deadline = requestDeadline();
+    try {
+      const response = await fetchImpl(`${connection.url}/api/status`, {
+        headers: connection.headers,
+        signal: deadline.signal,
+      });
+      if (!response.ok) throw new Error(`Cannot read Hub state (${response.status})`);
+      const status = hubStatusSchema.parse(await response.json());
+      if (status.events === undefined) throw new Error("Hub archive unavailable");
+      return status.events.epoch;
+    } finally {
+      deadline.clear();
+    }
+  }
+
   // `mode` is a new intent's. The empty resume (connect and sweep) writes no
-  // intent and compares no mode, so its default is never read.
+  // new intent and compares no mode, so its default is never read.
   async function forget(
     sessions: readonly ForgetSessionRef[],
     target?: string,
@@ -931,38 +959,41 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
           landed: false,
         };
     }
-    if (intent !== null && intent.hub !== connection.url)
-      return {
-        ok: false,
-        reason: "failed",
-        detail: "a deletion is pending on another Hub",
-        landed: false,
-        retryable: false,
-      };
     if (intent === null && sessions.length === 0)
       return { ok: true, sessionsRequested: 0, sessionsMatched: 0, rowsRemoved: 0 };
-    let landed = intent?.batches.some((batch) => batch.receipt !== undefined) ?? false;
+    // Landed on the connected Hub: receipts an intent holds from another Hub
+    // are dropped by its retarget below.
+    let landed =
+      intent?.hub === connection.url && intent.batches.some((batch) => batch.receipt !== undefined);
     let retryable = true;
     eventSync.suspend();
     try {
+      if (intent !== null && intent.hub !== connection.url) {
+        // #387 (ADR-0100, amended 2026-10-13): the intent follows the machine
+        // to the Hub it is connected to, known only by its URL. It keeps its
+        // sessions, their batching, its mode and `localComplete`, and is
+        // written against this Hub's epoch with fresh operation ids and no
+        // receipts, so the Hub it left is not asked again unless the machine
+        // goes back to it while the intent is still pending. Rewritten only
+        // once that epoch is read: a failed read leaves it as it was, and the
+        // catch below answers retryable. On a Hub that already deleted the
+        // rows the batches match nothing and rewrite nothing (ADR-0063).
+        const epoch = await readHubEpoch(connection);
+        intent = {
+          ...intent,
+          hub: connection.url,
+          epoch,
+          batches: intent.batches.map((batch) => ({
+            operationId: crypto.randomUUID(),
+            sessions: batch.sessions,
+          })),
+        };
+        forgetIntent.write(intent);
+      }
       if (intent === null) {
-        const deadline = requestDeadline();
-        const status = await (async () => {
-          try {
-            const response = await fetchImpl(`${connection.url}/api/status`, {
-              headers: connection.headers,
-              signal: deadline.signal,
-            });
-            if (!response.ok) throw new Error(`Cannot read Hub state (${response.status})`);
-            return hubStatusSchema.parse(await response.json());
-          } finally {
-            deadline.clear();
-          }
-        })();
-        if (status.events === undefined) throw new Error("Hub archive unavailable");
         intent = {
           hub: connection.url,
-          epoch: status.events.epoch,
+          epoch: await readHubEpoch(connection),
           // #311: a lossless forget has no archive half, so it is written
           // already done. A resume on connect or on the sweep reads this and
           // never rewrites the archive either (ADR-0107 §12). `lossless`
@@ -1051,6 +1082,17 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // replica has learned this action. A restart before this point resumes it.
       eventSync.resync();
       await eventSync.idle();
+      // A replica of another epoch than the intent's, as a move to another
+      // Hub leaves until the replica reseeds (#387): that pull found the
+      // mismatch and handed the reseed to the reconcile chain. Reconcile
+      // against the reseeded replica, not the one it replaces. Only then: a
+      // rebuild already on the chain over a replica of this epoch is not
+      // waited for. With event sync degraded no pull runs, the chain never
+      // starts, and the check below fails as before for a later resume.
+      if (replica !== null && replica.epoch() !== intent.epoch && reconciling) {
+        await reconcileChain;
+        await eventSync.idle();
+      }
       const requiredGeneration = Math.max(
         ...intent.batches.map((batch) => batch.receipt!.deletionGeneration),
       );
@@ -1121,8 +1163,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // doesn't.
 
   // The serializer. Returns the TRIGGER: a call landing while a refresh is in
-  // flight coalesces into exactly ONE follow-up pass (the settings-watch
-  // do/while — last state wins), so a sweep can never stack on a poke. `label`
+  // flight coalesces into exactly ONE follow-up pass (the watcher-restarts.ts
+  // coalescing loop — last state wins), so a sweep can never stack on a poke. `label`
   // names the work in the chain's catch-all log ("directory refresh", "home
   // publish").
   function createSerializedRefresh(
@@ -1254,7 +1296,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       pushOrganizationLabels();
       pushOrganizationAssertions();
       pullOrganizationRoster();
-      if (forgetIntent.read() !== null) void forget([]);
+      if (forgetIntent.read() !== null) void whenBootResolves(bootIngestion, () => forget([]));
     }, directorySweepMs);
   }
 
@@ -1920,7 +1962,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // synchronous connect verdict AND any later 404 latch (M7) both land on
       // the loopback status without waiting for a reconnect cycle.
       eventSync.connect({ url: ctx.url, headers: ctx.headers, events: ctx.events });
-      if (forgetIntent.read() !== null) void forget([], ctx.url);
+      if (forgetIntent.read() !== null)
+        void whenBootResolves(bootIngestion, () => forget([], ctx.url));
     },
     onDisconnected: () => {
       // Idempotent: the hub-client may fire a leading onDisconnected on configure

@@ -80,7 +80,7 @@ import {
   readSettingsFile,
   resolveTrackedOrganizations,
 } from "./settings-file";
-import { createFleetSync, type FleetForgetResult } from "./fleet";
+import { createFleetSync, type FleetForgetResult, type FleetSync } from "./fleet";
 import {
   createStorageReporter,
   forgetOrganizationOf,
@@ -123,6 +123,7 @@ import {
   dormantChange,
 } from "./organization-lifecycle";
 import { createSettingsWatch, type SettingsWatch } from "./settings-watch";
+import { createWatcherRestarts } from "./watcher-restarts";
 import { mintRescanWalkKey, scanGate } from "./scan-gate";
 import { createScanCache, type ScanCache } from "./engine/scan-cache";
 import { createEventStore, type EventStore, type ScanProgress } from "./engine/store";
@@ -151,6 +152,7 @@ import {
 import { loadOrCreateMachineId } from "./machine-id";
 import { startSaturationReporting, type SaturationSnapshot } from "./saturation";
 import { createBootProgressReporter, type BootProgressReporter } from "./boot-progress";
+import { whenBootResolves } from "./when-boot-resolves";
 import { defaultTimeZone, isValidTimeZone } from "./engine/timezone";
 import { localDateUncached } from "./engine/local-date";
 import { isInstantBound, parseRangeBound } from "./engine/range";
@@ -340,51 +342,56 @@ export type BuildAppDeps = {
 };
 
 /**
- * Scan `roots` into `store` and, if the walk succeeded, poke the fleet.
+ * Walk `roots` into the live store, then push local changes and invalidate
+ * local reports. Shared by roots changes and watch recovery (ADR-0113).
  *
  * The invariant this owns (ADR-0041): any ingest that lands local rows OUTSIDE
  * the watcher path must poke the fleet, or those rows sit unpushed until the
  * next watcher flush / 5-min sweep. The watcher itself pokes from `onRecords`,
  * but it runs `ignoreInitial: true`, so nothing it does covers a full walk —
- * hence the two non-watcher scan paths (boot, roots-changed) route through here.
+ * hence watcher restarts route their walk through here.
  * The poke is share- and connection-gated inside event-sync, so it costs a
  * hub-less client nothing.
  *
- * A failed scan pokes NOTHING — note the `return` in the catch. Do not
- * "simplify" this to `.catch(...).then(poke)`: a `.catch` handler that returns
+ * A failed scan pushes and invalidates NOTHING — note the `return` in the
+ * catch. Do not "simplify" this to `.catch(...).then(poke)`: a handler that returns
  * undefined yields a RESOLVED promise, so the poke would fire after a failure.
  *
- * `label` names the failing path in the log ("boot scan failed" vs "root change
- * scan failed"); both sites logged the same bare "scan failed:" before.
+ * `label` names the failing path in the log ("watch recovery scan failed" vs
+ * "root change scan failed").
  *
  * POST /api/rescan deliberately does NOT use this helper: it needs `scan`'s
- * return value for the response's `added` count, and binds the live store once
- * per request. Don't unify them — it would break `added`.
+ * return value for the response's `added` count and owns its invalidation in
+ * the renderer (ADR-0019).
  *
  * The walk runs through the shared `scanGate` (ADR-0059), so it never overlaps
  * the rescan endpoint's walk or the fleet's rebuild walk on the single JS
- * thread. Serialization only — a boot/roots-change walk still always runs.
- *
- * `onProgress` is passed by the BOOT call site only (ADR-0067). The
- * roots-changed walk shares this helper and deliberately stays silent: by then
- * the splash is long gone, and a "reading session files" bar reappearing over a
- * live app because the user edited a path in Settings would be a lie about what
- * the app is doing.
+ * thread. Read the store accessor INSIDE that gate. A rebuild can still swap
+ * it while this walk awaits I/O (its archive/replica seed follows its gated
+ * walk), so repeat on the replacement before announcing completion. This
+ * stays inside the gate: no corpus walks overlap, including the retry.
  */
 export async function scanAndPoke(
-  store: EventStore,
-  fleetPush: { notifyLocalChange: () => void },
+  getStore: () => EventStore,
+  fleetPush: Pick<FleetSync, "notifyLocalChange" | "invalidateReports">,
   roots: string[],
   label: string,
   onProgress?: (p: ScanProgress) => void,
 ): Promise<void> {
   try {
-    await scanGate.run(() => store.scan(roots, onProgress));
+    await scanGate.run(async () => {
+      let store: EventStore;
+      do {
+        store = getStore();
+        await store.scan(roots, onProgress);
+      } while (store !== getStore());
+    });
   } catch (err) {
     console.error(`[sidecar] ${label} scan failed:`, err);
     return;
   }
   fleetPush.notifyLocalChange();
+  fleetPush.invalidateReports();
 }
 
 /**
@@ -503,29 +510,6 @@ export function wireIdentityProbe(
         console.error("[sidecar] boot identity probe failed:", err);
       }
     });
-}
-
-/**
- * Run `work` once a boot promise (`localReady` or `engineReady`) RESOLVES, and
- * nothing if it rejects. Every `void`ed `.then` main() hangs off either one
- * goes through here (#340).
- *
- * Resolve, not settle: unlike the three wirings above, work wired here never
- * runs after a failed boot. The rejection is observed here
- * because main() `void`s the chain — unobserved, it reaches the
- * `unhandledRejection` handler, which exits(1), and the shell never respawns a
- * sidecar that has announced its port. It is not logged here:
- * `wireReadySignal` logs the failed boot once.
- *
- * Only the boot promise's rejection is observed. A throw from `work` still
- * rejects the returned chain, so it still reaches the global handler.
- *
- * Returns the chain so tests can await it; main() `void`s it.
- */
-export function whenBootResolves(ready: Promise<void>, work: () => unknown): Promise<unknown> {
-  return ready.then(work, () => {
-    // Logged by wireReadySignal.
-  });
 }
 
 type CommonQuery = {
@@ -672,6 +656,18 @@ function parseCommonQuery(c: Context, scope: OrganizationScopeState): CommonQuer
   return { since, until, mode, tz, projects, models, machines, organizations };
 }
 
+// Whether the report cache can answer an `/api/daily` window (#423, ADR-0116):
+// none at all, or `YYYYMMDD` local dates, which a date bucket is cut at. An
+// instant bound (ADR-0083) is a half-open window on each event's own timestamp
+// that falls inside a local date, so it takes the direct path. The two bounds
+// share a form (`parseCommonQuery`), so one instant decides.
+function windowIsLocalDates(q: CommonQuery): boolean {
+  return !(
+    (q.since !== undefined && isInstantBound(q.since)) ||
+    (q.until !== undefined && isInstantBound(q.until))
+  );
+}
+
 export function buildApp(deps: BuildAppDeps): Hono {
   const app = new Hono();
 
@@ -683,7 +679,8 @@ export function buildApp(deps: BuildAppDeps): Hono {
   const rescanWalkKey = mintRescanWalkKey();
 
   // The dirty-bucket report cache (#113 / ADR-0057) — serves /api/sessions,
-  // /api/projects, and the UNBOUNDED /api/daily family.
+  // /api/projects, the UNBOUNDED /api/daily family, and a local-date-bounded
+  // /api/daily as a slice of its unbounded entry (#423 / ADR-0116).
   //
   // Built HERE, not injected: the cache MUST wrap the same live store accessor
   // the handlers read, and a dep is a thing a call site can get wrong (ADR-0057's
@@ -781,17 +778,20 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // `aggregateDaily` does the date grouping and returns `{ daily, totals? }` —
   // `totals` is omitted on the 2+-project path per the E1 golden.
   //
-  // UNBOUNDED queries serve from the dirty-bucket cache (#113 / ADR-0057):
-  // per-date buckets, only the touched dates refolded. `projectFilterCount` is
-  // the RAW repeated-param count — duplicates NOT deduped, because the
-  // `>=2 omits totals` rule counts raw params (`project=A&project=A` omits).
+  // Unbounded and local-date-bounded queries serve from the dirty-bucket cache
+  // (#113 / ADR-0057; bounded since #423 / ADR-0116): per-date buckets, only
+  // the touched dates refolded, a bounded window answered as the unbounded
+  // entry's buckets inside it — so a moving `until` (today) churns no key.
+  // `projectFilterCount` is the RAW repeated-param count — duplicates NOT
+  // deduped, because the `>=2 omits totals` rule counts raw params
+  // (`project=A&project=A` omits).
   app.get(
     "/api/daily",
     withEngineErrors("/api/daily", async (c) => {
       const q = parseCommonQuery(c, deps.organizationScope());
       if (q instanceof Response) return q;
       await deps.engineReady();
-      if (q.since === undefined && q.until === undefined) {
+      if (windowIsLocalDates(q)) {
         const body = await reportCache.daily({
           mode: q.mode,
           timeZone: q.tz,
@@ -799,14 +799,15 @@ export function buildApp(deps: BuildAppDeps): Hono {
           models: q.models,
           machines: q.machines,
           organizations: q.organizations,
+          since: q.since,
+          until: q.until,
           projectFilterCount: q.projects.length,
         });
         return c.json(body);
       }
-      // Bounded queries stay on the direct path: the store's date filter makes
-      // them O(window) already, and a moving `until` would churn cache keys.
-      // The Organization scope narrows here too (#278) — the direct path is the
-      // one every bounded Date range takes.
+      // An instant-bounded window (ADR-0083, the anchored week) stays on the
+      // direct path: no local-date bucket can be cut at an instant. The
+      // Organization scope narrows here too (#278).
       const events = reportStore().query({
         since: q.since,
         until: q.until,
@@ -834,8 +835,11 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // never 502s (this is the fix for the pre-existing 502-on-empty bug noted in
   // fixtures/README.md).
   //
-  // Unbounded ⇒ the dirty-bucket cache (#113 / ADR-0057), bucketed per slug;
-  // bounded stays direct, exactly like /api/daily.
+  // Unbounded ⇒ the dirty-bucket cache (#113 / ADR-0057), bucketed per slug.
+  // Bounded stays direct — unlike /api/daily since #423 — because this
+  // family's cache bucket is the WHOLE slug: answering a window from it would
+  // refold the slug's whole history on every append, and resolve `path` from
+  // captures the bucket does not keep per date (ADR-0116).
   app.get(
     "/api/daily-by-project",
     withEngineErrors("/api/daily-by-project", async (c) => {
@@ -853,8 +857,8 @@ export function buildApp(deps: BuildAppDeps): Hono {
         });
         return c.json(body);
       }
-      // Bounded queries stay on the direct path: the store's date filter makes
-      // them O(window) already, and a moving `until` would churn cache keys.
+      // Bounded queries stay on the direct path: a store query with the
+      // window, then the pure aggregator over exactly the window's events.
       const events = reportStore().query({
         since: q.since,
         until: q.until,
@@ -878,7 +882,10 @@ export function buildApp(deps: BuildAppDeps): Hono {
   //
   // Unbounded ⇒ the dirty-bucket cache (#113 / ADR-0057), bucketed per machine
   // (`includeProjects` is a KEY axis there — it changes the fold shape, not
-  // just the assembly); bounded stays direct, exactly like /api/daily.
+  // just the assembly). Bounded stays direct, like /api/daily-by-project and
+  // for the same reason: the bucket is the WHOLE machine, so a cached window
+  // would refold that machine's whole history — for this machine's own
+  // events, most of the corpus — on every append (ADR-0116).
   app.get(
     "/api/daily-by-machine",
     withEngineErrors("/api/daily-by-machine", async (c) => {
@@ -898,8 +905,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         });
         return c.json(body);
       }
-      // Bounded queries stay on the direct path: the store's date filter makes
-      // them O(window) already, and a moving `until` would churn cache keys.
+      // Bounded queries stay on the direct path, as /api/daily-by-project's.
       const events = reportStore().query({
         since: q.since,
         until: q.until,
@@ -1432,10 +1438,12 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // --- /api/readout ---  (map #168 T5/M3; ADR-0076) the tray readout's one
   // wire: the desktop shell's Rust ambient writer polls this ~1/min and renders
   // the Windows tray tooltip / macOS menu-bar title from it. Composed here, not
-  // in Rust, so the tray is penny-exact with Live by construction: `todayCost`
-  // is the same store query + `aggregateDaily` fold the Today tile reads
-  // (bounded to today's local date in the requested zone, and narrowed by the
-  // `organization` scope as the tile is — #278), and `blockLive`
+  // in Rust, so the tray is penny-exact with Live: `todayCost` is the direct
+  // store query + `aggregateDaily` fold of the Today tile's window (bounded to
+  // today's local date in the requested zone, and narrowed by the
+  // `organization` scope as the tile is — #278). The tile itself reads that
+  // window as a slice of the report cache's daily entry since #423, equal to
+  // this fold byte for byte (ADR-0116, pinned by test). And `blockLive`
   // mirrors the renderer's usage-ring rule — a current sample whose
   // fiveHour.resetAt is still ahead (NaN-guarded, like usageRingState). The
   // shell supplies `mode`/`tz` from settings.json per poll, and `organization`
@@ -1824,7 +1832,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // the currently-watched roots into the event store, catching anything the
   // watcher's incremental tail-read missed (events while the machine slept, a
   // root that changed under it). `store.scan` is the same idempotent full walk
-  // the boot scan and the settings-change rescan use; its `(messageId,
+  // the boot scan and a watcher restart's rescan use; its `(messageId,
   // requestId)` dedup makes re-walking safe and merge-only — the store gains
   // missed events but never shrinks. The response carries the walk's own
   // changed-row count (`added` — rows new OR replaced by a fuller version) so
@@ -3217,6 +3225,57 @@ async function main(): Promise<void> {
   // passed MAXPRICE_SETTINGS_PATH. Declared here so `shutdown` can tear it down.
   let settingsWatch: SettingsWatch | null = null;
 
+  // The JSONL watcher's one serialized restart path (ADR-0014, ADR-0113): a
+  // `claudePaths` edit (through `settingsWatch`) and a watch loss (through
+  // each watcher's `onWatchLost`) both replace the watcher here, so the two
+  // can never interleave. Always built, settings file or not: the standalone
+  // sidecar loses watches too. `onReplaced` is the sole writer of
+  // `watcher`/`watchRoots` after boot; the module closes the watcher it
+  // supersedes.
+  const watcherRestarts = createWatcherRestarts({
+    resolveRoots,
+    getCurrentRoots: () => watchRoots,
+    getCurrentWatcher: () => watcher,
+    createJsonlWatcher: (roots) => createWatcher(jsonlWatcherOptions(roots)),
+    onReplaced: ({ watcher: next, roots }) => {
+      watcher = next;
+      watchRoots = roots;
+      // Broadcast the watched paths so the status bar updates live: new after
+      // a roots change, the same after a recovery.
+      liveHub.patchStatus({ watchedPaths: roots });
+      // …and the replacement's own health. UNCONDITIONAL, not
+      // `if (readyTimedOut)`: this is the only writer on the restart path, so
+      // it must both RAISE the flag for a replacement whose `ready` timed out
+      // and HEAL it when a healthy replacement supersedes a degraded watcher,
+      // a failed restart, or an exhausted recovery.
+      liveHub.patchStatus({ watcherDegraded: next.readyTimedOut });
+    },
+    scan: (roots, reason) => {
+      // Resolve the live store when the gated walk starts (ADR-0041), and
+      // re-walk a replacement if a rebuild swaps during it. After a roots
+      // change, a newly-added root's history lands outside the watcher path;
+      // after a recovery, so do the writes the dead watches missed. Either way
+      // `scanAndPoke` pushes them and invalidates local reports now.
+      void scanAndPoke(
+        getEngineStore,
+        fleet,
+        roots,
+        reason === "roots" ? "root change" : "watch recovery",
+      );
+    },
+    // A restart that failed leaves the PREVIOUS watcher installed — after a
+    // roots change on the PREVIOUS roots, after a recovery closed — so file
+    // watching no longer matches the configured paths, which is precisely what
+    // `watcherDegraded` tells the user. This also fires for a rejecting
+    // `resolveRoots()`, and that is still honest: either way the installed
+    // watcher may not match the settings on disk. No self-heal here — only a
+    // later successful `onReplaced` (or a late `ready`) clears it, which is the
+    // correct polarity.
+    onRestartFailed: () => liveHub.patchStatus({ watcherDegraded: true }),
+    // Recovery hit its bound: the installed watcher keeps its dead watches.
+    onRecoveryExhausted: () => liveHub.patchStatus({ watcherDegraded: true }),
+  });
+
   // exitCode distinguishes a deliberate shutdown (0) from a crash (1) so the
   // Rust parent can tell them apart — an unhandledRejection exiting 0 would
   // look identical to a clean SIGTERM.
@@ -3252,6 +3311,8 @@ async function main(): Promise<void> {
         await sampleStore.flush();
         liveHub.close();
         if (settingsWatch) await settingsWatch.close();
+        // Drain any restart in flight before closing what it installed.
+        await watcherRestarts.close();
         if (watcher) await watcher.close();
         // ADR-0098: cancel the repair's hub retry timer so no tick fires
         // post-teardown — and, since a tick reaches the archive, before the
@@ -3284,8 +3345,9 @@ async function main(): Promise<void> {
   });
 
   // Single source of truth for the JSONL watcher's wiring — reused for the
-  // initial creation below and for every settings-driven restart, so a change
-  // to the store/hub plumbing can't drift between two copies.
+  // initial creation below and for every restart (a roots change or a watch
+  // recovery), so a change to the store/hub plumbing can't drift between two
+  // copies.
   //
   // Append-before-emit (Part 4.5 invariant): the watcher appends the
   // freshly-parsed records to the event store *before* it calls `onEvent`, so
@@ -3346,6 +3408,14 @@ async function main(): Promise<void> {
       console.log("[sidecar] watcher 'ready' arrived late — file watching confirmed");
       liveHub.patchStatus({ watcherDegraded: false });
     },
+    // A watcher that lost watches it cannot get back (#338, ADR-0113) is
+    // restarted through the shared restart path. Held until the engine is
+    // ready, as the settings watch is: a replacement built before then would
+    // skip the boot watcher's organization gate. The loss names its own
+    // watcher, so one already replaced is ignored there.
+    onWatchLost: (lost) => {
+      void whenBootResolves(engineReady, () => watcherRestarts.recover(lost));
+    },
   });
 
   // The watcher joins the traced fan-out rather than blocking `main()` on a
@@ -3366,14 +3436,17 @@ async function main(): Promise<void> {
             liveHub.patchStatus({ watcherDegraded: true });
           }
           // The settings watch is built HERE, inside the watcher's `.then`, and
-          // not concurrently: `onRootsChanged` is the sole writer of
-          // `watcher`/`watchRoots`, and racing it against this assignment could
-          // clobber a newer watcher with the boot one — leaving `watcher` on the
-          // old roots while `watchRoots` claims the new ones, exactly the
-          // invariant `settings-watch.ts` is built around. The delay it costs is
-          // bounded by WATCHER_READY_TIMEOUT_MS and covers nothing that worked
-          // before: the settings watcher runs `ignoreInitial: true`, so an edit
-          // predating its creation was never seen anyway.
+          // not concurrently: `onReplaced` is the sole writer of
+          // `watcher`/`watchRoots` after boot, and racing it against this
+          // assignment could clobber a newer watcher with the boot one —
+          // leaving `watcher` on the old roots while `watchRoots` claims the new
+          // ones, exactly the invariant `watcher-restarts.ts` is built around.
+          // (A watch loss cannot race it either: a watcher reports one only
+          // after it has been handed out, a settle window after this `.then`.)
+          // The delay it costs is bounded by WATCHER_READY_TIMEOUT_MS and
+          // covers nothing that worked before: the settings watcher runs
+          // `ignoreInitial: true`, so an edit predating its creation was never
+          // seen anyway.
           void whenBootResolves(engineReady, () => wireSettingsWatch());
         },
       ),
@@ -3401,40 +3474,12 @@ async function main(): Promise<void> {
   // is always a complete document. `add` is handled identically: on a fresh
   // install the renderer creates settings.json *after* the sidecar boots, so
   // the first observed event is an `add`. The reentrancy-safe restart
-  // orchestration lives in `createSettingsWatch` (review I1/I2).
+  // orchestration lives in `watcher-restarts.ts` (review I1/I2, ADR-0113).
   function wireSettingsWatch(): void {
     if (settingsPath !== undefined) {
       settingsWatch = createSettingsWatch({
         settingsPath,
-        resolveRoots,
-        getCurrentRoots: () => watchRoots,
-        createJsonlWatcher: (roots) => createWatcher(jsonlWatcherOptions(roots)),
-        onRootsChanged: ({ watcher: next, roots }) => {
-          const previous = watcher;
-          watcher = next;
-          watchRoots = roots;
-          // Close the superseded watcher; a failure here is logged, not fatal.
-          if (previous)
-            void previous.close().catch((err: unknown) => {
-              console.error("[sidecar] superseded watcher close failed:", err);
-            });
-          // Broadcast the new watched paths so the status bar updates live.
-          liveHub.patchStatus({ watchedPaths: roots });
-          // …and the replacement's own health. UNCONDITIONAL, not
-          // `if (readyTimedOut)`: this is the only writer on the roots-change
-          // path, so it must both RAISE the flag for a replacement whose `ready`
-          // timed out (previously the flag was set only on the boot path, so a
-          // degraded replacement looked healthy) and HEAL it when a healthy
-          // replacement supersedes a degraded boot watcher.
-          liveHub.patchStatus({ watcherDegraded: next.readyTimedOut });
-        },
-        scan: (roots) => {
-          // Through the live accessor (ADR-0041): a fleet rebuild may have swapped
-          // the store since boot, so scan whatever store is current. A newly-added
-          // root's history lands outside the watcher path, so `scanAndPoke` pushes
-          // it now rather than on the next flush/sweep.
-          void scanAndPoke(getEngineStore(), fleet, roots, "root change");
-        },
+        restarts: watcherRestarts,
         // The ADR-0041 fleet-toggle hook — fired on every settings edit (roots
         // changed or not), so a share/replica toggle applies in-session without a
         // relaunch. `settingsPath` is narrowed to string inside this block.
@@ -3497,14 +3542,6 @@ async function main(): Promise<void> {
             if (scopeChanged) usagePoller.republish();
           }
         },
-        // A restart that failed leaves the PREVIOUS watcher installed on the
-        // PREVIOUS roots — file watching no longer matches the configured
-        // paths, which is precisely what `watcherDegraded` tells the user. This
-        // also fires for a rejecting `resolveRoots()`, and that is still honest:
-        // either way the installed watcher may not match the settings on disk.
-        // No self-heal here — only a later successful `onRootsChanged` (or a
-        // late `ready`) clears it, which is the correct polarity.
-        onRestartFailed: () => liveHub.patchStatus({ watcherDegraded: true }),
       });
     }
   }

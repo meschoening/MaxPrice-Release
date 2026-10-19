@@ -16,7 +16,7 @@ import {
   type WindowStates,
 } from "@maxprice/shared";
 import { queryClient } from "@/lib/query";
-import { getSidecarUrl, resetSidecarUrl, SidecarStartupError } from "@/lib/sidecar";
+import { getSidecarUrl, resetSidecarUrl, SidecarStartupError, urlFailureKind } from "@/lib/sidecar";
 import { useLiveStatus } from "@/state/use-live-status";
 import { usageCurrentQueryKey } from "@/state/use-usage-current";
 import { machinesQueryKey } from "@/state/use-machines";
@@ -551,12 +551,16 @@ async function openConnection(): Promise<void> {
     baseUrl = await getSidecarUrl();
   } catch (err) {
     // A terminal URL failure (SidecarStatus::Failed — the process is gone)
-    // before `ready` ever arrived is the boot splash's error card (T4). The
-    // backoff loop keeps running regardless: it can't respawn the sidecar,
-    // but a heal (dev-mode restarts) flows back through the `open` handler.
+    // before `ready` ever arrived is the boot splash's error card (T4); after
+    // it, the same failure is an Engine stop, and BootGate swaps the frame for
+    // the stopped card (ADR-0112). The backoff loop keeps running regardless:
+    // it can't respawn the sidecar, but a pre-ready heal (dev-mode restarts)
+    // flows back through the `open` handler.
     const status = useLiveStatus.getState();
-    if (err instanceof SidecarStartupError && err.terminal && status.ready !== true) {
-      status.setBootFailure(err.message);
+    if (err instanceof SidecarStartupError) {
+      const kind = urlFailureKind(err, status.ready);
+      if (kind === "engine-stop") status.setEngineStop(err.message);
+      else if (kind === "boot-failure") status.setBootFailure(err.message);
     }
     scheduleReconnect();
     return;

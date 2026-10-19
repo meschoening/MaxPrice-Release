@@ -17,7 +17,7 @@ import {
   type WindowState,
 } from "@maxprice/shared";
 import { organizationLabel, organizationLabelMap } from "@/lib/organization-scope-view";
-import { sidecarFetch } from "@/lib/sidecar";
+import { sidecarExited, sidecarFetch } from "@/lib/sidecar";
 import { insideTauri } from "@/lib/tauri";
 import { applyStoredTheme } from "@/lib/theme";
 import { ymdShift } from "@/lib/dates";
@@ -106,6 +106,24 @@ export async function withDeadline<T>(
   }
 }
 
+// Is a failing popout an Engine stop (ADR-0112 §4)? The fetches only ever
+// fail, whether the sidecar exited or merely stopped answering, so while one
+// is failing the popout asks the shell (`sidecarExited`). The shell records
+// the exit a beat after the socket drops, so a probe that lands first reads
+// a live sidecar; it asks again each second while the popout is on screen,
+// until the shell confirms. Never while hidden: nobody is reading, and the
+// next show invalidates every query, this one included.
+export const EXIT_PROBE_MS = 1_000;
+
+export function popoutSidecarExitQueryKey(): [string] {
+  return ["popout-sidecar-exit"];
+}
+
+// The probe's interval, pure for its test.
+export function exitProbeInterval(shown: boolean, exited: boolean | undefined): number | false {
+  return shown && exited !== true ? EXIT_PROBE_MS : false;
+}
+
 // Keep in lockstep with popout.rs's POPOUT_SHOWN_EVENT / POPOUT_HIDDEN_EVENT
 // and ambient.rs's UPDATE_AVAILABLE_EVENT.
 const POPOUT_SHOWN_EVENT = "popout:shown";
@@ -181,6 +199,9 @@ export function quotaWindowState(
 
 export type PopoutData = {
   anyError: boolean;
+  // The shell confirms the sidecar exited (ADR-0112). Raw: popoutView alone
+  // decides whether that makes the down state a stop.
+  engineStopped: boolean;
   settled: boolean;
   // ADR-0047's pair, passed through untouched so the view can apply
   // `corpusIsEmpty` to both. `null` before the first status frame.
@@ -259,6 +280,15 @@ export function usePopoutData(): PopoutData {
     retry: POPOUT_RETRY,
   });
 
+  const anyError = statusQ.isError || dailyQ.isError || blocksQ.isError || usageQ.isError;
+  const exitQ = useQuery({
+    queryKey: popoutSidecarExitQueryKey(),
+    queryFn: () => sidecarExited(),
+    enabled: anyError,
+    refetchInterval: (query) => exitProbeInterval(shown, query.state.data),
+    retry: false,
+  });
+
   const queryClient = useQueryClient();
   // The two visibility pokes, on THIS webview (`getCurrentWebviewWindow`, not
   // the global `listen`): both windows run the same bundle, so the popout must
@@ -293,7 +323,8 @@ export function usePopoutData(): PopoutData {
   const blocks = blocksQ.data?.blocks ?? [];
   const todayRow = dailyQ.data?.daily.find((r) => r.date === isoDate(today));
   return {
-    anyError: statusQ.isError || dailyQ.isError || blocksQ.isError || usageQ.isError,
+    anyError,
+    engineStopped: exitQ.data === true,
     settled,
     ready: statusQ.data?.ready ?? null,
     hasData: statusQ.data?.hasData ?? null,

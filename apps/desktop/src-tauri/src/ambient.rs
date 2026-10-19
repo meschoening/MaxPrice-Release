@@ -151,7 +151,7 @@ pub fn tooltip_text(readout: Option<&Readout>) -> String {
 ///
 /// Only the macOS write path calls it, so every other target would flag it
 /// dead — but the formatting rules are platform-independent and the tests
-/// (which run on the Windows primary) must keep pinning them.
+/// (which run on Linux and Windows, never on a Mac gate) must keep pinning them.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn title_text(readout: Option<&Readout>) -> String {
     match ambient_metric(readout) {

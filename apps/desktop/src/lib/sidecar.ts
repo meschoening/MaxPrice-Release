@@ -7,7 +7,8 @@ let pending: Promise<string> | null = null;
 // Rust's get_sidecar_url has exactly two Err shapes (SidecarState): this
 // Pending sentinel while the LISTENING handshake is in flight, and a
 // SidecarStatus::Failed message (spawn failure / process death) for
-// everything else.
+// everything else. The sentinel also answers once the shell has begun ending
+// the sidecar itself on the way out (ADR-0112): a quit is not a stop.
 const SIDECAR_PENDING_MESSAGE = "sidecar not ready";
 
 // True for the one retryable get_sidecar_url error. Tauri rejects invoke
@@ -28,6 +29,35 @@ export class SidecarStartupError extends Error {
     super(message);
     this.name = "SidecarStartupError";
     this.terminal = terminal;
+  }
+}
+
+// What a failed URL resolution means for this launch (ADR-0112 §2). Only a
+// terminal failure is the shell's own record that the process exited, and
+// only once `ready` has been true is that an Engine stop rather than the
+// Boot gate's startup failure. Anything else is retried: a sidecar that is
+// alive but not answering stays the connection state's "offline", because a
+// saturated sidecar recovers on its own.
+export type UrlFailureKind = "engine-stop" | "boot-failure" | "retry";
+
+export function urlFailureKind(err: unknown, ready: boolean | null): UrlFailureKind {
+  if (!(err instanceof SidecarStartupError) || !err.terminal) return "retry";
+  return ready === true ? "engine-stop" : "boot-failure";
+}
+
+// Has the shell recorded the sidecar's exit? The popout's probe (ADR-0112 §4):
+// its URL is resolved once and cached for the webview's life, so a failing
+// fetch cannot tell a dead sidecar from a stalled one. One `get_sidecar_url`
+// call, never the cache: a Failed answer is an exit; Ready (alive, just not
+// answering) and the Pending sentinel (still starting, or being ended by the
+// shell on quit) are not.
+export async function sidecarExited(): Promise<boolean> {
+  if (!insideTauri()) return false;
+  try {
+    await invoke<string>("get_sidecar_url");
+    return false;
+  } catch (err) {
+    return !isSidecarPendingError(err);
   }
 }
 

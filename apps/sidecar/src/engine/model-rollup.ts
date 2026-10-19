@@ -1,4 +1,5 @@
-import type { CostBreakdown, ModelBreakdown } from "@maxprice/shared";
+import type { CostBreakdown, CostMode, ModelBreakdown } from "@maxprice/shared";
+import { computeCostBreakdownInto, emptyCostBreakdown } from "@maxprice/shared";
 import type { StoredEvent } from "./store";
 
 // Part 4.5 — the shared model-rollup primitives for the engine aggregators.
@@ -19,7 +20,8 @@ import type { StoredEvent } from "./store";
 // map, so its fold is structurally different. `blocks` imports only
 // `byTimestamp`. The same divergence is the pricing-entry-point split
 // (ADR-0026): all five rollup fold sites — `daily`, `intraday`, `sessions`,
-// `projects`, `session-events` — call `computeCostBreakdown`, while `blocks`
+// `projects`, `session-events` — price through `computeCostBreakdownInto` (the
+// first, third and fourth via `priceAndFold` below), while `blocks`
 // deliberately stays on plain `computeCost` because it bypasses this rollup
 // and never accumulates the cache-cost slices. Of the five, only `daily` /
 // `intraday` carry the ROW-level slices to the wire (`DailyRow` / `BucketRow`,
@@ -71,9 +73,13 @@ export function emptyModelRollup(): ModelRollup {
 // ADR-0040 `outputCost` alongside the total. The per-model breakdown carries the
 // same slices (ADR-0033, ADR-0040) — the composable group-by's model × cache
 // cross-product needs an exact per-model cache-cost split. `cost` is a parameter
-// rather than computed here because
-// `projects` folds one event into two rollups (its windowed `range` and its
-// `allTime`) from a single `computeCostBreakdown` call.
+// rather than computed here because `intraday` folds one event into several
+// rollups (its windows, slugs and machines) from a single
+// `computeCostBreakdownInto` call.
+//
+// `cost` is read, never kept: every caller prices each event into one
+// breakdown it reuses across its loop (#416), so this copies the four numbers
+// out — into the sums, or into a new model breakdown — and never stores `cost`.
 export function foldModelUsage(rollup: ModelRollup, event: StoredEvent, cost: CostBreakdown): void {
   rollup.inputTokens += event.inputTokens;
   rollup.outputTokens += event.outputTokens;
@@ -111,6 +117,20 @@ export function foldModelUsage(rollup: ModelRollup, event: StoredEvent, cost: Co
     });
   }
 }
+
+// Price one event and fold it into one rollup: the whole pricing step of
+// `daily`, `sessions` and `projects`, which each fold an event into exactly one
+// rollup. Every event prices into the one breakdown below, reused for all of
+// them (#416), and `foldModelUsage` copies its numbers out before the next call
+// overwrites it. `intraday` and `session-events` price into a breakdown of
+// their own instead: the first folds an event into several rollups, the second
+// also streams each event's total.
+export function priceAndFold(rollup: ModelRollup, event: StoredEvent, mode: CostMode): void {
+  computeCostBreakdownInto(eventCost, event.model, event, mode, event.costUSD);
+  foldModelUsage(rollup, event, eventCost);
+}
+
+const eventCost = emptyCostBreakdown();
 
 // The eleven token/cost/model fields every per-bucket wire row carries (eight
 // base + the ADR-0026 `cacheCreationCost` / `cacheReadCost` split + the ADR-0040
@@ -176,8 +196,9 @@ export function flushRollup(rollup: ModelRollup): RollupTotals {
 // copy, which keeps every aggregator correct regardless of how it is called.
 //
 // The comparator below — plain `<` / `>` on the raw timestamp string — is
-// DELIBERATELY IDENTICAL to the one `engine/store.ts`'s `sortedEvents()` uses
-// to build the snapshot this function is normally handed, and that identity is
+// DELIBERATELY IDENTICAL to the one `engine/sorted-snapshot.ts` keeps the
+// store's snapshot sorted by (`compareTimestamps`, #417) — the snapshot this
+// function is normally handed — and that identity is
 // the invariant. Both the ordered-check and the fallback sort must use the
 // store's rule, because a DIVERGENT comparator would declare a store-sorted
 // array "out of order" and then re-sort the whole corpus under different rules.
@@ -186,7 +207,7 @@ export function flushRollup(rollup: ModelRollup): RollupTotals {
 // code-unit order on exactly the characters an ISO-8601 timestamp is made of.
 // A silent re-sort changes fold order, and with it the first-seen `modelsUsed`
 // ordering and the float-summation artifacts the golden corpus pins. If
-// `store.ts` ever changes its comparator, this one changes with it.
+// the snapshot's comparator ever changes, this one changes with it.
 //
 // Dropping `localeCompare` also removes ~70k ICU comparisons per fold on the
 // calibration corpus: the ordered-check runs once per adjacent pair over the

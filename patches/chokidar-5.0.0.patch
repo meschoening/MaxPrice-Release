@@ -1,0 +1,64 @@
+MaxPrice #338: chokidar 5.0.0 starts three promises it never observes:
+`add()`'s `Promise.all(...).then(...)`, and the async `DirEntry.remove()`
+that `_remove` and `_closePath` call. A rejection from any of them reached
+the sidecar's process-level `unhandledRejection` handler, which exits with
+code 1. This patch hands each to `_handleError`, so a failure arrives as an
+`error` event instead (ADR-0113).
+
+Drop this patch when upgrading to chokidar 6 or later, which rewrites these
+paths (upstream paulmillr/chokidar#1378).
+
+diff --git a/index.js b/index.js
+index f26482978d544bf39828bd152f2369d53413bc27..f4e377bed4be649b7ee809457cb03979bd910595 100644
+--- a/index.js
++++ b/index.js
+@@ -375,7 +375,7 @@ export class FSWatcher extends EventEmitter {
+                 if (item)
+                     this.add(sp.dirname(item), sp.basename(_origAdd || item));
+             });
+-        });
++        }).catch((error) => this._handleFloatingError(error));
+         return this;
+     }
+     /**
+@@ -559,6 +559,20 @@ export class FSWatcher extends EventEmitter {
+         }
+         return error || this.closed;
+     }
++    /**
++     * MaxPrice #338: the handler for a promise chokidar 5.0.0 starts and never
++     * awaits (`add()`'s result chain, and `DirEntry.remove()` from `_remove`
++     * and `_closePath`). Unobserved, its rejection reached the process-level
++     * `unhandledRejection` handler. It goes through `_handleError` like every
++     * other internal failure, so benign codes are still dropped and the rest
++     * arrive as an `error` event. Nothing is emitted once closed: `close()`
++     * removed every listener, and an `error` event with none throws.
++     * Drop this patch when upgrading to chokidar 6 or later.
++     */
++    _handleFloatingError(error) {
++        if (!this.closed)
++            this._handleError(error);
++    }
+     /**
+      * Helper utility for throttling
+      * @param actionType type being throttled
+@@ -731,7 +745,7 @@ export class FSWatcher extends EventEmitter {
+         // Check if item was on the watched list and remove it
+         const parent = this._getWatchedDir(directory);
+         const wasTracked = parent.has(item);
+-        parent.remove(item);
++        parent.remove(item).catch((error) => this._handleFloatingError(error));
+         // Fixes issue #1042 -> Relative paths were detected and added as symlinks
+         // (https://github.com/paulmillr/chokidar/blob/e1753ddbc9571bdc33b4a4af172d52cb6e611c10/lib/nodefs-handler.js#L612),
+         // but never removed from the map in case the path was deleted.
+@@ -765,7 +779,9 @@ export class FSWatcher extends EventEmitter {
+     _closePath(path) {
+         this._closeFile(path);
+         const dir = sp.dirname(path);
+-        this._getWatchedDir(dir).remove(sp.basename(path));
++        this._getWatchedDir(dir)
++            .remove(sp.basename(path))
++            .catch((error) => this._handleFloatingError(error));
+     }
+     /**
+      * Closes only file-specific watchers

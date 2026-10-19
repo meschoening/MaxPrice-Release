@@ -52,8 +52,9 @@ export async function refreshPricing(
 // where prices may come from the bundled floor or a persisted fetch and
 // this process has not attempted a network refresh yet.
 //
-// `source` needs no branch on the result. `withPricingOverrides` is documented
-// as identity-preserving precisely so this identity check holds (overrides.ts),
+// `source` needs no branch on the result. `carryForwardPricing` and
+// `withPricingOverrides` are documented as identity-preserving precisely so
+// this identity check holds (carry-forward.ts, overrides.ts),
 // and the refresh suite asserts `activePricingSnapshot() === pricingSnapshot` on
 // every failure path — so this is a tested property, not just a documented one.
 // It is also correct on the case a result-based branch would get wrong: a failed
@@ -68,8 +69,9 @@ export function buildPricingStatus(
   return {
     source: active === pricingSnapshot ? "vendored" : "fetched",
     capturedAt: active.capturedAt,
-    // Off the ACTIVE snapshot, so the count includes the ADR-0027 override
-    // gap-fill — the honest answer to "how many models can this app price".
+    // Off the ACTIVE snapshot, so the count includes every key carried forward
+    // (ADR-0114) and the ADR-0027 override gap-fill — the honest answer to "how
+    // many models can this app price".
     modelCount: Object.keys(active.models).length,
     unpricedModels: unresolvedModels(models),
     lastAttempt:
@@ -143,7 +145,8 @@ export type PricingRefresher = PricingRefreshLoop & {
 //
 // `newModels` is measured across the attempt from the ACTIVE snapshot's key
 // set — before the fetch and after the swap — so it counts exactly what this
-// attempt made priceable. It is 0 on failure by construction (no swap).
+// attempt made priceable. It is 0 on failure by construction (no swap). A key
+// carried forward (ADR-0114) was priced before the attempt, so it is never new.
 //
 // Behind the single-flight guard sits a COOLDOWN (DEFAULT_REFRESH_COOLDOWN_MS):
 // a call arriving within the window after the last attempt settled is answered

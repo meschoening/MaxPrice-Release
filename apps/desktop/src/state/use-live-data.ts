@@ -131,7 +131,7 @@ export function useLiveData(): LiveData {
   // `since`/`until` into the TanStack key, so a ticking `until` minted a new
   // key every 60s — and with it a `data: undefined` blank on the delta chip, a
   // bounded-window `/api/daily` fold that bypasses the report cache by
-  // construction (ADR-0057: only an unbounded window is cached), and one leaked
+  // construction (ADR-0116: an instant-bounded window is never cached), and one leaked
   // cache entry, once a minute, for as long as Live is open on an anchored
   // week. Off `dataUpdatedAt` the key moves only when the comparison actually
   // moves — i.e. on ADR-0058's invalidation rounds — and the tile is only as

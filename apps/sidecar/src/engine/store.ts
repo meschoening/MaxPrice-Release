@@ -22,6 +22,7 @@ import {
 } from "./presumption";
 import { isInstantBound } from "./range";
 import type { ScanCache } from "./scan-cache";
+import { createSortedSnapshot } from "./sorted-snapshot";
 import { defaultTimeZone } from "./timezone";
 import type { UsageRecord } from "./types";
 
@@ -427,7 +428,9 @@ export type EventStore = {
   // shared memoized sorted snapshot DIRECTLY rather than a fresh copy (f27), so
   // mutating it would corrupt every later query. No current aggregator mutates
   // it — daily/sessions/projects/intraday only iterate; blocks `.filter`s into a
-  // new array; every `.sort()` is on derived rows/buckets. The ordering is part
+  // new array; every `.sort()` is on derived rows/buckets. In return, the store
+  // never writes an array it has returned (#417): a caller may hold one across
+  // an await or for good, and later appends never change it. The ordering is part
   // of the contract: the aggregators fold events in timestamp order so
   // `modelsUsed` / `modelBreakdowns` come out first-seen-ordered, and `blocks`
   // forms blocks chronologically — none of them re-sort.
@@ -793,7 +796,7 @@ export function createEventStore(opts: {
     if (contributions.delete(key)) contributionChanged(null);
     if (incumbent === undefined) return null;
     events.delete(key);
-    sorted = null;
+    snapshot.discard();
     changes.push({ event: null, replaced: incumbent });
     return incumbent;
   }
@@ -822,16 +825,12 @@ export function createEventStore(opts: {
   // Lazily-built timestamp-sorted snapshot of every event, memoized so a burst
   // of back-to-back queries (`/api/daily` + `/api/daily-by-project` share a
   // store query; an SSE invalidation refetches every report) sorts the corpus
-  // once, not once per query. `appendInternal` invalidates it to `null`
-  // whenever it actually adds an event; the next `query` rebuilds it.
-  let sorted: StoredEvent[] | null = null;
-
-  function sortedEvents(): StoredEvent[] {
-    sorted ??= [...events.values()].sort((a, b) =>
-      a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
-    );
-    return sorted;
-  }
+  // once, not once per query. `upsert` keeps it sorted as events arrive (#417):
+  // a new event joins it and a replacement takes its slot, so the first query
+  // after an append neither copies nor re-sorts the corpus unless an earlier
+  // query handed the snapshot out. The removal paths discard it, and the next
+  // query rebuilds it. See ./sorted-snapshot.ts.
+  const snapshot = createSortedSnapshot(() => events.values());
 
   let resolveReady: () => void;
   const ready = new Promise<void>((resolve) => {
@@ -912,8 +911,9 @@ export function createEventStore(opts: {
     const event: StoredEvent = derived ?? withEventMs(input);
     events.set(key, event);
     recordDerived(event);
-    // A new or replacing event invalidates the memoized sorted snapshot.
-    sorted = null;
+    // A new key goes last in the map's order; a replacement keeps its key's place.
+    if (existing === undefined) snapshot.add(event);
+    else snapshot.replace(existing, event);
     // The displaced row rides along so a subscriber can un-count it without
     // holding its own copy of the store (`null` = this key is brand new).
     changes.push({ event, replaced: existing ?? null });
@@ -1357,14 +1357,17 @@ export function createEventStore(opts: {
     // Unfiltered fast path — every axis is "no filter", so the result IS the
     // shared sorted snapshot (f27). Return it DIRECTLY rather than copying it
     // element-by-element. Per the query contract the result is read-only, so
-    // sharing the memoized array is safe — no aggregator mutates it.
+    // sharing the memoized array is safe — no aggregator mutates it. Handing
+    // it out is recorded: the store never writes it again, and copies it at
+    // its next write instead (#417).
     if (since === undefined && until === undefined && matches === null) {
-      return sortedEvents();
+      return snapshot.handOut();
     }
 
     // Iterate the timestamp-sorted snapshot, not `events.values()` (insertion
     // order): a filter preserves order, so `out` comes out sorted with no
-    // per-query re-sort.
+    // per-query re-sort. A read, not a hand-out: the walk ends before `query`
+    // returns, and `out` is a fresh array.
     // ADR-0083: the bounds' form is decided ONCE per query (they share a
     // kind — the HTTP layer rejects a mix) and the instants are parsed once
     // here rather than per event.
@@ -1374,7 +1377,7 @@ export function createEventStore(opts: {
     const sinceMs = instantBounds && since !== undefined ? Date.parse(since) : undefined;
     const untilMs = instantBounds && until !== undefined ? Date.parse(until) : undefined;
     const out: StoredEvent[] = [];
-    for (const event of sortedEvents()) {
+    for (const event of snapshot.read()) {
       if (since !== undefined || until !== undefined) {
         if (instantBounds) {
           // Half-open `[since, until)` window on the event's own timestamp,
@@ -1383,7 +1386,7 @@ export function createEventStore(opts: {
           // An unparseable timestamp fails the filter safe, as on the ymd path.
           if (Number.isNaN(t)) continue;
           if (sinceMs !== undefined && t < sinceMs) continue;
-          // `continue`, never `break`: `sortedEvents` is a plain STRING sort
+          // `continue`, never `break`: the snapshot is a plain STRING sort
           // on `timestamp`, and the parser does not normalize, so a stream
           // holding an offset-bearing stamp (`...+02:00`) string-sorts hours
           // away from its instant — a `break` there would drop every later
@@ -1437,7 +1440,7 @@ export function createEventStore(opts: {
       }
       if (removedContribution) contributionChanged(null);
       if (changes.length === 0) return;
-      sorted = null;
+      snapshot.discard();
       rebuildDerivedSets();
       emitChanges(changes);
     },
@@ -1483,7 +1486,8 @@ export function createEventStore(opts: {
         }
       }
       if (changes.length > 0) {
-        sorted = null;
+        // A local copy is set again under its deleted key: last in the map's order.
+        snapshot.discard();
         rebuildDerivedSets();
         emitChanges(changes);
       }

@@ -40,6 +40,16 @@ export type CreateWatcherOptions = {
   // point of the self-healing degrade: the caller clears its amber flag.
   // At most once, and never after `close()`.
   onReadyLate?: () => void;
+  // Fired when this watcher has lost watches it cannot get back by itself
+  // (#338, ADR-0113): one call per burst of watch-loss errors, once the burst
+  // has settled, carrying this watcher's own handle so the caller can tell a
+  // loss in the watcher it holds from one in a watcher it already replaced.
+  // Never before `createWatcher` has resolved, and never after `close()`. The
+  // errors themselves still reach `onError`.
+  onWatchLost?: (lost: Watcher) => void;
+  // How long a burst of watch-loss errors must stay quiet before it is
+  // reported. See WATCH_LOSS_SETTLE_MS.
+  watchLossSettleMs?: number;
 };
 
 // MEASURED, not guessed: a healthy `ready` on the reference machine took
@@ -53,6 +63,29 @@ export type CreateWatcherOptions = {
 // appear. Re-measure before lowering it; the trace prints the real number
 // every boot (`watcher settled at +Nms`).
 export const WATCHER_READY_TIMEOUT_MS = 10_000;
+
+// MEASURED: a tree of 6 or 20 project directories deleted and recreated
+// before the watcher could run delivered its whole burst, one error per
+// session file, within 40 ms (#338). The window only has to outlast one
+// burst, so that the burst is one restart rather than one each: the watches
+// all died before the burst began, since the burst is chokidar catching up on
+// a tree that changed while it could not run. 1 s is 25x that spread. It is
+// also the longest a write in a recreated session file can go unseen before
+// the restart begins, and the restart's walk brings that write in.
+export const WATCH_LOSS_SETTLE_MS = 1_000;
+
+// The watch-loss signal (ADR-0113). On Windows, chokidar reports a watch that
+// died as `EPERM` from `watch`, and only once the path exists again: a path
+// still gone is silent (handler.js re-opens it before broadcasting). So the
+// error means "this path is back, and its watch is not". It is chokidar's
+// only report of a dead watch: chokidar takes a recreated file for the one it
+// already watches and never watches it again. Not ENOSPC (the OS watch
+// limit), since a restart asks for as many watches again.
+function isWatchLoss(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const { code, syscall } = err as { code?: unknown; syscall?: unknown };
+  return code === "EPERM" && syscall === "watch";
+}
 
 export type Watcher = {
   close: () => Promise<void>;
@@ -72,6 +105,7 @@ export type Watcher = {
 export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher> {
   const debounceMs = opts.debounceMs ?? 500;
   const readyTimeoutMs = opts.readyTimeoutMs ?? WATCHER_READY_TIMEOUT_MS;
+  const watchLossSettleMs = opts.watchLossSettleMs ?? WATCH_LOSS_SETTLE_MS;
   const tailReader = opts.tailReader ?? createTailReader();
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -183,16 +217,52 @@ export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher
     cursorAtEnd.delete(path);
     schedule(path);
   });
-  fsWatcher.on("error", (err) => opts.onError?.(err));
+  let readyTimedOut = false;
+  let closed = false;
+  // The watch-loss report's state; see `noteWatchLoss` below.
+  let lossTimer: ReturnType<typeof setTimeout> | undefined;
+  let lossHeld = false;
+  let handedOut = false;
+  const handle: Watcher = {
+    get readyTimedOut() {
+      return readyTimedOut;
+    },
+    close: async () => {
+      closed = true;
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+      if (lossTimer !== undefined) clearTimeout(lossTimer);
+      await fsWatcher.close();
+    },
+  };
+
+  // The watch-loss report (ADR-0113): a trailing settle window, so a burst is
+  // one report. A burst that settles before `createWatcher` has resolved is
+  // held, and re-armed at hand-out: the caller can only answer for a watcher
+  // it has installed, and a restart's replacement is not installed until the
+  // restart's own `await` resumes.
+  function noteWatchLoss(): void {
+    if (closed) return;
+    if (lossTimer !== undefined) clearTimeout(lossTimer);
+    lossTimer = setTimeout(() => {
+      lossTimer = undefined;
+      if (closed) return;
+      if (handedOut) opts.onWatchLost?.(handle);
+      else lossHeld = true;
+    }, watchLossSettleMs);
+  }
+
+  fsWatcher.on("error", (err) => {
+    opts.onError?.(err);
+    if (isWatchLoss(err)) noteWatchLoss();
+  });
 
   // Wait for `ready`, but never forever (issue #182). A hung `ready` used to
   // strand this promise, and with it both callers: `main()`'s boot fan-out, and
-  // `settings-watch`'s serialized restart chain — which holds `restarting =
-  // true` across the await, so a wedge there silently stops honouring
+  // the serialized restart chain (`watcher-restarts.ts`) — which holds its
+  // `running` flag across the await, so a wedge there silently stops honouring
   // `claudePaths` edits for the rest of the session. Neither has any way to
   // notice, which is the point: bound it here, once, where the signal lives.
-  let readyTimedOut = false;
-  let closed = false;
   await new Promise<void>((resolve) => {
     const timer = setTimeout(() => {
       readyTimedOut = true;
@@ -219,15 +289,10 @@ export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher
     });
   });
 
-  return {
-    get readyTimedOut() {
-      return readyTimedOut;
-    },
-    close: async () => {
-      closed = true;
-      for (const timer of timers.values()) clearTimeout(timer);
-      timers.clear();
-      await fsWatcher.close();
-    },
-  };
+  handedOut = true;
+  if (lossHeld) {
+    lossHeld = false;
+    noteWatchLoss();
+  }
+  return handle;
 }

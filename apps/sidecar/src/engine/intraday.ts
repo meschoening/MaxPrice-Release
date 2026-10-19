@@ -2,8 +2,9 @@ import type { BucketRow, CostMode, IntradayResponse, Span } from "@maxprice/shar
 import {
   BLOCK_BUCKET_MS,
   BLOCK_WINDOW_MS,
-  computeCostBreakdown,
+  computeCostBreakdownInto,
   DAY_MS,
+  emptyCostBreakdown,
   MAX_INTRADAY_BUCKETS,
   nativeBucketMs,
   SPAN_WINDOW_MS,
@@ -11,7 +12,7 @@ import {
   WEEK_BUCKET_MS,
 } from "@maxprice/shared";
 import type { ResolvedBlockSpan, WindowSpan } from "./block-windows";
-import { localClock, shiftYmd, zonedInstant } from "./local-date";
+import { localClock, shiftYmd, wallClockReader, wallMidnightMs, zonedInstant } from "./local-date";
 import type { ModelRollup } from "./model-rollup";
 import { byTimestamp, emptyModelRollup, flushRollup, foldModelUsage } from "./model-rollup";
 import {
@@ -138,10 +139,19 @@ function flushWindow(rollups: BucketRollups, starts: string[]): BucketRow[] {
 //     loop. Only the now-relative regime returns it (its right edge is `now`);
 //     the `today` regime never does (it filters by calendar date, not by a
 //     monotone right edge).
+//
+// `skip` and `stop` carry nothing of the event, so every classifier returns
+// the one `SKIP` and the one `STOP` below rather than a fresh literal per call
+// (#415): a `30d` request skips every event of its pre-window history. They are
+// read-only because every request shares them. A `bucket` carries its event's
+// indices and stays a fresh object.
+const SKIP: { readonly kind: "skip" } = { kind: "skip" };
+const STOP: { readonly kind: "stop" } = { kind: "stop" };
+
 type EventClass =
   | { kind: "bucket"; currentIdx: number | null; previousIdx: number | null }
-  | { kind: "skip" }
-  | { kind: "stop" };
+  | typeof SKIP
+  | typeof STOP;
 
 // The shared TAIL of both window regimes (f2). Only the per-event CLASSIFICATION
 // and the window math (bucket `count` + `bucketStart` strings) differ between
@@ -251,6 +261,10 @@ function assembleWindows(
     return slug;
   };
 
+  // Every kept event is priced into this one breakdown (#416); each
+  // `foldModelUsage` below adds its numbers in before the next event's land.
+  const cost = emptyCostBreakdown();
+
   // SINGLE per-event pass — `byTimestamp` first so `modelsUsed` /
   // `modelBreakdowns` come out first-seen-ordered (the invariant `daily.ts`
   // relies on), and so the ascending order lets the classifier `stop` early.
@@ -260,19 +274,9 @@ function assembleWindows(
     if (cls.kind === "skip") continue;
     const { currentIdx, previousIdx } = cls;
 
-    // `computeCostBreakdown` runs EXACTLY once per kept event, then folds into whichever
-    // windows the classifier picked — never once per (event × window/slug).
-    const cost = computeCostBreakdown(
-      event.model,
-      {
-        inputTokens: event.inputTokens,
-        outputTokens: event.outputTokens,
-        cacheCreationTokens: event.cacheCreationTokens,
-        cacheReadTokens: event.cacheReadTokens,
-      },
-      mode,
-      event.costUSD,
-    );
+    // `computeCostBreakdownInto` runs EXACTLY once per kept event, then folds into
+    // whichever windows the classifier picked — never once per (event × window/slug).
+    computeCostBreakdownInto(cost, event.model, event, mode, event.costUSD);
 
     if (currentIdx !== null) {
       const rollup = ensureRollup(current, currentIdx);
@@ -473,14 +477,44 @@ export function aggregateIntraday(
   mode: CostMode,
   options: AggregateIntradayOptions,
 ): IntradayResponse {
+  return aggregateWith(events, mode, options, assembleWindows);
+}
+
+// Test-only (intraday.test.ts, #415): the verdict each of `events` gets from
+// the classifier `options`' window regime folds with — the objects themselves,
+// so a test can see whether two verdicts are one shared object. Not for
+// shipping-code use.
+export function intradayVerdictsForTest(
+  events: StoredEvent[],
+  options: AggregateIntradayOptions,
+): EventClass[] {
+  const verdicts: EventClass[] = [];
+  aggregateWith([], "calculate", options, (_none, mode, params) => {
+    for (const event of events) verdicts.push(params.classify(event));
+    return assembleWindows([], mode, params);
+  });
+  return verdicts;
+}
+
+// The shared tail a window regime hands its windows to: `assembleWindows`, or
+// `intradayVerdictsForTest`'s stand-in that reads the classifier.
+type Assemble = typeof assembleWindows;
+
+// `aggregateIntraday` with its shared tail as a parameter.
+function aggregateWith(
+  events: StoredEvent[],
+  mode: CostMode,
+  options: AggregateIntradayOptions,
+  assemble: Assemble,
+): IntradayResponse {
   // `today` is the calendar-day span (ADR-0020): a different windowing regime
   // — local midnight → now, tz-aware, bucket count grows with the day — so it
   // has its own path. `block` is the active-block span (ADR-0031): a growing
   // window anchored to the resolved block start, sidecar-side rung. Everything
   // below is the `now`-relative windowing the remaining spans share.
-  if (options.span === "today") return aggregateToday(events, mode, options);
-  if (options.span === "block") return aggregateBlockSpan(events, mode, options);
-  if (options.span === "week") return aggregateWeekSpan(events, mode, options);
+  if (options.span === "today") return aggregateToday(events, mode, options, assemble);
+  if (options.span === "block") return aggregateBlockSpan(events, mode, options, assemble);
+  if (options.span === "week") return aggregateWeekSpan(events, mode, options, assemble);
 
   // ADR-0041 (M6) lean rule: with the machine axis ON, the project axis defaults
   // OFF (the nested per-machine byProject grid builds only when explicitly asked)
@@ -542,15 +576,15 @@ export function aggregateIntraday(
   const classify = (event: StoredEvent): EventClass => {
     const t = event.ms;
     // Unparseable timestamp → NaN → dropped (mirrors daily.ts's localDate skip).
-    if (Number.isNaN(t)) return { kind: "skip" };
-    if (t > now) return { kind: "stop" };
-    if (t < windowStart) return { kind: "skip" };
+    if (Number.isNaN(t)) return SKIP;
+    if (t > now) return STOP;
+    if (t < windowStart) return SKIP;
     const currentIndex = Math.floor((t - currentStart) / ms);
     const previousIndex = Math.floor((t - previousStart) / ms);
     const inCurrent = currentIndex >= 0 && currentIndex < count;
     // The previous window is only considered when its ghost series is wanted.
     const inPrevious = includePrevious && previousIndex >= 0 && previousIndex < count;
-    if (!inCurrent && !inPrevious) return { kind: "skip" };
+    if (!inCurrent && !inPrevious) return SKIP;
     return {
       kind: "bucket",
       currentIdx: inCurrent ? currentIndex : null,
@@ -558,7 +592,7 @@ export function aggregateIntraday(
     };
   };
 
-  return assembleWindows(events, mode, {
+  return assemble(events, mode, {
     count,
     currentStarts,
     previousStarts,
@@ -597,6 +631,7 @@ function aggregateToday(
   events: StoredEvent[],
   mode: CostMode,
   options: AggregateIntradayOptions,
+  assemble: Assemble,
 ): IntradayResponse {
   // ADR-0041 (M6) lean rule: machine axis on ⇒ project axis defaults off (see
   // `aggregateIntraday`); off ⇒ pre-M6 default (on), so a non-machine body stays
@@ -654,39 +689,51 @@ function aggregateToday(
       : [];
 
   // Prefilter (f4): only today's / yesterday's events can bucket, so compute the
-  // lower-bound local-midnight instant ONCE and cheaply `Date.parse`-reject
-  // anything earlier BEFORE the per-event `localClock` (an `Intl.formatToParts`
-  // call) — the hot path on a busy day. `yesterdayYmd ?? todayYmd` is yesterday's
-  // midnight when the ghost is wanted, else today's (the same `includePrevious`
-  // branch the windows take).
+  // lower-bound local-midnight instant ONCE and reject anything earlier on its
+  // `event.ms` alone. `yesterdayYmd ?? todayYmd` is yesterday's midnight when the
+  // ghost is wanted, else today's (the same `includePrevious` branch the windows
+  // take).
   const lowerBound = zonedInstant(yesterdayYmd ?? todayYmd, 0, tz);
+
+  // Every event's wall clock is arithmetic on its `event.ms` (ADR-0115): the
+  // reader reads the zone's offsets from `Intl` once, here, and each event costs
+  // an addition, never a `localClock` call. Its span holds every instant the
+  // prefilter keeps whose wall clock can read yesterday or today: it ends a day
+  // past tomorrow's local midnight, and no zone's offset reaches a day, so a
+  // later instant's wall clock reads tomorrow or after. The read is exactly
+  // `localClock`'s answer: a wall-ms is today's iff it lies in today's day of
+  // wall-ms, and its distance from today's midnight is `msSinceMidnight`.
+  const todayMidnight = wallMidnightMs(todayYmd);
+  const wallMsAt = wallClockReader(lowerBound, todayMidnight + 2 * DAY_MS, tz);
 
   // Bin by tz-local time-of-day. Never returns `stop`: events are filtered by
   // calendar date, not by a monotone right edge, so a later event might still be
   // a yesterday-window match.
   const classify = (event: StoredEvent): EventClass => {
     const t = event.ms;
-    // Unparseable, or before the lower bound → dropped without an `Intl` call.
-    if (Number.isNaN(t) || t < lowerBound) return { kind: "skip" };
-    const clock = localClock(event.timestamp, tz);
-    if (clock === null) return { kind: "skip" };
-    const idx = Math.floor(clock.msSinceMidnight / ms);
-    if (clock.ymd === todayYmd) {
+    // Unparseable, or before the lower bound → dropped.
+    if (Number.isNaN(t) || t < lowerBound) return SKIP;
+    // Wall-ms since today's local midnight: negative on yesterday, `NaN` past
+    // the reader's span, where no event is today's or yesterday's.
+    const sinceMidnight = wallMsAt(t) - todayMidnight;
+    if (sinceMidnight >= 0 && sinceMidnight < DAY_MS) {
       // f13: fold a future-dated same-day event into the final in-progress
       // bucket (see the function header) so the current window stays penny-exact
-      // with `/api/daily`'s today row. `idx ≥ 0` always (msSinceMidnight ≥ 0),
-      // so `min(idx, count-1)` is in range; for normal events it is a no-op.
+      // with `/api/daily`'s today row. The index is ≥ 0, so `min(idx, count-1)`
+      // is in range; for normal events it is a no-op.
+      const idx = Math.floor(sinceMidnight / ms);
       return { kind: "bucket", currentIdx: Math.min(idx, count - 1), previousIdx: null };
     }
     // Yesterday's same time-of-day slot → the previous (ghost) window, which
     // keeps the strict range check (a later-than-now yesterday slot stays out).
-    if (includePrevious && clock.ymd === yesterdayYmd && idx >= 0 && idx < count) {
-      return { kind: "bucket", currentIdx: null, previousIdx: idx };
+    if (includePrevious && sinceMidnight >= -DAY_MS && sinceMidnight < 0) {
+      const idx = Math.floor((sinceMidnight + DAY_MS) / ms);
+      if (idx < count) return { kind: "bucket", currentIdx: null, previousIdx: idx };
     }
-    return { kind: "skip" };
+    return SKIP;
   };
 
-  return assembleWindows(events, mode, {
+  return assemble(events, mode, {
     count,
     currentStarts,
     previousStarts,
@@ -722,6 +769,7 @@ function aggregateBlockSpan(
   events: StoredEvent[],
   mode: CostMode,
   options: AggregateIntradayOptions,
+  assemble: Assemble,
 ): IntradayResponse {
   if (options.span !== "block") throw new Error("intraday: aggregateBlockSpan requires span block");
   // ADR-0041 (M6) lean rule: machine axis on ⇒ project axis defaults off (see
@@ -761,7 +809,7 @@ function aggregateBlockSpan(
 
   const classify = (event: StoredEvent): EventClass => {
     const t = event.ms;
-    if (Number.isNaN(t)) return { kind: "skip" };
+    if (Number.isNaN(t)) return SKIP;
     // Ascending input: past the block's real end nothing later can land in
     // either frame (the previous block is earlier still). The half-open right
     // edge carries a measure-zero seam for HEURISTIC blocks only: the
@@ -774,7 +822,7 @@ function aggregateBlockSpan(
     // with the active heuristic block's floored start — `classify` claims it
     // for the current frame while the tile counts it in the previous block;
     // same unreachable measure-zero class.
-    if (t >= endMs) return { kind: "stop" };
+    if (t >= endMs) return STOP;
     // The two frames are evaluated INDEPENDENTLY — never else-if'd on the time
     // ranges. A heuristic block's hour-floored span can cut into the previous
     // resolved window's tail (the ADR-0028 seam), so an event can sit in BOTH
@@ -804,10 +852,10 @@ function aggregateBlockSpan(
       // Same-time-into-block only: the ghost stops where the current frame does.
       if (idx < count) return { kind: "bucket", currentIdx: null, previousIdx: idx };
     }
-    return { kind: "skip" };
+    return SKIP;
   };
 
-  const body = assembleWindows(events, mode, {
+  const body = assemble(events, mode, {
     count,
     currentStarts,
     previousStarts,
@@ -839,6 +887,7 @@ function aggregateWeekSpan(
   events: StoredEvent[],
   mode: CostMode,
   options: AggregateIntradayOptions,
+  assemble: Assemble,
 ): IntradayResponse {
   if (options.span !== "week") throw new Error("intraday: aggregateWeekSpan requires span week");
   // ADR-0041 (M6) lean rule: machine axis on ⇒ project axis defaults off (see
@@ -878,7 +927,7 @@ function aggregateWeekSpan(
   const lowerBound = includePrevious ? prevStart : startMs;
   const classify = (event: StoredEvent): EventClass => {
     const t = event.ms;
-    if (Number.isNaN(t) || t < lowerBound) return { kind: "skip" };
+    if (Number.isNaN(t) || t < lowerBound) return SKIP;
     if (t >= startMs) {
       // In the current week (including a future-dated event — fold into the
       // live bucket).
@@ -893,9 +942,9 @@ function aggregateWeekSpan(
     if (includePrevious && idx >= 0 && idx < count) {
       return { kind: "bucket", currentIdx: null, previousIdx: idx };
     }
-    return { kind: "skip" };
+    return SKIP;
   };
-  return assembleWindows(events, mode, {
+  return assemble(events, mode, {
     count,
     currentStarts,
     previousStarts,

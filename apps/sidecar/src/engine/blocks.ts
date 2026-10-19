@@ -338,17 +338,7 @@ export function foldBlockTotals(
   const machineNames = new Set<string>();
 
   for (const event of events) {
-    const cost = computeCost(
-      event.model,
-      {
-        inputTokens: event.inputTokens,
-        outputTokens: event.outputTokens,
-        cacheCreationTokens: event.cacheCreationTokens,
-        cacheReadTokens: event.cacheReadTokens,
-      },
-      mode,
-      event.costUSD,
-    );
+    const cost = computeCost(event.model, event, mode, event.costUSD);
 
     allCounts.inputTokens += event.inputTokens;
     allCounts.outputTokens += event.outputTokens;

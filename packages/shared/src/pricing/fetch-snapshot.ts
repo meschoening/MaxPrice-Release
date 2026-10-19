@@ -46,6 +46,9 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 // Compared against the VENDORED count, never `activePricingSnapshot()`: the
 // active one ratchets upward with each successful fetch, so using it would turn
 // the floor into a monotonic high-water mark that refuses legitimate prunings.
+// The vendored count itself now includes every retired key the bundled
+// snapshot carries forward (ADR-0114), so the bar rises a little with each
+// release that carries one; ADR-0114 names when that would bite.
 const MIN_MODEL_RATIO = 0.5;
 
 // Best-effort fetch and validation of upstream LiteLLM pricing. Resolves to a

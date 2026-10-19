@@ -45,7 +45,11 @@ export type PopoutViewState =
   // Queries not settled, OR the engine's boot scan has not landed — actions
   // only. Both mean the same thing to a reader: nothing here is a verdict yet.
   | { kind: "loading" }
-  | { kind: "down" } // sidecar unreachable — the danger inset
+  // The sidecar is unreachable — the danger inset. `stopped` is the shell's
+  // confirmed exit (ADR-0112 §4): the inset names the stop and the actions
+  // gain a Relaunch door. Otherwise the process is alive but not answering,
+  // and the copy stays "isn't responding".
+  | { kind: "down"; stopped: boolean }
   | { kind: "no-data" } // scanned and genuinely empty — the orb inset, no rows
   | {
       kind: "dash";
@@ -86,6 +90,12 @@ export type PopoutViewInput = {
   // Any popout query errored — getSidecarUrl failed or a fetch died. One bit:
   // the popout explains trouble with one danger inset, not per-row apologies.
   anyError: boolean;
+  // The shell confirms the sidecar exited (`sidecarExited`, asked only while a
+  // query is failing). It says why `anyError` holds; it never stands alone,
+  // and it is a stop only once the engine has answered this popout (`ready`
+  // non-null): a sidecar that never came up failed to start, and keeps the
+  // unresponsive copy while the window's Boot gate card says so.
+  engineStopped: boolean;
   // Every popout query has settled (data present).
   settled: boolean;
   // /api/status `ready` + `hasData` (ADR-0047), and they are read TOGETHER by
@@ -117,7 +127,9 @@ export type PopoutViewInput = {
 };
 
 export function popoutView(input: PopoutViewInput): PopoutViewState {
-  if (input.anyError) return { kind: "down" };
+  if (input.anyError) {
+    return { kind: "down", stopped: input.engineStopped && input.ready !== null };
+  }
   // Settled means the four fetches answered; `ready` means the answers are
   // final. Before `ready` every number below is a lower bound with nothing on
   // screen to say so, so the popout stays quiet rather than asserting either

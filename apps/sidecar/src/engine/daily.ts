@@ -5,10 +5,9 @@ import type {
   DailyResponse,
   DailyRow,
 } from "@maxprice/shared";
-import { computeCostBreakdown } from "@maxprice/shared";
 import { localDate } from "./local-date";
 import type { ModelRollup } from "./model-rollup";
-import { byTimestamp, emptyModelRollup, flushRollup, foldModelUsage } from "./model-rollup";
+import { byTimestamp, emptyModelRollup, flushRollup, priceAndFold } from "./model-rollup";
 import {
   capturePath,
   emptyPathCapture,
@@ -111,18 +110,31 @@ export function foldDailyEvent(
     rollup = emptyModelRollup();
     rollups.set(date.dashed, rollup);
   }
-  const cost = computeCostBreakdown(
-    event.model,
-    {
-      inputTokens: event.inputTokens,
-      outputTokens: event.outputTokens,
-      cacheCreationTokens: event.cacheCreationTokens,
-      cacheReadTokens: event.cacheReadTokens,
-    },
-    mode,
-    event.costUSD,
-  );
-  foldModelUsage(rollup, event, cost);
+  priceAndFold(rollup, event, mode);
+}
+
+// The store's local-date window test (`store.ts`'s `query`), applied to a
+// date bucket instead of to each event: every event in a bucket shares its
+// local date, so the bucket is in a `YYYYMMDD` window exactly when each of its
+// events would pass the store's filter. `ymd` is `localDate().ymd`, compared
+// lexically as the store compares it; with neither bound there is no filter.
+// The report cache answers a bounded `/api/daily` this way (#423, ADR-0116).
+export function inLocalDateWindow(
+  ymd: string,
+  since: string | undefined,
+  until: string | undefined,
+): boolean {
+  if (since !== undefined && ymd < since) return false;
+  if (until !== undefined && ymd > until) return false;
+  return true;
+}
+
+// A date bucket key's `ymd`. The key is `localDate().dashed`, and `localDate`
+// derives its `ymd` from that same string by dropping the hyphens
+// (`localDateUncached`), so this is the store's comparison string exactly —
+// unpadded years included.
+export function ymdOfDailyKey(dashed: string): string {
+  return dashed.replaceAll("-", "");
 }
 
 // Flush finished rollups into date-ascending wire rows — the exact flush tail

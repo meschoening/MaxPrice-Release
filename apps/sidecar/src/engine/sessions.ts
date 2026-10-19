@@ -1,10 +1,9 @@
 import type { CostMode, SessionRow, SessionsResponse } from "@maxprice/shared";
-import { computeCostBreakdown } from "@maxprice/shared";
 import { localDate } from "./local-date";
 import { inRange } from "./range";
 import { defaultTimeZone } from "./timezone";
 import type { ModelRollup } from "./model-rollup";
-import { byTimestamp, emptyModelRollup, foldModelUsage } from "./model-rollup";
+import { byTimestamp, emptyModelRollup, priceAndFold } from "./model-rollup";
 import {
   eventOrganization,
   eventOrganizationResolution,
@@ -188,7 +187,7 @@ const RESOLUTION_RANK: Record<OrganizationResolution, number> = {
 };
 
 // Fold one event into a bucket: delegate its four token counts + cost + model
-// breakdown to the shared `foldModelUsage`, capture the first non-empty `cwd`
+// breakdown to the shared `priceAndFold`, capture the first non-empty `cwd`
 // for the later `path` resolution, raise the session's resolution summary,
 // advance the latest event of its half (owner-less or owned), and advance
 // `lastActivity` and the latest-event attribution (machine, resolved
@@ -200,18 +199,7 @@ function foldEvent(
   dashed: string,
   presumption: Presumption,
 ): void {
-  const cost = computeCostBreakdown(
-    event.model,
-    {
-      inputTokens: event.inputTokens,
-      outputTokens: event.outputTokens,
-      cacheCreationTokens: event.cacheCreationTokens,
-      cacheReadTokens: event.cacheReadTokens,
-    },
-    mode,
-    event.costUSD,
-  );
-  foldModelUsage(bucket, event, cost);
+  priceAndFold(bucket, event, mode);
   // Events fold in timestamp order, so the fallback is still the first
   // non-empty `cwd`; a `cwd` that encodes to the session's project slug wins.
   capturePath(bucket.cwd, event.projectSlug, event.cwd);

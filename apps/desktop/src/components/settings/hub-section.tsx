@@ -24,8 +24,8 @@ import { dotVariant } from "@/lib/dot-variant";
 // M6 (T7): the three checkboxes are glass switches (presentation only — the
 // semantics stay boolean, labels + indented sub-lines verbatim); the two
 // LOAD-BEARING amber warnings (unrecognized host, pre-event-sync hub degrade)
-// are T1 warn insets, while validation errors stay bare `--bad` text lines
-// and the transient seed progress stays a dim text line.
+// are T1 warn insets, while validation errors stay bare `--bad` text lines.
+// The transient seed progress is a loading bar (#410, `SeedProgress`).
 
 // One glass switch row — the chart-foot toggle recipe reskinning a settings
 // boolean (role="switch", the visible label is the accessible name).
@@ -55,6 +55,42 @@ function SwitchRow({
   );
 }
 
+// The fleet-history seed bar (ADR-0041): a caption row over a full-width
+// track. `seedPercent` is its one value, so the fill, the visible percent and
+// aria-valuenow never disagree, and nothing smooths it: a target that moves
+// ahead dips the bar with it. No seed renders nothing, so completion stays
+// silent, with no hold at 100 and no "done" flash.
+export function SeedProgress({
+  seed,
+}: {
+  seed: { cursor: number; target: number } | null;
+}): React.ReactElement | null {
+  const pct = seedPercent(seed);
+  if (pct === null) return null;
+  return (
+    <div className="seed-progress self-stretch">
+      <div className="caption">
+        <span>Syncing fleet history</span>
+        {/* Hidden from assistive tech because the bar already carries the
+            value, as BootSplash's percent is. */}
+        <span className="num" aria-hidden>
+          {pct}%
+        </span>
+      </div>
+      <div
+        className="track"
+        role="progressbar"
+        aria-label="Fleet history sync"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct}
+      >
+        <i className="fill" style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
 export function HubSection(): React.ReactElement {
   const { data: settings } = useSettings();
   const update = useUpdateSettings();
@@ -74,7 +110,7 @@ export function HubSection(): React.ReactElement {
   // screen. This line keeps showing the live `connecting` state.
   const connectionState = useLiveStatus((s) => s.connectionState);
   // ADR-0041 (M6): mid-seed the sidecar drains its fleet replica from cursor 0 —
-  // render the transient progress percent; `hubEventsDegraded` marks a reachable
+  // render the transient progress bar; `hubEventsDegraded` marks a reachable
   // hub whose status carried no `events` object (the amber honesty line). That
   // absence has TWO causes the wire can't tell apart — a pre-M4 hub that doesn't
   // speak event sync at all, and a current hub whose fleet event archive failed
@@ -248,9 +284,7 @@ export function HubSection(): React.ReactElement {
         <span className={line.textClass}>{line.label}</span>
       </div>
 
-      {hubSeed !== null ? (
-        <p className="hint-line">Syncing fleet history — {seedPercent(hubSeed)}%</p>
-      ) : null}
+      <SeedProgress seed={hubSeed} />
 
       <input
         type="text"

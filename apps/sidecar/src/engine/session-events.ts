@@ -1,4 +1,9 @@
-import { computeCostBreakdown, type CostMode, type SessionSummaryFrame } from "@maxprice/shared";
+import {
+  computeCostBreakdownInto,
+  emptyCostBreakdown,
+  type CostMode,
+  type SessionSummaryFrame,
+} from "@maxprice/shared";
 import { byTimestamp, emptyModelRollup, flushRollup, foldModelUsage } from "./model-rollup";
 import { isParseableTimestamp } from "./local-date";
 import type { StoredEvent } from "./store";
@@ -22,8 +27,8 @@ import type { StoredEvent } from "./store";
 //     `SessionRow` the sessions aggregator reports for the same session. This
 //     endpoint needs no `tz` (ADR-0015): it never buckets by calendar date,
 //     only filters malformed timestamps, which is timezone-independent.
-//   - `computeCostBreakdown` runs once per event; its `.total` is summed into the
-//     summary AND returned per-event, guaranteeing `sum(eventCosts) === totalCost`.
+//   - `computeCostBreakdownInto` runs once per event; its `.total` is summed into
+//     the summary AND returned per-event, guaranteeing `sum(eventCosts) === totalCost`.
 
 // The aggregate the route handler streams: the `summary` frame, the frame-
 // ordered `events` (parseable-timestamp only), and `eventCosts` — `eventCosts[i]`
@@ -49,20 +54,13 @@ export function aggregateSessionEvents(
   // — a Set preserves insertion order. The summary is the attribution surface;
   // the per-event frames carry no machineId.
   const machines = new Set<string>();
+  // Every event is priced into this one breakdown (#416); its numbers are
+  // copied out (folded, and the total pushed) before the next event's land.
+  const cost = emptyCostBreakdown();
 
   for (const event of byTimestamp(events)) {
     if (!isParseableTimestamp(event.timestamp)) continue;
-    const cost = computeCostBreakdown(
-      event.model,
-      {
-        inputTokens: event.inputTokens,
-        outputTokens: event.outputTokens,
-        cacheCreationTokens: event.cacheCreationTokens,
-        cacheReadTokens: event.cacheReadTokens,
-      },
-      mode,
-      event.costUSD,
-    );
+    computeCostBreakdownInto(cost, event.model, event, mode, event.costUSD);
     foldModelUsage(rollup, event, cost);
     frameEvents.push(event);
     eventCosts.push(cost.total);

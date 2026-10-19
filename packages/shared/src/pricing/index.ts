@@ -11,11 +11,13 @@ export {
 } from "./resolve";
 export {
   computeCost,
-  computeCostBreakdown,
+  computeCostBreakdownInto,
+  emptyCostBreakdown,
   type CostBreakdown,
   type CostTokenCounts,
 } from "./compute-cost";
 export { transformUpstreamPricing, UPSTREAM_PRICING_URL } from "./snapshot-transform";
+export { carryForwardPricing } from "./carry-forward";
 
 export {
   fetchPricingSnapshot,

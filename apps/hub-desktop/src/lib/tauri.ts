@@ -90,6 +90,24 @@ export const getHubUrl = makeCachedResolver(
   () => import.meta.env.VITE_HUB_URL,
 );
 
+// Has the shell recorded the daemon's exit (ADR-0112 §6)? `getHubUrl` resolves
+// once and caches for the webview's life, so a failing status query cannot
+// tell a dead daemon from a stalled one. One `get_hub_url` call, never the
+// cache: a Failed answer is an exit; Ready (alive, just not answering) and the
+// Pending sentinel (still starting, or being ended by the shell on quit) are
+// not. Outside Tauri there is no shell to ask, and nothing has exited.
+const HUB_PENDING_MESSAGE = "hub not ready";
+
+export async function hubDaemonExited(): Promise<boolean> {
+  if (!insideTauri()) return false;
+  try {
+    await invoke<string>("get_hub_url");
+    return false;
+  } catch (err) {
+    return String(err) !== HUB_PENDING_MESSAGE;
+  }
+}
+
 // The embedded hub daemon's per-launch operator secret (ADR-0037), from the
 // Rust `get_operator_token` command once it has captured the OPERATOR_TOKEN
 // line. The webview attaches it as `Authorization: Bearer <secret>` to every
@@ -113,7 +131,7 @@ export async function setTrayTooltip(tooltip: string): Promise<void> {
   await invoke("set_tray_tooltip", { tooltip });
 }
 
-// The popout's three actions (ADR-0050). All window manipulation lives in
+// The popout's three actions (ADR-0050). Restart hub (ADR-0112 §6) is below. All window manipulation lives in
 // Rust — these are one-shot commands, no-ops outside Tauri like the tooltip.
 // open_main_window hides the popout and shows the console in ONE command so
 // the blur-hide debounce can't race a second IPC round-trip; quit_app is
@@ -130,4 +148,14 @@ export async function quitApp(): Promise<void> {
 export async function hidePopout(): Promise<void> {
   if (!insideTauri()) return;
   await invoke("hide_popout");
+}
+
+// Restart hub: relaunch_app restarts the whole hub app once its daemon has
+// exited — the shell never respawns the daemon in place (ADR-0112). It exits
+// through app.exit(0), quit_app's teardown chokepoint, then restarts from
+// RunEvent::Exit with the launch's arguments minus `--hidden`, the client
+// shell's rule kept alike.
+export async function relaunchApp(): Promise<void> {
+  if (!insideTauri()) return;
+  await invoke("relaunch_app");
 }

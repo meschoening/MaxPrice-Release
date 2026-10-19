@@ -1,6 +1,6 @@
 [package]
 name = "maxprice-desktop"
-version = "0.8.3"
+version = "0.8.4"
 description = "MaxPrice desktop"
 authors = ["Max Schoening"]
 license = "MIT"

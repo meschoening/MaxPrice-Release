@@ -1,4 +1,6 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
 use std::time::Duration;
 use std::time::Instant;
@@ -40,15 +42,36 @@ struct SidecarState {
     // `std::process::exit(0)` above all.
     #[cfg(windows)]
     job: Mutex<Option<job_object::JobHandle>>,
+    // Set by `kill_sidecar`, under the status lock, before it ends the daemon:
+    // the app is exiting, so the `Terminated` that follows is the shell's own
+    // doing, never a stopped daemon (ADR-0112). See `hub_url_answer`.
+    ending: AtomicBool,
+}
+
+/// What `get_hub_url` answers. Pure, for its test; the client shell's
+/// `sidecar_url_answer`, copied per app (ADR-0077).
+///
+/// The Pending sentinel is the renderer's "not exited" answer
+/// (`hubDaemonExited` in `apps/hub-desktop/src/lib/tauri.ts`). Any other Err is
+/// the shell's record that the daemon is gone, which the status card and the
+/// popout answer with Restart hub (ADR-0112 §6). `ending` is `kill_sidecar`'s
+/// latch: once the shell has begun ending the daemon itself, `Terminated`
+/// still sets Failed, but a quit is not a stop, so a console still running
+/// through teardown never flashes the stopped state on the way out.
+fn hub_url_answer(status: &SidecarStatus, ending: bool) -> Result<String, String> {
+    match status {
+        SidecarStatus::Ready(port) => Ok(format!("http://127.0.0.1:{port}")),
+        SidecarStatus::Failed(msg) if !ending => Err(msg.clone()),
+        SidecarStatus::Pending | SidecarStatus::Failed(_) => Err("hub not ready".into()),
+    }
 }
 
 #[tauri::command]
 fn get_hub_url(state: State<'_, SidecarState>) -> Result<String, String> {
-    match &*state.status.lock() {
-        SidecarStatus::Ready(port) => Ok(format!("http://127.0.0.1:{port}")),
-        SidecarStatus::Pending => Err("hub not ready".into()),
-        SidecarStatus::Failed(msg) => Err(msg.clone()),
-    }
+    // The latch is read under the status lock it is written under, so an
+    // answer that sees the Failed a kill caused also sees the kill's latch.
+    let status = state.status.lock();
+    hub_url_answer(&status, state.ending.load(Ordering::Relaxed))
 }
 
 #[tauri::command]
@@ -998,7 +1021,10 @@ fn spawn_sidecar(app: &AppHandle) -> Result<(), String> {
                     }
                     // Flip to Failed on EVERY termination so get_hub_url can't
                     // return a URL to a dead process forever. Benign on the
-                    // intentional-shutdown path (kill_sidecar during exit).
+                    // intentional-shutdown path (kill_sidecar during exit):
+                    // its latch keeps get_hub_url answering Pending. No
+                    // respawn, by decision (ADR-0112): relaunching the whole
+                    // hub app (Restart hub) is the only way back.
                     let msg = if announced {
                         format!("hub exited after announcing port (code={:?})", t.code)
                     } else {
@@ -1017,6 +1043,12 @@ fn spawn_sidecar(app: &AppHandle) -> Result<(), String> {
 
 fn kill_sidecar(app: &AppHandle) {
     let state = app.state::<SidecarState>();
+    // The quit latch (ADR-0112), set before the kill and under the status lock
+    // so no `get_hub_url` can see the Failed this kill causes without it.
+    {
+        let _status = state.status.lock();
+        state.ending.store(true, Ordering::Relaxed);
+    }
     let child = state.child.lock().take();
     if let Some(child) = child {
         let _ = child.kill();
@@ -1301,6 +1333,52 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
+/// Restart hub (ADR-0112 §6): `relaunch_app` sets it, and the app's
+/// `RunEvent::Exit` restarts without `--hidden` when it is set. The client
+/// shell's copy, per app (ADR-0077).
+#[derive(Default)]
+struct RelaunchRequest {
+    requested: AtomicBool,
+}
+
+/// The arguments a relaunch the user asked for restarts with: the launch's
+/// own, minus `--hidden`. The hub registers no `--hidden` today (its windows
+/// start hidden by config, ADR-0036), so this is the client's rule kept alike
+/// rather than a fix for a flag in use: a user-asked relaunch never carries
+/// `--hidden` in either app. `args[0]` is the executable and is kept, because
+/// `tauri::process::restart` skips it. Pure, for its test.
+fn relaunch_args(args: &[OsString]) -> Vec<OsString> {
+    let mut rest = args.iter();
+    let exe = rest.next().cloned();
+    exe.into_iter()
+        .chain(rest.filter(|arg| arg.as_os_str() != "--hidden").cloned())
+        .collect()
+}
+
+/// Restart hub: relaunch the whole hub app once its daemon has exited
+/// (ADR-0112 §6), from the status card or the popout. It exits through
+/// `app.exit(0)`, the one teardown chokepoint, so `ExitRequested` runs as on
+/// any quit, and `RunEvent::Exit` does the restart. The hub's port is fixed, so
+/// connected clients reconnect to the new daemon on their own.
+#[tauri::command]
+fn relaunch_app(app: AppHandle) {
+    app.state::<RelaunchRequest>()
+        .requested
+        .store(true, Ordering::Relaxed);
+    app.exit(0);
+}
+
+/// Restart with `relaunch_args`, from `RunEvent::Exit`: tauri's own restart
+/// path with the arguments filtered. By `Exit` the plugins have had the event,
+/// and `cleanup_before_exit` is the step tauri runs between the app's callback
+/// and its own restart.
+fn restart_without_hidden(app: &AppHandle) -> ! {
+    let mut env = app.env();
+    env.args_os = relaunch_args(&env.args_os);
+    app.cleanup_before_exit();
+    tauri::process::restart(&env)
+}
+
 // Esc-dismiss, invoked by the popout renderer's keydown listener. Blur
 // dismissal stays Rust-side (on_window_event below); no debounce stamp here —
 // Esc doesn't race a tray click (T2).
@@ -1351,6 +1429,7 @@ pub fn run() {
         .manage(PopoutState::default())
         .manage(FirewallCache::default())
         .manage(HubLog::default())
+        .manage(RelaunchRequest::default())
         .invoke_handler(tauri::generate_handler![
             get_hub_url,
             get_operator_token,
@@ -1360,6 +1439,7 @@ pub fn run() {
             autostart_status,
             open_main_window,
             quit_app,
+            relaunch_app,
             hide_popout,
             log_hub_event
         ])
@@ -1427,12 +1507,97 @@ pub fn run() {
             if let RunEvent::ExitRequested { .. } = event {
                 kill_sidecar(app_handle);
             }
+            // Restart hub (ADR-0112 §6), after ExitRequested has ended the
+            // daemon. Only `relaunch_app` sets the request; every other exit
+            // leaves it unset.
+            if matches!(event, RunEvent::Exit)
+                && app_handle
+                    .state::<RelaunchRequest>()
+                    .requested
+                    .load(Ordering::Relaxed)
+            {
+                restart_without_hidden(app_handle);
+            }
         });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- relaunch_args: a relaunch the user asked for drops --hidden ---
+    // ADR-0112 §5-6, the client shell's rule kept alike.
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn restart_hub_relaunches_without_hidden() {
+        let exe = r"C:\Program Files\MaxPrice Hub\MaxPrice Hub.exe";
+        assert_eq!(relaunch_args(&os(&[exe, "--hidden"])), os(&[exe]));
+        // The hub's own launches carry no arguments at all today.
+        assert_eq!(relaunch_args(&os(&[exe])), os(&[exe]));
+    }
+
+    #[test]
+    fn every_hidden_goes_and_every_other_argument_keeps_its_place() {
+        assert_eq!(
+            relaunch_args(&os(&["hub", "--hidden", "--verbose", "--hidden", "x"])),
+            os(&["hub", "--verbose", "x"])
+        );
+    }
+
+    #[test]
+    fn only_the_exact_flag_is_dropped() {
+        let lookalikes = os(&["hub", "--hidden=1", "--Hidden", "-hidden", "hidden"]);
+        assert_eq!(relaunch_args(&lookalikes), lookalikes);
+    }
+
+    #[test]
+    fn the_executable_is_never_filtered() {
+        // tauri::process::restart skips args[0] as the executable, so dropping
+        // it would shift the first real argument into its place and lose it.
+        assert_eq!(
+            relaunch_args(&os(&["--hidden", "--hidden"])),
+            os(&["--hidden"])
+        );
+        assert_eq!(relaunch_args(&[]), Vec::<OsString>::new());
+    }
+
+    // --- hub_url_answer: a quit is not a stopped daemon (ADR-0112) ---
+
+    const EXITED: &str = "hub exited after announcing port (code=Some(1))";
+
+    #[test]
+    fn an_exit_the_shell_did_not_cause_is_reported_as_one() {
+        assert_eq!(
+            hub_url_answer(&SidecarStatus::Failed(EXITED.into()), false),
+            Err(EXITED.to_string())
+        );
+    }
+
+    #[test]
+    fn a_daemon_the_shell_is_ending_answers_pending_never_its_exit() {
+        assert_eq!(
+            hub_url_answer(&SidecarStatus::Failed(EXITED.into()), true),
+            Err("hub not ready".to_string())
+        );
+    }
+
+    #[test]
+    fn ready_and_pending_answer_as_they_always_did() {
+        for ending in [false, true] {
+            assert_eq!(
+                hub_url_answer(&SidecarStatus::Ready(47100), ending),
+                Ok("http://127.0.0.1:47100".to_string())
+            );
+            assert_eq!(
+                hub_url_answer(&SidecarStatus::Pending, ending),
+                Err("hub not ready".to_string())
+            );
+        }
+    }
 
     // --- the renderer's feeder into hub.log (map #143) ---
 
