@@ -311,6 +311,15 @@ export const statusSnapshotSchema = z.object({
   // skewed producer, a hand-built fixture) still parses and keeps its other
   // fields instead of being dropped whole.
   ready: z.boolean().default(false),
+  // The initial Identity directory probe round has settled AND no boot,
+  // rescan or newly-seen-slug round is pending. Settled includes failure and
+  // per-path deadline expiry; it does not promise correct/complete identity.
+  // Independent of `ready`: the Desktop's splash and routes do not wait for it.
+  identityReady: z.boolean(),
+  // The sample store's first history load has settled, including failure or
+  // an absent file. Seeded false, then true forever; independent of `ready`.
+  // Only the Headless client's history-dependent reads wait for this field.
+  usageHistoryReady: z.boolean(),
   // What the boot is doing while `ready` is still false (ADR-0067) — shape and
   // semantics on `bootProgressSchema` above.
   //

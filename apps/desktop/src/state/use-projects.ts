@@ -1,5 +1,5 @@
-import { projectsKey, projectsResponseSchema } from "@maxprice/shared";
-import { makeReportHook, type ReportQueryInput } from "./report-hook";
+import { projectsKey, projectsResponseSchema, type ReportQueryInput } from "@maxprice/shared";
+import { makeReportHook } from "./report-hook";
 
 // /api/projects — ADR-0004 four-piece split, factory-built. See use-daily.ts.
 export type ProjectsQueryInput = ReportQueryInput;

@@ -2,17 +2,30 @@ import { useCallback, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ArrowUpRight, Ellipsis } from "lucide-react";
 import {
+  abbreviate,
+  aggregateProjectsRange,
   ALL_ORGANIZATIONS,
   deriveProjectName,
   deriveProjectPath,
-  formatRelativeTime,
+  formatCalendarDay,
+  formatCost,
   parentProjectSlug,
+  projectOrganizationsCell,
+  RANGE_LABEL,
   resolveOrganizationScope,
+  topModelFamily,
   type CostMode,
   type ProjectAnchorSnapshot,
   type ProjectRow,
+  type ProjectsRangeAggregate,
+  resolveDateRange,
+  ymdShift,
+  foldMachineIdList,
+  expandProjectFilter,
+  foldProjectRows,
+  groupChildren,
 } from "@maxprice/shared";
-import { resolveDateRange, useFilters } from "@/state/filters";
+import { useFilters } from "@/state/filters";
 import { useWeekWindow } from "@/state/use-week";
 import { useSettings } from "@/state/use-settings";
 import { useOrganizationScope } from "@/state/use-organization-scope";
@@ -24,11 +37,6 @@ import { useCorpusEmpty } from "@/state/use-corpus-empty";
 import { useDaily } from "@/state/use-daily";
 import { densifyDays } from "@/lib/daily-rows";
 import { useEscapeToDeselect } from "@/state/use-escape-deselect";
-import { ymdShift } from "@/lib/dates";
-import { foldMachineIdList } from "@/lib/machines";
-import { projectOrganizationsCell } from "@/lib/organization-scope-view";
-import { expandProjectFilter } from "@/lib/project-identity";
-import { foldProjectRows, groupChildren } from "@/lib/projects";
 import { EmptyState } from "@/components/EmptyState";
 import { DataTable, type Column, type TreeSpec } from "@/components/data-table";
 import { MachineChip } from "@/components/machine-chip";
@@ -40,9 +48,7 @@ import { ModelSplitBar } from "@/components/model-split-bar";
 import { CostChart } from "@/components/cost-chart";
 import { composeSeries } from "@/lib/composed-series";
 import { type GroupByAxis } from "@/lib/group-by";
-import { aggregateProjectsRange, type ProjectsRangeAggregate } from "@/lib/aggregate";
-import { daysSince, formatCost, RANGE_LABEL, STALE_DAYS, topModelFamily } from "@/lib/list-format";
-import { abbreviate } from "@/lib/active-block";
+import { daysSince, STALE_DAYS } from "@/lib/list-format";
 import { ProjectMergeDialog } from "@/components/project-merge-dialog";
 import { useArrangement } from "@/state/use-arrangement";
 import { costBarColumn } from "@/components/cost-bar";
@@ -464,7 +470,7 @@ export function ProjectsPage(): React.ReactElement {
         sortValue: (p) => Date.parse(p.lastActivity) || 0,
         cell: (p) => (
           <span title={`no activity since ${p.lastActivity || "—"}`}>
-            {formatRelativeTime(p.lastActivity, Date.now())}
+            {formatCalendarDay(p.lastActivity, tz, Date.now())}
           </span>
         ),
       }),

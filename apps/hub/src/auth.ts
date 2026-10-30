@@ -3,8 +3,10 @@ import { constantTimeEqual } from "@maxprice/usage-core";
 
 // Hub auth gate (ADR-0037): an OPTIONAL user-set password replaces the minted
 // bearer token. Three lanes, checked in order:
-//   1. the per-launch operator secret (embedded tray console only) — always
-//      accepted, so the console works with or without a password;
+//   1. the per-launch operator secret (the embedded tray console's, and a
+//      Headless Hub's on Linux, kept in its data dir's operator-token for the
+//      commands on its machine, ADR-0126 §8) — always accepted, so the
+//      console works with or without a password;
 //   2. no password set ⇒ open: every request passes and any presented
 //      credential is IGNORED (upgrade-friendly: pre-0037 clients still send
 //      their stale hex tokens);

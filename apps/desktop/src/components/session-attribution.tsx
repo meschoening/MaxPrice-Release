@@ -1,10 +1,6 @@
-import type { SessionRow } from "@maxprice/shared";
+import { organizationCellLabels, type SessionRow } from "@maxprice/shared";
 import { cn } from "@/lib/utils";
-import {
-  organizationCellLabels,
-  sessionTag,
-  type SessionTag as SessionTagView,
-} from "@/lib/session-assignment";
+import { sessionTag, type SessionTag as SessionTagView } from "@/lib/session-assignment";
 
 // How the Sessions table reads a session's Organization attribution (#312):
 // the `presumed` / `assigned` pill beside an owner-less session's id, and the

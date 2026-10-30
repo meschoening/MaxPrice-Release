@@ -9,8 +9,9 @@
    set when the stored override "maxprice-reduce-transparency" is "1" OR the
    OS asks via prefers-reduced-transparency — live on Chromium/WebView2;
    WebKit never matches the query, so on macOS the desktop Settings switch
-   (lib/transparency.ts) is the only driver. Kept byte-identical with
-   apps/hub-desktop/public/theme-boot.js. */
+   (lib/transparency.ts) is the only driver. Kept byte-identical in all
+   three copies: apps/desktop, apps/hub-desktop and apps/guide, each under
+   public/theme-boot.js (the guide's test holds them so). */
 (function () {
   var mq = window.matchMedia("(prefers-color-scheme: dark)");
   function stamp() {

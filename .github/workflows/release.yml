@@ -5,8 +5,8 @@ name: release
 # Trigger: push a `v*` tag (e.g. `v0.1.0`).
 #
 # Flow:
-#   1. preflight        — gates the release by asserting the tag matches both
-#                         products' declared versions, and that the updater
+#   1. preflight        — gates the release by asserting the tag matches every
+#                         product's declared versions, and that the updater
 #                         secrets exist. A red gate blocks every job below —
 #                         nothing builds or releases on a mismatched tag.
 #   2. create-release   — opens a DRAFT GitHub Release for the tag.
@@ -16,26 +16,34 @@ name: release
 #                         to carry their platform (see below).
 #   4. build-hub        — the MaxPrice Hub tray app, Windows only; uploads to the
 #                         same draft release, and renames the same way.
-#   5. notarize-macos   — separate, slow (10+ min) Apple notarization step that
+#   5. build-headless   — the two Headless tarballs, the Headless client's and
+#                         then the Headless Hub's, Linux x64 only, with Bun and
+#                         no Rust; compiles, checks, packs and signs each, and
+#                         uploads both and their .sigs to the same draft release
+#                         (ADR-0123 §1, ADR-0129 §1). Each name already carries
+#                         its platform.
+#   6. notarize-macos   — separate, slow (10+ min) Apple notarization step that
 #                         cannot fail the build job above.
-#   6. compose-updater  — moves the updater freight OFF this release and onto the
+#   7. compose-updater  — moves the updater freight OFF this release and onto the
 #                         MP-Updates repo, as a PRERELEASE.
-#   7. publish          — un-drafts the release.
-#   8. verify-updater   — proves every manifest URL resolves, then flips the
+#   8. publish          — un-drafts the release.
+#   9. verify-updater   — proves every manifest URL resolves, then flips the
 #                         MP-Updates prerelease to switch the channel over.
 #
 # THE UPDATE CHANNEL LIVES IN A SEPARATE REPO (ADR-0071).
 #
-# This release's asset list is five installers, and stays five installers. The
-# updater freight — the macOS .app.tar.gz and both manifests — goes to
+# This release's asset list is six: four installers and the two Headless
+# tarballs, the Headless client's and the Headless Hub's, and stays that. The
+# updater freight — the macOS .app.tar.gz and the four manifests — goes to
 # MP-Updates instead, so what a human sees when they open the releases page is
 # only the things a human downloads. Detached .sig files are published nowhere
-# at all: a signature travels INSIDE the manifest, which is the only place
-# Tauri's updater reads one from.
+# at all: a signature travels INSIDE the manifest, which is the only place an
+# updater reads one from.
 #
 # A manifest is just URLs, so nothing is copied that does not have to be:
-# Windows entries point straight back at the .exe on THIS release. Only macOS
-# needs a home in MP-Updates, because a .app.tar.gz is not an installer.
+# Windows entries point straight back at the .exe on THIS release, and each
+# headless product's entry at its tarball (ADR-0123 §3, ADR-0129 §3). Only
+# macOS needs a home in MP-Updates, because a .app.tar.gz is not an installer.
 #
 # ASSET NAMES SAY THE PLATFORM. Tauri names its bundles after the ARCHITECTURE
 # ("_universal.dmg", "_amd64.deb", "_x64-setup.exe"), which on a release page
@@ -48,16 +56,23 @@ name: release
 #
 # The rules live in each job's matrix. Two things they must not break: a
 # renamed bundle keeps its EXTENSION (compose-updater classifies platforms by
-# it), and the hub keeps its "MaxPrice.Hub_" prefix (that dot is how the two
-# products are told apart). The macOS .app.tar.gz is untouched — it never
-# appears on this release at all.
+# it), and each product keeps its prefix (compose-updater stages a .sig by it:
+# the dot in "MaxPrice.Hub_" is the hub, "maxprice-hub_" the Headless Hub,
+# "maxprice_" the Headless client, and anything else the desktop app). The
+# macOS .app.tar.gz is untouched — it never appears on this release at all.
+# Neither are the two Headless tarballs, maxprice_<v>_linux-x64.tar.gz and
+# maxprice-hub_<v>_linux-x64.tar.gz, which build-headless names for their
+# platform and signs under those names; the "MaxPrice_*" and "MaxPrice.Hub_*"
+# globs are case-sensitive, so no rule reaches either.
 #
 # `createUpdaterArtifacts` stays FALSE in both committed tauri.conf.json files.
 # The build jobs below merge `src-tauri/tauri.updater.conf.json` over it with
 # `--config`, which makes updater artifacts a property of the CI release path
 # rather than of the product — so the local hand-built fallback pipeline
-# (ADR-0052) is untouched and needs no signing key on any machine. The tradeoff
-# is recorded in ADR-0071: a fallback release serves no update, and the channel
+# (ADR-0052) is untouched and needs no signing key on any machine. The same
+# holds for the two Headless tarballs: build-headless signs them here, and the
+# fallback packs them unsigned (ADR-0123 §10, ADR-0129 §8). The tradeoff is
+# recorded in ADR-0071: a fallback release serves no update, and the channel
 # resumes at the next CI release.
 #
 # The ORDER of the last three jobs is the safety property, not an accident.
@@ -70,10 +85,13 @@ name: release
 # channel serving the old release, which is the one outcome that is never worse
 # than doing nothing.
 #
-# Two products ship from one tag and their platform sets DIFFER: the desktop app
-# (`build`, step 3) targets macOS / Windows / Linux, while the MaxPrice Hub tray
-# app (`build-hub`, step 4) is Windows only — no macOS and no Linux leg, by
+# Four products ship from one tag and their platform sets DIFFER: the desktop
+# app (`build`, step 3) targets macOS / Windows / Linux, while the MaxPrice Hub
+# tray app (`build-hub`, step 4) is Windows only — no macOS and no Linux leg, by
 # decision (ADR-0050). See that job's header for what restoring either takes.
+# The Headless client and the Headless Hub (`build-headless`, step 5) are
+# terminal binaries for Linux x64 servers, with no Tauri bundle at all
+# (ADR-0118, ADR-0127).
 #
 # Third-party actions are pinned to full commit SHAs (with a trailing `# vN`
 # comment) so a moved tag can't change what runs in this `contents: write`
@@ -104,9 +122,11 @@ name: release
 #                                         is the whole reason this one exists.
 #
 # The signing key must be the half matching the `pubkey` committed in BOTH
-# tauri.conf.json files. A mismatched pair signs cleanly, uploads cleanly, and
-# is rejected by every installed app — so compose-updater re-checks the key id
-# out of each signature against that committed pubkey rather than trusting it.
+# tauri.conf.json files and in packages/shared's UPDATE_CHANNEL, which the
+# Headless client and the Headless Hub verify against (ADR-0123 §9, ADR-0129
+# §3). A mismatched pair signs cleanly, uploads cleanly, and is rejected by
+# every installed copy — so compose-updater re-checks the key id out of each
+# signature against that committed pubkey rather than trusting it.
 #
 # `GITHUB_TOKEN` is provided automatically by GitHub Actions.
 
@@ -122,9 +142,16 @@ permissions:
 env:
   # The repo serving the update channel (ADR-0071). This must stay in lockstep
   # with the `plugins.updater.endpoints` URL committed in BOTH tauri.conf.json
-  # files — they are what an installed app polls, and nothing here can correct
-  # a shipped binary that points somewhere else.
+  # files and with packages/shared's UPDATE_CHANNEL.baseUrl — they are what an
+  # installed copy polls, and nothing here can correct a shipped binary that
+  # points somewhere else.
   UPDATES_REPO: meschoening/MP-Updates
+  # Every manifest this release composes, one per channel, named as the
+  # composer's manifestNameOf names them. compose-updater uploads this list and
+  # verify-updater downloads, verifies and confirms it, naming no manifest of
+  # its own (ADR-0129 §3), so a channel joins all four steps here. Space-
+  # separated, and word-split on purpose wherever it is read.
+  UPDATE_MANIFESTS: "latest.json hub-latest.json headless-latest.json headless-hub-latest.json"
 
 jobs:
   # --------------------------------------------------------------------------
@@ -137,14 +164,26 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Assert tag matches product versions
-        # One `v*` tag ships BOTH products of a version-locked monorepo, so a
-        # tag that disagrees with either tauri.conf.json publishes mislabelled
-        # installers: the bundle's filename and its self-reported runtime
-        # version would name a release it did not come from. (No updater is
-        # involved — ADR-0054 builds no updater artifacts at all.) Both
-        # tauri.conf.json files are load-bearing (they set the runtime version);
-        # both package.json files are baked in as __APP_VERSION__ — cosmetic, but
-        # asserted for lockstep hygiene. All four must equal the tag.
+        # One `v*` tag ships EVERY product of a version-locked monorepo, so a
+        # tag that disagrees with any of these files publishes a build that
+        # names a release it did not come from. These are the runtime and baked
+        # entries of scripts/version-files.ts, which updater-manifest.test.ts
+        # pins this list to. Both tauri.conf.json files set the runtime version
+        # the Tauri updater compares with the manifest's, so a lagging one
+        # re-downloads the same update forever. The rest are baked into a
+        # build: both apps' package.json as __APP_VERSION__, the version the app
+        # shows; apps/cli/package.json as the Headless client's own version,
+        # which its --version and `update` read (ADR-0123 §1); and
+        # apps/sidecar/package.json as the engineVersion the compiled `maxprice`
+        # bakes in, which every Headless command compares exactly with its own
+        # (ADR-0119 §5), so a lagging one ships a binary that reports version
+        # skew against itself; and apps/hub/package.json as the Hub's version,
+        # which its --version prints and build-headless checks against the tag
+        # (ADR-0129 §1, §2), and which its `GET /page/view` reports and the Hub
+        # page reloads on when it differs from the page's own build (ADR-0124
+        # §6); and apps/guide/package.json as the User guide's version, which
+        # its build stamps into every page (ADR-0132 §6). All eight must equal
+        # the tag.
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -154,7 +193,11 @@ jobs:
             apps/desktop/src-tauri/tauri.conf.json \
             apps/hub-desktop/src-tauri/tauri.conf.json \
             apps/desktop/package.json \
-            apps/hub-desktop/package.json; do
+            apps/hub-desktop/package.json \
+            apps/sidecar/package.json \
+            apps/cli/package.json \
+            apps/hub/package.json \
+            apps/guide/package.json; do
             got="$(jq -r '.version' "$file")"
             if [ "$got" != "$version" ]; then
               echo "::error file=$file::Version mismatch — $file declares '$got' but the tag is '$TAG' (expected '$version'). Bump $file to $version (or retag)."
@@ -162,15 +205,15 @@ jobs:
             fi
           done
           if [ "$fail" -ne 0 ]; then
-            echo "::error::Tag/version disagreement would publish mislabelled installers — refusing to release."; exit 1
+            echo "::error::Tag/version disagreement would publish mislabelled builds — refusing to release."; exit 1
           fi
 
       - name: Assert the updater secrets exist
         # Every one of these fails LATE if it is missing, which is the only
         # reason this step exists so early. Without the signing key `tauri build`
         # runs the entire release compile and dies at the bundling step; without
-        # the token, compose-updater dies after all four legs have finished. Both
-        # cost 20+ minutes to discover something knowable in a second.
+        # the token, compose-updater dies after every build leg has finished.
+        # Both cost 20+ minutes to discover something knowable in a second.
         #
         # The password must be NON-EMPTY: minisign accepts an empty passphrase
         # and Tauri will happily sign with it, so an accidentally-blank secret
@@ -231,8 +274,8 @@ jobs:
       # `--bundles` is pinned PER LEG, and must stay pinned. tauri.conf.json says
       # `bundle.targets: "all"`, which on Windows also builds an .msi and on
       # Linux also builds an .AppImage — neither of which this release ships.
-      # scripts/release-assets.ts is the source of truth for the five-installer
-      # shape and records why: no MSI, because ADR-0038's console-driven
+      # scripts/release-assets.ts is the source of truth for the fallback's
+      # installers and records why: no MSI, because ADR-0038's console-driven
       # firewall repair is written against the per-user unelevated NSIS install;
       # no AppImage, because linuxdeploy runs `ldd` over the Bun-compiled sidecar
       # and the dynamic loader segfaults. The three legs of the local fallback
@@ -271,7 +314,8 @@ jobs:
           # names its platform — see the "Rename release assets" step below for
           # why a rename, rather than a differently-named bundle, is what this
           # is. `rename-glob` scopes the rule to this leg's own product prefix
-          # (all four legs upload to ONE release and may run concurrently);
+          # (all four Tauri legs and build-headless upload to ONE release and
+          # may run concurrently);
           # `rename-from` is matched as a literal suffix; `rename-expect` is the
           # exact number of assets the rule must hit, so a Tauri bundle-name
           # change goes red here instead of shipping a half-renamed set.
@@ -344,8 +388,10 @@ jobs:
           # still pass. The macOS leg below signs, so a lower pin publishes an
           # Intel app that cannot launch. Never move it below 1.3.14. Bump in
           # lockstep with the repo's local Bun (root package.json `engines.bun`
-          # requires >=1.3.14), and with the other of the TWO pins of the same
-          # value in this file (`build`, `build-hub`) — both must move together.
+          # requires >=1.3.14), and with the other two of the THREE load-bearing
+          # pins of the same value in this file (`build`, `build-hub`,
+          # `build-headless`, each of which compiles a binary that embeds it) —
+          # all three must move together.
           bun-version: "1.3.14"
 
       - name: Install dependencies
@@ -574,9 +620,10 @@ jobs:
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          # One of TWO bun-version pins in this file (`build`, `build-hub`) —
-          # bump both together; `build`'s pin carries the rationale (it applies
-          # verbatim to the compiled `maxprice-hub` binary this leg embeds).
+          # One of THREE load-bearing bun-version pins in this file (`build`,
+          # `build-hub`, `build-headless`) — bump all three together; `build`'s
+          # pin carries the rationale (it applies verbatim to the compiled
+          # `maxprice-hub` binary this leg embeds).
           bun-version: "1.3.14"
 
       - name: Install dependencies
@@ -636,7 +683,7 @@ jobs:
         # Verbatim twin of the desktop job's step (that one carries the
         # rationale); only the matrix rule differs. Duplicated rather than
         # factored into a composite action because a local action would be a
-        # fifth file in the overlay subtree for twenty lines of shell.
+        # sixth file in the overlay subtree for twenty lines of shell.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
@@ -668,7 +715,82 @@ jobs:
           fi
 
   # --------------------------------------------------------------------------
-  # 5. Notarize macOS bundles — separate job so a slow (10+ min) notarization
+  # 5. Build the two Headless tarballs, the Headless client's (ADR-0123 §1) and
+  #    then the Headless Hub's (ADR-0129 §1), and upload them, with their
+  #    signatures, to the same draft release.
+  #
+  #    Bun and nothing else: `maxprice` and `maxprice-hub` are each one
+  #    compiled Bun binary (ADR-0118, ADR-0129 §1), so there is no Rust
+  #    toolchain, no Tauri bundle and no tauri-action, and Linux x64 is their
+  #    only target. One run of scripts/build-headless.ts builds both, the
+  #    client first. For each it compiles the binary, the Hub's with its Hub
+  #    page embedded (ADR-0124), refuses one whose --version is not the tag
+  #    minus its `v`, packs maxprice_<v>_linux-x64.tar.gz or
+  #    maxprice-hub_<v>_linux-x64.tar.gz, and signs it with the desktop
+  #    workspace's `tauri signer sign` under that published name: the name
+  #    `maxprice update` or ADR-0129 §4's `maxprice-hub update` checks the
+  #    signature's `file:` against (ADR-0123 §4 check 3). The local fallback
+  #    runs the same script unsigned, which is why the upload is a step of its
+  #    own here.
+  #
+  #    Both tarballs stay on the release: they are the fifth and sixth assets,
+  #    what a human downloads to install, and what headless-latest.json and
+  #    headless-hub-latest.json point at. Their .sigs are read and stripped by
+  #    compose-updater like every other; that job's `*.sig | *.app.tar.gz`
+  #    strip leaves the tarballs themselves alone.
+  # --------------------------------------------------------------------------
+  build-headless:
+    needs: [preflight, create-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # One of THREE load-bearing bun-version pins in this file (`build`,
+          # `build-hub`, `build-headless`) — bump all three together; `build`'s
+          # pin carries the rationale (the compiled `maxprice` and
+          # `maxprice-hub` both embed this Bun).
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build, check, pack and sign both tarballs
+        # With no --out, each tarball and its .sig are written beside its
+        # binary, in apps/cli/binaries/ and apps/hub/binaries/, where the next
+        # step uploads them from.
+        env:
+          TAG: ${{ github.ref_name }}
+          # Minisign, as on the Tauri legs: `tauri signer sign` reads the same
+          # two secrets, and preflight asserted both.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bun scripts/build-headless.ts --tag "$TAG"
+
+      - name: Upload both tarballs and their signatures
+        # No --clobber: a re-run that finds any of the four already on the
+        # draft fails here rather than pairing a new tarball with an older
+        # signature, which every install on that channel would refuse. Delete
+        # them from the draft first.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          client="apps/cli/binaries/maxprice_${TAG#v}_linux-x64.tar.gz"
+          hub="apps/hub/binaries/maxprice-hub_${TAG#v}_linux-x64.tar.gz"
+          gh release upload "$TAG" \
+            "$client" "$client.sig" \
+            "$hub" "$hub.sig" \
+            --repo "$GITHUB_REPOSITORY"
+
+  # --------------------------------------------------------------------------
+  # 6. Notarize macOS bundles — separate job so a slow (10+ min) notarization
   #    can never fail the build jobs. Covers the DESKTOP .dmg only: the hub tray
   #    app has no macOS leg (ADR-0050 — Windows-only for now), so no hub .dmg
   #    exists to notarize. Restoring the hub's macOS leg requires adding
@@ -771,7 +893,7 @@ jobs:
           done
 
   # --------------------------------------------------------------------------
-  # 6. Move the updater freight off this release and onto MP-Updates (ADR-0071).
+  # 7. Move the updater freight off this release and onto MP-Updates (ADR-0071).
   #
   #    Runs BEFORE publish, which is the whole point: the draft is not public,
   #    so the .sig files and the .app.tar.gz are removed from it without ever
@@ -780,16 +902,19 @@ jobs:
   #    if this job failed.
   #
   #    What lands in MP-Updates is a PRERELEASE. GitHub excludes prereleases
-  #    from `releases/latest`, so `latest/download/latest.json` — the URL both
-  #    apps poll — keeps serving the PREVIOUS release throughout. Nothing here
-  #    changes what any installed app sees; only verify-updater's flip does.
+  #    from `releases/latest`, so `latest/download/<manifest>` — the URL every
+  #    installed app and headless product polls (the Headless Hub's check is
+  #    ADR-0129 §6's) — keeps serving the PREVIOUS
+  #    release throughout. Nothing here changes what any installed copy sees;
+  #    only verify-updater's flip does.
   # --------------------------------------------------------------------------
   compose-updater:
-    needs: [preflight, create-release, build, build-hub]
+    needs: [preflight, create-release, build, build-hub, build-headless]
     if: >-
       !cancelled()
       && needs.build.result == 'success'
       && needs.build-hub.result == 'success'
+      && needs.build-headless.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -801,7 +926,8 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           # Runs the composer only — no binary is compiled here, so this pin is
-          # hygiene rather than the load-bearing floor the two build jobs carry.
+          # hygiene rather than the load-bearing floor the three build jobs
+          # carry.
           bun-version: "1.3.14"
 
       - name: Stage the updater bundles off the draft release
@@ -810,7 +936,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          mkdir -p staged/desktop staged/hub staged/mac
+          mkdir -p staged/mac
           # Tolerated non-zero: `gh release download` fails when its pattern
           # matches nothing, with a generic message. The likeliest cause by far
           # is that --config stopped merging the updater overlay, so no leg
@@ -822,20 +948,17 @@ jobs:
             echo "::error::No .sig assets on the draft release. No leg produced a signed updater bundle — check that the build jobs still pass --config src-tauri/tauri.updater.conf.json, and that TAURI_SIGNING_PRIVATE_KEY reached them."
             exit 1
           fi
-          # Split by product. GitHub rewrites the space in the hub's
-          # "MaxPrice Hub_…" bundle to a dot on upload, so on the release the
-          # character after "MaxPrice" is the discriminator: "." is the hub,
-          # "_" is the desktop app. Reading the names back off the release
-          # rather than out of the build's bundle directory is what keeps the
-          # manifest's URLs and the release's asset names the same strings.
-          for f in staged/*.sig; do
-            case "$(basename "$f")" in
-              MaxPrice.Hub_*) mv "$f" staged/hub/ ;;
-              *) mv "$f" staged/desktop/ ;;
-            esac
-          done
-          echo "desktop:"; ls -1 staged/desktop
-          echo "hub:"; ls -1 staged/hub
+          # Split by product, into staged/<channel>/, by the prefix of the asset
+          # each .sig signs (ADR-0129 §3). GitHub rewrites the space in the
+          # hub's "MaxPrice Hub_…" bundle to a dot on upload, so "MaxPrice.Hub_"
+          # is the hub, "maxprice-hub_" the Headless Hub, "maxprice_" the
+          # Headless client, and anything else the desktop app. The composer's
+          # `stage` holds that table and makes every channel's directory, so
+          # each compose below reads its own.
+          # Reading the names back off the release rather than out of the
+          # build's bundle directory is what keeps the manifest's URLs and the
+          # release's asset names the same strings.
+          bun scripts/compose-updater-manifest.ts stage --dir staged
           echo "macOS bundle:"; ls -1 staged/mac
 
       - name: Rehome the macOS bundle to MP-Updates
@@ -863,7 +986,11 @@ jobs:
           fi
           gh release upload "$TAG" "staged/mac/$darwin_asset" --repo "$UPDATES_REPO" --clobber
 
-      - name: Compose both manifests
+      - name: Compose a manifest per channel
+        # One compose per entry of UPDATE_MANIFESTS. The two headless ones read
+        # their trusted key from packages/shared/src/update-channel.ts in this
+        # checkout, where the two Tauri ones read their tauri.conf.json, and
+        # have no macOS bundle to name.
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -882,12 +1009,25 @@ jobs:
             --installers-repo "$GITHUB_REPOSITORY" \
             --updates-repo "$UPDATES_REPO" \
             --out hub-latest.json
+          bun scripts/compose-updater-manifest.ts compose \
+            --channel headless --version "$version" --tag "$TAG" \
+            --dir staged/headless \
+            --installers-repo "$GITHUB_REPOSITORY" \
+            --updates-repo "$UPDATES_REPO" \
+            --out headless-latest.json
+          bun scripts/compose-updater-manifest.ts compose \
+            --channel headless-hub --version "$version" --tag "$TAG" \
+            --dir staged/headless-hub \
+            --installers-repo "$GITHUB_REPOSITORY" \
+            --updates-repo "$UPDATES_REPO" \
+            --out headless-hub-latest.json
 
       - name: Upload the manifests to MP-Updates
         env:
           GH_TOKEN: ${{ secrets.UPDATES_REPO_TOKEN }}
           TAG: ${{ github.ref_name }}
-        run: gh release upload "$TAG" latest.json hub-latest.json --repo "$UPDATES_REPO" --clobber
+        # $UPDATE_MANIFESTS unquoted on purpose: one argument per manifest.
+        run: gh release upload "$TAG" $UPDATE_MANIFESTS --repo "$UPDATES_REPO" --clobber
 
       - name: Strip the updater freight from the draft release
         env:
@@ -897,7 +1037,11 @@ jobs:
           set -euo pipefail
           # Last, deliberately — every step above reads these assets. Detached
           # .sig files are published nowhere at all: the signature travels
-          # inside the manifest, which is the only place Tauri reads one from.
+          # inside the manifest, which is the only place an updater reads one
+          # from. The two Headless tarballs, maxprice_<v>_linux-x64.tar.gz and
+          # maxprice-hub_<v>_linux-x64.tar.gz, match neither pattern and stay:
+          # each is an installer on this release, and what headless-latest.json
+          # or headless-hub-latest.json points at. Only their .sigs go.
           # `while read` rather than `for name in $(...)`: GitHub rewrites a
           # space in an uploaded filename to a dot, so no published asset name
           # can contain one today — but a word-splitting loop that deletes
@@ -915,15 +1059,16 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
 
   # --------------------------------------------------------------------------
-  # 7. Publish — un-draft the release once both products' builds are green.
+  # 8. Publish — un-draft the release once all three build jobs are green.
   # --------------------------------------------------------------------------
   publish:
-    needs: [create-release, build, build-hub, notarize-macos, compose-updater]
-    # All-or-nothing publish: BOTH products' builds must be green, or the release
-    # stays a draft. `notarize-macos` is the ONLY tolerated failure — it is
-    # continue-on-error and deliberately NOT referenced below, so an Apple-notary
-    # hiccup alone still publishes. `!cancelled()` (not `always()`) keeps a
-    # manually-cancelled run from publishing.
+    needs: [create-release, build, build-hub, build-headless, notarize-macos, compose-updater]
+    # All-or-nothing publish: ALL THREE build jobs, and so all four products'
+    # builds, must be green, or the release stays a draft. `notarize-macos` is
+    # the ONLY tolerated failure — it is continue-on-error and deliberately NOT
+    # referenced below, so an Apple-notary hiccup alone still publishes.
+    # `!cancelled()` (not `always()`) keeps a manually-cancelled run from
+    # publishing.
     #
     # compose-updater IS referenced, and must be: it is what strips the updater
     # freight off the draft, so publishing without it would put the very assets
@@ -932,6 +1077,7 @@ jobs:
       !cancelled()
       && needs.build.result == 'success'
       && needs.build-hub.result == 'success'
+      && needs.build-headless.result == 'success'
       && needs.compose-updater.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -976,7 +1122,7 @@ jobs:
             }
 
   # --------------------------------------------------------------------------
-  # 8. Verify the update channel, then switch it over.
+  # 9. Verify the update channel, then switch it over.
   #
   #    This is the gate the two-repo split makes necessary. A manifest and the
   #    artifacts it names are now published by different steps, to different
@@ -984,16 +1130,19 @@ jobs:
   #    — every client would retry the same dead download on every launch, and
   #    nothing about the release page would look wrong.
   #
-  #    So: fetch every URL in both manifests for real, and only then flip the
-  #    MP-Updates prerelease off. That flip is the single moment the channel
-  #    switches, and it is the last thing that happens in the whole pipeline.
-  #    Every failure path above it leaves the previous release serving, which is
-  #    the one outcome that is never worse than doing nothing.
+  #    So: fetch every URL in every manifest of UPDATE_MANIFESTS for real, and
+  #    only then flip the MP-Updates prerelease off. That flip is the single
+  #    moment the channel switches, for all four manifests at once, and it is
+  #    the last thing that happens in the whole pipeline. Every failure path
+  #    above it leaves the previous release serving, which is the one outcome
+  #    that is never worse than doing nothing. No step here names a manifest of
+  #    its own: each reads the one list (ADR-0129 §3).
   #
   #    It has to run AFTER publish for a mechanical reason, not just a tidy one:
   #    a draft release's assets 404 on their public download URLs, so the
-  #    Windows entries — which point back at the installers on that release —
-  #    are unverifiable until the release is public.
+  #    Windows and headless entries — which point back at the installers and
+  #    the tarballs on that release — are unverifiable until the release is
+  #    public.
   # --------------------------------------------------------------------------
   verify-updater:
     needs: [compose-updater, publish]
@@ -1019,15 +1168,23 @@ jobs:
           TAG: ${{ github.ref_name }}
         # Downloaded rather than recomposed: verifying the bytes that are
         # actually attached is the point. A manifest that composed cleanly and
-        # then failed to upload would otherwise verify green.
+        # then failed to upload would otherwise verify green. Each is fetched by
+        # its own name, so a missing one fails here, where a single
+        # '*latest.json' pattern would succeed on whichever ones are there.
         run: |
           set -euo pipefail
           mkdir -p manifests
-          gh release download "$TAG" --repo "$UPDATES_REPO" --pattern '*latest.json' --dir manifests
+          for manifest in $UPDATE_MANIFESTS; do
+            gh release download "$TAG" --repo "$UPDATES_REPO" --pattern "$manifest" --dir manifests
+          done
           ls -1 manifests
 
       - name: Verify every manifest URL resolves
-        run: bun scripts/compose-updater-manifest.ts verify manifests/latest.json manifests/hub-latest.json
+        run: |
+          set -euo pipefail
+          files=()
+          for manifest in $UPDATE_MANIFESTS; do files+=("manifests/$manifest"); done
+          bun scripts/compose-updater-manifest.ts verify "${files[@]}"
 
       - name: Switch the channel over
         env:
@@ -1039,14 +1196,15 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         # The end-to-end proof, and the only step that exercises the URL the
-        # apps actually poll: `releases/latest/download/…` is a GitHub redirect
-        # resolved at request time, so nothing before the flip can test it. The
-        # retry is for that redirect catching up, which is not instant.
+        # apps and the headless products actually poll (ADR-0123 §8, ADR-0129 §6):
+        # `releases/latest/download/…` is a GitHub redirect resolved at request
+        # time, so nothing before the flip can test it. The retry is for that
+        # redirect catching up, which is not instant.
         run: |
           set -uo pipefail
           version="${TAG#v}"
           fail=0
-          for manifest in latest.json hub-latest.json; do
+          for manifest in $UPDATE_MANIFESTS; do
             url="https://github.com/$UPDATES_REPO/releases/latest/download/$manifest"
             got=""
             for attempt in 1 2 3 4 5 6; do

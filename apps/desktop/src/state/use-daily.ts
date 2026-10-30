@@ -1,5 +1,5 @@
-import { dailyKey, dailyResponseSchema } from "@maxprice/shared";
-import { makeReportHook, type ReportQueryInput } from "./report-hook";
+import { dailyKey, dailyResponseSchema, type ReportQueryInput } from "@maxprice/shared";
+import { makeReportHook } from "./report-hook";
 
 // /api/daily. The ADR-0004 four-piece split (key + URL + fetch + wrapper) is
 // produced by `makeReportHook` and re-exported below under the documented

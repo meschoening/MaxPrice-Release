@@ -13,14 +13,12 @@ import {
   type TokenCategory,
   type DailyRow,
   type ModelFamily,
-} from "@maxprice/shared";
-import { bucketFromDaily, type ChartBucket } from "@/lib/chart-bucket";
-import { projectTopN, type GroupByAxis } from "@/lib/group-by";
-import {
   MACHINE_FALLBACK_COLOR,
   type FoldedMachine,
   type MachineSeriesEntry,
-} from "@/lib/machines";
+} from "@maxprice/shared";
+import { bucketFromDaily, type ChartBucket } from "@/lib/chart-bucket";
+import { projectTopN, type GroupByAxis } from "@/lib/group-by";
 import type { Metric } from "@/state/filters";
 
 // ADR-0033 — the compose step. Turns the selected group-by axes + the fetched
@@ -95,7 +93,7 @@ export type ComposeInput = {
   projectData?: Record<string, { path: string; rows: DailyRow[] }>;
   prevProjectData?: Record<string, { path: string; rows: DailyRow[] }>;
   // ADR-0041 (M6) — required when axes includes "machine": the per-machine map,
-  // ALREADY alias-folded + named (lib/machines.ts foldMachineEntries), keyed by
+  // ALREADY alias-folded + named (`@maxprice/shared` foldMachineEntries), keyed by
   // target machineId. `projects` nests the per-(machine, project) rows when the
   // project axis is also on. machineOrder (foldMachines) carries the canonical
   // order + colors + isSelf. Caller contract mirrors the project axis: machine

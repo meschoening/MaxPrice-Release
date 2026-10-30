@@ -1,15 +1,15 @@
 import { useMemo } from "react";
-import type { HubMachine } from "@maxprice/shared";
-import { useFilters, type GroupByAxis } from "./filters";
-import { useSettings } from "./use-settings";
-import { useLiveStatus } from "./use-live-status";
-import { useMachines } from "./use-machines";
 import {
+  type HubMachine,
   expandMachineFilter,
   foldMachines,
   machineUiEnabled,
   type FoldedMachine,
-} from "@/lib/machines";
+} from "@maxprice/shared";
+import { useFilters, type GroupByAxis } from "./filters";
+import { useSettings } from "./use-settings";
+import { useLiveStatus } from "./use-live-status";
+import { useMachines } from "./use-machines";
 
 // ADR-0041 (M6) — the machine-axis gate hook, the ONE place the "replica on AND
 // hub configured" rule is evaluated for the renderer's three machine surfaces

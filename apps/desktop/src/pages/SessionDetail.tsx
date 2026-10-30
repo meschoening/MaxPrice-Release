@@ -2,11 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Check, Copy } from "lucide-react";
 import {
+  abbreviate,
   deriveProjectPath,
   formatAbsoluteTimestamp,
+  formatCost,
   formatRelativeTime,
   type CostMode,
   type TimeDisplay,
+  foldMachineIdList,
 } from "@maxprice/shared";
 import { useFilters, type Metric } from "@/state/filters";
 import { useSettings, useTimeDisplay } from "@/state/use-settings";
@@ -15,14 +18,11 @@ import { useNowTick } from "@/state/use-now-tick";
 import { useSessionEvents, type SessionEventsData } from "@/state/use-session-events";
 import { useSessionRow } from "@/state/use-session-row";
 import { useMachineAxis, type MachineAxis } from "@/state/use-machine-axis";
-import { foldMachineIdList } from "@/lib/machines";
 import { MachineChip } from "@/components/machine-chip";
 import { ModelSplitBar } from "@/components/model-split-bar";
 import { UnpricedChip } from "@/components/unpriced-chip";
 import { SessionTimeline } from "@/components/session-timeline";
 import { StripIdentity, StripStat } from "@/components/detail-strip";
-import { formatCost } from "@/lib/list-format";
-import { abbreviate } from "@/lib/active-block";
 import { cn } from "@/lib/utils";
 
 // M5 — the standalone /sessions/:id page wearing Glass (T6 `lens`,

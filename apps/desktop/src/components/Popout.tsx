@@ -1,10 +1,10 @@
 import { Component, useEffect, type ErrorInfo, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
+import { popoutView, type PopoutHead, type PopoutViewState } from "@maxprice/shared";
 import { insideTauri } from "../lib/tauri";
 import { relaunchApp } from "../lib/relaunch";
-import { popoutView, type PopoutHead, type PopoutViewState } from "../lib/popout-view";
-import { ringStrokeDasharray } from "../lib/active-block-tile-state";
+import { ringStrokeDasharray } from "../lib/ring-stroke";
 import { usePendingUpdate, usePopoutData } from "../state/use-popout-data";
 import { useNowTick } from "../state/use-now-tick";
 import { useSettings, useTimeDisplay } from "../state/use-settings";

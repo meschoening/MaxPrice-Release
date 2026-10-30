@@ -74,8 +74,9 @@ export function installParentWatchdog(opts: WatchdogOptions): WatchdogHandle {
 // The libc to dlopen. macOS: `libc.dylib`. Linux: `libc.so.6`, glibc's runtime
 // soname (shipped Linux builds are glibc `.deb`s); `libc.${suffix}` there is
 // `libc.so`, which is absent or, with libc6-dev, a GNU ld linker script, and
-// dlopen rejects both — so the Linux watchdog never armed (#433).
-const LIBC = process.platform === "linux" ? "libc.so.6" : `libc.${suffix}`;
+// dlopen rejects both — so the Linux watchdog never armed (#433). Exported
+// for flock.ts, which opens the same libc.
+export const LIBC = process.platform === "linux" ? "libc.so.6" : `libc.${suffix}`;
 
 export function libcGetppid(): () => number {
   const libc = dlopen(LIBC, {
@@ -118,9 +119,9 @@ export function installStdinWatchdog(opts: StdinWatchdogOptions): void {
 
 // A watchdog must be armed BEFORE anything that can hang, and the teardown it
 // fires is built long after that point. Issue #182: the sidecar installed its
-// watchdog as the last statement of `main()`, downstream of the one
-// post-handshake top-level `await` (`createWatcher`, which resolves on
-// chokidar's `ready`). A `ready` that never fires — a known FSEvents failure
+// watchdog as the last statement of `main()` (now `bootSidecar`), downstream
+// of the one post-handshake top-level `await` (`createWatcher`, which resolves
+// on chokidar's `ready`). A `ready` that never fires — a known FSEvents failure
 // mode over large or permission-restricted trees — left `main()` unfinished
 // while the HTTP server, started earlier, kept serving: a listening,
 // CPU-burning sidecar with NO parent watchdog, observed in the wild at ppid 1

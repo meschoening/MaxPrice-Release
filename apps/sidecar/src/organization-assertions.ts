@@ -19,8 +19,8 @@ import { sameAssertions, withAssertions, type Presumption } from "./engine/presu
 // fleet pushes these entries to the Hub's Organization assertion directory and
 // adopts its union back through `merge`, so the file also holds claims made on
 // other machines; a machine with no Hub works from this file alone. The engine
-// never sees an edit time or a tombstone: main() installs `resolved()` into
-// the presumption cell (engine/presumption.ts, `withAssertions`).
+// never sees an edit time or a tombstone: bootSidecar() installs `resolved()`
+// into the presumption cell (engine/presumption.ts, `withAssertions`).
 
 // Entries stay `unknown` so ONE bad entry can't empty the whole file — each is
 // parsed (and dropped) individually at load, under the one entry schema the
@@ -43,9 +43,9 @@ export type OrganizationAssertions = {
   // map: callers only read it.
   entries: () => ReadonlyMap<string, Readonly<OrganizationAssertionEntry>>;
   // sessionId → organizationUuid for every live claim — no tombstone, no edit
-  // time. A FRESH map per call, never mutated afterwards: main() installs it
-  // into the presumption, whose identity every report cache compares, so its
-  // contents must never change under it.
+  // time. A FRESH map per call, never mutated afterwards: bootSidecar()
+  // installs it into the presumption, whose identity every report cache
+  // compares, so its contents must never change under it.
   resolved: () => Map<string, string>;
   // Claims every listed session for `organizationUuid`, or clears each claim
   // (`null`), with ONE write for the batch. Duplicates collapse. A session that
@@ -230,7 +230,7 @@ export function createOrganizationAssertions(opts: {
   };
 }
 
-// ── main()'s writer, and the PUT's rules (#310) ──
+// ── bootSidecar()'s writer, and the PUT's rules (#310) ──
 
 // The assertion writer's swap, asked before it is made (#309's handoff): the
 // presumption `current` with `resolved` installed through `withAssertions`, or
@@ -261,11 +261,11 @@ export type OrganizationAssertResult =
 // Organization it has seen, Tracked or Excluded (#306 item 7); a clear names
 // none, so it reads no roster. Sessions are opaque: an id need not exist here,
 // since archive-only history and other machines' sessions are legitimate
-// targets. When the set wrote, main()'s writer installs the resolved claims
-// (`install`, true when the presumption swapped), a swap is followed by the
-// wholesale report invalidation, and `assertionsWritten` pushes the map to the
-// Hub. `assertions.set` must wait for the store's boot load (main()'s
-// `assertionsReady`).
+// targets. When the set wrote, bootSidecar()'s writer installs the resolved
+// claims (`install`, true when the presumption swapped), a swap is followed by
+// the wholesale report invalidation, and `assertionsWritten` pushes the map to
+// the Hub. `assertions.set` must wait for the store's boot load
+// (bootSidecar()'s `assertionsReady`).
 export function createOrganizationAssert(deps: {
   roster: () => Promise<OrganizationsResponse>;
   assertions: Pick<OrganizationAssertions, "set">;

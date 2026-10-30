@@ -2,12 +2,11 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ChevronRight } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
+import { excludePatch, makeHomePatch, trackPatch } from "@maxprice/shared";
 import {
   assignedHereText,
   excludedClaims,
-  excludePatch,
   HOME_HINT,
-  makeHomePatch,
   organizationListRows,
   presumptionLine,
   navigateToPresumptionReview,
@@ -16,7 +15,6 @@ import {
   returnWrite,
   reviewScopePatch,
   trackingFacts,
-  trackPatch,
   type LimitsPhrase,
   type OrganizationRowView,
 } from "@/lib/organization-list-view";
@@ -48,7 +46,9 @@ import { ExcludeConfirm, TrackConfirm } from "./organization-tracking-dialog";
 // rename hides and the Limits answer in words; `Make Home` and the tracked
 // switch sit at its end, and the chevron opens its facts. No row carries a
 // usage count; an Excluded row's facts count the sessions claimed for it
-// (#312). The row views come from lib/organization-list-view.
+// (#312). The row views come from lib/organization-list-view, and the
+// settings patches from packages/shared (organization-tracking.ts), which the
+// Headless client's `maxprice org` writes too.
 //
 // `Make Home` writes a Home change inside an unchanged tracked set
 // (`makeHomePatch`), so the sidecar walks nothing and it needs no

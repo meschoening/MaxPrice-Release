@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   formatRelativeTime,
+  hubKeyLabel,
   usageConnectionDot,
   usageConnectionLabel,
   type HubOrganization,
@@ -16,7 +17,6 @@ import { showToast } from "@/lib/toast";
 import {
   accountOrganizationValue,
   discoveredOrganizations,
-  formatProvenance,
   organizationLabels,
 } from "@/lib/presentation";
 
@@ -71,11 +71,7 @@ export function ClaudeAccountCard(): React.ReactElement {
         <AccountOrganizationRow rows={organizations?.organizations} connection={conn} />
         <div className="krow">
           <span>Key</span>
-          <b>
-            {present
-              ? formatProvenance(status?.credentialUpdatedAt, status?.credentialSource, now)
-              : "No key set"}
-          </b>
+          <b>{hubKeyLabel(status, now)}</b>
         </div>
       </div>
 

@@ -293,6 +293,41 @@ export function formatWallDayMonth(instant: number | string | Date, display: Tim
   return `${MONTHS[parts.month - 1] ?? "?"} ${parts.day}`;
 }
 
+// A calendar date as the day a person names it: "today", "yesterday", "Oct 14"
+// earlier this year, "Oct 14, 2025" in an earlier one. For a report's Last
+// activity, which is a calendar date in the configured Timezone (the engine's
+// `localDate`, "YYYY-MM-DD") rather than an instant (#459). Shared so every
+// surface that shows one names the day the same way.
+//
+// The date is never `Date.parse`d. A bare YYYY-MM-DD parses as UTC midnight, so
+// timing it against `now` read a session from minutes ago as "20h ago" in
+// Chicago. Instead today is read in `tz` (`undefined` is the host zone, as in
+// `tzClockParts`), and the two days are compared as Y/M/D numbers through
+// `Date.UTC`, a DST-free frame, the way the desktop's `daysSince` anchors its
+// diff. `now` is the instant that decides today.
+//
+// A date after today (a clock-skewed fleet peer's, which the `all` range
+// admits) reads as its date, never "today". An empty or malformed date (the
+// engine seeds "" before a bucket's first event) reads as an em dash.
+export function formatCalendarDay(date: string, tz: string | undefined, now: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  const today = partsOrNull(now, tz);
+  if (m === null || today === null) return NO_TIME;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  // The round trip rejects what `Date.UTC` would roll over ("2026-02-30" is
+  // March 2) or remap (it reads a year below 100 as 19xx).
+  const at = new Date(Date.UTC(year, month - 1, day));
+  if (at.getUTCFullYear() !== year || at.getUTCMonth() !== month - 1 || at.getUTCDate() !== day)
+    return NO_TIME;
+  const daysAgo = (Date.UTC(today.year, today.month - 1, today.day) - at.getTime()) / 86_400_000;
+  if (daysAgo === 0) return "today";
+  if (daysAgo === 1) return "yesterday";
+  const label = `${MONTHS[month - 1] ?? "?"} ${day}`;
+  return year === today.year ? label : `${label}, ${year}`;
+}
+
 // A human absolute timestamp — "May 21 2026, 2:05:33 PM" / "May 21 2026, 14:05:33".
 // This is what the hover tooltips show beside a relative label ("3h ago"): the
 // tooltip is the ONLY absolute reading those surfaces offer, so it answers in

@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import type { Update } from "@tauri-apps/plugin-updater";
-import { ControlRow, Row } from "@/components/Rows";
+import { USER_GUIDE_ADDRESS } from "@maxprice/shared";
+import { ControlRow, LinkRow, Row } from "@/components/Rows";
 import { logHubEvent } from "@/lib/hub-log";
 import { updateCardView, type UpdateCardState } from "@/lib/update-card";
 import { applyUpdate, detectUpdate, updatesSupported } from "@/lib/updater";
+import { openUserGuide, USER_GUIDE_HREF } from "@/lib/user-guide";
 import { useNowTick } from "@/state/use-now-tick";
 
 // App info — the console's sixth card (map #143). A plain `panel card` peer of
@@ -21,8 +23,13 @@ import { useNowTick } from "@/state/use-now-tick";
 // literally App info (map #100 T3) — one design system, one name for where a
 // version lives.
 //
-// Every string is in `lib/update-card.ts`; this file is structure and wiring
-// only. All copy decisions live there with their reasoning.
+// Every update string is in `lib/update-card.ts`; this file is structure and
+// wiring only. All copy decisions live there with their reasoning.
+//
+// The User guide row (#564) closes the card, as it closes the client's App
+// info: the guide's address as a link, which opens the Hub tray app's Overview
+// in the default browser. Its words are the client's, from the shared
+// user-guide constants.
 export function UpdatesCard(): React.ReactElement {
   const now = useNowTick();
   // The platform gate is STATIC and resolved once, at mount — never inferred
@@ -176,6 +183,16 @@ export function UpdatesCard(): React.ReactElement {
           {view.below.after}
         </p>
       ) : null}
+      {/* Last in the card, below the Updates row's disclosure, so the
+          disclosure stays under the row it belongs to. */}
+      <div className="krows">
+        <LinkRow
+          label="User guide"
+          value={USER_GUIDE_ADDRESS}
+          href={USER_GUIDE_HREF}
+          onClick={openUserGuide}
+        />
+      </div>
     </section>
   );
 }

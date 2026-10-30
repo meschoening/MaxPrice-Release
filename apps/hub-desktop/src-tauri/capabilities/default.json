@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for the MaxPrice Hub operator window. The hub daemon is spawned by Rust via app.shell().sidecar(), so the renderer does not need shell:allow-spawn; the tray and autostart are driven from Rust.",
+  "description": "Default capability for the MaxPrice Hub operator window. The hub daemon is spawned by Rust via app.shell().sidecar(), so the renderer does not need shell:allow-spawn; the tray and autostart are driven from Rust. opener:allow-open-url is scoped to the User guide, which the App info card's User guide row opens in the default browser (#564); the Popout has no opener permission.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -9,6 +9,10 @@
     "process:default",
     "updater:default",
     "os:allow-platform",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://meschoening.github.io/MaxPrice-Release/*" }]
+    },
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled"

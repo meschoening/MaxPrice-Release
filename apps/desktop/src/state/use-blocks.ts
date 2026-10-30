@@ -1,5 +1,5 @@
-import { blocksKey, blocksResponseSchema } from "@maxprice/shared";
-import { makeReportHook, type ReportQueryInput } from "./report-hook";
+import { blocksKey, blocksResponseSchema, type ReportQueryInput } from "@maxprice/shared";
+import { makeReportHook } from "./report-hook";
 
 // /api/blocks — ADR-0004 four-piece split, factory-built. See use-daily.ts.
 // blocks intentionally ignores `project` at the sidecar (the 5-hour quota

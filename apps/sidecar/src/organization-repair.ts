@@ -145,15 +145,15 @@ export type OrganizationRepairDeps = {
   forgetExcludedFromLocalArchive: (sessions: readonly ForgetSessionRef[]) => Promise<void>;
   // fleet.rebuildEngine — after an archive-only forget.
   rebuild: () => Promise<void>;
-  // The dormant half (#311), read from main()'s live engine store: its dormant
-  // session snapshot (the marker's `dormant` key), the locally backed pairs it
-  // refused as dormant, and the lossless Hub forget of those pairs, which never
-  // rewrites the Local archive. Within one run the two reads can come from
-  // different stores: the digest is read before the evidence half's awaits
-  // (its forget and its `rebuild()`, which swaps the store, or any rebuild that
-  // lands meanwhile), and the pairs after. That is safe: the pairs are marked
-  // under the older digest, so if the newer store's set differs, the next run
-  // meets a different digest, wipes the list and forgets again.
+  // The dormant half (#311), read from bootSidecar()'s live engine store: its
+  // dormant session snapshot (the marker's `dormant` key), the locally backed
+  // pairs it refused as dormant, and the lossless Hub forget of those pairs,
+  // which never rewrites the Local archive. Within one run the two reads can
+  // come from different stores: the digest is read before the evidence half's
+  // awaits (its forget and its `rebuild()`, which swaps the store, or any
+  // rebuild that lands meanwhile), and the pairs after. That is safe: the pairs
+  // are marked under the older digest, so if the newer store's set differs, the
+  // next run meets a different digest, wipes the list and forgets again.
   dormantSessions: () => ReadonlySet<string>;
   dormantPairs: () => ForgetSessionRef[];
   forgetDormantOnHub: (

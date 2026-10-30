@@ -4,9 +4,9 @@ import {
   SPAN_WINDOW_MS,
   todayLineBucketMs,
   type WeekWindow,
+  msSinceLocalMidnight,
 } from "@maxprice/shared";
 import type { ChartStyle, Span } from "@/state/filters";
-import { msSinceLocalMidnight } from "./dates";
 
 // ADR-0018: the line chart styles (`cumulative` / `trend`) draw a fine 15-min
 // bucket on every span, so they always read from the `/api/intraday` data

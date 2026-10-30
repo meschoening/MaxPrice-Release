@@ -1,10 +1,14 @@
-import { formatWallClock, type BlockRow, type TimeDisplay } from "@maxprice/shared";
-import { abbreviate, formatRange } from "@/lib/active-block";
 import {
+  abbreviate,
   activeBlockTileState,
-  ringStrokeDasharray,
+  formatElapsed,
+  formatRange,
+  formatWallClock,
   type ActiveBlockTileState,
-} from "@/lib/active-block-tile-state";
+  type BlockRow,
+  type TimeDisplay,
+} from "@maxprice/shared";
+import { ringStrokeDasharray } from "@/lib/ring-stroke";
 import type { NoLimit } from "@/lib/organization-scope-view";
 import { NoLimitsNote } from "@/components/no-limits-note";
 import { UsageExpiredHint } from "@/components/usage-expired-hint";
@@ -277,12 +281,4 @@ function tileValueText(state: TileState): string {
 function windowChip(startMs: number, endMs: number, display: TimeDisplay): string {
   const hours = Math.round((endMs - startMs) / 3_600_000);
   return `${formatRange(startMs, endMs, display).replace(" – ", " → ")} (${hours}h)`;
-}
-
-// "3h 12m" / "42m" — elapsed time within the block.
-function formatElapsed(ms: number): string {
-  const totalMin = Math.max(0, Math.floor(ms / 60_000));
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }

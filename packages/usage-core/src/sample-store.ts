@@ -134,8 +134,9 @@ const NONE: readonly UsageSample[] = Object.freeze([]);
 const newBucket = (): Bucket => ({ byTime: new Map(), sorted: [] });
 
 // capturedAt is fixed-width ISO-8601 UTC (producers use new Date().toISOString()),
-// so a plain string compare is chronological — no Date.parse needed.
-function byCapturedAt(a: UsageSample, b: UsageSample): number {
+// so a plain string compare is chronological — no Date.parse needed. Exported
+// for the Hub's restore, which merges client histories in this order (ADR-0130 §4).
+export function byCapturedAt(a: UsageSample, b: UsageSample): number {
   return a.capturedAt < b.capturedAt ? -1 : a.capturedAt > b.capturedAt ? 1 : 0;
 }
 

@@ -47,3 +47,51 @@ export function ControlRow(props: {
     </div>
   );
 }
+
+/**
+ * A pair whose value is a link that leaves the app for the default browser
+ * (the App info card's User guide row, #564), marked by the external-link
+ * glyph. `onClick` hands the URL to the opener; `href` is what a browser
+ * without Tauri follows.
+ */
+export function LinkRow(props: {
+  label: string;
+  value: string;
+  href: string;
+  onClick: (event: React.MouseEvent<HTMLAnchorElement>) => void;
+}): React.ReactElement {
+  return (
+    <div className="krow">
+      <span>{props.label}</span>
+      <a
+        className="link"
+        href={props.href}
+        target="_blank"
+        rel="noreferrer"
+        onClick={props.onClick}
+      >
+        {props.value}
+        <ExternalLinkIcon />
+      </a>
+    </div>
+  );
+}
+
+// lucide's external-link, which the Desktop client's row wears.
+function ExternalLinkIcon(): React.ReactElement {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M15 3h6v6" />
+      <path d="M10 14 21 3" />
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+    </svg>
+  );
+}

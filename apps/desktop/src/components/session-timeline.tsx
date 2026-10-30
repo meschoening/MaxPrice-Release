@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   formatAbsoluteTimestamp,
+  formatCost,
   formatRelativeTime,
   normalizeModelName,
   type SessionEventFrame,
@@ -9,7 +10,7 @@ import {
 } from "@maxprice/shared";
 import { useNowTick } from "@/state/use-now-tick";
 import { useTimeDisplay } from "@/state/use-settings";
-import { formatCost, familyColor } from "@/lib/list-format";
+import { familyColor } from "@/lib/list-format";
 import { cn } from "@/lib/utils";
 import { useArrangement } from "@/state/use-arrangement";
 import { CostBar } from "@/components/cost-bar";

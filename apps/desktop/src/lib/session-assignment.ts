@@ -1,9 +1,11 @@
-import { deriveProjectName, type OrganizationEntry, type SessionRow } from "@maxprice/shared";
 import {
+  deriveProjectName,
   organizationLabel,
   organizationLabelMap,
   sessionOrganizationLabel,
-} from "@/lib/organization-scope-view";
+  type OrganizationEntry,
+  type SessionRow,
+} from "@maxprice/shared";
 
 // The Sessions page's Organization assignment (#312), as pure view logic: how
 // an owner-less session reads, how the review list groups it, what a selection
@@ -87,32 +89,6 @@ export function sessionTag(
     title: `${title}. Only its owner-less part — the rest has an Owner record for ${ownedLabel}.`,
     part: true,
     ownedLabel,
-  };
-}
-
-// --- the All-scope Organization cell -----------------------------------------
-
-export interface OrganizationCellLabels {
-  // The line the cell leads with, which is also what the column sorts and
-  // searches by: a partly owned session's owned half, else the row's
-  // Organization; null for none (the em dash).
-  label: string | null;
-  // A partly owned session's owner-less half, read beneath.
-  ownerlessLabel?: string;
-}
-
-// The Sessions table's Organization cell under All organizations. A partly
-// owned session leads with the Organization its Owner records name, never the
-// row's own (its latest event's, which may be the owner-less half).
-export function organizationCellLabels(
-  row: SessionRow,
-  labels: ReadonlyMap<string, string>,
-): OrganizationCellLabels {
-  const split = row.organizationSplit;
-  if (split === undefined) return { label: sessionOrganizationLabel(row.organizationUuid, labels) };
-  return {
-    label: organizationLabel(labels, split.owned),
-    ownerlessLabel: organizationLabel(labels, split.ownerless),
   };
 }
 

@@ -1,6 +1,6 @@
-import { Database } from "bun:sqlite";
+import { Database, SQLiteError } from "bun:sqlite";
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { setImmediate as yieldToLoop } from "node:timers/promises";
 import {
   fleetEventSchema,
@@ -43,6 +43,13 @@ export function fleetJsonBytes(json: string): number {
 
 export class FleetRecoveryRequired extends Error {}
 export class FleetUploadConflict extends Error {}
+/**
+ * The store's own refusal of a database it read: an integrity, metadata,
+ * format or row mismatch its load or a row's parse found. A plain Error's
+ * name, so its text is what it always was: the replica's recovery still
+ * matches it by message, and the Hub's restore by class (ADR-0130 §2).
+ */
+export class FleetDatabaseInvalid extends Error {}
 
 type Snapshot = {
   rows: readonly FleetEvent[];
@@ -233,7 +240,8 @@ function openFleetDatabase<T extends { readonly seq: number }>(
       if (opts.mode === "hub") db.exec("PRAGMA locking_mode=EXCLUSIVE;");
       db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;");
       const check = db.query<{ quick_check: string }, []>("PRAGMA quick_check").get();
-      if (check?.quick_check !== "ok") throw new Error("Fleet database integrity check failed");
+      if (check?.quick_check !== "ok")
+        throw new FleetDatabaseInvalid("Fleet database integrity check failed");
       const fresh =
         db
           .query<
@@ -269,9 +277,11 @@ function openFleetDatabase<T extends { readonly seq: number }>(
         });
       else {
         createSchema();
-        if (get("format") === "") throw new Error("Fleet database integrity: missing metadata");
+        if (get("format") === "")
+          throw new FleetDatabaseInvalid("Fleet database integrity: missing metadata");
       }
-      if (get("format") !== "1") throw new Error("Unsupported fleet database format");
+      if (get("format") !== "1")
+        throw new FleetDatabaseInvalid("Unsupported fleet database format");
       for (const name of [
         "cursor",
         "eventSeq",
@@ -281,10 +291,10 @@ function openFleetDatabase<T extends { readonly seq: number }>(
         "snapshotOffset",
       ]) {
         if (!/^\d+$/.test(get(name)) || !Number.isSafeInteger(number(name)))
-          throw new Error("Fleet database integrity: invalid metadata");
+          throw new FleetDatabaseInvalid("Fleet database integrity: invalid metadata");
       }
       if (number("floor") > number("cursor") || (opts.mode === "hub" && get("epoch") === ""))
-        throw new Error("Fleet database integrity: invalid archive boundary");
+        throw new FleetDatabaseInvalid("Fleet database integrity: invalid archive boundary");
       loaded = true;
       // Validate complete payloads. A corrupt archive must never become writable.
       committed();
@@ -315,8 +325,12 @@ function openFleetDatabase<T extends { readonly seq: number }>(
   // and seq it is stored under.
   function parseStored({ key, seq, body }: StoredRow): FleetEvent {
     const row = internRowStrings(fleetEventSchema.parse(JSON.parse(body)));
-    if (key !== fleetEventKey(row.messageId, row.requestId) || seq !== row.seq)
-      throw new Error("Fleet database integrity mismatch");
+    if (
+      !Number.isSafeInteger(seq) ||
+      key !== fleetEventKey(row.messageId, row.requestId) ||
+      seq !== row.seq
+    )
+      throw new FleetDatabaseInvalid("Fleet database integrity mismatch");
     return row;
   }
   // Every stored row, in seq order, a chunk at a time. Each chunk is its own
@@ -327,12 +341,15 @@ function openFleetDatabase<T extends { readonly seq: number }>(
     const query = database().query<StoredRow, [number, number]>(
       "SELECT key,seq,body FROM events WHERE seq>? ORDER BY seq LIMIT ?",
     );
-    for (let after = 0; ; ) {
-      const stored = query.all(after, ROW_CHUNK);
-      if (stored.length === 0) return;
+    // The first page has no lower bound: invalid nonpositive sequences
+    // still need parseStored's schema/identity validation during load.
+    let stored = database()
+      .query<StoredRow, [number]>("SELECT key,seq,body FROM events ORDER BY seq LIMIT ?")
+      .all(ROW_CHUNK);
+    while (stored.length > 0) {
       yield stored;
       if (stored.length < ROW_CHUNK) return;
-      after = stored.at(-1)!.seq;
+      stored = query.all(stored.at(-1)!.seq, ROW_CHUNK);
     }
   }
   // The committed resident entries, built once from every stored row: that
@@ -975,4 +992,157 @@ export function createFleetEventStore(
 ): FleetEventStore | FleetReplicaStore | LocalArchiveStore {
   if (opts.mode === "hub") return hubStore(opts);
   return opts.mode === "replica" ? replicaStore(opts) : archiveStore(opts);
+}
+
+// ── Hub restore (ADR-0130 §2, §3) ──────────────────────────────────────────
+// `maxprice-hub restore` copies a stopped Hub's `events.sqlite` into its
+// staging dir, with its `-wal` or `-journal` when present (never its `-shm`,
+// the wal-index SQLite rebuilds), and hands the copy here. Every SQLite step
+// runs on the copy, never on the backup's own files.
+
+/** A copied Hub archive restore cannot use: corrupt, not a Hub's (a client's Fleet replica included), or failing the Hub's own load. */
+export class FleetArchiveUnrestorable extends Error {}
+
+export type RestoredHubArchive = {
+  events: number;
+  cursor: number;
+  deletionGeneration: number;
+  previousEpoch: string;
+  epoch: string;
+};
+
+// SQLite's primary result codes (sqlite3.h) that describe the file: a SQL
+// error (a foreign schema's "no such column"), a schema change, a row too big,
+// a constraint, a datatype mismatch, corruption, not a database. Every other
+// code (I/O, a full disk, cannot open, read-only, no memory, permission, busy,
+// locked) is about the disk or the process.
+const SQLITE_FILE_CODES: ReadonlySet<number> = new Set([1, 11, 17, 18, 19, 20, 26]);
+
+// What a failed open, check or load says about the file rather than the disk:
+// told by the error's class (the store's FleetDatabaseInvalid, a SyntaxError),
+// a ZodError's name, and an SQLiteError's result code, never by a pattern over
+// a message, which may carry a path. Anything else (a read error, a full disk,
+// restoreCopy's own checks) is I/O, and propagates as itself.
+function unrestorableReason(error: unknown): string | null {
+  const firstLine = (message: string) => message.split("\n")[0]!;
+  if (error instanceof SQLiteError) {
+    return SQLITE_FILE_CODES.has(error.errno & 0xff) ? firstLine(error.message) : null;
+  }
+  if (!(error instanceof Error)) return null;
+  // A ZodError's message is its issues as indented JSON; name the first.
+  if (error.name === "ZodError") {
+    const { issues } = error as Error & { issues?: { path: unknown[]; message: string }[] };
+    const issue = issues?.[0];
+    const where =
+      issue === undefined ? "" : ` (${issue.path.join(".") || "row"}: ${issue.message})`;
+    return `a stored event fails the event schema${where}`;
+  }
+  // A stored row's body that is not JSON.
+  if (error instanceof SyntaxError) return firstLine(error.message);
+  if (error instanceof FleetDatabaseInvalid) return error.message;
+  return null;
+}
+
+/**
+ * Makes the Hub archive copied at `path` a restored Hub's (ADR-0130 §2, §3):
+ * SQLite's own recovery folds the copied WAL in or rolls a hot journal back,
+ * `PRAGMA integrity_check` reads every page, and the Hub's own load validates
+ * it as `serve` would, every row's payload included. The copy then gets a
+ * fresh random epoch, so every client reseeds once and re-contributes, and
+ * leaves WAL mode, so it stands alone with no sibling; the Hub's first load
+ * turns WAL on again. Its rows, seqs, Fleet change cursor, floor and Deletion
+ * generation stay the backup's. Throws FleetArchiveUnrestorable for a file it
+ * cannot use; an I/O error propagates.
+ */
+export async function restoreHubArchive(path: string): Promise<RestoredHubArchive> {
+  try {
+    return await restoreCopy(path);
+  } catch (error) {
+    const reason = unrestorableReason(error);
+    if (reason === null || error instanceof FleetArchiveUnrestorable) throw error;
+    throw new FleetArchiveUnrestorable(reason);
+  }
+}
+
+async function restoreCopy(path: string): Promise<RestoredHubArchive> {
+  // a. Read-write, never create: the first read recovers the copy's WAL or
+  //    rolls its hot journal back, here and not on the backup.
+  const check = new Database(path, { readwrite: true, strict: true });
+  try {
+    const rows = check
+      .query<{ integrity_check: string }, []>("PRAGMA integrity_check")
+      .all()
+      .map((row) => row.integrity_check);
+    if (rows.length !== 1 || rows[0] !== "ok")
+      throw new FleetArchiveUnrestorable(
+        `its integrity check failed: ${rows[0]?.split("\n").join(" ") ?? "no answer"}`,
+      );
+    // A Hub archive is born with its epoch. Anything without one (an empty
+    // file, another database, a Local archive) is no Hub's, and the Hub's
+    // load would take a file with no tables for a fresh archive.
+    const hasMeta =
+      check.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").get() !== null;
+    const epoch = hasMeta
+      ? check.query<{ value: string }, []>("SELECT value FROM meta WHERE name='epoch'").get()?.value
+      : undefined;
+    if (!epoch) throw new FleetArchiveUnrestorable("it has no epoch, so it is no Hub archive");
+  } finally {
+    check.close();
+  }
+
+  // b. The Hub's own boot validation: quick_check, schema, metadata, every
+  //    payload parsed.
+  const store = createFleetEventStore({ path, mode: "hub" });
+  let facts: Omit<RestoredHubArchive, "epoch">;
+  try {
+    await store.load();
+    facts = {
+      events: store.size(),
+      cursor: store.cursor(),
+      deletionGeneration: store.deletionGeneration(),
+      previousEpoch: store.epoch(),
+    };
+  } finally {
+    await store.close();
+  }
+
+  const epoch = crypto.randomUUID();
+  const db = new Database(path, { readwrite: true, strict: true });
+  try {
+    // c. A Hub's own counters. A client's Fleet replica has these tables, an
+    //    epoch and the Hub's seqs, and the Hub's load takes it; but a Hub
+    //    never writes `seeded` or a snapshot, and a replica's eventSeq is 0
+    //    under its rows, so every push to a Hub restored from one would fail
+    //    `UNIQUE constraint failed: events.seq`.
+    const meta = (name: string) =>
+      db.query<{ value: string }, [string]>("SELECT value FROM meta WHERE name=?").get(name)
+        ?.value ?? "";
+    if (meta("seeded") === "1" || meta("snapshot") !== "" || meta("snapshotOffset") !== "0")
+      throw new FleetArchiveUnrestorable("it is a client's Fleet replica, not a Hub archive");
+    const { top } = db
+      .query<{ top: number }, []>("SELECT coalesce(max(seq), 0) AS top FROM events")
+      .get()!;
+    if (Number(meta("eventSeq")) < top)
+      throw new FleetArchiveUnrestorable("its event seq counter is behind its rows");
+
+    // d. The fresh epoch, then rollback-journal mode, which checkpoints the
+    //    WAL into the file and deletes it. Their failures are this module's
+    //    or the disk's, not the file's: no path or text the classification
+    //    above reads.
+    const { changes } = db.query("UPDATE meta SET value=? WHERE name='epoch'").run(epoch);
+    if (changes !== 1) throw new Error(`restore's epoch update changed ${changes} rows`);
+    const mode = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode=DELETE").get();
+    if (mode?.journal_mode !== "delete")
+      throw new Error(`the restored archive stayed in journal_mode ${mode?.journal_mode}`);
+  } finally {
+    db.close();
+  }
+
+  // e. The restored file stands alone.
+  const left = ["-wal", "-shm", "-journal"].filter((suffix) => existsSync(path + suffix));
+  if (left.length > 0) {
+    const names = left.map((suffix) => basename(path) + suffix).join(", ");
+    throw new Error(`${names} remained after the restore`);
+  }
+  return { ...facts, epoch };
 }

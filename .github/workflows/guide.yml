@@ -1,0 +1,130 @@
+name: guide
+
+# Publishes the User guide to GitHub Pages when a release goes public
+# (ADR-0132). The mirror ships the guide's source, apps/guide, and this
+# workflow builds it here, so no built page ever passes the mirror.
+#
+# Trigger: the `release` workflow completing, whatever its conclusion, and
+# workflow_dispatch, which redeploys the last released tree.
+#
+# THE GATE IS THAT THE COMMIT IS A PUBLISHED RELEASE (ADR-0132 §3). The job
+# checks out the commit the release run built (on dispatch, `main`) and
+# deploys only when a `v*` tag points at it whose release here is not a draft.
+# So the guide goes live when the downloads do, at `publish`, without waiting
+# for verify-updater's channel flip; a release run that failed before
+# `publish` deploys nothing, and neither does a dispatch over a mirrored tree
+# whose release never published. Every path that stops short of the deploy,
+# or fails in it, leaves the previous guide serving. A skipped deploy is a
+# green run that says so in its summary.
+#
+# Its own workflow rather than jobs in release.yml: that workflow runs from
+# the tag's ref, which the `github-pages` environment's default main-only rule
+# refuses, and a Pages flake would turn a public release red. workflow_run and
+# workflow_dispatch both run on the default branch, which the rule allows.
+#
+# The last step fetches the guide's URL and every page in
+# apps/guide/src/pages.ts until each answers 200 carrying the tag's version
+# (apps/guide/src/live-check.ts, ADR-0132 §6), so a green run means the
+# release's guide is what readers get.
+#
+# Third-party actions are pinned to full commit SHAs, as in release.yml.
+#
+# One-time setup: Settings -> Pages -> Source is "GitHub Actions" (ADR-0132
+# §8). The release wizards check it at stage 1.
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and a queued one never cancels a deploy in flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # The live check's own bound is about ten minutes; this caps a hung step.
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out the released commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'main' }}
+
+      # The tags pointing at HEAD, read from the remote: the checkout is
+      # shallow and fetched none. An annotated tag lists its commit under
+      # `<tag>^{}`, a lightweight one under the tag itself.
+      - name: Find the commit's published release
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(git rev-parse HEAD)
+          tags=$(git ls-remote --tags origin 'v*' \
+            | awk -v head="$head" '$1 == head { sub("^refs/tags/", "", $2); sub("\\^\\{\\}$", "", $2); print $2 }' \
+            | sort -u -V -r)
+          tag=""
+          for candidate in $tags; do
+            # Only a missing release skips the tag: any other failure of gh
+            # (rate limit, network) fails the run rather than pass for a skip.
+            if ! draft=$(gh release view "$candidate" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>"$RUNNER_TEMP/gh.err"); then
+              grep -q "release not found" "$RUNNER_TEMP/gh.err" || { cat "$RUNNER_TEMP/gh.err" >&2; exit 1; }
+              draft=none
+            fi
+            if [ "$draft" = "false" ]; then tag=$candidate; break; fi
+            echo "$candidate: its release is not published (isDraft: $draft)"
+          done
+          if [ -z "$tag" ]; then
+            echo "::notice::$head is no published release's commit, so the guide is not deployed and the previous one keeps serving."
+            echo "Skipped: $head is no published release's commit. The previous guide keeps serving." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Deploying the guide for $tag ($head)."
+            echo "Deploying the guide for $tag." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install Bun
+        if: steps.gate.outputs.tag != ''
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # release.yml's pin: the release built this tree with it.
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        if: steps.gate.outputs.tag != ''
+        run: bun install --frozen-lockfile
+
+      - name: Build the guide
+        if: steps.gate.outputs.tag != ''
+        run: bun --filter @maxprice/guide build
+
+      - name: Upload the site
+        if: steps.gate.outputs.tag != ''
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: apps/guide/dist
+
+      - name: Deploy to Pages
+        id: deployment
+        if: steps.gate.outputs.tag != ''
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      # USER_GUIDE_URL and every page in pages.ts, each until it answers 200
+      # stamped with the tag's version, or for ten minutes, which outlasts
+      # Pages' cache.
+      - name: Check the live guide
+        if: steps.gate.outputs.tag != ''
+        env:
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: bun apps/guide/src/live-check.ts "$TAG"

@@ -1,5 +1,5 @@
 import type { MachineAxis } from "@/state/use-machine-axis";
-import { machineColor, machineName } from "@/lib/machines";
+import { machineColor, machineName } from "@maxprice/shared";
 import { cn } from "@/lib/utils";
 
 // One machine's colored dot + resolved name (ADR-0041 M6) — the list/detail

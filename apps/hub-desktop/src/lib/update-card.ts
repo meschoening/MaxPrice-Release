@@ -65,7 +65,7 @@ export type UpdateCardView = {
   sub?: string;
   /** Step 1, in the row's value cell. */
   action?: { label: string; disabled: boolean };
-  /** Everything beneath the two rows. */
+  /** Everything beneath the rows. */
   below?: UpdateBelow;
 };
 

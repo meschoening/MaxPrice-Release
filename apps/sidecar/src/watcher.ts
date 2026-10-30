@@ -12,7 +12,7 @@ export type CreateWatcherOptions = {
   // with the freshly-parsed usage records from a write-burst *before* it emits
   // the opaque `onEvent` signal — see the append-before-emit invariant in
   // `flush`. Optional so a Part-3-shaped watcher (no store) still works; the
-  // sidecar's `main()` always wires it.
+  // sidecar's `bootSidecar()` always wires it.
   onRecords?: (
     records: UsageRecord[],
     projectSlug: string,
@@ -258,11 +258,12 @@ export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher
   });
 
   // Wait for `ready`, but never forever (issue #182). A hung `ready` used to
-  // strand this promise, and with it both callers: `main()`'s boot fan-out, and
-  // the serialized restart chain (`watcher-restarts.ts`) — which holds its
-  // `running` flag across the await, so a wedge there silently stops honouring
-  // `claudePaths` edits for the rest of the session. Neither has any way to
-  // notice, which is the point: bound it here, once, where the signal lives.
+  // strand this promise, and with it both callers: `bootSidecar()`'s boot
+  // fan-out, and the serialized restart chain (`watcher-restarts.ts`) — which
+  // holds its `running` flag across the await, so a wedge there silently stops
+  // honouring `claudePaths` edits for the rest of the session. Neither has any
+  // way to notice, which is the point: bound it here, once, where the signal
+  // lives.
   await new Promise<void>((resolve) => {
     const timer = setTimeout(() => {
       readyTimedOut = true;

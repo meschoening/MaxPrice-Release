@@ -7,8 +7,12 @@ import { DEFAULT_WEEK, weekSettingSchema } from "./week";
 // Settings (GLOSSARY.md): durable user config, persisted as settings.json in
 // the OS app-data dir. Distinct from ephemeral filter-rail/chart state.
 // `timezone` and `costMode` travel to the engine as `tz`/`mode` query params,
-// and `organizationScope` as `organization` (#278);
-// `claudePaths` is the only field the sidecar consumes directly (ADR-0014).
+// and `organizationScope` as `organization` (#278). The sidecar reads the file
+// directly, at boot and on every watch event: `claudePaths` (ADR-0014; an
+// absent key falls through to `$CLAUDE_CONFIG_DIR`, ADR-0122 §5),
+// `hubShareEvents` and `hubFleetReplica` (ADR-0041), and `homeOrganization`
+// and `trackedOrganizations` (ADR-0098); `organizationScope` only for the
+// status's usage connection; and `hubUrl` at boot only.
 // `timeFormat` travels nowhere — it is renderer-only (ADR-0060).
 
 // Default Claude data paths — the two standard locations, kept literal and
@@ -80,8 +84,9 @@ export const settingsSchema = z
     timeFormat: timeFormatSchema.default(hostTimeFormat).catch(hostTimeFormat),
     // The Week (ADR-0083): what "this week" means — rolling 7 days (the
     // original behaviour), the weekly-limit reset window, or a custom
-    // weekday + time in `timezone`. Renderer-only: the sidecar never reads it;
-    // the renderer resolves instants and passes them on the wire.
+    // weekday + time in `timezone`. Client-only: the sidecar never reads it;
+    // the renderer and the Headless client's reports resolve instants and
+    // pass them on the wire.
     week: weekSettingSchema.default(DEFAULT_WEEK).catch(DEFAULT_WEEK),
     // Whether the user has collapsed the sidebar to its 64px icon rail
     // (map #151 / T11, ADR-0073). Renderer-only, like `timeFormat`: it reaches

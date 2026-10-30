@@ -6,8 +6,9 @@ import {
   type HubMachine,
   type IntradayResponse,
   type TimeDisplay,
+  foldMachineEntries,
+  type MachineSeriesEntry,
 } from "@maxprice/shared";
-import { foldMachineEntries, type MachineSeriesEntry } from "@/lib/machines";
 
 // Part 5 — T5.4b: the intraday → chart adapter.
 //
@@ -142,7 +143,7 @@ export function intradayByProjectToProjectData(
 // `composeSeries` consumes (ADR-0041 M6). Each entry's BucketRow[] (and its
 // nested per-project sub-map, when the project axis is on) is adapted exactly
 // like the top-level window; alias ids then fold into their directory targets
-// (lib/machines.ts). `which` selects the current window (default) or the
+// (`@maxprice/shared`). `which` selects the current window (default) or the
 // per-machine ghost grids ("previousBuckets").
 export function intradayByMachineToMachineData(
   byMachine: NonNullable<IntradayResponse["byMachine"]>,

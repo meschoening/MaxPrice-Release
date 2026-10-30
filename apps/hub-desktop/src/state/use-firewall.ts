@@ -7,7 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { insideTauri } from "@/lib/tauri";
-import type { FirewallVerdict } from "@/lib/presentation";
+import type { FirewallVerdict } from "@maxprice/shared";
 
 // The one-click repair's two outcomes: the rule was registered, or the operator
 // declined the UAC prompt (an answer, not an error — ADR-0038).

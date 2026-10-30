@@ -1,10 +1,9 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { isValidHubPassword } from "@maxprice/shared";
+import { accessDot, accessLabel, isValidHubPassword } from "@maxprice/shared";
 import { useHubStatus } from "@/state/use-hub-status";
 import { hubFetch, hubStatusQueryKey } from "@/lib/hub-api";
 import { dotVariant } from "@/lib/dot-variant";
-import { accessDot, accessLabel } from "@/lib/presentation";
 import { showToast } from "@/lib/toast";
 
 // Hub password card (ADR-0037): set / replace / clear the optional password
@@ -50,8 +49,9 @@ export function AccessCard(): React.ReactElement {
       <div className="card-head">
         <span className="eyebrow">Access</span>
         <span className="status">
-          {/* Vocabulary lives in presentation.ts (ADR-0050): the popout's
-              Access row consumes the same source, so the words can't drift. */}
+          {/* Vocabulary lives in @maxprice/shared's hub-rows.ts (ADR-0050):
+              the popout's Access row consumes the same source, so the words
+              can't drift. */}
           <span aria-hidden className={`dot ${dotVariant(accessDot(isProtected))}`} />
           {accessLabel(isProtected)}
         </span>

@@ -438,14 +438,16 @@ export type OrganizationRenameResult =
 // the whole map, so one unkeyable entry would have the Hub refuse them all
 // (#288). A rename that changes the stored label emits the wholesale
 // invalidation a Home change emits (labels decision 10), and the roster's own
-// `organizations:changed` poke beside it, then `labelsWritten` — main()'s push
-// to the Hub's Organization directory (#288); one that changes nothing writes
-// nothing and emits nothing, and still answers the roster.
+// `organizations:changed` poke beside it, then `labelsWritten` —
+// bootSidecar()'s push to the Hub's Organization directory (#288); one that
+// changes nothing writes nothing and emits nothing, and still answers the
+// roster.
 //
 // Renames run one at a time through one promise chain: each composes the
 // roster, checks, and writes before the next composes, so two concurrent PUTs
 // can never both pass the uniqueness check against the same roster. `list` and
-// `labels.set` must each await the label store's load (main()'s `labelsReady`).
+// `labels.set` must each await the label store's load (bootSidecar()'s
+// `labelsReady`).
 export function createOrganizationRename(deps: {
   list: () => Promise<OrganizationsResponse>;
   labels: Pick<OrganizationLabels, "set">;

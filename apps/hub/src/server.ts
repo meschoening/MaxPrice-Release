@@ -15,6 +15,7 @@ import {
   ORGANIZATION_LABEL_MAX,
   checkOrganizationLabel,
   hubPurgeRequestSchema,
+  liveClientCount,
   PROJECT_IDENTITY_PATH,
   hubEventsForgetRequestSchema,
   hubEventsPushRequestSchema,
@@ -48,11 +49,14 @@ import {
 } from "@maxprice/shared";
 import type { FleetEventStore, IdentityDirectory } from "@maxprice/usage-core";
 import { createClientRegistry, type ClientRegistry } from "./clients";
+import type { CredentialProvenance } from "./credstore";
 import type { HubFanout } from "./fanout";
 import type { MachineDirectory } from "./machine-directory";
 import type { OrganizationAssertionDirectory } from "./organization-assertion-directory";
 import type { OrganizationDirectory } from "./organization-directory";
 import { hubOrganizationRows, type HubRosterEntry } from "./organization-rows";
+import { mountHubPage, type HubPageDeps } from "./page";
+import { socketPeerAddress } from "./peer";
 import type { HubPollSet } from "./poll-set";
 
 // The hub's HTTP surface (ADR-0035). Optional-password gated (ADR-0037) except
@@ -62,6 +66,8 @@ import type { HubPollSet } from "./poll-set";
 // interfaces by design and the auth gate already covers every data route. A
 // default-open hub still binds loopback, though, so a CSRF Origin guard (below)
 // rejects the cross-origin browser POST/PUT/DELETE/PATCH the open auth gate can't.
+// A Headless Hub's read-only Hub page (`page`, below) sits outside /api/* and
+// none of those gates: it answers loopback peers only (page.ts, ADR-0124).
 export type BuildHubAppDeps = {
   // Auth gate (ADR-0037): optional-password verify — see auth.ts. Tests inject
   // a createHubAuth instance directly.
@@ -82,9 +88,15 @@ export type BuildHubAppDeps = {
   // What the poller reads (#283): the Organizations the key lists. A credential
   // push re-lists; a clear empties it.
   pollSet: Pick<HubPollSet, "refresh" | "clear">;
-  // Writes through the credstore (OS keychain via the Rust helper). Failures
-  // surface as a 500 — the caller (a Settings push) should see them.
-  persistCredential: (c: UsageCredential | null) => Promise<void>;
+  // Writes through the credstore: on Linux `<data dir>/secrets.json`, with the
+  // push's provenance (ADR-0126 §2, §4), elsewhere the OS keychain via the
+  // Rust helper. A key always comes with its provenance, the same the status
+  // then reports; a clear (null) with none. Failures surface as a 500 — the
+  // caller (a Settings push) should see them.
+  persistCredential: (
+    c: UsageCredential | null,
+    provenance?: CredentialProvenance,
+  ) => Promise<void>;
   // Connected-client registry (ADR-0036). Optional: buildHubApp constructs its
   // own if omitted, so existing tests/call sites stay green. index.ts passes the
   // production instance.
@@ -151,6 +163,11 @@ export type BuildHubAppDeps = {
   // Wall-clock for the lastPushAt stamps (M7). Injectable for tests; the
   // stamps are in-memory since-daemon-start, the roster's exact posture.
   nowImpl?: () => string;
+  // The Hub page (ADR-0124): the dist-page files this build embedded and the
+  // Hub's version. index.ts gives it only to a Headless Hub, which mounts the
+  // page whether or not a Hub page URL is set. Absent ⇒ no /page route at all:
+  // the embedded tray daemon and every test or sidecar rig caller (§1).
+  page?: HubPageDeps;
 };
 
 // The FULL HubStatus.events object (ADR-0041 M7). fanout.patchStatus merges
@@ -170,23 +187,11 @@ export function fleetEventsStatus(store: FleetEventStore): NonNullable<HubStatus
   };
 }
 
-// Bun passes its Server as the Hono fetch `env`; `requestIP` resolves the
-// client's socket address. Absent under Hono's app.request() test harness (→
-// null), and any failure degrades to null — the roster's remoteAddr is
-// best-effort (tailnet/loopback IP when resolvable).
-function remoteAddrOf(c: Context): string | null {
-  const server = c.env as { requestIP?: (req: Request) => { address: string } | null } | undefined;
-  try {
-    return server?.requestIP?.(c.req.raw)?.address ?? null;
-  } catch {
-    return null;
-  }
-}
-
-// Shared by the self-update PUT and the console rename POST: trim, reject
+// Shared by the self-update PUT and the console rename POST, and by the
+// live `rename` (operator.ts), which checks before it sends: trim, reject
 // empty, cap at cleanHostname's 63-char registration ceiling. Returns the
 // cleaned name or null (⇒ 400).
-function cleanRenameName(raw: string): string | null {
+export function cleanRenameName(raw: string): string | null {
   const name = raw.trim();
   if (name === "" || name.length > 63) return null;
   return name;
@@ -196,6 +201,14 @@ function parseRenameName(raw: unknown): string | null {
   const parsed = hubMachineRenameRequestSchema.safeParse(raw);
   return parsed.success ? cleanRenameName(parsed.data.name) : null;
 }
+
+// The protocol check's 409 (below). The operator commands tell it from a
+// route's own 409, a name in use or an alias cycle, by this body alone, and
+// exit 4 on it (operator-client.ts, ADR-0127 §7). Its wording is pinned
+// across versions by scripts/acceptance/protocol-warning.ts.
+export const HUB_PROTOCOL_MISMATCH: ErrorResponse = {
+  error: "Hub protocol mismatch; update both apps",
+};
 
 export function buildHubApp(deps: BuildHubAppDeps): Hono {
   const app = new Hono();
@@ -271,9 +284,23 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
 
   app.get("/healthz", (c) => c.json({ ok: true, service: "maxprice-hub" }));
 
+  // The Hub page (ADR-0124), outside /api/*: none of the /api/* middleware
+  // (CSRF, password, protocol, readiness, roster) runs for it; it has its own
+  // loopback-peer guard and awaits `ready` for its view alone. Its clients
+  // count is the Popout's: live clients only.
+  if (deps.page !== undefined) {
+    mountHubPage(app, {
+      ...deps.page,
+      status: () => deps.fanout.getStatus(),
+      liveClients: () => liveClientCount(registry.list()),
+      ready: deps.ready,
+    });
+  }
+
   // Optional-password auth on everything else (ADR-0037; see auth.ts): open
   // hub ⇒ every request passes, presented credentials ignored; protected hub ⇒
-  // Bearer <password> or the console's operator secret.
+  // Bearer <password> or the operator secret (the console's, or a Headless
+  // Hub's operator-token on Linux).
   app.use("/api/*", async (c, next) => {
     if (!(await deps.auth.verify(c.req.header("authorization")))) {
       const body: ErrorResponse = { error: "unauthorized" };
@@ -287,13 +314,13 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
       !["GET", "HEAD", "OPTIONS"].includes(c.req.method) &&
       c.req.header("x-maxprice-protocol") !== String(HUB_PROTOCOL_VERSION)
     )
-      return c.json({ error: "Hub protocol mismatch; update both apps" }, 409);
+      return c.json(HUB_PROTOCOL_MISMATCH, 409);
     await next();
   });
 
   // Boot-readiness gate (F1): every authenticated /api/* handler — /api/status
   // included — parks here until the hub has loaded its history and seeded the
-  // credential. This is what closes the auto-heal race: the seed's keychain
+  // credential. This is what closes the auto-heal race: the seed's credstore
   // read (inside `ready`) always precedes any heal POST's credential write,
   // because that POST cannot enter its handler until `ready` resolves. Mounted
   // only when serve() supplies `ready`; absent ⇒ no gate (tests, remote
@@ -342,7 +369,7 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     const machineId = c.req.header("x-maxprice-machine");
     if (machineId) {
       const hostname = c.req.header("x-maxprice-hostname") ?? null;
-      registry.recordRequest(machineId, hostname, remoteAddrOf(c));
+      registry.recordRequest(machineId, hostname, socketPeerAddress(c));
       // Implicit directory registration (ADR-0041): any authenticated contact
       // from an unknown machine writes an entry — name frozen at first sight.
       // Only a NEW registration pokes (the directory is otherwise unchanged).
@@ -1038,15 +1065,16 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     });
   }
 
-  // Key custody (ADR-0035): persist to the OS keychain via the credstore, then
-  // arm the poller. Every push — the console's, or a client's heal — re-lists
+  // Key custody (ADR-0035, ADR-0126 §4): persist through the credstore (on
+  // Linux the data dir's secrets.json, elsewhere the OS keychain), then arm
+  // the poller. Every push — the console's, or a client's heal — re-lists
   // the Organizations the key can see and polls all of them before the ack, for
   // a fast first sample (#283): nothing in the body decides what the Hub polls.
   // Write-only: the hub never serves the key back out.
   app.post("/api/credential", async (c) => {
     // Parse explicitly so an UNPARSEABLE body (a truncated / proxy-mangled
     // request) is a 400 — NOT folded into the same `null` the documented clear
-    // contract uses, which would silently delete the keychain key and disarm
+    // contract uses, which would silently delete the stored key and disarm
     // the poller on a mangled write (F4). A literal `null` still clears; both
     // shipped callers send the literal body "null".
     let raw: unknown;
@@ -1080,19 +1108,27 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
       const body: ErrorResponse = { error: "invalid credential" };
       return c.json(body, 400);
     }
-    // Persist-first is the fail-closed ordering: if the keychain write
-    // rejects, the 500 fires before the poller is armed — never a poller
-    // running on a credential that didn't persist.
-    await deps.persistCredential(parsed.data);
-    deps.usage.setCredential(parsed.data);
     // Provenance (ADR-0036, overview §8): WHO set/healed the key and WHEN. The
     // console's own POST carries no machine header ⇒ "local"; a sidecar
-    // auto-heal POST carries its machineId ⇒ that machine is the healer. The
-    // session key value is never stored or echoed — write-only stays intact.
+    // auto-heal POST carries its machineId ⇒ that machine is the healer. An
+    // empty header names no machine, as the client registry reads it, and
+    // secrets.json refuses an empty source. Taken ONCE: the store keeps it
+    // beside the key (on Linux, so a restart restores it, ADR-0126 §3) and the
+    // status reports the same. The session key value is never echoed —
+    // write-only stays intact.
+    const provenance: CredentialProvenance = {
+      setAt: new Date().toISOString(),
+      source: c.req.header("x-maxprice-machine") || "local",
+    };
+    // Persist-first is the fail-closed ordering: if the write rejects, the
+    // 500 fires before the poller is armed or the status names a key — never
+    // a poller running on a credential that didn't persist.
+    await deps.persistCredential(parsed.data, provenance);
+    deps.usage.setCredential(parsed.data);
     deps.fanout.patchStatus({
       credentialPresent: true,
-      credentialUpdatedAt: new Date().toISOString(),
-      credentialSource: c.req.header("x-maxprice-machine") ?? "local",
+      credentialUpdatedAt: provenance.setAt,
+      credentialSource: provenance.source,
     });
     // A changed set is polled as the listing installs it; the explicit poll
     // then covers an unchanged one (a new key for the same Organizations) and

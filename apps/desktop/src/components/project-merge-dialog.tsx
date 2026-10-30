@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Check, ChevronDown } from "lucide-react";
-import { deriveProjectPath, type ProjectAnchorSnapshot } from "@maxprice/shared";
-import type { IdentityIndex } from "@/lib/project-identity";
+import {
+  deriveProjectPath,
+  type ProjectAnchorSnapshot,
+  type IdentityIndex,
+} from "@maxprice/shared";
 import { showToast } from "@/lib/toast";
 import { useProjectMerge } from "@/state/use-project-merges";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";

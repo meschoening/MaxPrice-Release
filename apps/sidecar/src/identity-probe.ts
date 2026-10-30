@@ -78,9 +78,9 @@ export type IdentityProber = {
   // change; it is the difference between a wedged `open(2)` costing one probe
   // and costing the entire sidecar for as long as it lasts.
   //
-  // Probes stay SEQUENTIAL. Nothing here is latency-critical, one path at a
-  // time bounds the pool cost to a single thread, and it keeps the
-  // one-record-call-per-probe-event rule below trivially true. Sequential is
+  // Probes stay SEQUENTIAL. One path at a time bounds the pool cost to a
+  // single thread, and keeps the one-record-call-per-probe-event rule below
+  // trivially true. Sequential is
   // also why each probe carries a DEADLINE (`PROBE_DEADLINE_MS`): without one,
   // a single wedged path would hold up every project queued behind it.
   //
@@ -99,6 +99,9 @@ export function createIdentityProber(deps: {
   // fleet.recordProbes — persists + emits identity:changed + (share-gated)
   // pushes. Called with the probed rows of ONE probe event, never per row.
   record: (rows: ProjectIdentityRow[]) => void;
+  // Synchronous transitions around whole rounds (scan + probes + record).
+  // Overlapping boot/rescan/new-slug rounds keep pending until all settle.
+  onPendingChange?: (pending: boolean) => void;
   probe?: (path: string) => Promise<ProbeResult>; // seam; default probeRepoId
   nowIso?: () => string; // seam; default () => new Date().toISOString()
   // Slow-probe watchdog seams (issue #183).
@@ -127,6 +130,16 @@ export function createIdentityProber(deps: {
   // Paths whose probe blew the deadline and has STILL not returned. Skipped
   // while they sit here — see `abandon`.
   const abandoned = new Set<string>();
+  let pending = 0;
+
+  async function trackRound(work: () => Promise<void>): Promise<void> {
+    if (pending++ === 0) deps.onPendingChange?.(true);
+    try {
+      await work();
+    } finally {
+      if (--pending === 0) deps.onPendingChange?.(false);
+    }
+  }
 
   // Names the path a probe is stuck on (issue #183, the half that async alone
   // cannot supply). `lsof` cannot answer this — a blocking `open(2)` has no
@@ -251,33 +264,36 @@ export function createIdentityProber(deps: {
     // a promise; a synchronous throw would sail straight past that guard, and
     // the boot one would then reach `unhandledRejection` — which exits the
     // sidecar the Rust shell never respawns.
-    runAll: async () => probePaths(selfExactProjectPaths(deps.getStore().query(), deps.machineId)),
+    runAll: () =>
+      trackRound(() => probePaths(selfExactProjectPaths(deps.getStore().query(), deps.machineId))),
     noticeSlug: async (slug) => {
       if (seen.has(slug)) return;
-      // The scope is SEMANTIC, not a saving. An unfiltered `query()` hands back
-      // the store's memoized sorted snapshot — no copy, no iteration — so a
-      // filtered store query is strictly MORE work than the unfiltered one, and
-      // the scoping cannot be justified on the query's cost. What it bounds is
-      // the PROBE set: unscoped, this would hand `probePaths` every project on
-      // the machine and re-stat the whole world the first time one new slug
-      // appears. The scan is affordable because the `seen` guard above makes
-      // this run at most ONCE PER SLUG for the process lifetime — not per
-      // watcher flush, which costs only that Set hit.
-      //
-      // Scoped through the store's own compiled matcher rather than a
-      // `slug ===` test because ADR-0061's project axis also admits the slug's
-      // WORKTREES, which is wanted — a worktree is its own directory with its
-      // own row — and that prefix rule must have exactly one definition.
-      const paths = selfExactProjectPaths(
-        deps.getStore().query(),
-        deps.machineId,
-        compileAxisMatcher({ projects: [slug] }),
-      );
-      // Even a no-cwd / unreachable miss counts as seen, or every subsequent
-      // flush for that slug re-queries (and re-stats a dead directory). The
-      // boot/rescan runAll re-covers it once a capture or the directory lands.
-      seen.add(slug);
-      await probePaths(paths);
+      await trackRound(async () => {
+        // The scope is SEMANTIC, not a saving. An unfiltered `query()` hands back
+        // the store's memoized sorted snapshot — no copy, no iteration — so a
+        // filtered store query is strictly MORE work than the unfiltered one, and
+        // the scoping cannot be justified on the query's cost. What it bounds is
+        // the PROBE set: unscoped, this would hand `probePaths` every project on
+        // the machine and re-stat the whole world the first time one new slug
+        // appears. The scan is affordable because the `seen` guard above makes
+        // this run at most ONCE PER SLUG for the process lifetime — not per
+        // watcher flush, which costs only that Set hit.
+        //
+        // Scoped through the store's own compiled matcher rather than a
+        // `slug ===` test because ADR-0061's project axis also admits the slug's
+        // WORKTREES, which is wanted — a worktree is its own directory with its
+        // own row — and that prefix rule must have exactly one definition.
+        const paths = selfExactProjectPaths(
+          deps.getStore().query(),
+          deps.machineId,
+          compileAxisMatcher({ projects: [slug] }),
+        );
+        // Even a no-cwd / unreachable miss counts as seen, or every subsequent
+        // flush for that slug re-queries (and re-stats a dead directory). The
+        // boot/rescan runAll re-covers it once a capture or the directory lands.
+        seen.add(slug);
+        await probePaths(paths);
+      });
     },
   };
 }

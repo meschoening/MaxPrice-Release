@@ -1,26 +1,14 @@
 import { Component, useEffect, type ErrorInfo, type ReactNode } from "react";
-import { usageConnectionDot } from "@maxprice/shared";
+import { hubDaemonState, liveClientCount } from "@maxprice/shared";
+import { HubStatusRows } from "@/components/HubStatusRows";
 import { useHubDaemonExited } from "@/state/use-hub-daemon-exited";
 import { useHubStatus } from "@/state/use-hub-status";
 import { useHubClients } from "@/state/use-hub-clients";
 import { useHubStream } from "@/state/use-hub-stream";
 import { useFirewallCheck } from "@/state/use-firewall";
 import { hidePopout, openMainWindow, quitApp, relaunchApp, setTrayTooltip } from "@/lib/tauri";
-import { dotVariant } from "@/lib/dot-variant";
 import { applyStoredTheme } from "@/lib/theme";
-import {
-  accessDot,
-  accessShortLabel,
-  hubDaemonDot,
-  hubDaemonLabel,
-  hubDaemonState,
-  hubDotPulse,
-  isDeliberateLoopback,
-  liveClientCount,
-  noFreshReading,
-  trayTooltip,
-  usageConnectionShortLabel,
-} from "@/lib/presentation";
+import { trayTooltip } from "@/lib/presentation";
 
 // Fire a Tauri command and log its rejection — never `void` it. Both sides of
 // these calls name the command with a STRING (lib/tauri.test.ts pins all three
@@ -38,15 +26,10 @@ function run(command: string, action: () => Promise<void>): void {
 // replaced the native two-item tray menu. Read-only stacked rows — the three
 // console card-head chips compressed, then the live clients count — a
 // divider, and the two actions. A stopped daemon (ADR-0112) trades the clients
-// count for a third action, Restart hub, ahead of the two. presentation.ts is
-// the only vocabulary source; nothing here re-derives a state.
-//
-// The row NAMES are deliberately shorter than the console cards they mirror
-// ("Hub" / "claude.ai", not "Hub status" / "Claude account"): they name a
-// subject the surrounding chrome has already established, and every pixel
-// they save comes off the window's configured width (tauri.conf.json). Same
-// reasoning as `usageConnectionShortLabel` / `accessShortLabel` on the value
-// side — this is a glance surface, not a card.
+// count for a third action, Restart hub, ahead of the two. The rows and the
+// clients line are HubStatusRows, which the Hub page renders too
+// (ADR-0124 §7); their words come from @maxprice/shared's hub-rows.ts and the
+// tooltip's from presentation.ts. Nothing here re-derives a state.
 export function Popout(): React.ReactElement {
   const { data: status, isError } = useHubStatus();
   const { data: firewall } = useFirewallCheck();
@@ -60,8 +43,9 @@ export function Popout(): React.ReactElement {
   const exited = useHubDaemonExited(isError);
   const daemon = hubDaemonState(isError, status, firewall, exited);
   // A stopped daemon (ADR-0112 §6) trades the clients line for the Restart hub
-  // door. The window is a fixed 224px with no room for a third action, and a
-  // dead daemon has no clients to count: the line would only be the em-dash.
+  // door: HubStatusRows drops the line, and the actions put Restart hub ahead
+  // of the two. The window is a fixed 224px with no room for a third action,
+  // and a dead daemon has no clients to count.
   const stopped = daemon === "stopped";
 
   // theme-boot.js stamps <html data-theme> once before first paint and
@@ -99,12 +83,6 @@ export function Popout(): React.ReactElement {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // No fresh reading while the daemon is starting / not responding: the
-  // dependent rows dim to a soft dot + em-dash rather than rendering stale
-  // claims beside a dead-daemon row (the trayTooltip rule, applied twice).
-  const dim = noFreshReading(daemon);
-  const conn = status?.usageConnection ?? "disconnected";
-  const passworded = status?.passwordProtected ?? false;
   const count = clients !== undefined ? liveClientCount(clients.clients) : null;
 
   // `role="group"`, not `role="menu"`: the frame owns three read-only status
@@ -115,42 +93,7 @@ export function Popout(): React.ReactElement {
   // implement. MachinesCard's `role="menu"` is a real menu and stays.
   return (
     <div className="popout-frame" role="group" aria-label="MaxPrice Hub">
-      <div className="prows" role="group" aria-label="Hub status">
-        <Row
-          name="Hub"
-          dot={dotVariant(hubDaemonDot(daemon, isDeliberateLoopback(status)))}
-          pulse={hubDotPulse(daemon)}
-          state={hubDaemonLabel(daemon)}
-        />
-        <Row
-          name="claude.ai"
-          dim={dim}
-          dot={dim ? "soft" : dotVariant(usageConnectionDot(conn))}
-          state={dim ? "—" : usageConnectionShortLabel(conn)}
-        />
-        <Row
-          name="Access"
-          dim={dim}
-          dot={dim ? "soft" : dotVariant(accessDot(passworded))}
-          state={dim ? "—" : accessShortLabel(passworded)}
-        />
-        {/* Left-aligned, no dot (T1): the count leads, flush with the dots'
-            edge. Dims with the others — and an unfetched roster reads as the
-            same honest em-dash, never a stale number. */}
-        {stopped ? null : (
-          <div className={dim || count === null ? "prow dim" : "prow"}>
-            <span className="state clients">
-              {dim || count === null ? (
-                "— connected clients"
-              ) : (
-                <>
-                  <b>{count}</b> connected clients
-                </>
-              )}
-            </span>
-          </div>
-        )}
-      </div>
+      <HubStatusRows daemon={daemon} status={status} liveClients={count} />
       <div className="pdivider" aria-hidden />
       <PopoutActions restart={stopped} />
     </div>
@@ -249,28 +192,6 @@ function PopoutFallback(): React.ReactElement {
       </div>
       <div className="pdivider" aria-hidden />
       <PopoutActions />
-    </div>
-  );
-}
-
-function Row({
-  name,
-  dot,
-  state,
-  dim = false,
-  pulse = false,
-}: {
-  name: string;
-  dot: string;
-  state: string;
-  dim?: boolean;
-  pulse?: boolean;
-}): React.ReactElement {
-  return (
-    <div className={dim ? "prow dim" : "prow"}>
-      <span aria-hidden className={`dot ${dot}${pulse ? " pulse-anim" : ""}`} />
-      <span className="name">{name}</span>
-      <span className="state">{state}</span>
     </div>
   );
 }

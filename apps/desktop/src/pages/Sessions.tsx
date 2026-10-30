@@ -3,13 +3,21 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Check, Copy } from "lucide-react";
 import {
+  abbreviate,
+  aggregateSessions,
   deriveProjectName,
   deriveProjectPath,
-  formatRelativeTime,
-  parentProjectPath,
+  formatCalendarDay,
+  formatCost,
+  organizationCellLabels,
+  RANGE_LABEL,
   type SessionRow,
+  type SessionsAggregate,
+  resolveDateRange,
+  machineName,
+  sessionProjectName,
 } from "@maxprice/shared";
-import { resolveDateRange, useFilters } from "@/state/filters";
+import { useFilters } from "@/state/filters";
 import { useWeekWindow } from "@/state/use-week";
 import { useSettings } from "@/state/use-settings";
 import { useOrganizationScope } from "@/state/use-organization-scope";
@@ -23,12 +31,10 @@ import { useMachineAxis } from "@/state/use-machine-axis";
 import { useProjectAxis } from "@/state/use-project-axis";
 import { useCorpusEmpty } from "@/state/use-corpus-empty";
 import { useEscapeToDeselect } from "@/state/use-escape-deselect";
-import { machineName } from "@/lib/machines";
 import {
   chooserOptions,
   groupOwnerless,
   isOwnerless,
-  organizationCellLabels,
   pruneSelection,
   selectionSummary,
   shownSessionIds,
@@ -59,9 +65,6 @@ import { UnpricedChip } from "@/components/unpriced-chip";
 import { ModelSplitBar } from "@/components/model-split-bar";
 import { useArrangement } from "@/state/use-arrangement";
 import { costBarColumn } from "@/components/cost-bar";
-import { aggregateSessions, type SessionsAggregate } from "@/lib/aggregate";
-import { formatCost, RANGE_LABEL } from "@/lib/list-format";
-import { abbreviate } from "@/lib/active-block";
 import {
   isOwnerlessView,
   selectedIdFromParams,
@@ -84,11 +87,6 @@ const NONE: ReadonlySet<string> = new Set();
 // changes — DataTable's `processed` memo keys on `rowId`, so an inline arrow
 // here would re-filter+re-sort every row on every render.
 const sessionRowId = (s: SessionRow): string => s.sessionId;
-
-// The project a session belongs to, which for a worktree session is the
-// repository above it (ADR-0061). Derived from the session's own `path` — no
-// project list needed, so this can never disagree with a row that hasn't loaded.
-const sessionProjectName = (s: SessionRow): string => deriveProjectName(parentProjectPath(s.path));
 
 // What the All-scope Organization cell prints, as search keys: its label (""
 // for the em dash, as before #312) and a partly owned session's owner-less half.
@@ -229,11 +227,11 @@ export function SessionsPage(): React.ReactElement {
         width: "132px",
         sortValue: (s: SessionRow) => Date.parse(s.lastActivity) || 0,
         cell: (s: SessionRow) => (
-          <span title={s.lastActivity}>{formatRelativeTime(s.lastActivity, Date.now())}</span>
+          <span title={s.lastActivity}>{formatCalendarDay(s.lastActivity, tz, Date.now())}</span>
         ),
       },
     ],
-    [machineAxis, isAll, multi, labels, wide, barMax],
+    [machineAxis, isAll, multi, labels, wide, barMax, tz],
   );
   const rows = useMemo(() => query.data?.sessions ?? [], [query.data]);
 
@@ -344,6 +342,7 @@ export function SessionsPage(): React.ReactElement {
         loaded={query.data !== undefined}
         labels={labels}
         home={settings?.homeOrganization ?? null}
+        tz={tz}
         searchKeys={searchKeys}
         strip={strip}
         headerAction={ownerlessSwitch}
@@ -409,6 +408,7 @@ function OwnerlessReview({
   loaded,
   labels,
   home,
+  tz,
   searchKeys,
   strip,
   headerAction,
@@ -421,6 +421,8 @@ function OwnerlessReview({
   labels: ReadonlyMap<string, string>;
   // The settings Home: the chooser's first option, marked "(home)".
   home: string | null;
+  // The settings Timezone, which decides the rows' today.
+  tz: string | undefined;
   // The table's search keys, so the review search finds what the table's does.
   searchKeys: (s: SessionRow) => string[];
   strip: React.ReactNode;
@@ -521,6 +523,7 @@ function OwnerlessReview({
               selected={live}
               open={open}
               search={search}
+              tz={tz}
               now={Date.now()}
               headerAction={headerAction}
               emptyMessage={emptyMessage}

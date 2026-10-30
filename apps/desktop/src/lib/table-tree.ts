@@ -22,6 +22,8 @@
 //      is sorted — which is what lets the virtualizer count one flat list while
 //      a re-sort can never separate a child from its parent.
 
+import { hasDisclosableChildren } from "@maxprice/shared";
+
 export type TreeEntry<Row> = { row: Row; child: boolean };
 
 export type FlattenInput<Row> = {
@@ -45,29 +47,6 @@ export type FlattenInput<Row> = {
 function compare(a: number | string, b: number | string): number {
   if (typeof a === "number" && typeof b === "number") return a - b;
   return String(a).localeCompare(String(b));
-}
-
-// Whether a row has enough children to be worth disclosing. The single source
-// of this rule: the flatten below decides whether to emit children, and the
-// table decides whether to draw a disclosure control, and the two MUST agree —
-// disagreement renders either a control that opens nothing or children with no
-// control to close them.
-//
-// Two invariants live in the ">1", and both are load-bearing:
-//   - A project whose only member is its own directory is not a tree. It must
-//     render exactly as it did before trees existed: no control, no child row
-//     repeating its own name beneath it.
-//   - The count is of the FULL child set, never the search-filtered one.
-//     "This project has no worktrees" is a property of the project, not of what
-//     the current search happened to match. Counting the filtered set is the
-//     bug this module was extracted for: a search matching exactly one worktree
-//     left one child, looked identical to a worktree-less project, and shut the
-//     row on the very search that should have opened it.
-export function hasDisclosableChildren(children: {
-  lead: readonly unknown[];
-  rest: readonly unknown[];
-}): boolean {
-  return children.lead.length + children.rest.length > 1;
 }
 
 export function flattenTreeRows<Row>(input: FlattenInput<Row>): {
@@ -125,8 +104,8 @@ export function flattenTreeRows<Row>(input: FlattenInput<Row>): {
   for (const row of ordered) {
     entries.push({ row, child: false });
     const id = rowId(row);
-    // `all`, never `shown` — see `hasDisclosableChildren` for why the decision
-    // is made on the full child set.
+    // `all`, never `shown` — see `hasDisclosableChildren` (`project-fold.ts`)
+    // for why the decision is made on the full child set.
     const all = childrenOf(row);
     if (!hasDisclosableChildren(all)) continue;
     const picked = shown.get(id);

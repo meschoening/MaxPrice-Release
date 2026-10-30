@@ -5,10 +5,15 @@ import {
   type StoredUsageCredential,
   type UsageCredential,
 } from "@maxprice/shared";
+import { createFileCredstore, secretsPath } from "./secrets";
 
-// TS face of the Rust keyring helper (see credstore/src/main.rs). The secret
-// crosses process boundaries via stdin/stdout only. The helper inherits this
-// process's env, so MAXPRICE_CREDSTORE_ACCOUNT (tests) flows through.
+// Where the Hub keeps its claude.ai session key (ADR-0035, ADR-0126 §1), chosen
+// by the platform in `openCredstore`: on Linux, `<data dir>/secrets.json`
+// (secrets.ts), and nowhere else; elsewhere the OS keychain through the Rust
+// keyring helper (credstore/src/main.rs), else memory. The rest of this module
+// is the helper's TS face: the secret crosses process boundaries via
+// stdin/stdout only, and the helper inherits this process's env, so
+// MAXPRICE_CREDSTORE_ACCOUNT (tests) flows through.
 
 const exeExt = process.platform === "win32" ? ".exe" : "";
 
@@ -34,11 +39,19 @@ export function resolveCredstorePath(
   return null;
 }
 
-// `get` reads what the keychain holds — a pre-#283 entry still carries the
-// `orgId` the boot stamp needs (ADR-0104); `set` only ever writes the key.
+// When the key was set and by whom: `credentialUpdatedAt` and
+// `credentialSource` on HubStatus (ADR-0036), "local" for the console's push or
+// a healing client's machine id. POST /api/credential takes it once per push.
+export type CredentialProvenance = { setAt: string; source: string };
+
+// `get` reads what the store holds — a pre-#283 keychain entry still carries
+// the `orgId` the boot stamp needs (ADR-0104), and the file store's entry its
+// provenance, which the boot restores to the status (ADR-0126 §3); `set` only
+// ever writes the key, with its provenance where the store keeps one. The
+// keychain and memory stores keep none: theirs is lost at a restart.
 export type Credstore = {
-  get: () => Promise<StoredUsageCredential | null>;
-  set: (cred: UsageCredential | null) => Promise<void>;
+  get: () => Promise<(StoredUsageCredential & { provenance?: CredentialProvenance }) | null>;
+  set: (cred: UsageCredential | null, provenance?: CredentialProvenance) => Promise<void>;
 };
 
 // Injectable helper-IPC seam. The default spawns the Rust binary; tests pass a
@@ -133,9 +146,10 @@ export function createCredstore(
   };
 }
 
-// Fallback when no helper binary is found (a dev box without cargo): the hub
-// still runs, the credential is memory-only — exactly ADR-0035's rejected-as-
-// end-state but acceptable-as-degraded mode (a client re-push re-arms it).
+// Fallback, off Linux, when no helper binary is found (a dev box without
+// cargo): the hub still runs, the credential is memory-only — exactly
+// ADR-0035's rejected-as-end-state but acceptable-as-degraded mode (a client
+// re-push re-arms it). A Linux Hub never falls back to it (ADR-0126 §1).
 // `initial` seeds it (tests: a pre-#283 entry for the boot migration).
 export function createMemoryCredstore(initial: StoredUsageCredential | null = null): Credstore {
   let held: StoredUsageCredential | null = initial;
@@ -146,4 +160,34 @@ export function createMemoryCredstore(initial: StoredUsageCredential | null = nu
       return Promise.resolve();
     },
   };
+}
+
+const MEMORY_ONLY =
+  "[hub] no credstore helper found — credential will be memory-only (set MAXPRICE_CREDSTORE_PATH or build credstore/)";
+
+export type OpenCredstoreOptions = {
+  platform?: NodeJS.Platform;
+  env?: Record<string, string | undefined>;
+  // The file store's status line (stdout).
+  log: (line: string) => void;
+  // The file store's tighten and skip lines, and the memory-only warning
+  // (stderr).
+  warn: (line: string) => void;
+};
+
+// serve's store for the key (ADR-0126 §1). The platform decides, not
+// headlessness: on Linux every Hub, an embedded one run from source included,
+// keeps its key in `<data dir>/secrets.json`, and never resolves the helper,
+// MAXPRICE_CREDSTORE_PATH included, nor falls back to memory, since the
+// helper's keyring there loses the key at a reboot or refuses every write
+// (#450). Elsewhere, as before: the helper, else memory with a warning.
+export function openCredstore(
+  dataDir: string,
+  { platform = process.platform, env = process.env, log, warn }: OpenCredstoreOptions,
+): Credstore {
+  if (platform === "linux") return createFileCredstore(secretsPath(dataDir), { log, warn });
+  const helper = resolveCredstorePath(env);
+  if (helper !== null) return createCredstore(helper);
+  warn(MEMORY_ONLY);
+  return createMemoryCredstore();
 }

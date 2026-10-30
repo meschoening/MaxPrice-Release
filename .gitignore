@@ -17,11 +17,14 @@ apps/desktop/src-tauri/gen/
 apps/hub/credstore/target/
 apps/hub-desktop/src-tauri/target/
 
-# Compiled sidecar/hub binaries (built per-target during the release build)
+# Compiled sidecar/hub/CLI binaries (built per-target during the release build;
+# apps/cli/binaries/ and apps/hub/binaries/ also hold the Headless client's and
+# the Headless Hub's tarballs and their .sigs)
 apps/sidecar/binaries/
 apps/desktop/src-tauri/binaries/
 apps/hub/binaries/
 apps/hub-desktop/src-tauri/binaries/
+apps/cli/binaries/
 
 # Editor / OS
 .vscode/

@@ -38,10 +38,10 @@ import {
 // levels of the walk (directories AND files), so the in-flight ceiling really is
 // `concurrency` rather than `concurrency²` — see `walkTree`.
 
-// Basenames of the files main() writes beside `usage-history.jsonl`. Exported
-// so main() JOINS THESE rather than repeating the literals: the segment
-// attribution below is by basename, so a drift between the two would silently
-// move a 40 MB file into `other`.
+// Basenames of the files bootSidecar() writes beside `usage-history.jsonl`.
+// Exported so bootSidecar() JOINS THESE rather than repeating the literals: the
+// segment attribution below is by basename, so a drift between the two would
+// silently move a 40 MB file into `other`.
 export const STORAGE_FILE = {
   fleetReplica: "fleet-events.sqlite",
   localArchive: "local-archive.sqlite",
@@ -255,8 +255,8 @@ export async function walkTree(
  *
  * The env var is a path LIST joined by the platform delimiter, not a single
  * path: the profile is one directory on Windows, two on macOS and nine on Linux
- * (#125). Exported so main() calls THIS rather than inlining the split — the
- * inline copy and the test's copy of it could only agree by luck.
+ * (#125). Exported so bootSidecar() calls THIS rather than inlining the split —
+ * the inline copy and the test's copy of it could only agree by luck.
  */
 export function parseWebviewProfileDirs(raw: string | undefined): string[] {
   return (raw ?? "").split(delimiter).filter((p) => p !== "");
@@ -362,10 +362,10 @@ export type StorageReporter = {
   // anyway — and a report that is always freshly measured cannot be caught
   // lying.
   read: () => Promise<StorageSnapshot>;
-  // The safe action (#132). Lives here rather than in main() because it acts on
-  // exactly the two things `read` measures for its `clean` preview, through the
-  // same deps — the app-data path and the live replica accessor. Serialized
-  // against itself; see `clean` below.
+  // The safe action (#132). Lives here rather than in bootSidecar() because it
+  // acts on exactly the two things `read` measures for its `clean` preview,
+  // through the same deps — the app-data path and the live replica accessor.
+  // Serialized against itself; see `clean` below.
   clean: () => Promise<StorageCleanResponse>;
 };
 

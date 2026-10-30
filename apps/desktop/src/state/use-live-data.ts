@@ -1,7 +1,17 @@
 import { useMemo } from "react";
-import type { BlockRow, DailyRow, ProjectRow, SessionRow } from "@maxprice/shared";
-import { isoFromYmd, ymdShift } from "@/lib/dates";
-import { resolveDateRange, useFilters } from "./filters";
+import {
+  activeBlockOf,
+  type BlockRow,
+  type DailyRow,
+  type ProjectRow,
+  type SessionRow,
+  isoFromYmd,
+  ymdShift,
+  resolveDateRange,
+  foldProjectRows,
+  typicalBlockTokens,
+} from "@maxprice/shared";
+import { useFilters } from "./filters";
 import { useSettings } from "./use-settings";
 import { useOrganizationScope } from "./use-organization-scope";
 import { useNowTick } from "./use-now-tick";
@@ -13,8 +23,6 @@ import { useSessions } from "./use-sessions";
 import { useProjects } from "./use-projects";
 import { useMachineAxis } from "./use-machine-axis";
 import { useProjectAxis } from "./use-project-axis";
-import { typicalBlockTokens } from "@/lib/aggregate";
-import { foldProjectRows } from "@/lib/projects";
 
 // Today/yesterday/week derive from a 14-day window — covers the current and
 // prior week tiles + today and yesterday tiles in one cache entry per range.
@@ -228,7 +236,7 @@ export function useLiveData(): LiveData {
       rollingPrevWeekRows.find((r) => r.date === yesterdayIso) ??
       null;
 
-    const activeBlock = blocks.find((b) => b.isActive && !b.isGap) ?? null;
+    const activeBlock = activeBlockOf(blocks) ?? null;
     // The "typical" block — median tokens across the range's completed blocks
     // (excludes the active block + gaps). Backs the Active block tile's
     // "typical" row.

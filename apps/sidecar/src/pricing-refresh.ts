@@ -113,7 +113,7 @@ export function schedulePricingRefresh(opts: {
   const handle = setIntervalImpl(() => {
     // `refreshPricing` never rejects by contract; the attempt rejects only if
     // the status patch throws. Either way a timer callback must not surface it
-    // — `index.ts` turns an unhandled rejection into a sidecar shutdown.
+    // — `boot.ts` turns an unhandled rejection into a sidecar shutdown.
     void opts.attempt().catch((err: unknown) => {
       console.warn("[sidecar] periodic pricing refresh failed:", err);
     });
@@ -121,14 +121,14 @@ export function schedulePricingRefresh(opts: {
   return { stop: () => clearIntervalImpl(handle) };
 }
 
-// The handle `main()` keeps: `stop()` cancels both timers; `refreshNow()`
-// is what POST /api/pricing/refresh calls (ADR-0085).
+// The handle `bootSidecar()` keeps: `stop()` cancels both timers;
+// `refreshNow()` is what POST /api/pricing/refresh calls (ADR-0085).
 export type PricingRefresher = PricingRefreshLoop & {
   refreshNow: () => Promise<PricingRefreshResponse>;
   republish: () => void;
 };
 
-// The SINGLE wiring site: `main()` calls this once, after the LISTENING
+// The SINGLE wiring site: `bootSidecar()` calls this once, after the LISTENING
 // handshake, and keeps the returned handle.
 //
 // Startup, daily, manual and model-discovery callers share ONE attempt
@@ -286,7 +286,7 @@ export function wirePricingRefresh(opts: {
 
   // The startup arm. `void`ed so it never gates the handshake / scan / any
   // endpoint; its own `.catch` keeps a throwing `patch` away from
-  // `unhandledRejection`, which `index.ts` handles by exiting the process.
+  // `unhandledRejection`, which `boot.ts` handles by exiting the process.
   // With `startupFetch: false` it reads the cache and attempts nothing.
   const startup =
     opts.startupFetch === false ? (opts.cachePath ? readCache(opts.cachePath) : null) : attempt();
@@ -328,8 +328,8 @@ function sameList(a: readonly string[], b: readonly string[]): boolean {
 // Subscribe to a store's change feed and call `republish` the first time any
 // raw model string appears in a batch (#110). Cheap by construction: one Set
 // lookup per changed row, and `republish` itself only broadcasts when the
-// unpriced list actually moved. Returns the unsubscribe; `main()` re-attaches
-// on the fleet's store swap, the way the local archive does.
+// unpriced list actually moved. Returns the unsubscribe; `bootSidecar()`
+// re-attaches on the fleet's store swap, the way the local archive does.
 export function watchNewModels(
   store: Pick<EventStore, "onChanged">,
   republish: () => void,

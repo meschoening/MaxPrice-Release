@@ -1,0 +1,723 @@
+/* The User guide's stylesheet. Glass arrives as a dependency, never a copy
+   (ADR-0131 §7): its tokens and the self-hosted Manrope come from the one
+   source. Glass has no prose styles, so the frame (ADR-0135 §1), the prose
+   layer (§2) and the blocks (§3) are written here, from Glass tokens only. */
+@import "@maxprice/glass";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+}
+html {
+  scroll-padding-top: 16px;
+}
+/* Text in an accent or status tone is mixed toward ink, which deepens it in
+   light and lifts it in dark: the light theme's --accent and status tokens
+   fall below 4.5:1 for body-size text on the page panel (#567's measurements).
+   The mix is in OKLab, so amber does not swing through red to reach indigo. */
+:root {
+  --link: color-mix(in oklab, var(--accent) 85%, var(--text));
+}
+body {
+  font-size: 15px;
+  line-height: 1.65;
+  /* Glass's tabular default is for the apps' numbers, not for prose. */
+  font-variant-numeric: normal;
+}
+a {
+  color: var(--link);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2.5px;
+  text-decoration-color: color-mix(in oklch, var(--accent) 40%, transparent);
+}
+a:hover {
+  text-decoration-color: currentColor;
+}
+.ic {
+  width: 1em;
+  height: 1em;
+  flex-shrink: 0;
+  vertical-align: -0.125em;
+}
+a.external .ic {
+  width: 0.78em;
+  height: 0.78em;
+  margin-left: 2px;
+  opacity: 0.7;
+}
+
+/* ================= the frame (ADR-0135 §1) ================= */
+.skip-link {
+  position: absolute;
+  left: 16px;
+  top: -100px;
+  z-index: 20;
+  padding: 7px 14px;
+  border-radius: 999px;
+  background: var(--panel-opaque);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--chip-shadow);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+}
+.skip-link:focus {
+  top: 16px;
+}
+
+.frame {
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+  max-width: 1380px;
+  margin: 0 auto;
+  padding: 16px max(16px, env(safe-area-inset-right, 0px)) 0
+    max(16px, env(safe-area-inset-left, 0px));
+}
+
+/* The identity: the orb, the wordmark and the guide's badge. */
+.identity {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  text-decoration: none;
+  flex-shrink: 0;
+}
+.identity .logo {
+  --logo-d: 28px;
+}
+.identity .wordmark {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+.identity .badge {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  line-height: 1.5;
+  color: var(--soft);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+}
+
+/* The detached sidebar. It scrolls on its own, since every group starts open. */
+.sidebar {
+  position: sticky;
+  top: 16px;
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  padding: 18px 10px 20px;
+}
+.sidebar .identity {
+  padding: 0 8px 6px;
+}
+.sidebar-nav {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline);
+}
+
+/* The tree: each section is a disclosure in ink, its pages hang off an
+   indented hairline guide in the soft tone, and the current page wears the
+   accent pill, its stretch of the guide turned accent. */
+.nav-home,
+.nav-group a {
+  position: relative;
+  display: block;
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--soft);
+  text-decoration: none;
+  transition:
+    color 0.15s,
+    background-color 0.15s;
+}
+.nav-home {
+  margin-bottom: 6px;
+  /* Its text lines up with the section names, past their chevrons. */
+  padding: 6px 10px 6px 27px;
+  border-radius: 10px;
+  font-weight: 650;
+  color: var(--text);
+}
+.nav-home:hover,
+.nav-group a:hover {
+  color: var(--text);
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+}
+.nav-home.active,
+.nav-group a.active {
+  color: var(--text);
+  font-weight: 600;
+  background: color-mix(in oklch, var(--accent) 22%, transparent);
+  box-shadow: var(--panel-inner);
+}
+.nav-group + .nav-group {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--hairline);
+}
+.nav-group > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px 6px 8px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.nav-group > summary::-webkit-details-marker {
+  display: none;
+}
+.nav-group > summary:hover {
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+}
+.nav-group > summary .ic {
+  width: 13px;
+  height: 13px;
+  color: var(--soft);
+  transition: transform 0.18s var(--ease-glass);
+}
+.nav-group[open] > summary .ic {
+  transform: rotate(90deg);
+}
+.nav-group.current > summary .ic {
+  color: var(--accent);
+}
+.nav-group ul {
+  list-style: none;
+  margin: 1px 0 8px 15px;
+  padding: 0 0 0 9px;
+  border-left: 1px solid var(--hairline);
+}
+.nav-group li + li {
+  margin-top: 1px;
+}
+.nav-group a.active::before {
+  content: "";
+  position: absolute;
+  left: -10px;
+  top: 3px;
+  bottom: 3px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+/* The page panel; on a wide window, "On this page" is a rail inside it. */
+.page {
+  min-width: 0;
+  padding: 40px 52px 44px;
+}
+.page-column {
+  min-width: 0;
+}
+.on-this-page.rail {
+  display: none;
+}
+@media (width >= 1260px) {
+  .page.has-rail {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 210px;
+    gap: 40px;
+  }
+  .page.has-rail .on-this-page.rail {
+    display: block;
+    position: sticky;
+    top: 56px;
+    align-self: start;
+    max-height: calc(100dvh - 72px);
+    overflow-y: auto;
+    scrollbar-width: thin;
+    /* Room inside the scroller for a link's focus ring (2px, offset 2px). */
+    margin: 0 -4px;
+    padding: 0 4px 4px;
+  }
+  .page.has-rail .on-this-page.box {
+    display: none;
+  }
+}
+/* Inside the article under the lead, so it outranks the prose layer's lists. */
+.prose .on-this-page ul,
+.on-this-page ul {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+}
+.prose .on-this-page li + li,
+.on-this-page li + li {
+  margin-top: 2px;
+}
+.on-this-page a {
+  display: block;
+  padding: 3px 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--soft);
+  text-decoration: none;
+}
+.on-this-page a:hover {
+  color: var(--text);
+}
+.on-this-page.box {
+  max-width: 72ch;
+  margin: 0 0 22px;
+  padding: 10px 16px;
+  border-radius: 14px;
+  border: 1px solid var(--hairline);
+}
+.on-this-page.box ul {
+  columns: 2 220px;
+  column-gap: 24px;
+}
+.on-this-page.box li {
+  break-inside: avoid;
+}
+
+/* Previous and next, in manifest order. */
+.pager {
+  max-width: 72ch;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 36px;
+}
+.pager a {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 12px 16px;
+  border-radius: 14px;
+  border: 1px solid var(--hairline);
+  color: var(--text);
+  text-decoration: none;
+}
+.pager a:hover {
+  border-color: color-mix(in oklch, var(--accent) 45%, var(--hairline));
+}
+.pager .next {
+  grid-column: 2;
+  text-align: right;
+}
+.pager-label {
+  font-size: 14.5px;
+  font-weight: 600;
+}
+
+.site-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px 18px;
+  padding: 28px 16px 40px;
+  font-size: 12.5px;
+  color: var(--soft);
+}
+.site-foot a {
+  color: var(--soft);
+}
+
+/* Narrow windows: a frosted pill header whose Menu opens the same tree in an
+   opaque leaf. A frosted leaf inside the frosted header would have nothing
+   behind it to blur. */
+.top-bar {
+  display: none;
+}
+.guide-menu {
+  position: relative;
+}
+.guide-menu > summary {
+  list-style: none;
+  cursor: pointer;
+}
+.guide-menu > summary::-webkit-details-marker {
+  display: none;
+}
+.guide-menu[open] > summary {
+  color: var(--text);
+  border-color: color-mix(in oklch, var(--accent) 45%, var(--panel-border));
+}
+.menu-leaf {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 10px);
+  width: min(340px, calc(100vw - 32px));
+  max-height: min(70dvh, 640px);
+  overflow-y: auto;
+  padding: 12px 10px 16px;
+  background: var(--panel-opaque);
+}
+@media (width < 920px) {
+  html {
+    scroll-padding-top: 80px;
+  }
+  .frame {
+    grid-template-columns: minmax(0, 1fr);
+    padding-top: 12px;
+  }
+  .sidebar {
+    display: none;
+  }
+  .top-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 10px;
+    z-index: 5;
+    margin: 10px max(16px, env(safe-area-inset-right, 0px)) 0
+      max(16px, env(safe-area-inset-left, 0px));
+    padding: 7px 8px 7px 10px;
+    border-radius: 999px;
+    backdrop-filter: var(--frost-head);
+    -webkit-backdrop-filter: var(--frost-head);
+  }
+  .page {
+    padding: 28px 22px 32px;
+  }
+}
+
+/* ================= the prose layer (ADR-0135 §2) ================= */
+.prose {
+  min-width: 0;
+  max-width: 72ch;
+  overflow-wrap: break-word;
+}
+.prose .kicker {
+  margin: 0 0 6px;
+}
+.prose h1 {
+  margin: 0 0 10px;
+  font-size: 30px;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+.prose .lead {
+  margin: 0 0 22px;
+  font-size: 17px;
+  line-height: 1.6;
+  color: var(--soft);
+}
+.prose h2 {
+  margin: 40px 0 10px;
+  padding-top: 18px;
+  border-top: 1px solid var(--hairline);
+  font-size: 20px;
+  line-height: 1.3;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+.prose h3 {
+  margin: 26px 0 8px;
+  font-size: 16px;
+  line-height: 1.4;
+  font-weight: 650;
+}
+.prose h4,
+.prose h5,
+.prose h6 {
+  margin: 20px 0 6px;
+  font-size: 14px;
+  line-height: 1.4;
+  font-weight: 650;
+}
+.prose p,
+.prose ul,
+.prose ol,
+.prose dl {
+  margin: 0 0 14px;
+}
+.prose ul,
+.prose ol {
+  padding-left: 22px;
+}
+.prose li + li {
+  margin-top: 4px;
+}
+.prose li > ul,
+.prose li > ol {
+  margin: 4px 0 0;
+}
+.prose strong {
+  font-weight: 650;
+}
+.prose :not(pre) > code {
+  padding: 1.5px 6px;
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+  font-size: 0.86em;
+  overflow-wrap: anywhere;
+}
+.prose kbd {
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--hairline);
+  font-size: 0.86em;
+}
+.prose hr {
+  margin: 28px 0;
+  border: 0;
+  border-top: 1px solid var(--hairline);
+}
+.prose blockquote {
+  margin: 0 0 14px;
+  padding-left: 14px;
+  border-left: 2px solid var(--hairline);
+  color: var(--soft);
+}
+.prose details {
+  margin: 0 0 14px;
+}
+.prose summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+/* ================= the blocks (ADR-0135 §3) ================= */
+
+/* A command (```sh) is a Terminal block; any other fence is labelled with its
+   language. One click on a command selects all of it; copy.js adds a Copy
+   button to its head (§4). */
+.terminal,
+.code {
+  margin: 0 0 16px;
+  border-radius: 14px;
+  border: 1px solid var(--hairline);
+  background: color-mix(in oklch, var(--text) 4.5%, transparent);
+  overflow: hidden;
+}
+.block-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 4px 8px 4px 14px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--soft);
+}
+.block-head .ic {
+  width: 13px;
+  height: 13px;
+  color: var(--accent);
+}
+.terminal pre,
+.code pre {
+  margin: 0;
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.55;
+}
+/* A long line makes the block a keyboard scroller; its block clips anything
+   drawn outside it, so the focus ring is drawn inside. */
+.terminal pre:focus-visible,
+.code pre:focus-visible {
+  outline-offset: -2px;
+}
+.terminal code {
+  user-select: all;
+  -webkit-user-select: all;
+  cursor: text;
+}
+.copy-button {
+  margin-left: auto;
+  padding: 3px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+  background: var(--panel);
+  box-shadow: var(--panel-inner);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  color: var(--soft);
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    border-color 0.15s;
+}
+.copy-button:hover {
+  color: var(--text);
+  border-color: color-mix(in oklch, var(--accent) 35%, var(--panel-border));
+}
+
+/* Callouts are GitHub alerts, each in one Glass token. */
+.alert {
+  --tone: var(--accent);
+  margin: 0 0 16px;
+  padding: 12px 16px 2px;
+  border-radius: 14px;
+  background: color-mix(in oklch, var(--tone) 9%, transparent);
+  border: 1px solid color-mix(in oklch, var(--tone) 30%, transparent);
+}
+.alert-tip {
+  --tone: var(--live);
+}
+.alert-important {
+  --tone: var(--opus);
+}
+.alert-warning {
+  --tone: var(--warn);
+}
+.alert-caution {
+  --tone: var(--bad);
+}
+.alert-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 4px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: color-mix(in oklab, var(--tone) 70%, var(--text));
+}
+.alert-title .ic {
+  width: 15px;
+  height: 15px;
+}
+.alert p,
+.alert ul,
+.alert ol {
+  margin-bottom: 10px;
+}
+.alert .terminal,
+.alert .code {
+  margin-bottom: 12px;
+}
+
+/* Platform sections, stacked: a row of jump links, then one block each. */
+.platforms {
+  margin: 8px 0 22px;
+}
+.platform-jump {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-bottom: 6px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--chip-shadow), var(--panel-inner);
+}
+.platform-jump a {
+  padding: 4px 13px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--soft);
+  text-decoration: none;
+}
+.platform-jump a:hover {
+  color: var(--text);
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+}
+.platform {
+  margin-top: 14px;
+  padding: 4px 18px 6px;
+  border-radius: 16px;
+  border: 1px solid var(--hairline);
+}
+.platform h3 {
+  margin-top: 14px;
+}
+
+/* A screenshot, at the size of the window it was taken from, or narrower. */
+.screenshot {
+  margin: 8px 0 24px;
+}
+.screenshot img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+  border-radius: 12px;
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-shadow);
+}
+.screenshot figcaption {
+  margin-top: 10px;
+  font-size: 12.5px;
+  text-align: center;
+  color: var(--soft);
+}
+
+/* Padded so a link's focus ring fits inside the scroller. */
+.table-wrap {
+  margin: -4px -4px 14px;
+  padding: 4px;
+  overflow-x: auto;
+}
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.prose th {
+  padding: 6px 12px 8px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  text-align: left;
+  color: var(--soft);
+}
+.prose td {
+  padding: 9px 12px 9px 0;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: top;
+}
+
+@media (width <= 560px) {
+  .prose h1 {
+    font-size: 25px;
+  }
+  .prose .lead {
+    font-size: 16px;
+  }
+  .pager {
+    grid-template-columns: 1fr;
+  }
+  .pager .next {
+    grid-column: 1;
+    text-align: left;
+  }
+  .identity .badge {
+    display: none;
+  }
+}

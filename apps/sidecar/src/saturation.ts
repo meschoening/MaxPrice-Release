@@ -160,7 +160,7 @@ export function startSaturationReporting(deps: SaturationReportingDeps): Saturat
   // status patch is REPORTING; the sampler's job is measurement, and a broken
   // consumer must stop neither. The heartbeat site is the more exposed of the
   // two: it is a bare interval callback, and the sidecar wires no
-  // `uncaughtException` handler (index.ts), so an escaping throw there exits
+  // `uncaughtException` handler (boot.ts), so an escaping throw there exits
   // the process — and the Rust shell does not respawn ("No respawn here by
   // design", lib.rs). Guarding only the edge would leave that path live while
   // reading as handled.
@@ -246,7 +246,7 @@ export function createSaturationSampler(deps?: SaturationSamplerDeps): Saturatio
 
   // Reporting is not measurement: a broken consumer must not stop the sampler
   // or take the process down. There is no `uncaughtException` handler
-  // (index.ts wires only SIGINT / SIGTERM / unhandledRejection) and an uncaught
+  // (boot.ts wires only SIGINT / SIGTERM / unhandledRejection) and an uncaught
   // throw from a timer callback terminates Bun with exit 1, which the Rust
   // shell does not recover from ("No respawn here by design", lib.rs) — so an
   // unguarded callback turns a reporting bug into a dead sidecar. No production
@@ -287,7 +287,7 @@ export function createSaturationSampler(deps?: SaturationSamplerDeps): Saturatio
         dispatchVerdict(false);
       }
     } finally {
-      // Always re-arm. `start()` runs exactly once (index.ts), so anything
+      // Always re-arm. `start()` runs exactly once (boot.ts), so anything
       // escaping the body above would leave `pending === null` with nothing
       // left to schedule the next sample — measurement silently dead for the
       // life of the process.

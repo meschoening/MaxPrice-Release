@@ -1,5 +1,5 @@
-import type { SessionRow } from "@maxprice/shared";
-import { resolveDateRange, useFilters } from "@/state/filters";
+import { type SessionRow, resolveDateRange } from "@maxprice/shared";
+import { useFilters } from "@/state/filters";
 import { useWeekWindow } from "./use-week";
 import { useSettings } from "@/state/use-settings";
 import { useOrganizationScope } from "@/state/use-organization-scope";

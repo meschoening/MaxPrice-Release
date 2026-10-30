@@ -1,7 +1,7 @@
 // The live driver of an Organization settings edit (#276, extending #277's D8).
-// Extracted from main() — like `wireIdentityProbe` — so every verdict is
-// drivable by a test holding a real fleet and a real store, which is the only
-// way to observe that one of them rebuilds nothing.
+// Extracted from main() (now `bootSidecar`) — like `wireIdentityProbe` — so
+// every verdict is drivable by a test holding a real fleet and a real store,
+// which is the only way to observe that one of them rebuilds nothing.
 
 // Set equality BY VALUE — size, then membership. `resolveTrackedOrganizations`
 // builds a fresh `Set` on every call, so identity says nothing about whether
@@ -112,12 +112,13 @@ export type OrganizationSettingsChange = {
 export type OrganizationSettingsDriverDeps = {
   // Synchronous arrival fence: an excluded in-flight read cannot append while a walk queues.
   setPollingOrganizations: (ids: ReadonlySet<string> | null, home: string | null) => void;
-  // Install a Home into main()'s one presumption cell (`withSelfHome`), keeping
-  // the published Homes the Machine directory supplied (#281). The driver owns
-  // WHEN a Home change takes effect — in queue order — but not the peer half,
-  // which the fleet replaces on its own schedule. Every store reads that one
-  // cell through the `getPresumption` thunk it was built with, so a single
-  // write reaches the live engine, the retained report view, and both caches.
+  // Install a Home into bootSidecar()'s one presumption cell (`withSelfHome`),
+  // keeping the published Homes the Machine directory supplied (#281). The
+  // driver owns WHEN a Home change takes effect — in queue order — but not the
+  // peer half, which the fleet replaces on its own schedule. Every store reads
+  // that one cell through the `getPresumption` thunk it was built with, so a
+  // single write reaches the live engine, the retained report view, and both
+  // caches.
   installHome: (home: string | null) => void;
   // Release at arrival, ahead of any queued walk.
   releaseRetainedView: () => void;
@@ -131,17 +132,18 @@ export type OrganizationSettingsDriverDeps = {
   resetRepair: () => Promise<void>;
   invalidateReports: () => void;
   reingest: ReingestState;
-  // main()'s `liveHub.emitOrganizationsChanged` — the roster's own refetch poke
-  // (#287, ADR-0105). A narrow invalidation, never a round (ADR-0058): it asks
-  // the renderer for GET /api/organizations and nothing else.
+  // bootSidecar()'s `liveHub.emitOrganizationsChanged` — the roster's own
+  // refetch poke (#287, ADR-0105). A narrow invalidation, never a round
+  // (ADR-0058): it asks the renderer for GET /api/organizations and nothing
+  // else.
   rosterChanged: () => void;
-  // The tracked set RIGHT NOW — main()'s `trackedNow`. Read between the rebuild
-  // and the repair to see whether a later edit moved the set out from under
-  // this one's walk; see `createOrganizationSettingsDriver`.
+  // The tracked set RIGHT NOW — bootSidecar()'s `trackedNow`. Read between the
+  // rebuild and the repair to see whether a later edit moved the set out from
+  // under this one's walk; see `createOrganizationSettingsDriver`.
   trackedNow: () => ReadonlySet<string> | null;
-  // The dormant set RIGHT NOW — main()'s live `dormantNow` (#311). Read beside
-  // `trackedNow`, so a change overtaken by a later edit OR a later assertion
-  // install skips its repair.
+  // The dormant set RIGHT NOW — bootSidecar()'s live `dormantNow` (#311). Read
+  // beside `trackedNow`, so a change overtaken by a later edit OR a later
+  // assertion install skips its repair.
   dormantNow: () => ReadonlySet<string>;
 };
 
@@ -167,10 +169,11 @@ export function classifyAdmissionChange(
   return tracked;
 }
 
-// main()'s one producer of a DORMANT-ONLY change (#311): after an assertion
-// install (the PUT, the fleet's adoption) or at the boot seed, the dormant set
-// recomputed against the one last queued. null when it did not move, which is
-// what keeps a machine with no Excluded claim rebuilding nothing new.
+// bootSidecar()'s one producer of a DORMANT-ONLY change (#311): after an
+// assertion install (the PUT, the fleet's adoption) or at the boot seed, the
+// dormant set recomputed against the one last queued. null when it did not
+// move, which is what keeps a machine with no Excluded claim rebuilding nothing
+// new.
 export function dormantChange(opts: {
   home: string | null;
   tracked: ReadonlySet<string> | null;
@@ -189,8 +192,8 @@ export function dormantChange(opts: {
 }
 
 export type OrganizationSettingsDriver = {
-  // Settles when THIS change has been applied. Never rejects; main() `void`s it
-  // and the tests await it.
+  // Settles when THIS change has been applied. Never rejects; bootSidecar()
+  // `void`s it and the tests await it.
   apply: (change: OrganizationSettingsChange) => Promise<void>;
 };
 
@@ -234,13 +237,13 @@ export type OrganizationSettingsDriver = {
  * The engine's admission is really the PAIR (tracked, dormant) (#311, ADR-0107
  * §12): a session asserted to an Organization outside the tracked set has its
  * owner-less own rows refused, and an assertion install can move that set with
- * no settings edit at all. So main() queues a dormant-only change here too
- * (`dormantChange`), and `classifyAdmissionChange` judges the pair: a session
- * becoming dormant is restrictive, one leaving is additive. A dormant-only
- * change installs no Home and marks nothing re-ingesting (no Organization is
- * re-walked in), but pokes the roster like any changing verdict. The repair
- * after its rebuild is also what runs the lossless forget of the dormant
- * sessions on the Hub.
+ * no settings edit at all. So bootSidecar() queues a dormant-only change here
+ * too (`dormantChange`), and `classifyAdmissionChange` judges the pair: a
+ * session becoming dormant is restrictive, one leaving is additive. A
+ * dormant-only change installs no Home and marks nothing re-ingesting (no
+ * Organization is re-walked in), but pokes the roster like any changing
+ * verdict. The repair after its rebuild is also what runs the lossless forget
+ * of the dormant sessions on the Hub.
  *
  * A Home change installs its Home into the presumption on EVERY verdict, ahead
  * of the work: a rebuild that kept the preceding Home would go on presuming
@@ -253,8 +256,8 @@ export type OrganizationSettingsDriver = {
  * right after `end()`. The second is the only "done" signal there is: the
  * rebuild's own wholesale poke fires before the mark ends. A Home-only edit
  * fires it once, beside its invalidation. A change queued behind another's
- * walk needs no poke at arrival: main()'s tracked cell moved then, so the
- * predecessor's done signal already reads the new `tracked`.
+ * walk needs no poke at arrival: bootSidecar()'s tracked cell moved then, so
+ * the predecessor's done signal already reads the new `tracked`.
  *
  * ONE CHANGE AT A TIME, in arrival order. A walk takes seconds, and the hook
  * that produces a change moves `currentTracked` synchronously, so two Settings
@@ -284,9 +287,10 @@ export type OrganizationSettingsDriver = {
  * rather than simply returning.
  *
  * `apply` returns that change's settlement so tests can await a verdict
- * deterministically; main() `void`s it. It never rejects — a failed walk must
- * not reach the process `unhandledRejection` handler — which is also what keeps
- * the queue intact: a rejected tail would strand every later edit behind it.
+ * deterministically; bootSidecar() `void`s it. It never rejects — a failed walk
+ * must not reach the process `unhandledRejection` handler — which is also what
+ * keeps the queue intact: a rejected tail would strand every later edit behind
+ * it.
  */
 export function createOrganizationSettingsDriver(
   deps: OrganizationSettingsDriverDeps,
@@ -317,7 +321,7 @@ async function applyChange(
   opts: OrganizationSettingsChange,
 ): Promise<void> {
   // EVERYTHING is inside the try, including the Home install and the
-  // classification: main() `void`s this promise, so a rejection — even a
+  // classification: bootSidecar() `void`s this promise, so a rejection — even a
   // synchronous throw from a collaborator — would land on the process
   // `unhandledRejection` handler. "Never rejects" has to be unconditional
   // rather than true only of the statements that happen to be awaited.
@@ -371,7 +375,7 @@ async function applyChange(
 }
 
 // The roster poke is a notification: a throw from it is logged, and never
-// costs a change its walk or rejects the settlement main() `void`s — the
+// costs a change its walk or rejects the settlement bootSidecar() `void`s — the
 // `finally` above calls it too.
 function pokeRoster(deps: OrganizationSettingsDriverDeps): void {
   try {

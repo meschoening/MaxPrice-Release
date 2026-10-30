@@ -1,0 +1,74 @@
+/* The Hub page (ADR-0124 §7, layout D of #452's prototype): the console's
+   pill header above one Glass panel holding the Popout's rows, then a footer
+   line. The system is @maxprice/glass; the header and the rows are this app's
+   own shared recipes, the same files the tray app's globals.css imports. What
+   follows them is the page's layout alone. No Tailwind: nothing here uses a
+   utility, so the page also does without its preflight, and resets the few
+   defaults it meets itself. */
+@import "@maxprice/glass";
+@import "../styles/hub-header.css";
+@import "../styles/hub-rows.css";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+}
+body {
+  min-height: 100dvh;
+}
+h1,
+p {
+  margin: 0;
+}
+
+/* One column, at most 464px, centred: 12px gutters on a phone, and a little
+   air above it on a tall window. */
+.hub-page {
+  max-width: 464px;
+  margin: 0 auto;
+  padding: max(0px, calc(10vh - 60px)) 0 24px;
+}
+/* The console's pill, neither sticky nor frosted: nothing scrolls under it
+   (ADR-0075). Its right end holds the host, text rather than the console's
+   26px theme chip, so it takes the wider inset, and the orb is a step larger.
+   The pill stays 42px tall, so the 26px orb sits 8px inside its top and
+   bottom edges, and the left inset steps down to 7px (8px with the border)
+   to keep the caps concentric (hub-header.css). The #452 prototype kept the
+   console's 8px, which put the orb 1px off centre. */
+.hub-page .hub-header {
+  position: static;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  padding-right: 14px;
+  padding-left: 7px;
+}
+.hub-page .hub-header .logo {
+  --logo-d: 26px;
+}
+.hub-page-host {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hub-page-main {
+  padding: 14px 12px 0;
+}
+/* The Popout's frame padding around its rows, at the console's panel radius. */
+.hub-page-card {
+  padding: 6px;
+  border-radius: 18px;
+}
+.hub-page-foot {
+  margin-top: 12px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--soft);
+}

@@ -230,7 +230,8 @@ fn get_usage_auth_token(
 
 // Absolute path of settings.json in Tauri's app-data dir — the single
 // durable user-config file (ADR-0014). The renderer is its sole writer; the
-// sidecar reads only `claudePaths` from it.
+// sidecar reads it and applies each edit through its watch (the roots, the
+// Hub sharing toggles, the Home and Tracked organizations).
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()

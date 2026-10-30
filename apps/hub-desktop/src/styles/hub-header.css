@@ -1,0 +1,46 @@
+/* The console's floating pill header (the Hub console mock's ?shell=pill, T1;
+   history per ADR-0088): the lens orb, the wordmark and whatever sits at the
+   right end. Its own file because two builds wear it: the console, from
+   globals.css, and the Hub page (ADR-0124 §7), from src/page/page.css, which
+   unsticks and unfrosts it and re-insets it around a larger orb, keeping the
+   concentric caps below. */
+
+/* The floating pill header — sticky at a 10px inset, cards sliding
+   beneath it (the frost proof). */
+.hub-header {
+  position: sticky;
+  top: 10px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 12px 0;
+  /* Concentric caps: the pill's round ends and the round ends nested inside
+     them (the orb, the theme chip) share a centre, so each reads as the pill's
+     own cap shrunk in place rather than a circle parked near it. That holds
+     when the horizontal gap to a cap equals the vertical gap — the pill is
+     42px tall, the chip 26px and the orb 24px, so 8px clears both. The border
+     eats 1px of each gap, hence 7px right / 8px left. Both are load-bearing:
+     bumping the header's padding, the chip's, or --logo-d breaks the ring. */
+  padding: 7px 7px 7px 8px;
+  border-radius: 999px;
+  background: var(--panel);
+  -webkit-backdrop-filter: var(--frost-panel);
+  backdrop-filter: var(--frost-panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-shadow), var(--panel-inner);
+}
+/* A lone header label since the version moved to the App info card (map #143).
+   The `.identity` wrapper that used to hold the pair is gone with it: it existed
+   to make the 14px wordmark and the 10.5px version share a baseline — centring
+   each label's own line box left the version ~2.4px high, reading as a
+   superscript rather than a caption — and a flex group around a single child is
+   a gap that never applies. */
+.wordmark {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  /* One-line pill at the 380px floor: the wordmark never wraps. Nothing
+     else in the header can grow, so there is no ellipsis case left. */
+  white-space: nowrap;
+}

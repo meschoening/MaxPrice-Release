@@ -218,6 +218,27 @@ export const discoverOrgsResponseSchema = z.object({
 });
 export type DiscoverOrgsResponse = z.infer<typeof discoverOrgsResponseSchema>;
 
+// What every surface that checks a session key says when its listing names
+// no Organization, in one set of words: the Desktop client's Usage
+// connection section, the Headless client's `key set` (ADR-0121 §6) and the
+// Hub's (ADR-0126 §6). Any kind but `expired`, none included, reads as
+// claude.ai unreachable, as each surface always has.
+export function sessionKeyListingFailure(kind: string | null): string {
+  return kind === "expired"
+    ? "That session key looks invalid or expired."
+    : "Couldn't reach Anthropic — check your connection and try again.";
+}
+
+// Claude Code's OAuth token, which both headless products' `key set` name
+// and never send to claude.ai: it is not a claude.ai session key
+// (ADR-0121 §10, ADR-0126 §6).
+export function isClaudeCodeToken(value: string): boolean {
+  return value.startsWith("sk-ant-oat");
+}
+
+export const CLAUDE_CODE_TOKEN_REFUSAL =
+  "that is a Claude Code OAuth token, not a claude.ai session key";
+
 // POST /api/usage/credential ack.
 export const credentialAckSchema = z.object({ ok: z.literal(true) });
 export type CredentialAck = z.infer<typeof credentialAckSchema>;

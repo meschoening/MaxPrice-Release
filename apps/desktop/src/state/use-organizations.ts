@@ -3,12 +3,12 @@ import { useQuery } from "@tanstack/react-query";
 import {
   errorResponseSchema,
   ORGANIZATIONS_PATH,
+  organizationLabelMap,
   organizationPath,
   organizationsResponseSchema,
   type OrganizationRenameRequest,
   type OrganizationsResponse,
 } from "@maxprice/shared";
-import { organizationLabelMap } from "@/lib/organization-scope-view";
 import { getSidecarUrl } from "@/lib/sidecar";
 import { usageAuthHeaders } from "@/lib/usage-credential";
 import { useSettings, useUpdateSettings } from "@/state/use-settings";

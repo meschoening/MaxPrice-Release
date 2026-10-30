@@ -1,8 +1,11 @@
 {
   "name": "@maxprice/sidecar",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "private": true,
   "type": "module",
+  "exports": {
+    "./boot": "./src/boot.ts"
+  },
   "scripts": {
     "dev": "bun --watch run src/index.ts",
     "build:binaries": "bun run scripts/build-binaries.ts",

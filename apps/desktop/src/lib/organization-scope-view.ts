@@ -1,7 +1,7 @@
 import {
   ALL_ORGANIZATIONS,
-  displayOrganizationLabels,
-  resolveOrganizationLabel,
+  organizationLabel,
+  organizationLabelMap,
   resolveOrganizationScope,
   type OrganizationEntry,
   type OrganizationLimits,
@@ -35,53 +35,6 @@ export function isNoLimitsAnswer(
   answer: OrganizationLimits["answer"] | undefined,
 ): answer is "none" | "forbidden" {
   return answer === "none" || answer === "forbidden";
-}
-
-// uuid → the label to render, collision-suffixed across the WHOLE roster, so
-// the chip and every other surface that names an Organization agree.
-export function organizationLabelMap(
-  roster: ReadonlyArray<Pick<OrganizationEntry, "uuid" | "label">>,
-): Map<string, string> {
-  return displayOrganizationLabels(roster);
-}
-
-// A uuid the roster has not listed renders the shared label resolution's
-// answer for an Organization with no rename and no plan word, so the fallback
-// is spelled in one place; the upstream name never appears.
-export function organizationLabel(labels: ReadonlyMap<string, string>, uuid: string): string {
-  return (
-    labels.get(uuid) ??
-    resolveOrganizationLabel({ uuid, rename: null, organizationType: null, hints: null }).label
-  );
-}
-
-// The Organization cells of the Sessions and Projects tables, shown only under
-// All organizations. A session with no attributed Organization reads null —
-// the cell renders an em dash rather than a label it cannot claim.
-export function sessionOrganizationLabel(
-  uuid: string | undefined,
-  labels: ReadonlyMap<string, string>,
-): string | null {
-  return uuid === undefined ? null : organizationLabel(labels, uuid);
-}
-
-// A project's Organizations in first-seen order: none is null, one reads as its
-// label, several as a count whose title lists every label in that order. One
-// label is its own title, since a long one truncates in the cell.
-export function projectOrganizationsCell(
-  uuids: readonly string[],
-  labels: ReadonlyMap<string, string>,
-): { text: string; title: string } | null {
-  const [only] = uuids;
-  if (only === undefined) return null;
-  if (uuids.length === 1) {
-    const label = organizationLabel(labels, only);
-    return { text: label, title: label };
-  }
-  return {
-    text: `${uuids.length} organizations`,
-    title: uuids.map((uuid) => organizationLabel(labels, uuid)).join(", "),
-  };
 }
 
 export interface ScopeOption {

@@ -147,45 +147,11 @@ button:disabled {
   cursor: default;
 }
 
-/* The floating pill header — sticky at a 10px inset, cards sliding
-   beneath it (the frost proof). */
-.hub-header {
-  position: sticky;
-  top: 10px;
-  z-index: 5;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 12px 12px 0;
-  /* Concentric caps: the pill's round ends and the round ends nested inside
-     them (the orb, the theme chip) share a centre, so each reads as the pill's
-     own cap shrunk in place rather than a circle parked near it. That holds
-     when the horizontal gap to a cap equals the vertical gap — the pill is
-     42px tall, the chip 26px and the orb 24px, so 8px clears both. The border
-     eats 1px of each gap, hence 7px right / 8px left. Both are load-bearing:
-     bumping the header's padding, the chip's, or --logo-d breaks the ring. */
-  padding: 7px 7px 7px 8px;
-  border-radius: 999px;
-  background: var(--panel);
-  -webkit-backdrop-filter: var(--frost-panel);
-  backdrop-filter: var(--frost-panel);
-  border: 1px solid var(--panel-border);
-  box-shadow: var(--panel-shadow), var(--panel-inner);
-}
-/* A lone header label since the version moved to the App info card (map #143).
-   The `.identity` wrapper that used to hold the pair is gone with it: it existed
-   to make the 14px wordmark and the 10.5px version share a baseline — centring
-   each label's own line box left the version ~2.4px high, reading as a
-   superscript rather than a caption — and a flex group around a single child is
-   a gap that never applies. */
-.wordmark {
-  font-size: 14px;
-  font-weight: 800;
-  letter-spacing: -0.01em;
-  /* One-line pill at the 380px floor: the wordmark never wraps. Nothing
-     else in the header can grow, so there is no ellipsis case left. */
-  white-space: nowrap;
-}
+/* The pill header's recipe, which the Hub page shares (ADR-0124 §7). An
+   @import after other rules is not valid CSS on its own: Tailwind inlines it
+   here, in place, so the rules keep the cascade position they always had. */
+@import "./hub-header.css";
+
 /* The theme chip is the header's only right-side control now that the overall
    status dot/label is gone (it duplicated the Hub status card's own), so it
    takes over the auto margin that used to push that pair to the edge. */
@@ -228,6 +194,12 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+/* A second run of rows straight after the first (the App info card's User
+   guide row, with no Updates disclosure between them) keeps the rows' own 4px
+   gap rather than the card's 8px. */
+.krows + .krows {
+  margin-top: -4px;
 }
 .krow {
   display: flex;
@@ -274,6 +246,26 @@ button:disabled {
 .krow.control .val .sub {
   font-size: 11px;
   color: var(--soft);
+}
+/* The pairs row whose value is a link out to the browser (the App info card's
+   User guide row, #564): the accent the client's App info link wears, with the
+   external-link glyph. */
+.krow a.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+  border-radius: 4px;
+}
+.krow a.link:hover {
+  text-decoration: underline;
+}
+.krow a.link svg {
+  width: 11px;
+  height: 11px;
+  flex: none;
 }
 .hint {
   font-size: 11px;
@@ -418,46 +410,10 @@ body.popout-window {
   border: 1px solid var(--panel-border);
   box-shadow: var(--panel-inner);
 }
-.prows {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-.prow {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  min-width: 0;
-  padding: 7px 10px;
-}
-.prow .name {
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-.prow .state {
-  margin-left: auto;
-  font-size: 11.5px;
-  color: var(--soft);
-  text-align: right;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.prow .state b {
-  font-weight: 600;
-  color: var(--text);
-}
-/* The clients row: count leading, flush with the dots' edge — no dot, no
-   name-column indent (T1's resolved left alignment). */
-.prow .state.clients {
-  margin-left: 0;
-  text-align: left;
-}
-/* No fresh reading (starting / not responding) — the dependent rows dim. */
-.prow.dim {
-  opacity: 0.55;
-}
+/* The Popout's rows recipe, which the Hub page shares (ADR-0124 §7), inlined
+   in place by Tailwind like hub-header.css above. */
+@import "./hub-rows.css";
+
 .pdivider {
   height: 1px;
   flex-shrink: 0;

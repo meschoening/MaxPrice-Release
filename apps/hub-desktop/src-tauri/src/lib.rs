@@ -1425,6 +1425,9 @@ pub fn run() {
         // platform" indistinguishably, so a manifest-driven answer would print
         // "Up to date" to a macOS host a version behind.
         .plugin(tauri_plugin_os::init())
+        // The App info card's User guide row (#564): `openUrl`, which the
+        // console's capability scopes to the guide's URLs.
+        .plugin(tauri_plugin_opener::init())
         .manage(SidecarState::default())
         .manage(PopoutState::default())
         .manage(FirewallCache::default())

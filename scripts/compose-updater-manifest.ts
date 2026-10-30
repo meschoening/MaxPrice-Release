@@ -1,44 +1,82 @@
-// Compose and verify the Tauri updater manifests that drive MaxPrice's update
-// channel, which is served from a THIRD repo (ADR-0071).
+// Compose and verify the four updater manifests that drive MaxPrice's update
+// channel, which is served from a THIRD repo (ADR-0071): the two Tauri apps'
+// manifests, the Headless client's (ADR-0123 §3) and the Headless Hub's
+// (ADR-0129 §3), all in Tauri's format.
 //
+//   bun scripts/compose-updater-manifest.ts stage --dir staged
 //   bun scripts/compose-updater-manifest.ts compose --channel desktop ...
-//   bun scripts/compose-updater-manifest.ts verify latest.json hub-latest.json
+//   bun scripts/compose-updater-manifest.ts verify latest.json hub-latest.json \
+//       headless-latest.json headless-hub-latest.json
 //
 // PUBLIC-ONLY FILE. It lives in the private repo under release/overlay/ and
 // reaches the public build repo through the overlay pass, never the allowlist
 // (ADR-0070 §5). Nothing in the private repo's own release path calls it: the
 // local hand-built pipeline (ADR-0052) produces no updater artifacts at all,
 // because `createUpdaterArtifacts` is false in both committed tauri.conf.json
-// files and only the CI build merges the overlay that flips it on. So this runs
-// exactly once per release, inside GitHub Actions, and its only dependencies
-// are node builtins plus the `gh` CLI the runners already carry.
+// files and only the CI build merges the overlay that flips it on, and it
+// packs both Headless tarballs unsigned. So this runs once per release, inside
+// GitHub Actions. Its only dependencies are node builtins, its sibling
+// build-headless.ts (beside it at both paths: release/overlay/scripts/ here,
+// scripts/ in the mirror), whose asset names and `.sig` reader it shares and
+// which imports only node builtins, the `gh` CLI the runners already carry,
+// and, for the two headless channels' key, the checked-out
+// packages/shared/src/update-channel.ts, found under --root.
 //
 // WHERE THE PIECES LIVE, and why it is split across two repos at all:
 //
-//   MaxPrice-Release   the five installers. This is what a human downloads,
-//                      and keeping its asset list to five is the entire point
-//                      of the split — updater freight used to double it.
-//   MP-Updates         the manifests, plus the one artifact that has nowhere
-//                      else to go: macOS updates in-place from a .app.tar.gz,
-//                      which is not an installer anybody would download.
+//   MaxPrice-Release   the four installers and the two Headless tarballs, the
+//                      Headless client's and the Headless Hub's. This is what
+//                      a human downloads, and keeping its asset list to those
+//                      is the entire point of the split — updater freight used
+//                      to double it.
+//   MP-Updates         the four manifests, plus the one artifact that has
+//                      nowhere else to go: macOS updates in-place from a
+//                      .app.tar.gz, which is not an installer anybody would
+//                      download.
 //
-// A manifest is just URLs, so Windows entries point straight back at the .exe
-// already sitting in MaxPrice-Release and nothing is copied. Detached .sig
-// files are never published anywhere — the signature travels INSIDE the
-// manifest as a string, which is the only place Tauri's updater reads it from.
+// A manifest is just URLs, so the Windows entries point straight back at the
+// .exe, and each headless product's at its tarball, already sitting in
+// MaxPrice-Release, and nothing is copied. Detached .sig files are never
+// published anywhere — the signature travels INSIDE the manifest as a string,
+// which is the only place an updater reads it from.
 //
-// PLATFORM COVERAGE is asserted, not discovered. A missing .sig would otherwise
-// drop its platform from the manifest silently and every client on it would sit
-// on "no update available" forever, which is indistinguishable from a healthy
-// channel until someone notices a version gap in the wild.
+// PLATFORM COVERAGE is asserted in both directions, not discovered. A missing
+// .sig would otherwise drop its platform from the manifest silently and every
+// client on it would sit on "no update available" forever, which is
+// indistinguishable from a healthy channel until someone notices a version gap
+// in the wild. And an artifact for a platform its manifest does not carry is
+// refused rather than added, because one bad entry fails every client's parse
+// of that manifest.
 //
-//   desktop   darwin-aarch64, darwin-x86_64, windows-x86_64
-//   hub       windows-x86_64
+//   desktop        latest.json                darwin-aarch64, darwin-x86_64, windows-x86_64
+//   hub            hub-latest.json            windows-x86_64
+//   headless       headless-latest.json       linux-x86_64
+//   headless-hub   headless-hub-latest.json   linux-x86_64
 //
-// Linux is deliberately absent from both. Tauri v2 can only update an AppImage,
-// and this release ships a .deb (release-assets.ts records why no AppImage is
-// built: linuxdeploy runs ldd over the Bun-compiled sidecar and the dynamic
-// loader segfaults). A .deb updates through the distro, or by re-downloading.
+// Linux is deliberately absent from the two Tauri manifests. Tauri v2 can only
+// update an AppImage, and this release ships a .deb (release-assets.ts records
+// why no AppImage is built: linuxdeploy runs ldd over the Bun-compiled sidecar
+// and the dynamic loader segfaults). A .deb updates through the distro, or by
+// re-downloading. Each Headless tarball is its own manifest's only entry
+// (ADR-0123 §3, ADR-0129 §3), so a Desktop updater on Linux never finds a
+// tarball, the Windows tray app's hub-latest.json never carries the Headless
+// Hub's, and a bad Headless entry never fails another product's parse.
+//
+// STAGING goes by asset name. `stage` routes each .sig off the draft release to
+// its channel's directory by the prefix of the asset it signs (ADR-0129 §3):
+//
+//   MaxPrice.Hub_   hub
+//   maxprice-hub_   headless-hub
+//   maxprice_       headless
+//   anything else   desktop
+//
+// THE SIGNED NAME is checked where a channel's clients check it. Each headless
+// product's update, `maxprice update` and ADR-0129 §4's `maxprice-hub update`,
+// computes its asset name from the manifest's version and refuses a signature whose trusted
+// comment names any other file (ADR-0123 §4 check 3, ADR-0129 §4), so the
+// composer refuses that manifest first, rather than publish one every install
+// on the channel refuses. It reads `file:` with build-headless's
+// `signedFileOf`, which finds the trusted comment by the update's own rules.
 //
 // BOTH darwin keys point at ONE universal bundle, which is correct here and was
 // a bug in the Actions-era predecessor this replaces: CI builds macOS with
@@ -47,13 +85,20 @@
 // the local fallback pipeline's, where each arch would overwrite the other —
 // so `classifyArtifact` keys off the fact that ONE darwin artifact is staged,
 // and refuses outright if it is ever handed two.
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
 import { basename, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
-export type Channel = "desktop" | "hub";
+import { headlessAssetName, headlessHubAssetName, signedFileOf } from "./build-headless";
+
+export type Channel = "desktop" | "hub" | "headless" | "headless-hub";
 
 /** Tauri's platform keys — `<os>-<arch>`, as the updater looks them up. */
-export type UpdaterPlatform = "darwin-aarch64" | "darwin-x86_64" | "windows-x86_64";
+export type UpdaterPlatform =
+  | "darwin-aarch64"
+  | "darwin-x86_64"
+  | "windows-x86_64"
+  | "linux-x86_64";
 
 /** Which repo hosts the artifact a platform entry points at. */
 export type Host = "installers" | "updates";
@@ -69,19 +114,63 @@ export type Manifest = {
 /** A staged updater artifact: the bundle's published name and its signature. */
 export type StagedArtifact = { name: string; signature: string };
 
+/** Each channel's manifest carries exactly these platforms, no fewer and no more. */
 export const EXPECTED_PLATFORMS: Record<Channel, readonly UpdaterPlatform[]> = {
   desktop: ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"],
   hub: ["windows-x86_64"],
+  headless: ["linux-x86_64"],
+  "headless-hub": ["linux-x86_64"],
 };
 
-/** The Tauri project whose tauri.conf.json carries a channel's updater pubkey. */
-export function projectOf(channel: Channel): string {
-  return channel === "hub" ? "apps/hub-desktop" : "apps/desktop";
-}
+export const CHANNELS = Object.keys(EXPECTED_PLATFORMS) as Channel[];
+
+const MANIFEST_NAMES: Record<Channel, string> = {
+  desktop: "latest.json",
+  hub: "hub-latest.json",
+  headless: "headless-latest.json",
+  "headless-hub": "headless-hub-latest.json",
+};
 
 export function manifestNameOf(channel: Channel): string {
-  return channel === "hub" ? "hub-latest.json" : "latest.json";
+  return MANIFEST_NAMES[channel];
 }
+
+/**
+ * Where each channel's trusted pubkey is committed: the key its installed
+ * copies were built to verify against. The two Tauri apps carry theirs in
+ * tauri.conf.json; the two headless products have none, and both verify
+ * against packages/shared's UPDATE_CHANNEL (ADR-0123 §9, ADR-0129 §3).
+ */
+const PUBKEY_SOURCES: Record<Channel, string> = {
+  desktop: "apps/desktop/src-tauri/tauri.conf.json",
+  hub: "apps/hub-desktop/src-tauri/tauri.conf.json",
+  headless: "packages/shared/src/update-channel.ts",
+  "headless-hub": "packages/shared/src/update-channel.ts",
+};
+
+export function pubkeySourceOf(channel: Channel): string {
+  return PUBKEY_SOURCES[channel];
+}
+
+/**
+ * The channels whose clients check the name a signature binds, and the asset
+ * name each computes from a manifest's version. Only the headless products
+ * read the trusted comment: Tauri's updater does not, and the rename step
+ * changes a Windows installer's published name after tauri-action signed it,
+ * so its `file:` names the pre-rename bundle and must not be checked.
+ */
+export const SIGNED_ASSETS: Partial<
+  Record<Channel, { client: string; assetName(version: string): string }>
+> = {
+  headless: {
+    client: "maxprice update",
+    assetName: headlessAssetName,
+  },
+  "headless-hub": {
+    client: "maxprice-hub update",
+    assetName: headlessHubAssetName,
+  },
+};
 
 /**
  * Which platforms an artifact serves, and which repo hosts it.
@@ -89,15 +178,20 @@ export function manifestNameOf(channel: Channel): string {
  * Extension-driven because that is genuinely what decides it: under Tauri v2's
  * `createUpdaterArtifacts`, the NSIS installer IS the Windows updater bundle
  * (there is no separate .nsis.zip — mapping one was the second bug in the
- * Actions-era predecessor), while macOS gets a purpose-built .app.tar.gz.
- * Returns null for anything else so an unrecognised artifact is REPORTED rather
- * than quietly left out of the manifest.
+ * Actions-era predecessor), while macOS gets a purpose-built .app.tar.gz. Any
+ * other .tar.gz is a Linux tarball, which the Headless client or the Headless
+ * Hub downloads straight from MaxPrice-Release. Returns null for anything else
+ * so an unrecognised artifact is REPORTED rather than quietly left out of the
+ * manifest.
  */
 export function classifyArtifact(
   name: string,
 ): { platforms: UpdaterPlatform[]; host: Host } | null {
   if (name.endsWith(".app.tar.gz")) {
     return { platforms: ["darwin-aarch64", "darwin-x86_64"], host: "updates" };
+  }
+  if (name.endsWith(".tar.gz")) {
+    return { platforms: ["linux-x86_64"], host: "installers" };
   }
   if (name.endsWith(".exe")) {
     return { platforms: ["windows-x86_64"], host: "installers" };
@@ -151,7 +245,7 @@ export type ComposeInput = {
   version: string;
   tag: string;
   artifacts: StagedArtifact[];
-  /** The channel's committed updater pubkey, base64 as tauri.conf.json holds it. */
+  /** The channel's committed updater pubkey, base64 as its source holds it. */
   pubkey: string;
   installersRepo: string;
   updatesRepo: string;
@@ -184,6 +278,11 @@ export function composeManifest(input: ComposeInput): ComposeResult {
   if (decodedPub.error !== null) errors.push(decodedPub.error);
   const shippedKeyId = decodedPub.keyId;
 
+  const manifestName = manifestNameOf(input.channel);
+  const expectedPlatforms = EXPECTED_PLATFORMS[input.channel];
+  const signedAsset = SIGNED_ASSETS[input.channel];
+  const expectedName = signedAsset?.assetName(input.version) ?? null;
+
   let darwinSeen: string | null = null;
 
   for (const artifact of input.artifacts) {
@@ -191,9 +290,30 @@ export function composeManifest(input: ComposeInput): ComposeResult {
     if (kind === null) {
       errors.push(
         `${artifact.name} is not a recognised updater bundle ` +
-          `(expected *.app.tar.gz or *.exe) — refusing to guess its platform`,
+          `(expected *.app.tar.gz, *.tar.gz or *.exe) — refusing to guess its platform`,
       );
       continue;
+    }
+
+    // The other half of coverage: an entry this manifest's clients do not
+    // expect. A Linux tarball in latest.json is the case ADR-0123 §3 rules
+    // out, since a Desktop updater on Linux would find a tarball there; any
+    // such entry means the staging split misfiled an artifact.
+    const unexpected = kind.platforms.filter((p) => !expectedPlatforms.includes(p));
+    if (unexpected.length > 0) {
+      errors.push(
+        `${artifact.name} serves ${unexpected.join(" and ")}, which ${manifestName} does not ` +
+          `carry (it carries ${expectedPlatforms.join(", ")}) — refusing to add an entry its ` +
+          `clients do not expect, since one bad entry fails every client's parse of the manifest`,
+      );
+      continue;
+    }
+
+    if (signedAsset !== undefined && artifact.name !== expectedName) {
+      errors.push(
+        `${artifact.name} is not ${expectedName}, the name ${signedAsset.client} computes from ` +
+          `version ${input.version} — every client on ${manifestName} would refuse this entry`,
+      );
     }
 
     if (kind.host === "updates") {
@@ -215,6 +335,17 @@ export function composeManifest(input: ComposeInput): ComposeResult {
       continue;
     }
 
+    if (signedAsset !== undefined) {
+      const file = signedFileOf(artifact.signature);
+      if (file !== expectedName) {
+        errors.push(
+          `${artifact.name}.sig's trusted comment names ${file ?? "no file"}, not ` +
+            `${expectedName} — ${signedAsset.client} refuses a signature for any other file ` +
+            `(ADR-0123 §4 check 3), so every client on ${manifestName} would refuse this update`,
+        );
+      }
+    }
+
     if (shippedKeyId !== null) {
       const signed = minisignKeyId(artifact.signature, `${artifact.name}.sig`);
       if (signed.error !== null) {
@@ -224,8 +355,8 @@ export function composeManifest(input: ComposeInput): ComposeResult {
       if (!signed.keyId.equals(shippedKeyId)) {
         errors.push(
           `${artifact.name}.sig was signed by key ${formatKeyId(signed.keyId)}, but ` +
-            `${projectOf(input.channel)}/src-tauri/tauri.conf.json ships pubkey ` +
-            `${formatKeyId(shippedKeyId)} — every installed app would reject this update`,
+            `${pubkeySourceOf(input.channel)} ships pubkey ` +
+            `${formatKeyId(shippedKeyId)} — every installed copy would reject this update`,
         );
         continue;
       }
@@ -271,6 +402,48 @@ export function composeManifest(input: ComposeInput): ComposeResult {
     },
     errors: null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Staging — which channel each signature off the draft release belongs to.
+// ---------------------------------------------------------------------------
+
+/**
+ * ADR-0129 §3's table, matched against the asset a `.sig` signs; no match is
+ * the desktop app. No prefix begins another, so the order of the rows decides
+ * nothing. GitHub rewrites the space in the hub's "MaxPrice Hub_…" bundle to a
+ * dot on upload, so on the release the hub's prefix is "MaxPrice.Hub_". The
+ * match is case-sensitive: "maxprice_" is the Headless client and "MaxPrice_"
+ * the desktop app.
+ */
+const STAGING_PREFIXES: readonly (readonly [prefix: string, channel: Channel])[] = [
+  ["MaxPrice.Hub_", "hub"],
+  ["maxprice-hub_", "headless-hub"],
+  ["maxprice_", "headless"],
+];
+
+/** The channel of one published asset name (the `.sig`'s name minus `.sig`). */
+export function stagingChannelOf(assetName: string): Channel {
+  for (const [prefix, channel] of STAGING_PREFIXES) {
+    if (assetName.startsWith(prefix)) return channel;
+  }
+  return "desktop";
+}
+
+export type StagingMove = { name: string; channel: Channel };
+
+/**
+ * Where every `.sig` among a directory's entries goes, by the name of the
+ * asset it signs, never by its extension: a tarball under the desktop app's
+ * prefix is staged as desktop, where the composer then refuses its Linux key.
+ * Every `.sig` has a channel, so none is left where no compose reads it, which
+ * would drop its platform silently (ADR-0071 §8). Anything that is not a
+ * `.sig` stays where it is.
+ */
+export function planStaging(names: readonly string[]): StagingMove[] {
+  return names
+    .filter((name) => name.endsWith(".sig"))
+    .map((name) => ({ name, channel: stagingChannelOf(basename(name, ".sig")) }));
 }
 
 // ---------------------------------------------------------------------------
@@ -330,10 +503,24 @@ export function manifestUrls(manifest: Manifest): string[] {
 // CLI
 // ---------------------------------------------------------------------------
 
-/** The updater pubkey a channel's app was actually built to verify against. */
-function readPubkey(root: string, channel: Channel): string | null {
-  const path = join(root, projectOf(channel), "src-tauri", "tauri.conf.json");
+/**
+ * The updater pubkey a channel's installed copies were actually built to
+ * verify against, read under `root`: a Tauri app's tauri.conf.json's
+ * `plugins.updater`, or, for both headless channels, the `UPDATE_CHANNEL` that
+ * packages/shared's update-channel.ts exports. The module is imported
+ * from `root` and never from beside this script, which sits at a different
+ * depth in each repo; it imports nothing, so no `bun install` is needed.
+ */
+export async function readPubkey(root: string, channel: Channel): Promise<string | null> {
+  const path = join(root, pubkeySourceOf(channel));
   try {
+    if (path.endsWith(".ts")) {
+      const source = (await import(pathToFileURL(path).href)) as {
+        UPDATE_CHANNEL?: { pubkey?: unknown };
+      };
+      const pubkey = source.UPDATE_CHANNEL?.pubkey;
+      return typeof pubkey === "string" ? pubkey : null;
+    }
     const conf = JSON.parse(readFileSync(path, "utf8")) as {
       plugins?: { updater?: { pubkey?: string } };
     };
@@ -377,13 +564,31 @@ function requireFlag(argv: string[], name: string): string {
   return value;
 }
 
+function cmdStage(argv: string[]): number {
+  const dir = requireFlag(argv, "dir");
+  const moves = planStaging(readdirSync(dir).sort());
+  // Every channel's directory, even an empty one, so that a channel with no
+  // signature fails its compose by naming the missing .sig.
+  for (const channel of CHANNELS) mkdirSync(join(dir, channel), { recursive: true });
+  for (const move of moves) {
+    renameSync(join(dir, move.name), join(dir, move.channel, move.name));
+  }
+  for (const channel of CHANNELS) {
+    console.log(`${channel}:`);
+    for (const move of moves.filter((m) => m.channel === channel)) {
+      console.log(`  ${move.name}`);
+    }
+  }
+  return 0;
+}
+
 async function cmdCompose(argv: string[]): Promise<number> {
   const rawChannel = requireFlag(argv, "channel");
-  if (rawChannel !== "desktop" && rawChannel !== "hub") {
-    console.error(`Unknown channel "${rawChannel}" (expected desktop or hub)`);
+  const channel = CHANNELS.find((c) => c === rawChannel);
+  if (channel === undefined) {
+    console.error(`Unknown channel "${rawChannel}" (expected ${CHANNELS.join(", ")})`);
     return 2;
   }
-  const channel: Channel = rawChannel;
   const version = requireFlag(argv, "version");
   const tag = requireFlag(argv, "tag");
   const dir = requireFlag(argv, "dir");
@@ -393,10 +598,10 @@ async function cmdCompose(argv: string[]): Promise<number> {
   const root = flag(argv, "root") ?? process.cwd();
   const out = flag(argv, "out") ?? manifestNameOf(channel);
 
-  const pubkey = readPubkey(root, channel);
+  const pubkey = await readPubkey(root, channel);
   if (pubkey === null) {
     console.error(
-      `No updater pubkey in ${projectOf(channel)}/src-tauri/tauri.conf.json — ` +
+      `No updater pubkey in ${join(root, pubkeySourceOf(channel))} — ` +
         `cannot tell what should have signed these bundles.`,
     );
     return 1;
@@ -405,9 +610,10 @@ async function cmdCompose(argv: string[]): Promise<number> {
   const artifacts = readStaged(dir);
   if (artifacts.length === 0) {
     console.error(
-      `No .sig files under ${dir}. The build legs produce updater bundles only when ` +
-        `the CI config overlay (src-tauri/tauri.updater.conf.json) was merged — check ` +
-        `that the build job still passes --config.`,
+      `No .sig files under ${dir}, so no job uploaded a signed ${channel} bundle. The Tauri ` +
+        `legs produce updater bundles only when the CI config overlay ` +
+        `(src-tauri/tauri.updater.conf.json) was merged — check that the build jobs still ` +
+        `pass --config; build-headless signs and uploads both tarballs' .sigs itself.`,
     );
     return 1;
   }
@@ -479,6 +685,8 @@ async function cmdVerify(argv: string[]): Promise<number> {
 async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
   switch (command) {
+    case "stage":
+      return cmdStage(rest);
     case "compose":
       return cmdCompose(rest);
     case "verify":
@@ -486,9 +694,10 @@ async function main(argv: string[]): Promise<number> {
     default:
       console.error(
         "usage:\n" +
-          "  compose-updater-manifest.ts compose --channel <desktop|hub> --version <v> \\\n" +
-          "      --tag <vX.Y.Z> --dir <staged> --installers-repo <o/r> --updates-repo <o/r> \\\n" +
-          "      [--darwin-asset <name>] [--root <dir>] [--out <file>]\n" +
+          "  compose-updater-manifest.ts stage --dir <staged>\n" +
+          `  compose-updater-manifest.ts compose --channel <${CHANNELS.join("|")}> --version <v> \\\n` +
+          "      --tag <vX.Y.Z> --dir <staged>/<channel> --installers-repo <o/r> \\\n" +
+          "      --updates-repo <o/r> [--darwin-asset <name>] [--root <dir>] [--out <file>]\n" +
           "  compose-updater-manifest.ts verify <manifest.json>...",
       );
       return 2;

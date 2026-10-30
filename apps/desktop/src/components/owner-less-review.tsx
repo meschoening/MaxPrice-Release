@@ -1,6 +1,5 @@
 import { Check, ChevronDown, ChevronRight, Minus } from "lucide-react";
-import { formatRelativeTime, type SessionRow } from "@maxprice/shared";
-import { formatCost } from "@/lib/list-format";
+import { formatCalendarDay, formatCost, type SessionRow } from "@maxprice/shared";
 import {
   checkState,
   sessionTag,
@@ -117,7 +116,9 @@ export interface OwnerlessReviewContentProps {
   // every group it matches whatever this holds.
   open: ReadonlySet<string>;
   search: string;
-  // For the rows' last activity.
+  // For the rows' last activity: the settings Timezone and the instant that
+  // decide which day is today.
+  tz: string | undefined;
   now: number;
   // The head bar's switch.
   headerAction?: React.ReactNode;
@@ -140,6 +141,7 @@ export function OwnerlessReviewContent({
   selected,
   open,
   search,
+  tz,
   now,
   headerAction,
   emptyMessage = "No owner-less sessions in this range.",
@@ -196,6 +198,7 @@ export function OwnerlessReviewContent({
               labels={labels}
               selected={selected}
               isOpen={searching || open.has(group.key)}
+              tz={tz}
               now={now}
               onToggleOpen={() => toggleOpen(group.key)}
               onSelectionChange={onSelectionChange}
@@ -219,6 +222,7 @@ function ReviewGroup({
   labels,
   selected,
   isOpen,
+  tz,
   now,
   onToggleOpen,
   onSelectionChange,
@@ -227,6 +231,7 @@ function ReviewGroup({
   labels: ReadonlyMap<string, string>;
   selected: ReadonlySet<string>;
   isOpen: boolean;
+  tz: string | undefined;
   now: number;
   onToggleOpen: () => void;
   onSelectionChange: (selected: ReadonlySet<string>) => void;
@@ -271,6 +276,7 @@ function ReviewGroup({
               row={row}
               labels={labels}
               checked={selected.has(row.sessionId)}
+              tz={tz}
               now={now}
               onToggle={() => onSelectionChange(toggleSessions(selected, [row.sessionId]))}
             />
@@ -286,12 +292,14 @@ function ReviewSession({
   row,
   labels,
   checked,
+  tz,
   now,
   onToggle,
 }: {
   row: SessionRow;
   labels: ReadonlyMap<string, string>;
   checked: boolean;
+  tz: string | undefined;
   now: number;
   onToggle: () => void;
 }): React.ReactElement {
@@ -316,7 +324,7 @@ function ReviewSession({
         <span className="review-meta review-rest">{`rest has an Owner record · ${tag.ownedLabel}`}</span>
       )}
       <span className="review-meta review-when" title={row.lastActivity}>
-        {formatRelativeTime(row.lastActivity, now)}
+        {formatCalendarDay(row.lastActivity, tz, now)}
       </span>
       <span className="review-cost num">{formatCost(row.totalCost)}</span>
     </div>

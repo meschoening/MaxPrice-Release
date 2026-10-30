@@ -560,7 +560,7 @@ export function createEventStore(opts: {
   // The on-disk parse cache (ADR-0048). When present, the scan reads each
   // file through it — cached records on a (size, mtimeMs) match, a real parse
   // otherwise — instead of always parsing. The store never saves the cache;
-  // that is main()'s one post-ready write (`wireScanCachePersist`).
+  // that is bootSidecar()'s one post-ready write (`wireScanCachePersist`).
   scanCache?: ScanCache;
   // The tracked set (the #260 lifecycle decision, item 7): the Organizations
   // whose usage this store counts, already unioned with the Home organization
@@ -1039,9 +1039,9 @@ export function createEventStore(opts: {
     // eviction listed. A pair already listed stays silent, so re-reading a
     // transcript (a rescan, the watcher's first read from byte 0) never
     // re-invalidates it. No listener is attached during a boot or rebuild
-    // walk: main() installs a store only after that walk has run, so it lists
-    // its pairs silently and the boot-gate repair reads them against its done
-    // lists. A rescan of the live store re-presents pairs already listed.
+    // walk: bootSidecar() installs a store only after that walk has run, so it
+    // lists its pairs silently and the boot-gate repair reads them against its
+    // done lists. A rescan of the live store re-presents pairs already listed.
     if (newForeignEvidence || (!listedBefore && foreignSessions.has(key))) {
       const sessions = [{ projectSlug, sessionId }, ...evictedPairs.values()];
       for (const listener of foreignListeners) {

@@ -31,10 +31,10 @@ import type { StoredEvent } from "./store";
 // mints a NEW identity per call precisely so a holder can detect a swap by
 // identity rather than by comparing contents. The presumption has THREE
 // writers — the Home (settings), the Machine directory (fleet), and the
-// Organization assertions (main()'s `installAssertions`, #310) — and each
-// replaces only its own half through `withSelfHome` / `withPublishedHomes` /
-// `withAssertions`, which mint that new identity carrying the other writers'
-// halves unchanged, so no swap drops another's.
+// Organization assertions (bootSidecar()'s `installAssertions`, #310) — and
+// each replaces only its own half through `withSelfHome` /
+// `withPublishedHomes` / `withAssertions`, which mint that new identity
+// carrying the other writers' halves unchanged, so no swap drops another's.
 
 // Everything an owner-less row is answered from at query time. The name
 // predates the assertion half and is kept: every cache that must rebind when
@@ -101,11 +101,11 @@ export function withPublishedHomes(
   return createPresumption(p.selfHome, homeByMachine, p.assertedBySession);
 }
 
-// The assertion writer's swap (main()'s `installAssertions`, #310, through
-// organization-assertions.ts's `presumptionWithAssertions`): a new identity
-// with the assertions replaced and both Home halves kept as they are. Every
-// cache that rebinds on the presumption's identity therefore rebinds on an
-// assertion change too, and — like a Home change — it moves no row and walks
+// The assertion writer's swap (bootSidecar()'s `installAssertions`, #310,
+// through organization-assertions.ts's `presumptionWithAssertions`): a new
+// identity with the assertions replaced and both Home halves kept as they are.
+// Every cache that rebinds on the presumption's identity therefore rebinds on
+// an assertion change too, and — like a Home change — it moves no row and walks
 // nothing.
 export function withAssertions(
   p: Presumption,

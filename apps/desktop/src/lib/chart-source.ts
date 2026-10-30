@@ -8,10 +8,20 @@ import type {
   TimeDisplay,
   WeekWindow,
 } from "@maxprice/shared";
-import { weekParamsFor, zonedInstant, type IntradayResponse } from "@maxprice/shared";
+import {
+  weekParamsFor,
+  zonedInstant,
+  type IntradayResponse,
+  ymdShift,
+  foldMachineEntries,
+  type FoldedMachine,
+  type MachineSeriesEntry,
+  type IdentityIndex,
+  foldMachineProjectSeries,
+  foldProjectSeries,
+} from "@maxprice/shared";
 import type { ChartStyle, Span } from "@/state/filters";
 import type { GroupByAxis } from "@/lib/group-by";
-import { ymdShift } from "./dates";
 import { densifyDays } from "./daily-rows";
 import { isLineStyle, lineRequestFor, type TodayClock } from "./line-style";
 import { blockSpanState } from "./block-span-state";
@@ -20,9 +30,6 @@ import {
   intradayByMachineToMachineData,
   intradayByProjectToProjectData,
 } from "./intraday-adapter";
-import { foldMachineEntries, type FoldedMachine, type MachineSeriesEntry } from "./machines";
-import type { IdentityIndex } from "./project-identity";
-import { foldMachineProjectSeries, foldProjectSeries } from "./projects";
 
 // The Live cost chart's ONE data-source seam (architecture review 2026-07-18,
 // candidate 1): the pure resolution from (span × chart style × group-by axes ×

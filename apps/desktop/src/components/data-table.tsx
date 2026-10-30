@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowDown, ArrowUp, ChevronRight } from "lucide-react";
+import { hasDisclosableChildren } from "@maxprice/shared";
 import { cn } from "@/lib/utils";
-import { flattenTreeRows, hasDisclosableChildren } from "@/lib/table-tree";
+import { flattenTreeRows } from "@/lib/table-tree";
 import { TableHeadBar } from "./table-head-bar";
 
 export type SortDir = "asc" | "desc";

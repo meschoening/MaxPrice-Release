@@ -114,7 +114,7 @@ export function placeNotePopover(
 
 // The typed-confirm token: THIS machine's own directory name.
 //
-// Deliberately not `machineName()` from lib/machines — that resolves the
+// Deliberately not `machineName()` from `@maxprice/shared` — that resolves the
 // `mergedInto` alias chain, and a merged machine would offer its TARGET's name
 // as the token. The forget route scopes on `row.machineId === x-maxprice-machine`
 // byte-equal and never alias-resolves (T4/ADR-0063), so the word you type has

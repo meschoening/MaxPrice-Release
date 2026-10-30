@@ -3236,6 +3236,25 @@ a.sb-footrow:hover .sb-label {
   border-radius: 5px;
   background: color-mix(in oklch, var(--text) 7%, transparent);
 }
+/* The User guide row's value (#564): the section's one link, in the accent
+   the Settings text links wear, with the external-link glyph saying it leaves
+   the app for the browser. */
+.ai-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent);
+  font-weight: 600;
+  border-radius: 4px;
+}
+.ai-link:hover {
+  text-decoration: underline;
+}
+.ai-link svg {
+  width: 11px;
+  height: 11px;
+  flex: none;
+}
 
 /* --- the Organizations list (Claude account, past one Organization): the
    Storage sample's flat-tint table recipe (`.st-sample`) at row scale. A row

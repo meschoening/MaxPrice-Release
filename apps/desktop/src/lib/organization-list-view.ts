@@ -3,8 +3,11 @@ import {
   checkOrganizationLabel,
   displayOrganizationLabels,
   formatWallClock,
+  homeFirst,
+  makeHomePatch,
   ORGANIZATION_LABEL_MAX,
   resolveOrganizationLabel,
+  seenOnText,
   usageConnectionLabel,
   type HubConnection,
   type OrganizationEntry,
@@ -103,11 +106,7 @@ export function showOrganizationList(roster: OrganizationsResponse | undefined):
 export function organizationListRows(input: OrganizationListInput): OrganizationRowView[] {
   const { roster, home, settings, key, hubSourced, lastOpenedAt, display } = input;
   const labels = displayOrganizationLabels(roster.organizations);
-  const ordered = [
-    ...roster.organizations.filter((entry) => entry.uuid === home),
-    ...roster.organizations.filter((entry) => entry.uuid !== home),
-  ];
-  return ordered.map((entry): OrganizationRowView => {
+  return homeFirst(roster.organizations, home).map((entry): OrganizationRowView => {
     const isHome = entry.uuid === home;
     const limits = limitsPhrase(entry, key, hubSourced, display);
     // With no Home the sidecar resolves no tracked set and excludes nothing,
@@ -210,15 +209,6 @@ function lastSampleText(entry: OrganizationEntry, display: TimeDisplay): string 
   return formatWallClock(at, display);
 }
 
-function seenOnText(seenOn: OrganizationEntry["seenOn"]): string {
-  const places = [
-    seenOn.machine ? "this machine" : null,
-    seenOn.fleet ? "the fleet" : null,
-    seenOn.account ? "your account" : null,
-  ].filter((place) => place !== null);
-  return places.length === 0 ? "—" : places.join(" · ");
-}
-
 // An untracked Organization first recorded after the previous Settings visit.
 // No recorded visit, or no first-seen time, marks nothing new.
 export function isNewOrganization(entry: OrganizationEntry, lastOpenedAt: string | null): boolean {
@@ -265,64 +255,9 @@ export function keyStatusLine(key: UsageConnection, roster: OrganizationsRespons
   }
 }
 
-// The settings write that makes `target` Home without changing the resolved
-// tracked set (Home ∪ the list, as the sidecar resolves it): the target leaves
-// the list and the old Home joins it, so the sidecar sees a Home change inside
-// an unchanged set and nothing is re-walked. null when there is no Home yet,
-// the target already is Home, or it is untracked (its becoming Home would
-// widen the set). Tracked means both the row says so and the settings list
-// names it: settings are the authority, and the roster's `tracked` can lag a
-// settings write.
-export function makeHomePatch(
-  settings: Pick<Settings, "homeOrganization" | "trackedOrganizations">,
-  target: string,
-  tracked: boolean,
-): Pick<Settings, "homeOrganization" | "trackedOrganizations"> | null {
-  const home = settings.homeOrganization;
-  if (home === null || target === home || !tracked) return null;
-  const list = new Set(settings.trackedOrganizations);
-  if (!list.has(target)) return null;
-  list.delete(target);
-  list.add(home);
-  return { homeOrganization: target, trackedOrganizations: [...list] };
-}
-
-// The settings write that tracks `uuid`: the list with it appended, which
-// widens the resolved tracked set. null when there is no Home yet (the sidecar
-// then resolves no set and excludes nothing, so a list edit changes nothing),
-// `uuid` is Home (always tracked), or the list already names it. Built inside
-// the settings write chain (`update((current) => trackPatch(current, uuid))`),
-// so it reads the list as the write before it left it.
-export function trackPatch(
-  settings: Pick<Settings, "homeOrganization" | "trackedOrganizations">,
-  uuid: string,
-): Pick<Settings, "trackedOrganizations"> | null {
-  const home = settings.homeOrganization;
-  if (home === null || uuid === home) return null;
-  if (settings.trackedOrganizations.includes(uuid)) return null;
-  return { trackedOrganizations: [...settings.trackedOrganizations, uuid] };
-}
-
-// The settings write that excludes `uuid`: the list without it, which narrows
-// the resolved tracked set. null when there is no Home yet, `uuid` is Home
-// (always tracked, whatever the list says), or the list does not name it. A
-// scope on `uuid` resets in the same write, since the writer resolves the
-// scope against the new list (`parseSettings`). Built inside the write chain,
-// like `trackPatch`.
-export function excludePatch(
-  settings: Pick<Settings, "homeOrganization" | "trackedOrganizations">,
-  uuid: string,
-): Pick<Settings, "trackedOrganizations"> | null {
-  const home = settings.homeOrganization;
-  if (home === null || uuid === home) return null;
-  if (!settings.trackedOrganizations.includes(uuid)) return null;
-  return {
-    trackedOrganizations: settings.trackedOrganizations.filter((member) => member !== uuid),
-  };
-}
-
 // What the track and exclude confirmations say, from what tracking an
-// Organization changes on this machine.
+// Organization changes on this machine. The exclude confirmation's words
+// (`excludeCopy`, packages/shared) read `hub` alone.
 export interface TrackingFacts {
   // It has usage on this machine (`seenOn.machine`).
   local: boolean;
@@ -390,32 +325,8 @@ export function trackCopy(facts: TrackingFacts): string[] {
   return copy;
 }
 
-// The exclude confirmation's paragraphs. Excluding repairs this machine's
-// history alone (ADR-0098 §5): its sessions leave the hub and the Local
-// archive, and only the session files can bring them back.
-export function excludeCopy(facts: TrackingFacts): string[] {
-  return [
-    facts.hub
-      ? "Its usage leaves every report on this machine, and this machine's sessions for it are removed from your hub. What other machines recorded for it stays on your hub."
-      : "Its usage leaves every report on this machine.",
-    "Claude Code session files aren't touched: tracking it again brings back whatever they still hold, and nothing else.",
-  ];
-}
-
 export function trackTitle(row: Pick<OrganizationRowView, "label">): string {
   return `Track ${row.label}?`;
-}
-
-// The bare label, since the id follows: a collision suffix would print it twice.
-export function excludeTitle(row: Pick<OrganizationRowView, "bareLabel" | "facts">): string {
-  return `Exclude ${row.bareLabel} (${row.facts.id})?`;
-}
-
-// The exclude confirmation's typed token is the bare label: the collision
-// suffix's middle dot is not typeable, and the title names the id. Trimmed,
-// case-sensitive (`isForgetArmed`'s rule).
-export function isExcludeArmed(typed: string, bareLabel: string): boolean {
-  return typed.trim() === bareLabel;
 }
 
 export type RenameSubmission =

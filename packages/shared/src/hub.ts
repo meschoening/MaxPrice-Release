@@ -154,6 +154,70 @@ export const hubStatusSchema = z.object({
 });
 export type HubStatus = z.infer<typeof hubStatusSchema>;
 
+// The status fields ADR-0124 §4 picks: the five the Hub rows read, plus
+// `service`, which keeps another server's body from parsing.
+const HUB_ROW_FIELDS = {
+  service: true,
+  usageConnection: true,
+  passwordProtected: true,
+  bindHosts: true,
+  bindWarning: true,
+  events: true,
+} as const;
+export type HubRowStatus = Pick<HubStatus, keyof typeof HUB_ROW_FIELDS>;
+
+// The Hub page's data, which a Headless Hub serves at GET /page/view
+// (ADR-0124 §4; apps/hub/src/page.ts): exactly what the page renders and nothing else of the
+// status. A visitor learns the bound addresses,
+// the bind warning and the event-archive counters, never an Organization id, a
+// usage reading or credential provenance. `liveClients` is the Hub's own count
+// of live clients, never the roster (hostnames and remote addresses stay off
+// the page); `version` is the Hub's package version.
+export const hubPageViewSchema = hubStatusSchema.pick(HUB_ROW_FIELDS).extend({
+  liveClients: z.number().int().nonnegative(),
+  version: z.string(),
+});
+export type HubPageView = z.infer<typeof hubPageViewSchema>;
+
+// What `maxprice-hub status --json` prints (ADR-0127 §8; apps/hub/src/
+// status.ts), one object, which #503's release-gate smoke is to parse. Each
+// form says where the daemon lives: the data dir, absolute; the pid and the
+// port serve.lock records; and whether that pid runs in
+// maxprice-hub.service. Both are always known: a report names a holder that
+// recorded its port, and a record with a port has a pid. A Hub that answered
+// adds its page view, the Hub row's state as the shared `hubDaemonState`
+// derives it from that view, and its key as ADR-0126 §3 reveals it: set or
+// not, when, and by whom, never the value. A holder that recorded its port
+// but did not answer within the bound is `not-responding`, with nothing it
+// would have said. No other state reaches a report: with no daemon the
+// command exits 3 and prints none, a holder with a pid alone is no daemon a
+// report can describe, and a command never sees the console's `starting` or
+// `stopped`, its reach waiting out the first and the lock telling it the
+// second.
+const hubStatusReportDaemon = {
+  dataDir: z.string().startsWith("/"),
+  pid: z.number().int().positive(),
+  port: z.number().int().min(1).max(65535),
+  inUnit: z.boolean(),
+};
+export const hubStatusReportSchema = z.discriminatedUnion("state", [
+  hubPageViewSchema.extend({
+    state: z.enum(["online", "local-only", "events-down"]),
+    key: z.object({
+      present: z.boolean(),
+      updatedAt: z.string().nullable(),
+      source: z.string().nullable(),
+    }),
+    ...hubStatusReportDaemon,
+  }),
+  z.object({
+    service: z.literal("maxprice-hub"),
+    state: z.literal("not-responding"),
+    ...hubStatusReportDaemon,
+  }),
+]);
+export type HubStatusReport = z.infer<typeof hubStatusReportSchema>;
+
 // Connected-clients roster (ADR-0036). NEW in M3; consumed only by the operator
 // console (Phase 3) via GET /api/clients. A live/recently-seen view since the
 // daemon started — the registry is in-memory and resets on restart.

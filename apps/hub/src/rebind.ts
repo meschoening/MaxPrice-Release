@@ -66,6 +66,31 @@ export type BindReconciler = {
   stop: () => Promise<void>;
 };
 
+// `host:port` as a URL or a log line writes it: an IPv6 host bracketed
+// (ADR-0127 §9), any other as it is.
+export function hostAndPort(host: string, port: number): string {
+  return host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`;
+}
+
+// The first pass's fatal throw (see `bind` below): the host and port it failed
+// on, and the listen error's code, so `serve` can say what holds the port
+// (ADR-0127 §2). The listen error itself is its `cause`.
+export class FirstBindError extends Error {
+  readonly code: string | undefined;
+
+  constructor(
+    readonly host: string,
+    readonly port: number,
+    cause: unknown,
+  ) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    super(`cannot bind ${hostAndPort(host, port)}: ${message}`, { cause });
+    this.name = "FirstBindError";
+    const code = (cause as { code?: unknown } | null)?.code;
+    this.code = typeof code === "string" ? code : undefined;
+  }
+}
+
 // Modes whose desired host set is a constant — no interface change can alter
 // it, so there is nothing to watch and the timer never starts.
 //
@@ -73,9 +98,9 @@ export type BindReconciler = {
 // canonical form — so `bind: "::ffff:127.0.0.1"` reads as loopback there and not
 // here, and starts a timer that re-resolves a constant set forever. Left as a
 // known seam rather than closed: the cost is one wasted comparison every 10s on
-// a spelling only a hand-edited hub.json could produce, no behavior differs, and
-// closing it would mean either exporting canonicalHost or growing a second copy
-// of it in this module.
+// a spelling only a hand-edited hub.json could produce, and no behavior differs.
+// bind.ts exports canonicalHost now (the Hub page guard reads it, ADR-0124 §2),
+// so closing the seam is one call; it is still left open, since nothing differs.
 function isStaticBind(bind: string): boolean {
   return bind === "loopback" || bind === "0.0.0.0" || bind === "::" || isLoopbackHost(bind);
 }
@@ -132,12 +157,15 @@ export function startBindReconciler(opts: BindReconcilerOptions): BindReconciler
       // passes `fatal` only on the first pass AND only for a host
       // `isBindClassifiable` vouches for (an IP literal the interface table
       // reports, or a wildcard). For such a host a throw can only mean another
-      // process owns the port — a second hub instance — which must stay a loud
-      // exit 1 rather than a daemon that half-serves. A host the gate cannot
+      // process owns the port, which must stay a loud exit 1 rather than a
+      // daemon that half-serves: a second hub, or something that is no hub at
+      // all, which serve's /healthz probe tells apart (ADR-0127 §2). A host the gate cannot
       // vouch for (a hostname, an ungated loopback literal) throws the SAME
       // EADDRINUSE for "that address isn't here", so it degrades onto the retry
-      // path below instead. Every later pass retries next tick regardless.
-      if (fatal) throw err;
+      // path below instead. Every later pass retries next tick regardless. The
+      // fatal throw names the host and port, which the bare listen error does
+      // not, for serve's line about what holds them (ADR-0127 §2).
+      if (fatal) throw new FirstBindError(hostname, opts.port, err);
       const last = lastFailureLogAt.get(hostname);
       const t = now();
       if (last === undefined || t - last >= BIND_FAILURE_LOG_THROTTLE_MS) {
@@ -170,9 +198,9 @@ export function startBindReconciler(opts: BindReconcilerOptions): BindReconciler
 
   // `fatal` is true ONLY on the first pass, from startBindReconciler's own
   // synchronous call — the boot bind keeps its deliberate unguarded posture
-  // (index.ts: "a throw here is a fatal unhandled rejection, loud exit 1, no
-  // zombie"), while every timer-driven pass is guarded and retries. Within that
-  // first pass it is narrowed per host by `isBindClassifiable`, below.
+  // (index.ts's serve catches the throw, says what holds the port and exits 1:
+  // no zombie), while every timer-driven pass is guarded and retries. Within
+  // that first pass it is narrowed per host by `isBindClassifiable`, below.
   function reconcile(fatal: boolean): void {
     if (stopped) return;
     // ONE interface read, used for both the resolution and the classification.
@@ -209,7 +237,7 @@ export function startBindReconciler(opts: BindReconcilerOptions): BindReconciler
     //     at all — so without this the console would see
     //     {bindHosts:["127.0.0.1"], bindWarning:null} and read it as a CHOSEN
     //     loopback bind (isDeliberateLoopback,
-    //     apps/hub-desktop/src/lib/presentation.ts), painting a
+    //     packages/shared/src/hub-rows.ts), painting a
     //     fleet-unreachable hub as local-only-by-request. Worse on a half-failed
     //     dual stack: v4 bound reads "Online" while AAAA-preferring clients hit
     //     a dead address — the ADR-0038 fault, silently.
@@ -259,12 +287,12 @@ export function startBindReconciler(opts: BindReconcilerOptions): BindReconciler
   // Guard the TIMER CALLBACK, never reconcile()'s body — the fatal first pass
   // is the direct call above, outside the timer, and must keep throwing. There
   // is no `uncaughtException` handler anywhere in the daemon (index.ts registers
-  // SIGINT, SIGTERM and `unhandledRejection` only), so a throw out of a tick
-  // would abort the process with poller.stop(), the sample flush,
-  // fleetEvents.close() and binds.stop() all skipped. Sources that really can
-  // throw in here: interfacesImpl() (os.networkInterfaces() under adapter
-  // churn), log(), and the synchronous half of server.stop(). One bad tick
-  // should cost one tick.
+  // SIGINT, SIGTERM, a Headless Hub's SIGHUP and `unhandledRejection` only), so
+  // a throw out of a tick would abort the process with poller.stop(), the
+  // sample flush, fleetEvents.close() and binds.stop() all skipped. Sources
+  // that really can throw in here: interfacesImpl() (os.networkInterfaces()
+  // under adapter churn), log(), and the synchronous half of server.stop().
+  // One bad tick should cost one tick.
   function guardedTick(): void {
     try {
       reconcile(false);

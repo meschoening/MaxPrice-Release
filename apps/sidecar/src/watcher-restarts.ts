@@ -7,10 +7,11 @@ import type { Watcher } from "./watcher";
 // settings restart can never interleave, or swap the watcher out from under
 // each other.
 //
-// Extracted from `main()` so the reentrancy-safe orchestration is a single
-// named, testable unit. The JSONL-watcher factory, the roots resolver and the
-// install callback are all injected, so a unit test can drive the whole state
-// machine with fakes and never touch the real filesystem.
+// Extracted from `main()` (now `bootSidecar`) so the reentrancy-safe
+// orchestration is a single named, testable unit. The JSONL-watcher factory,
+// the roots resolver and the install callback are all injected, so a unit test
+// can drive the whole state machine with fakes and never touch the real
+// filesystem.
 
 // Why a restart ran: `roots` for a re-check that found new roots, `recovery`
 // for a watch loss on unchanged ones.
@@ -28,7 +29,7 @@ export type CreateWatcherRestartsOptions = {
   getCurrentRoots: () => string[];
   getCurrentWatcher: () => Watcher | null;
   // Build a JSONL watcher for `roots`. Injected (rather than importing
-  // `createWatcher` directly) so `main()` keeps the single shared option
+  // `createWatcher` directly) so `bootSidecar()` keeps the single shared option
   // builder and tests can supply fakes.
   createJsonlWatcher: (roots: string[]) => Promise<Watcher>;
   // Install a completed restart: record the new watcher and its roots. Called

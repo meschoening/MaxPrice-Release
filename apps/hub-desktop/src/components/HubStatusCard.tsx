@@ -6,21 +6,23 @@ import { useHubStatus } from "@/state/use-hub-status";
 import { useHubUrl } from "@/state/use-hub-url";
 import { useCompactStore } from "@/state/use-machine-mutations";
 import { useNowTick } from "@/state/use-now-tick";
-import { formatRelativeTime } from "@maxprice/shared";
+import {
+  eventsDown,
+  formatRelativeTime,
+  hubDaemonDot,
+  hubDaemonLabel,
+  hubDaemonState,
+  isDeliberateLoopback,
+} from "@maxprice/shared";
 import { formatUptime } from "@/lib/relative-time";
 import { dotVariant } from "@/lib/dot-variant";
 import { showToast } from "@/lib/toast";
 import { relaunchApp } from "@/lib/tauri";
 import {
   autostartRow,
-  eventsDown,
   formatBytes,
   formatCount,
   formatListening,
-  hubDaemonDot,
-  hubDaemonLabel,
-  hubDaemonState,
-  isDeliberateLoopback,
   showFirewallWarning,
 } from "@/lib/presentation";
 

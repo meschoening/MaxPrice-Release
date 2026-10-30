@@ -3,12 +3,24 @@
 // AND copies into apps/hub-desktop/src-tauri/binaries/ so the MaxPrice Hub
 // tray app (ADR-0036) can bundle the daemon as its externalBin sidecar
 // (mirrors apps/sidecar/scripts/build-binaries.ts).
+//
+// linux-x64 is the Headless Hub's target, and it alone embeds the Hub page
+// (ADR-0124 §1, §7). Its build orders itself: the page build
+// (`bun run build:page` in apps/hub-desktop, into dist-page/), then the page
+// manifest (page-manifest.ts, into the git-ignored apps/hub/generated/), then
+// the compile under `--conditions=maxprice-hub-page`, which resolves
+// `#page-manifest` to that generated module and so embeds every dist-page file.
+// Every tray target compiles with the argv it always had, so `#page-manifest`
+// resolves to the committed empty src/page-manifest.ts, and never builds or
+// reads dist-page. No build rewrites a tracked file.
 import { mkdir, copyFile, readdir, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { PAGE_DIST_DIR, PAGE_MANIFEST_FILE, writePageManifest } from "./page-manifest";
 
 const HUB_DIR = resolve(import.meta.dir, "..");
-const TAURI_BIN_DIR = resolve(HUB_DIR, "..", "hub-desktop", "src-tauri", "binaries");
+const HUB_DESKTOP_DIR = resolve(HUB_DIR, "..", "hub-desktop");
+const TAURI_BIN_DIR = resolve(HUB_DESKTOP_DIR, "src-tauri", "binaries");
 
 // `bun build --compile` writes a `.<hash>.bun-build` temp into the working
 // directory and only deletes it on a clean exit — so every interrupted or
@@ -57,6 +69,77 @@ function hostKey(): string {
   return hostKeyFrom(process.platform, process.arch);
 }
 
+// The package `imports` condition under which `#page-manifest` resolves to the
+// generated manifest (apps/hub/package.json).
+export const PAGE_CONDITION = "maxprice-hub-page";
+
+// The Headless Hub's target. The tray app ships on Windows alone (ADR-0050). A
+// Linux tray run from source (`bun run dev:hub`) bundles this same binary, page
+// and all, but runs it embedded, and an embedded daemon mounts no `/page/`.
+const HEADLESS_HUB_TARGET = "linux-x64";
+
+/** Whether a target's binary embeds the Hub page: the Headless Hub's alone. */
+export function embedsPage(target: TargetSpec): boolean {
+  return target.triple === TARGETS[HEADLESS_HUB_TARGET]!.triple;
+}
+
+/**
+ * The `bun build --compile` argv for one target. `--define` folds the update
+ * channel's test seam away on every target (src/update-channel.ts, ADR-0129
+ * §7 with ADR-0123 §9 as amended by #472): defined as `undefined`, its
+ * `typeof` check is constant, so the binary carries UPDATE_CHANNEL alone and
+ * never looks the global up. Without it a compiled binary would read
+ * MAXPRICE_TEST_UPDATE_CHANNEL at runtime, which BUN_OPTIONS=--preload can
+ * set, and check and install from that channel. A tray binary never checks
+ * or updates (an embedded daemon checks nothing, and `update` is Linux
+ * only), but it compiles the same module, so it folds the seam away too.
+ */
+export function compileArgs(target: TargetSpec, entryPath: string, outfile: string): string[] {
+  return [
+    "bun",
+    "build",
+    "--compile",
+    `--target=${target.bunTarget}`,
+    "--define",
+    "MAXPRICE_TEST_UPDATE_CHANNEL=undefined",
+    ...(embedsPage(target) ? [`--conditions=${PAGE_CONDITION}`] : []),
+    entryPath,
+    "--outfile",
+    outfile,
+  ];
+}
+
+export type BuildSteps = {
+  buildPage(): Promise<void>;
+  writeManifest(): void | Promise<void>;
+  compile(target: TargetSpec): Promise<void>;
+};
+
+/** Builds one target: the page and its manifest first when it embeds the page. */
+export async function buildTarget(target: TargetSpec, steps: BuildSteps): Promise<void> {
+  if (embedsPage(target)) {
+    await steps.buildPage();
+    await steps.writeManifest();
+  }
+  await steps.compile(target);
+}
+
+async function buildPage() {
+  console.log(`[build] Hub page → ${PAGE_DIST_DIR}`);
+  const proc = Bun.spawn(["bun", "run", "build:page"], {
+    cwd: HUB_DESKTOP_DIR,
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  const code = await proc.exited;
+  if (code !== 0) throw new Error(`the Hub page build failed (exit ${code})`);
+}
+
+function writeManifest() {
+  const keys = writePageManifest(PAGE_DIST_DIR, PAGE_MANIFEST_FILE);
+  console.log(`[build] page manifest: ${keys.length} files → ${PAGE_MANIFEST_FILE}`);
+}
+
 async function compile(
   entry: string,
   outName: string,
@@ -70,18 +153,10 @@ async function compile(
 
   console.log(`[build] ${entry} → ${outfile}`);
   try {
-    const proc = Bun.spawn(
-      [
-        "bun",
-        "build",
-        "--compile",
-        `--target=${target.bunTarget}`,
-        entryPath,
-        "--outfile",
-        outfile,
-      ],
-      { stdout: "inherit", stderr: "inherit" },
-    );
+    const proc = Bun.spawn(compileArgs(target, entryPath, outfile), {
+      stdout: "inherit",
+      stderr: "inherit",
+    });
     const code = await proc.exited;
     if (code !== 0) throw new Error(`bun build failed for ${entry} (exit ${code})`);
   } finally {
@@ -107,8 +182,13 @@ async function main() {
         })
       : [TARGETS[hostKey()]!];
 
+  const steps: BuildSteps = {
+    buildPage,
+    writeManifest,
+    compile: (t) => compile("src/index.ts", "maxprice-hub", t),
+  };
   for (const t of targetsToBuild) {
-    await compile("src/index.ts", "maxprice-hub", t);
+    await buildTarget(t, steps);
   }
 
   const exeExt = process.platform === "win32" ? ".exe" : "";

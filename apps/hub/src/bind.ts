@@ -27,7 +27,7 @@ export type Ifaces = ReturnType<typeof networkInterfaces>;
 // address isn't here" from "another process owns the port". The interface table
 // is the classifier instead: an address the OS doesn't report is not offered for
 // binding at all, which leaves a throw from a PRESENCE-GATED host meaning one
-// thing — a port conflict, i.e. a second hub instance — and keeps that fatal at
+// thing — a port conflict with another process — and keeps that fatal at
 // boot.
 //
 // That guarantee is exactly as narrow as the gate. Two host shapes are NOT gated
@@ -60,7 +60,11 @@ const V4_MAPPED = /^[0:]*:ffff:(\d{1,3}(?:\.\d{1,3}){3})$/;
 // re-ran the impossible comparison every 10s. Any OTHER v4-in-v6 form
 // (`::a.b.c.d`) is left alone: it has no dotted-quad equivalent in the interface
 // table either way, so folding it would buy nothing.
-function canonicalHost(host: string): string {
+//
+// The Hub page's guard (peer.ts) canonicalises a socket peer with it too: a
+// dual-stack `::` listener reports an IPv4 peer as `::ffff:127.0.0.1`, which
+// isLoopbackHost alone does not recognise (ADR-0124 §2).
+export function canonicalHost(host: string): string {
   const h = (host.split("%")[0] ?? "").toLowerCase();
   if (!h.includes(":")) return h;
   const mapped = V4_MAPPED.exec(h);
@@ -149,7 +153,7 @@ export function tailnetIPv6(ifaces: Ifaces = networkInterfaces()): string | null
 // INVARIANT — a loopback-only bind returns a warning ONLY when the loopback was
 // NOT what the operator asked for (today: `bind: "tailnet"` that found no
 // interface, or an explicit IP the machine does not have yet).
-// `isDeliberateLoopback` in apps/hub-desktop/src/lib/presentation.ts
+// `isDeliberateLoopback` in packages/shared/src/hub-rows.ts
 // infers "chosen loopback vs failed tailnet" from the mere PRESENCE of a
 // warning, so a new warning on an intentionally loopback-only bind would repaint
 // a chosen state with a fault color. Adding one means updating that function too.

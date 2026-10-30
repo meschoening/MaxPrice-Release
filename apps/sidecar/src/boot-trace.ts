@@ -39,7 +39,7 @@ export type BootTrace = {
   // Wraps one fan-out phase. Returns a promise that settles exactly as `work`
   // does — including rejecting with the same error — so tracking a phase can
   // never change what the caller sees, and an unhandled rejection stays
-  // unhandled (index.ts exits on those, deliberately).
+  // unhandled (boot.ts exits on those, deliberately).
   track: <T>(name: string, work: Promise<T>) => Promise<T>;
   // Sub-phase progress, shown inline in the tick line: `scan(412/1253 files)`.
   // Silently ignored for a phase that has already settled.

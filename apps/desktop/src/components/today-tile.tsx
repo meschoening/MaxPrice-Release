@@ -1,5 +1,4 @@
-import type { DailyRow } from "@maxprice/shared";
-import { abbreviate } from "@/lib/active-block";
+import { abbreviate, type DailyRow } from "@maxprice/shared";
 import { useBump } from "@/state/use-bump";
 import { DeltaChip } from "./delta-chip";
 import { UnpricedChip } from "./unpriced-chip";

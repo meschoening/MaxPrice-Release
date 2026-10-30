@@ -1,0 +1,45 @@
+/* The hub Popout's rows recipe (ADR-0050): the three status rows and the
+   clients line that HubStatusRows renders. Its own file because two builds
+   wear it at this exact recipe, one markup and one CSS (ADR-0124 §7): the
+   tray app, from globals.css, and the Hub page, from src/page/page.css. */
+
+.prows {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.prow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 7px 10px;
+}
+.prow .name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.prow .state {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--soft);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.prow .state b {
+  font-weight: 600;
+  color: var(--text);
+}
+/* The clients row: count leading, flush with the dots' edge — no dot, no
+   name-column indent (T1's resolved left alignment). */
+.prow .state.clients {
+  margin-left: 0;
+  text-align: left;
+}
+/* No fresh reading (starting / not responding) — the dependent rows dim. */
+.prow.dim {
+  opacity: 0.55;
+}

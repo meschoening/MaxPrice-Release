@@ -1,7 +1,7 @@
 // Single source of truth for tz-local WALL-CLOCK reads.
 //
 // Both the engine (`apps/sidecar/src/engine/local-date.ts` `localClock`, used by
-// `aggregateToday`) and the renderer (`apps/desktop/src/lib/dates.ts`
+// `aggregateToday`) and the renderer (`packages/shared/src/dates.ts`
 // `msSinceLocalMidnight`, driving the adaptive `today`-line granularity, ADR-0022)
 // need the SAME quantity: an instant's Y/M/D H:M:S wall clock in a given IANA
 // zone. They used to compute it two different ways — the engine via a

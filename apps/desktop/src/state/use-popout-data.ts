@@ -5,25 +5,22 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { listen } from "@tauri-apps/api/event";
 import {
   ALL_ORGANIZATIONS,
+  popoutQueryInputs,
+  popoutQuotaTag,
+  popoutReadings,
+  type PopoutReadings,
   resolveOrganizationScope,
   statusSnapshotSchema,
-  type BlockRow,
-  type ModelScopedWindow,
-  type OrganizationsResponse,
   type Settings,
   type StatusSnapshot,
-  type UsageOrganizations,
-  type UsageWindow,
-  type WindowState,
+  scopeParams,
+  type ScopeParams,
 } from "@maxprice/shared";
-import { organizationLabel, organizationLabelMap } from "@/lib/organization-scope-view";
 import { sidecarExited, sidecarFetch } from "@/lib/sidecar";
 import { insideTauri } from "@/lib/tauri";
 import { applyStoredTheme } from "@/lib/theme";
-import { ymdShift } from "@/lib/dates";
 import { blocksQueryKey, fetchBlocks } from "./use-blocks";
 import { dailyQueryKey, fetchDaily } from "./use-daily";
-import { scopeParams, type ScopeParams } from "./use-organization-scope";
 import { fetchOrganizations, organizationsQueryKey } from "./use-organizations";
 import { fetchUsageCurrent, usageCurrentQueryKey } from "./use-usage-current";
 import { useSettings } from "./use-settings";
@@ -132,9 +129,9 @@ const UPDATE_AVAILABLE_EVENT = "update:available";
 
 // /api/status, four-piece style (ADR-0004) — the popout needs `ready` +
 // `hasData` (the first-launch inset, which takes BOTH per ADR-0047; see
-// popout-view.ts) and `usageConnection` (the ADR-0030 limit-row dim), and
-// the main window's copy lives in a zustand store fed by its SSE channel,
-// which a glance surface has no business standing up.
+// packages/shared/src/popout-view.ts) and `usageConnection` (the ADR-0030
+// limit-row dim), and the main window's copy lives in a zustand store fed by
+// its SSE channel, which a glance surface has no business standing up.
 export function popoutStatusQueryKey(): [string] {
   return ["popout-status"];
 }
@@ -167,60 +164,21 @@ export function popoutScope(
   return { organization, quotaOrganization, isAll, multi };
 }
 
-// The Active block eyebrow's tag: the Quota organization's label, under every
-// scope, while more than one Organization is tracked. The popout has no scope
-// chip, so unlike the main window's tile (which tags only under All) the
-// eyebrow is the one place that says whose block this is. The label is the
-// collision-suffixed one over the whole roster, with the shared fallback for a
-// uuid the roster lacks. A roster not yet loaded, or failed, tags nothing:
-// flashing `Organization <first 8>` before the real label would be worse than
-// an untagged eyebrow for a moment. Pure; exported for its test.
-export function popoutQuotaTag(
-  multi: boolean,
-  quotaOrganization: string | undefined,
-  roster: OrganizationsResponse | undefined,
-): string | null {
-  if (!multi || quotaOrganization === undefined || roster === undefined) return null;
-  return organizationLabel(organizationLabelMap(roster.organizations), quotaOrganization);
-}
-
-// The Quota organization's 5-hour Window state from the status's Organization
-// map (#384): undefined with no Home, before a status frame, or before its
-// first successful read. An own key only: a uuid is never a prototype name.
-// Pure; exported for its test.
-export function quotaWindowState(
-  organizations: UsageOrganizations | undefined,
-  quotaOrganization: string | undefined,
-): WindowState | undefined {
-  if (organizations === undefined || quotaOrganization === undefined) return undefined;
-  if (!Object.hasOwn(organizations, quotaOrganization)) return undefined;
-  return organizations[quotaOrganization]!.windowStates?.fiveHour;
-}
-
-export type PopoutData = {
+// The readings are `popoutReadings`' over the four answers, shared with the
+// Headless client's `live`: ADR-0047's `ready`/`hasData` pair passed through
+// untouched so the view can apply `corpusIsEmpty` to both, and the Quota
+// organization's 5-hour Window state (#384) from the status the popout
+// already fetches.
+export type PopoutData = PopoutReadings & {
   anyError: boolean;
   // The shell confirms the sidecar exited (ADR-0112). Raw: popoutView alone
   // decides whether that makes the down state a stop.
   engineStopped: boolean;
   settled: boolean;
-  // ADR-0047's pair, passed through untouched so the view can apply
-  // `corpusIsEmpty` to both. `null` before the first status frame.
-  ready: boolean | null;
-  hasData: boolean | null;
-  usageConnected: boolean;
-  block: BlockRow | null;
-  usageWindow: UsageWindow | null;
-  weeklyWindow: UsageWindow | null;
-  modelWindow: ModelScopedWindow | null;
-  todayCost: number;
-  todayTokens: number;
   // The Quota organization's label for the eyebrow (`popoutQuotaTag`).
   quotaTag: string | null;
   // The scope is All organizations.
   allOrganizations: boolean;
-  // The Quota organization's 5-hour Window state (#384), read from the status
-  // the popout already fetches; undefined before a successful read.
-  fiveHourState: WindowState | undefined;
 };
 
 export function usePopoutData(): PopoutData {
@@ -231,10 +189,13 @@ export function usePopoutData(): PopoutData {
   // that way until the first tray click. Only the Rust pokes below move it —
   // nothing the renderer can read ever will.
   const [shown, setShown] = useState(false);
-  const mode = settings?.costMode ?? "auto";
-  const tz = settings?.timezone;
-  const today = ymdShift(0, tz);
-  const yesterday = ymdShift(-1, tz);
+  // Today's window and the blocks window, as `popoutQueryInputs` explains
+  // them; the Headless client's `live` requests the same two.
+  const inputs = popoutQueryInputs({
+    mode: settings?.costMode ?? "auto",
+    tz: settings?.timezone,
+    organization,
+  });
 
   const statusQ = useQuery({
     queryKey: popoutStatusQueryKey(),
@@ -242,23 +203,15 @@ export function usePopoutData(): PopoutData {
     refetchInterval: shown ? POPOUT_REFRESH_MS : false,
     retry: POPOUT_RETRY,
   });
-  // Today's row only — the Today tile's cost + tokens (ADR-0020's calendar day),
-  // under the scope: every tracked Organization's day under All.
-  const dailyInput = { since: today, until: today, mode, tz, organization };
   const dailyQ = useQuery({
-    queryKey: dailyQueryKey(dailyInput),
-    queryFn: ({ signal }) => withDeadline(signal, (s) => fetchDaily(dailyInput, s)),
+    queryKey: dailyQueryKey(inputs.today),
+    queryFn: ({ signal }) => withDeadline(signal, (s) => fetchDaily(inputs.today, s)),
     refetchInterval: shown ? POPOUT_REFRESH_MS : false,
     retry: POPOUT_RETRY,
   });
-  // The active block can straddle midnight, so the window reaches back a day.
-  // Blocks are cross-project by design and the popout carries no filter rail,
-  // so the input carries only the scope (ADR-0017 untouched), which the
-  // sidecar resolves to the Quota organization's Blocks (ADR-0108).
-  const blocksInput = { since: yesterday, until: today, mode, tz, organization };
   const blocksQ = useQuery({
-    queryKey: blocksQueryKey(blocksInput),
-    queryFn: ({ signal }) => withDeadline(signal, (s) => fetchBlocks(blocksInput, s)),
+    queryKey: blocksQueryKey(inputs.blocks),
+    queryFn: ({ signal }) => withDeadline(signal, (s) => fetchBlocks(inputs.blocks, s)),
     refetchInterval: shown ? POPOUT_REFRESH_MS : false,
     retry: POPOUT_RETRY,
   });
@@ -320,30 +273,18 @@ export function usePopoutData(): PopoutData {
     blocksQ.data !== undefined &&
     usageQ.data !== undefined;
 
-  const blocks = blocksQ.data?.blocks ?? [];
-  const todayRow = dailyQ.data?.daily.find((r) => r.date === isoDate(today));
   return {
     anyError,
     engineStopped: exitQ.data === true,
     settled,
-    ready: statusQ.data?.ready ?? null,
-    hasData: statusQ.data?.hasData ?? null,
-    usageConnected: statusQ.data?.usageConnection === "connected",
-    block: blocks.find((b) => b.isActive && !b.isGap) ?? null,
-    usageWindow: usageQ.data?.sample?.fiveHour ?? null,
-    weeklyWindow: usageQ.data?.sample?.weekly ?? null,
-    modelWindow: usageQ.data?.sample?.weeklyModel ?? null,
-    todayCost: todayRow?.totalCost ?? 0,
-    todayTokens: todayRow?.totalTokens ?? 0,
-    quotaTag: popoutQuotaTag(multi, quotaOrganization, rosterQ.data),
+    ...popoutReadings(
+      { status: statusQ.data, today: dailyQ.data, blocks: blocksQ.data, usage: usageQ.data },
+      inputs.todayYmd,
+      quotaOrganization,
+    ),
+    quotaTag: popoutQuotaTag(multi, quotaOrganization, rosterQ.data?.organizations),
     allOrganizations: isAll,
-    fiveHourState: quotaWindowState(statusQ.data?.organizations, quotaOrganization),
   };
-}
-
-// The wire `date` is dashed YYYY-MM-DD; ymdShift returns dashless YYYYMMDD.
-function isoDate(ymd: string): string {
-  return `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
 }
 
 // The pending update's version, for the accent update row (T5 decision 7):

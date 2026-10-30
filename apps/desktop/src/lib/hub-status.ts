@@ -1,9 +1,12 @@
 import type { HubConnection } from "@maxprice/shared";
 
-// Dot + label for the hub connection state (ADR-0035), the usage-status.ts
-// pattern. `off` returns null — there is no canonical color for the
-// unconfigured state; the Settings section shows its own "Not configured"
-// treatment, the consumer decides how to present `null`.
+// Dot and text emphasis for the hub connection state (ADR-0035), the
+// usage-status.ts pattern. The label moved to `@maxprice/shared`'s
+// `hubConnectionLabel` (#463), which the Headless client's `maxprice status`
+// shares; these two maps are Tailwind classes, so they stay with the renderer.
+// `off` returns null — there is no canonical color for the unconfigured state;
+// the Settings section shows its own "Not configured" treatment, the consumer
+// decides how to present `null`.
 export function hubConnectionDot(conn: HubConnection): string | null {
   switch (conn) {
     case "connected":
@@ -23,30 +26,10 @@ export function hubConnectionDot(conn: HubConnection): string | null {
   }
 }
 
-// Human-readable label for a hub connection state — one label per state.
-export function hubConnectionLabel(conn: HubConnection): string {
-  switch (conn) {
-    case "connected":
-      return "Connected — hub is polling";
-    case "connecting":
-      return "Connecting…";
-    case "fallback":
-      return "Hub unreachable — polling locally";
-    case "keyless":
-      return "Hub has no working Claude key — polling locally";
-    case "mismatch":
-      return "Hub version mismatch — update both apps; polling locally";
-    case "unauthorized":
-      return "Hub password rejected — polling locally";
-    case "off":
-      return "Not configured";
-  }
-}
-
 // Text-emphasis class for the Settings status line's label — one class per
 // state, centralizing what was a bare-else ternary in HubSection. The non-null
 // return type makes a missing arm a compile error, keeping this exhaustive
-// alongside the dot/label maps above.
+// alongside the dot map above and the shared label.
 export function hubConnectionTextClass(conn: HubConnection): string {
   switch (conn) {
     case "connected":

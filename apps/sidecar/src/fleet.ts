@@ -92,8 +92,8 @@ type Conn = { url: string; headers: Record<string, string> };
 type RefreshTrigger = { (): void; reset: () => void };
 
 // The label store as the Organization directory sync sees it (#288): what to
-// push, and where to adopt the union. `ready` is main()'s `labelsReady` —
-// nothing is pushed or adopted before the store has loaded, because the load
+// push, and where to adopt the union. `ready` is bootSidecar()'s `labelsReady`
+// — nothing is pushed or adopted before the store has loaded, because the load
 // would overwrite an entry adopted ahead of it.
 type FleetOrganizationLabels = {
   ready: Promise<void>;
@@ -103,7 +103,8 @@ type FleetOrganizationLabels = {
 
 // The assertion store as the Organization assertion directory sync sees it
 // (#310) — the label store's shape above, for the same reason: `ready` is
-// main()'s `assertionsReady`, and nothing is pushed or adopted before it.
+// bootSidecar()'s `assertionsReady`, and nothing is pushed or adopted before
+// it.
 type FleetOrganizationAssertions = {
   ready: Promise<void>;
   entries: () => ReadonlyMap<string, Readonly<OrganizationAssertionEntry>>;
@@ -141,7 +142,7 @@ export type FleetSyncDeps = {
   getStore: () => EventStore;
   // The private first-launch selection must settle before any outward feeder.
   ingestionReady?: Promise<void>;
-  swapStore: (next: EventStore) => void; // main()'s storeRef assignment
+  swapStore: (next: EventStore) => void; // bootSidecar()'s `installStore`
   createStore: () => EventStore; // () => createEventStore({ selfMachineId: machineId })
   // The Local archive's engine feeder (ADR-0069): rebuildEngine seeds every
   // fresh store from it, exactly as it seeds from the replica — without this, a
@@ -159,11 +160,11 @@ export type FleetSyncDeps = {
   // their admitted rows stay archived. Never the pair-wide forget above: absent,
   // as in a rig that wires no archive, the repair's local half does nothing.
   forgetExcludedFromLocalArchive?: (sessions: readonly ForgetSessionRef[]) => Promise<void>;
-  // main()'s half of the presumption cell (`withPublishedHomes`, #281): the
-  // machineId -> published Home map the Machine directory implies. The fleet
-  // owns the directory, so it builds the map and decides when it CHANGED; the
-  // report cache sees the swap by identity (ADR-0057's rebind trigger), and the
-  // fleet's own `pokeNow` is the wholesale invalidation that follows it.
+  // bootSidecar()'s half of the presumption cell (`withPublishedHomes`, #281):
+  // the machineId -> published Home map the Machine directory implies. The
+  // fleet owns the directory, so it builds the map and decides when it CHANGED;
+  // the report cache sees the swap by identity (ADR-0057's rebind trigger), and
+  // the fleet's own `pokeNow` is the wholesale invalidation that follows it.
   installPublishedHomes?: (homes: ReadonlyMap<string, string>) => void;
   // The user's renames, synced with the Hub's Organization directory (#288).
   // Absent — a rig that wires no label store — and the fleet neither pushes
@@ -173,9 +174,10 @@ export type FleetSyncDeps = {
   // assertion directory (#310). Absent — a rig that wires no assertion store —
   // and the fleet neither pushes nor pulls them.
   organizationAssertions?: FleetOrganizationAssertions;
-  // main()'s assertion writer (#310): called after an adoption that changed
-  // some session's resolved Organization, BEFORE the fleet's own wholesale
-  // invalidation, so every renderer's refetch already sees the new claims.
+  // bootSidecar()'s assertion writer (#310): called after an adoption that
+  // changed some session's resolved Organization, BEFORE the fleet's own
+  // wholesale invalidation, so every renderer's refetch already sees the new
+  // claims.
   assertionsAdopted?: () => void;
   // #366: the Hub's roster, learned into this machine's Organization registry
   // so Settings lists every Organization the Hub's key can see. Absent — a rig
@@ -345,11 +347,12 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   const cache = createMachineDirectoryCache({ path: deps.directoryCachePath });
   cache.load();
 
-  // The published Homes last handed to main() (#281). Starts as the empty map,
-  // which is exactly what main()'s initial presumption carries.
+  // The published Homes last handed to bootSidecar() (#281). Starts as the
+  // empty map, which is exactly what bootSidecar()'s initial presumption
+  // carries.
   let installedHomes: ReadonlyMap<string, string> = publishedHomes([], deps.machineId);
-  // Hand main() the presumption map a directory list implies — only when it
-  // CHANGED. Every GET carries fresh `live`/`lastSeenAt` join fields, so an
+  // Hand bootSidecar() the presumption map a directory list implies — only when
+  // it CHANGED. Every GET carries fresh `live`/`lastSeenAt` join fields, so an
   // unconditional install would mint a new presumption identity, and clear
   // every report cache in the fleet, on every 5-minute sweep.
   function adoptPublishedHomes(machines: readonly HubMachine[], poke: boolean): void {
@@ -1359,10 +1362,10 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // the directory entry exists on any authenticated contact, and rows shared
   // before sharing was switched off still need their producer's Home.
   //
-  // The Home this process runs under, as main() last handed it. `undefined`
-  // until the first `setHome` — a first launch's Home is not known until the
-  // seed walk settles, and publishing a placeholder would only make every peer
-  // drop its caches twice.
+  // The Home this process runs under, as bootSidecar() last handed it.
+  // `undefined` until the first `setHome` — a first launch's Home is not known
+  // until the seed walk settles, and publishing a placeholder would only make
+  // every peer drop its caches twice.
   let home: string | null | undefined;
   // The Home this CONNECTION last saw the Hub accept: the value SENT in a PUT
   // answered 2xx — not the live `home` at completion, so a `setHome` landing
@@ -1685,12 +1688,12 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   }
 
   // Adopt a union. Only a change to some session's resolved Organization is
-  // announced: main() installs the new claims (`assertionsAdopted`), then the
-  // wholesale invalidation tells every renderer to refetch. An `editedAt` that
-  // moved alone, or a tombstone for a session with no claim, is written to
-  // disk and shown to no one. A merge that rejects restored the store, so there
-  // is nothing to announce. No roster poke: a claim moves no Organization's
-  // row in Settings.
+  // announced: bootSidecar() installs the new claims (`assertionsAdopted`),
+  // then the wholesale invalidation tells every renderer to refetch. An
+  // `editedAt` that moved alone, or a tombstone for a session with no claim, is
+  // written to disk and shown to no one. A merge that rejects restored the
+  // store, so there is nothing to announce. No roster poke: a claim moves no
+  // Organization's row in Settings.
   async function adoptOrganizationAssertions(
     store: FleetOrganizationAssertions,
     union: Record<string, OrganizationAssertionEntry>,

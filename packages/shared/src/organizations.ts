@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { SessionRow } from "./sessions";
 import {
   orgLimitsAnswerSchema,
   windowStatesSchema,
@@ -174,6 +175,103 @@ export function displayOrganizationLabels(
       (counts.get(label.toLowerCase()) ?? 0) > 1 ? `${label} · ${uuid.slice(0, 8)}` : label,
     ]),
   );
+}
+
+// uuid → the label to render, collision-suffixed across the WHOLE roster, so
+// the chip and every other surface that names an Organization agree.
+export function organizationLabelMap(
+  roster: ReadonlyArray<Pick<OrganizationEntry, "uuid" | "label">>,
+): Map<string, string> {
+  return displayOrganizationLabels(roster);
+}
+
+// A uuid the roster has not listed renders the shared label resolution's
+// answer for an Organization with no rename and no plan word, so the fallback
+// is spelled in one place; the upstream name never appears.
+export function organizationLabel(labels: ReadonlyMap<string, string>, uuid: string): string {
+  return (
+    labels.get(uuid) ??
+    resolveOrganizationLabel({ uuid, rename: null, organizationType: null, hints: null }).label
+  );
+}
+
+// The Organization cells of the Sessions and Projects tables, shown only under
+// All organizations. A session with no attributed Organization reads null —
+// the cell renders an em dash rather than a label it cannot claim.
+export function sessionOrganizationLabel(
+  uuid: string | undefined,
+  labels: ReadonlyMap<string, string>,
+): string | null {
+  return uuid === undefined ? null : organizationLabel(labels, uuid);
+}
+
+// A project's Organizations in first-seen order: none is null, one reads as its
+// label, several as a count whose title lists every label in that order. One
+// label is its own title, since a long one truncates in the cell.
+export function projectOrganizationsCell(
+  uuids: readonly string[],
+  labels: ReadonlyMap<string, string>,
+): { text: string; title: string } | null {
+  const [only] = uuids;
+  if (only === undefined) return null;
+  if (uuids.length === 1) {
+    const label = organizationLabel(labels, only);
+    return { text: label, title: label };
+  }
+  return {
+    text: `${uuids.length} organizations`,
+    title: uuids.map((uuid) => organizationLabel(labels, uuid)).join(", "),
+  };
+}
+
+export interface OrganizationCellLabels {
+  // The line the cell leads with, which is also what the column sorts and
+  // searches by: a partly owned session's owned half, else the row's
+  // Organization; null for none (the em dash).
+  label: string | null;
+  // A partly owned session's owner-less half, read beneath.
+  ownerlessLabel?: string;
+}
+
+// The Sessions table's Organization cell under All organizations. A partly
+// owned session leads with the Organization its Owner records name, never the
+// row's own (its latest event's, which may be the owner-less half).
+export function organizationCellLabels(
+  row: SessionRow,
+  labels: ReadonlyMap<string, string>,
+): OrganizationCellLabels {
+  const split = row.organizationSplit;
+  if (split === undefined) return { label: sessionOrganizationLabel(row.organizationUuid, labels) };
+  return {
+    label: organizationLabel(labels, split.owned),
+    ownerlessLabel: organizationLabel(labels, split.ownerless),
+  };
+}
+
+// Where this machine learned of an Organization (`seenOn`), as the Desktop
+// client's row facts and `maxprice org list`'s Seen on column both word it:
+// the places in a fixed order, or an em dash for none.
+export function seenOnText(seenOn: OrganizationEntry["seenOn"]): string {
+  const places = [
+    seenOn.machine ? "this machine" : null,
+    seenOn.fleet ? "the fleet" : null,
+    seenOn.account ? "your account" : null,
+  ].filter((place) => place !== null);
+  return places.length === 0 ? "—" : places.join(" · ");
+}
+
+// Home first, then the rest in their own order: how the Desktop client's
+// Organizations list (`organizationListRows`) and `maxprice org list` both
+// order their rows. A null Home, or one the entries lack, leaves the order
+// as it is.
+export function homeFirst<T extends { uuid: string }>(
+  entries: readonly T[],
+  home: string | null,
+): T[] {
+  return [
+    ...entries.filter((entry) => entry.uuid === home),
+    ...entries.filter((entry) => entry.uuid !== home),
+  ];
 }
 
 // The rename limits: trimmed, 1 to 40 code points (not UTF-16 units, so an

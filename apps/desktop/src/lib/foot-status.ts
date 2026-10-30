@@ -1,6 +1,11 @@
-import { formatRelativeTime, usageConnectionDot, usageConnectionLabel } from "@maxprice/shared";
+import {
+  formatRelativeTime,
+  hubConnectionLabel,
+  usageConnectionDot,
+  usageConnectionLabel,
+} from "@maxprice/shared";
 import type { HubConnection, UsageConnection } from "@maxprice/shared";
-import { hubConnectionDot, hubConnectionLabel } from "./hub-status";
+import { hubConnectionDot } from "./hub-status";
 import { STALE_HUB_LINE, STALE_USAGE_LINE } from "./stale-status";
 import { dotVariant, type DotVariant } from "./dot-variant";
 

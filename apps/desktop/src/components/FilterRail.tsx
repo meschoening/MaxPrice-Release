@@ -1,10 +1,16 @@
 import { useMemo, useState } from "react";
 import { Check, ChevronDown } from "lucide-react";
-import { MODEL_LEGEND_ORDER } from "@maxprice/shared";
-import { buildProjectOptions } from "@/lib/project-options";
+import {
+  MODEL_LEGEND_ORDER,
+  buildProjectOptions,
+  type DateRangePreset,
+  resolveDateRange,
+  corpusExtent,
+  ymdShift,
+  shortMachineId,
+} from "@maxprice/shared";
 import { isOptionSelected, selectedOptionCount, toggleOption } from "@/lib/multi-select";
-import { useFilters, type DateRangePreset, resolveDateRange } from "@/state/filters";
-import { corpusExtent, ymdShift } from "@/lib/dates";
+import { useFilters } from "@/state/filters";
 import { useSettings, useTimeDisplay } from "@/state/use-settings";
 import { useOrganizationScope } from "@/state/use-organization-scope";
 import { useWeekWindow } from "@/state/use-week";
@@ -12,7 +18,6 @@ import { weekReadout } from "@/lib/week-copy";
 import { useProjects } from "@/state/use-projects";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useProjectAxis } from "@/state/use-project-axis";
-import { shortMachineId } from "@/lib/machines";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 
@@ -67,7 +72,7 @@ export function FilterRail() {
   // foreign rows with no data behind them). The option *value* stays a slug
   // (the group representative, the server-side filter key); the label is the
   // project's name, path-disambiguated only where names still collide — see
-  // `lib/project-options`.
+  // `project-options.ts` in `@maxprice/shared`.
   const projectOptions = useMemo(
     () => buildProjectOptions(projectsQ.data?.projects ?? [], projectAxis.index),
     [projectsQ.data, projectAxis.index],

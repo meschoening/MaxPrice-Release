@@ -1,10 +1,11 @@
 import { useMemo } from "react";
-import type { ProjectIdentityRow, ProjectMergeAssertion } from "@maxprice/shared";
 import {
+  type ProjectIdentityRow,
+  type ProjectMergeAssertion,
   buildIdentityIndex,
   expandProjectFilter,
   type IdentityIndex,
-} from "@/lib/project-identity";
+} from "@maxprice/shared";
 import { useFilters } from "./filters";
 import { useProjectIdentity } from "./use-project-identity";
 

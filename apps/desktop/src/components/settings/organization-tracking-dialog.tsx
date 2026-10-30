@@ -1,9 +1,7 @@
 import { useId, useRef, useState } from "react";
 import { XIcon } from "lucide-react";
+import { excludeCopy, excludeTitle, isExcludeArmed } from "@maxprice/shared";
 import {
-  excludeCopy,
-  excludeTitle,
-  isExcludeArmed,
   trackCopy,
   trackTitle,
   type OrganizationRowView,
@@ -20,8 +18,9 @@ import {
 // The Organizations list's two confirmations (ADR-0098): tracking is the update
 // gate's plain recipe (components/UpdateGate.tsx), excluding the typed recipe
 // of Storage's Forget (`ForgetConfirm`), since excluding removes this machine's
-// history for it from the Local archive and the hub. Their words come from
-// lib/organization-list-view.
+// history for it from the Local archive and the hub. Tracking's words come
+// from lib/organization-list-view, and excluding's from packages/shared
+// (organization-tracking.ts), which `maxprice org exclude` prints too.
 //
 // While the write is pending every dismiss locks (Cancel, ×, Esc, scrim). A
 // failed write keeps the dialog open over the error line (the settings writer
@@ -170,7 +169,7 @@ export function ExcludeConfirm({
       >
         {pending ? null : <CloseX />}
         <DialogTitle asChild>
-          <h3>{excludeTitle(row)}</h3>
+          <h3>{excludeTitle(row.bareLabel, row.facts.id)}</h3>
         </DialogTitle>
         <DialogDescription asChild>
           <p>{lead}</p>

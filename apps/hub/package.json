@@ -1,6 +1,6 @@
 {
   "name": "@maxprice/hub",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -12,6 +12,12 @@
     "./organization-assertion-directory": "./src/organization-assertion-directory.ts",
     "./organization-roster": "./src/organization-roster.ts",
     "./poll-set": "./src/poll-set.ts"
+  },
+  "imports": {
+    "#page-manifest": {
+      "maxprice-hub-page": "./generated/page-manifest.ts",
+      "default": "./src/page-manifest.ts"
+    }
   },
   "scripts": {
     "dev": "bun --watch run src/index.ts",

@@ -1,5 +1,5 @@
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
-import { usageCurrentSchema, type UsageCurrent } from "@maxprice/shared";
+import { buildUsageCurrentUrl, usageCurrentSchema, type UsageCurrent } from "@maxprice/shared";
 import { getSidecarUrl } from "@/lib/sidecar";
 
 // /api/usage/current — the last-known sample for the rings' first paint
@@ -8,7 +8,8 @@ import { getSidecarUrl } from "@/lib/sidecar";
 // the usage:sample SSE event, which writes the reading's own Organization's entry
 // (`usageCurrentQueryKey(organizationUuid)`, see live-stream.ts), so the rings
 // update without polling; the bare entry is filled only by this fetch.
-// Four-piece split per ADR-0004.
+// Four-piece split per ADR-0004; the URL builder lives in `@maxprice/shared`'s
+// `report-url.ts`.
 //
 // The one param is the Quota organization's uuid (ADR-0106 §8), `organization`
 // on the wire: the scoped uuid, else Home's, so every Organization keys and
@@ -17,13 +18,6 @@ import { getSidecarUrl } from "@/lib/sidecar";
 
 export function usageCurrentQueryKey(organization?: string): [string] | [string, string] {
   return organization === undefined ? ["usage-current"] : ["usage-current", organization];
-}
-
-export function buildUsageCurrentUrl(base: string, organization?: string): string {
-  const url = `${base}/api/usage/current`;
-  return organization === undefined
-    ? url
-    : `${url}?organization=${encodeURIComponent(organization)}`;
 }
 
 export async function fetchUsageCurrent(

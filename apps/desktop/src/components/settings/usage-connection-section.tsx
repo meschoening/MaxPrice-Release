@@ -11,6 +11,7 @@ import {
 } from "@/lib/usage-credential";
 import {
   formatWallClock,
+  sessionKeyListingFailure,
   usageConnectionDot,
   usageConnectionLabel,
   usageConnectionTextClass,
@@ -91,11 +92,7 @@ export function UsageConnectionSection(): React.ReactElement {
     try {
       const { orgs, error: discErr } = await discoverOrgsViaSidecar(key.trim());
       if (orgs.length === 0) {
-        setError(
-          discErr === "expired"
-            ? "That session key looks invalid or expired."
-            : "Couldn't reach Anthropic — check your connection and try again.",
-        );
+        setError(sessionKeyListingFailure(discErr));
         return;
       }
       // The keychain first, so a failed push keeps the new key for the next

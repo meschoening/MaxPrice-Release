@@ -1,5 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { isRecognizedTailnetHost, isValidHubPassword, normalizeHubUrl } from "@maxprice/shared";
+import {
+  hubConnectionLabel,
+  isRecognizedTailnetHost,
+  isValidHubPassword,
+  normalizeHubUrl,
+  seedPercent,
+} from "@maxprice/shared";
 import { useLiveStatus } from "@/state/use-live-status";
 import { useSettings, useUpdateSettings } from "@/state/use-settings";
 import {
@@ -8,9 +14,8 @@ import {
   pushHubConfigToSidecar,
   disconnectHub,
 } from "@/lib/hub-config";
-import { hubConnectionDot, hubConnectionLabel, hubConnectionTextClass } from "@/lib/hub-status";
+import { hubConnectionDot, hubConnectionTextClass } from "@/lib/hub-status";
 import { isStale, STALE_HUB_LINE } from "@/lib/stale-status";
-import { seedPercent } from "@/lib/machines";
 import { insideTauri } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { dotVariant } from "@/lib/dot-variant";

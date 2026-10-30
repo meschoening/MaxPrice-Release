@@ -248,8 +248,12 @@ export function SettingsPage(): React.ReactElement {
             (T3's placement, map #100). The Pricing data row moved out to
             Settings › Pricing (ADR-0085). Mostly read-once ones; the Sidecar
             row added on 2026-08-01 is the exception, and the description says
-            so rather than letting a live row hide under "versions". */}
-        <Section title="App info" description="Versions and whether the sidecar is running.">
+            so rather than letting a live row hide under "versions", as it
+            names the User guide row that closes the section (#564). */}
+        <Section
+          title="App info"
+          description="Versions, whether the sidecar is running, and the User guide."
+        >
           <AppInfoSection />
         </Section>
       </div>

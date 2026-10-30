@@ -22,10 +22,11 @@ import { modelBreakdownSchema } from "./models";
 //
 // `path` is the project's real working directory, resolved sidecar-side from
 // the JSONL `cwd` field (ADR-0009). The `slug` is lossy and can't be reversed
-// to a path, so the human name + display path derive renderer-side from `path`
-// (`deriveProjectName` / `deriveProjectPath`, project-path.ts). Staleness
-// derives renderer-side from `lastActivity` (the 90-day threshold) and shows as
-// a dimmed row — the Status column that used to spell it out is gone.
+// to a path, so the human name + display path derive client-side (the renderer
+// and the Headless client) from `path` (`deriveProjectName` /
+// `deriveProjectPath`, project-path.ts). Staleness derives renderer-side from
+// `lastActivity` (the 90-day threshold) and shows as a dimmed row — the Status
+// column that used to spell it out is gone.
 const projectRowSchema = z.object({
   slug: z.string(),
   path: z.string(),

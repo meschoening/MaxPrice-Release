@@ -1,8 +1,12 @@
 import { useMemo } from "react";
-import type { DailyRow, TimeDisplay, WeekWindow } from "@maxprice/shared";
-import { formatRemainingLong } from "@/lib/active-block";
+import {
+  formatRemainingLong,
+  usageRingState,
+  type DailyRow,
+  type TimeDisplay,
+  type WeekWindow,
+} from "@maxprice/shared";
 import type { NoLimit } from "@/lib/organization-scope-view";
-import { usageRingState } from "@/lib/usage-ring";
 import { useLiveStatus } from "@/state/use-live-status";
 import { useNowTick } from "@/state/use-now-tick";
 import { useOrganizationScope } from "@/state/use-organization-scope";

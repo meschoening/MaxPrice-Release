@@ -1,7 +1,7 @@
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   HUB_PROTOCOL_VERSION,
-  isValidHubPassword,
   type HubStatus,
   type UsageCredential,
   type UsageSample,
@@ -21,29 +21,73 @@ import {
   type IdentityDirectory,
   type SampleStore,
 } from "@maxprice/usage-core";
-import { defaultDataDir, loadOrInitConfig, savePasswordHash } from "./config";
+import type { Env } from "@maxprice/usage-core/home-path";
+import { EXIT_INTERRUPTED } from "@maxprice/usage-core/secret-input";
+import { terminalText } from "@maxprice/usage-core/terminal-text";
+import { startUpdateChecks } from "@maxprice/usage-core/update-check";
+import { CliError, EXIT, runHubCli, type Writer } from "./cli";
+import { defaultDataDir, loadOrInitConfig, requireHub, savePasswordHash } from "./config";
+import { prepareDataDir } from "./data-dir";
+import { RESTORE_STAGING, restoreHub, unfinishedRestore } from "./restore";
+import { hubStatus } from "./status";
 import { createMachineDirectory } from "./machine-directory";
 import { createOrganizationAssertionDirectory } from "./organization-assertion-directory";
 import { createOrganizationDirectory } from "./organization-directory";
 import { createHubAuth, mintOperatorSecret } from "./auth";
-import { startBindReconciler } from "./rebind";
+import { FirstBindError, hostAndPort, startBindReconciler, type BindReconciler } from "./rebind";
 import { createClientRegistry } from "./clients";
 import { createHubFanout, type HubFanout } from "./fanout";
 import { createHubPollSet, type HubPollSet } from "./poll-set";
+import { findPortHolder, type PortHolder } from "./port-holder";
 import { createOrganizationRoster, type OrganizationRoster } from "./organization-roster";
+import { PAGE_MANIFEST } from "#page-manifest";
+import { cliPage, cliPageClear, cliPageSet, cliPageSnippet } from "./page-publish";
+import type { HubPageDeps } from "./page";
+import type { PageManifest } from "./page-manifest";
 import { buildHubApp, fleetEventsStatus } from "./server";
+import { takeServeLock, type ServeLock } from "./serve-lock";
+import { hubService } from "./service";
+import { runSetup, type SetupDeps } from "./setup";
+import { createSetupTerminal } from "./setup-terminal";
+import { hubUpdate } from "./update";
 import { createHubUsageStatus } from "./usage-status";
+import { PRODUCT } from "./update-channel";
+import { VERSION } from "./version";
+import { openCredstore, type Credstore } from "./credstore";
+import { operatorTokenPath, removeOperatorToken, writeOperatorToken } from "./secrets";
+import { reachHub, type ReachOptions, type RunningHub } from "./operator-client";
 import {
-  createCredstore,
-  createMemoryCredstore,
-  resolveCredstorePath,
-  type Credstore,
-} from "./credstore";
+  keyClear,
+  keySet,
+  liveCompact,
+  liveMergeMachine,
+  livePasswordClear,
+  livePasswordSet,
+  livePurgeMachine,
+  liveRenameMachine,
+  readNewPassword,
+  type SecretDeps,
+} from "./operator";
 
-// maxprice-hub (ADR-0035): the standalone always-on usage poller. Subcommands:
-//   (none) / serve                      → run the daemon
-//   password set [value]                → set the hub password (ADR-0037)
-//   password clear                      → clear the hub password (open the hub)
+// maxprice-hub (ADR-0035): the standalone always-on usage poller. Its command
+// line is cli.ts's (ADR-0127 §2): no command, or `serve`, runs the daemon;
+// `status` (ADR-0127 §8, status.ts) describes the running daemon on Linux;
+// `password set|clear` (ADR-0037, ADR-0128 §6), `key set|clear` (ADR-0126 §6,
+// §7) and the operator verbs `rename`, `merge`, `purge-machine` and `compact`
+// (ADR-0041) act on the Hub at the data dir: on Linux through the running
+// daemon's own routes while one holds the data dir, else on its files
+// (ADR-0127 §7; operator.ts); `restore` (ADR-0130, restore.ts) fills an empty
+// data dir from a backup; `service install|uninstall|status|logs` (ADR-0127
+// §5–6, service.ts) runs serve as a systemd user unit on Linux; `update`
+// (ADR-0129 §4–§5, update.ts) installs the newest release over this binary on
+// Linux and restarts the unit that runs it; `page` and
+// `page set|clear|snippet` (ADR-0125, page-publish.ts) report and set the Hub
+// page URL beside a running Hub; `setup` (ADR-0128 §1–§5, setup.ts) walks
+// key set, password set|clear, page set|clear and service install on a
+// terminal, making the data dir first. The work behind each is this
+// module's, status.ts's, operator.ts's, restore.ts's, service.ts's,
+// page-publish.ts's, setup.ts's or update.ts's, handed to cli.ts by the
+// entry block at the bottom, so `--version` and `--help` run none of it.
 //
 // Parent watchdog: installed ONLY when embedded (MAXPRICE_HUB_EMBEDDED=1, the
 // tray shell — ADR-0036). Headless `serve` has none — it must OUTLIVE whatever
@@ -114,6 +158,11 @@ export function createBindStatusPatcher(
 // every /api/* route gates on. Exported as a factory for the same reason
 // createMergeSamples is: the test drives THIS closure rather than a hand-copied
 // double.
+//
+// The seed restores what the status says about the key with it: present, and,
+// where the store keeps them (secrets.json, on Linux), when it was set and by
+// whom (ADR-0126 §3), so a restart no longer resets them to null. A keychain
+// entry keeps neither, so they stay null.
 //
 // Boot is also where the Hub stamps its usage history (#279): a credstore entry
 // written before #283 still carries the orgId this Hub polled with, the
@@ -222,7 +271,11 @@ export async function runReadySequence(deps: ReadySequenceDeps): Promise<void> {
         }
       }
       poller.setCredential(cred);
-      fanout.patchStatus({ credentialPresent: true });
+      fanout.patchStatus({
+        credentialPresent: true,
+        credentialUpdatedAt: stored.provenance?.setAt ?? null,
+        credentialSource: stored.provenance?.source ?? null,
+      });
       // Boot polls the persisted roster at once and lists in the background
       // (#284): each minute while the listing fails and nothing is polled,
       // hourly otherwise. A listing that refuses the key expires it and
@@ -244,9 +297,165 @@ export async function runReadySequence(deps: ReadySequenceDeps): Promise<void> {
 
 // True when the tray shell (Phase 2) spawned us as its sidecar — it sets
 // MAXPRICE_HUB_EMBEDDED=1. Gates the OPERATOR_TOKEN stdout emit and the
-// parent-death watchdog; headless `serve` (Linux) leaves it unset (ADR-0035/0036).
+// parent-death watchdog; headless `serve` (Linux) leaves it unset (ADR-0035/0036)
+// and, on Linux, keeps its operator secret in a file instead (ADR-0126 §8).
 export function isEmbedded(env: Record<string, string | undefined> = process.env): boolean {
   return env.MAXPRICE_HUB_EMBEDDED === "1";
+}
+
+// Whether `serve` owns its data dir through serve.lock (ADR-0127 §3): a
+// Headless Hub on Linux, where the Headless Hub runs and where flock binds
+// glibc's libc.so.6. An embedded daemon never does: the tray app's daemon is
+// unchanged, with no lock and no 0700 tightening.
+export function isLockable(
+  env: Record<string, string | undefined> = process.env,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return !isEmbedded(env) && platform === "linux";
+}
+
+// Whether `serve` checks the update channel (ADR-0129 §6): a Headless Hub on
+// Linux, the one `maxprice-hub update` can update, since the channel's one
+// entry is linux-x86_64 and `update` is Linux only. An embedded daemon never
+// does: the tray app has Tauri's updater, which reads `hub-latest.json`.
+// The same test as isLockable's today, kept apart because it answers
+// another question.
+export function checksForUpdates(
+  env: Record<string, string | undefined> = process.env,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return !isEmbedded(env) && platform === "linux";
+}
+
+// Who mints the per-launch operator secret (ADR-0037's first lane) and where
+// it goes. An embedded daemon prints it for the tray shell (`OPERATOR_TOKEN`,
+// bootAnnouncement). A Headless Hub on Linux writes it to
+// `<data dir>/operator-token`, 0600, for the commands on its own machine,
+// and never prints it, so it stays out of the journal (ADR-0126 §8). A
+// Headless Hub elsewhere mints none.
+export function operatorSecretCustody(
+  env: Record<string, string | undefined> = process.env,
+  platform: NodeJS.Platform = process.platform,
+): "stdout" | "file" | null {
+  if (isEmbedded(env)) return "stdout";
+  return isLockable(env, platform) ? "file" : null;
+}
+
+// The Hub page dep buildHubApp mounts /page/ from (ADR-0124 §1): a Headless
+// Hub always gets it, whether or not a Hub page URL is set, so an SSH tunnel to
+// the Hub's port reaches the page with no web server. An embedded daemon gets
+// none: the tray app's routes are unchanged. `manifest` is the build's own
+// (`#page-manifest`, empty in every build but the linux-x64 compile).
+export function hubPageDeps(
+  env: Record<string, string | undefined>,
+  manifest: PageManifest,
+  version: string,
+): HubPageDeps | undefined {
+  return isEmbedded(env) ? undefined : { manifest, version };
+}
+
+// A Headless Hub's boot lines for its page (ADR-0125 §5): the loopback URL a
+// web server proxies to, with the Hub page URL it is published at when one is
+// set, as read at boot (a later `page set` needs no restart, and leaves this
+// line stale until the next start), and, when this build carries no page
+// files (a source run, or a non-linux build run headless), a warning that
+// /page/ will 404 while /page/view still answers.
+export function hubPageBootLines(
+  port: number,
+  manifest: PageManifest,
+  pageUrl: string | null,
+): { log: string; warn: string | null } {
+  return {
+    log: `[hub] Hub page: http://127.0.0.1:${port}/page/ (loopback only)${pageUrl === null ? "" : `, published at ${pageUrl}`}`,
+    warn: Object.hasOwn(manifest, "index.html")
+      ? null
+      : "[hub] this build embeds no Hub page files, so /page/ answers 404; the linux-x64 build embeds them (bun apps/hub/scripts/build-binaries.ts linux-x64)",
+  };
+}
+
+// What serve prints once its first bind holds. An embedded daemon keeps the
+// stdout handshake (ADR-0036; mirrors the sidecar's ADR-0002): the tray app's
+// Rust shell reads `LISTENING <port>` to learn the port (get_hub_url) and
+// captures `OPERATOR_TOKEN`, the per-launch operator secret (ADR-0037), for
+// the webview's Authorization header WITHOUT echoing it. Every bind shares
+// config.port, and the set of bound hosts changes over the daemon's life, so
+// the port is announced exactly once, from the config. A Headless Hub prints
+// neither: nothing reads them, and its journal must never hold a secret
+// (ADR-0127 §9). Its `listening on` lines bracket an IPv6 host, as a URL
+// does; the embedded daemon's stay as they were.
+export function bootAnnouncement(boot: {
+  embedded: boolean;
+  port: number;
+  hosts: readonly string[];
+  operatorSecret: string | null;
+}): { handshake: string[]; listening: string[] } {
+  const { embedded, port, hosts, operatorSecret } = boot;
+  return {
+    handshake: embedded
+      ? [
+          `LISTENING ${port}\n`,
+          ...(operatorSecret === null ? [] : [`OPERATOR_TOKEN ${operatorSecret}\n`]),
+        ]
+      : [],
+    listening: hosts.map(
+      (host) =>
+        `[hub] listening on http://${embedded ? `${host}:${port}` : hostAndPort(host, port)}`,
+    ),
+  };
+}
+
+// GET /healthz with a manual timeout (NOT AbortSignal.timeout — the bun/win32
+// parked-loop bug, commit 199c284): whether it answered 2xx and the service
+// its body names, or null when nothing answered in time.
+async function getHealthz(
+  url: string,
+  fetchImpl: typeof fetch,
+): Promise<{ ok: boolean; service: unknown } | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 1_500);
+  try {
+    const res = await fetchImpl(url, { signal: ctrl.signal });
+    const body = (await res.json().catch(() => null)) as { service?: unknown } | null;
+    return { ok: res.ok, service: body?.service };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// After a failed first bind (ADR-0127 §2): whether a Hub answers /healthz
+// where the bind failed, which its body says by naming the service
+// `maxprice-hub` (a sidecar's names `maxprice-sidecar`). A wildcard is asked
+// on its own loopback.
+export async function hubAnswersAt(
+  host: string,
+  port: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<boolean> {
+  const at = host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "::1" : host;
+  const answer = await getHealthz(`http://${hostAndPort(at, port)}/healthz`, fetchImpl);
+  return answer?.ok === true && answer.service === "maxprice-hub";
+}
+
+// serve's one line for a failed first bind (ADR-0127 §2). A port in use says
+// what holds it, a Hub or not, and the holder's pid and command when /proc
+// shows them (`findPortHolder`); any other failure is the listen error's own
+// message.
+export function bindFailureLine(
+  error: FirstBindError,
+  hubAnswers: boolean,
+  holder: PortHolder | null = null,
+): string {
+  const at = `[hub] cannot bind ${hostAndPort(error.host, error.port)}`;
+  if (error.code === "EADDRINUSE") {
+    const who = holder === null ? "" : ` (pid ${holder.pid}, ${holder.command})`;
+    return hubAnswers
+      ? `${at}: a Hub already answers /healthz there${who} (EADDRINUSE)`
+      : `${at}: something that is not a Hub holds it${who} (EADDRINUSE)`;
+  }
+  const cause = error.cause instanceof Error ? error.cause.message : String(error.cause);
+  return error.code === undefined ? `${at}: ${cause}` : `${at}: ${cause} (${error.code})`;
 }
 
 // Backpressure-aware single-line stdout write — the handshake lines must land
@@ -278,14 +487,46 @@ export function resolveIdentityDirectory(store: IdentityDirectory): IdentityDire
   return undefined;
 }
 
-async function serve(): Promise<void> {
-  const dataDir = defaultDataDir();
-  const config = loadOrInitConfig(dataDir);
+// The lock's descriptor, held for the process's whole life (ADR-0127 §3).
+let serveLock: ServeLock | null = null;
 
-  // Per-launch operator secret (ADR-0037): minted only when embedded — the tray
-  // shell captures it from stdout and the console authenticates with it, so the
-  // console works whatever the password state. Headless serve mints none.
-  const operatorSecret = isEmbedded() ? mintOperatorSecret() : null;
+async function serve(): Promise<number> {
+  const env = process.env;
+  const embedded = isEmbedded(env);
+  const dataDir = defaultDataDir(env);
+  // ADR-0127 §3: a Headless Hub on Linux makes its data dir 0700 and takes
+  // serve.lock before loadOrInitConfig can rewrite hub.json, so a second
+  // serve on this dir exits 5 having changed nothing, once the take's bounded
+  // retry has run out (serve-lock.ts). Everywhere else the dir
+  // is made as it always was, with no lock. Only serve makes a data dir, and
+  // setup, which makes it as this does before its first step (ADR-0128 §2),
+  // and restore, which fills it from a backup (§4, ADR-0130).
+  if (isLockable(env)) {
+    prepareDataDir(dataDir);
+    serveLock = await takeServeLock(dataDir, env);
+  } else {
+    mkdirSync(dataDir, { recursive: true });
+  }
+  // ADR-0130: a restore killed while it placed its files left its staging
+  // dir beside them, maybe with no hub.json yet. Refused under the lock, so a
+  // restore still running is exit 5 first, and before loadOrInitConfig, which
+  // would write a default hub.json beside a half-placed archive and boot it.
+  // On every platform: a data dir may be copied to one.
+  if (existsSync(join(dataDir, RESTORE_STAGING))) throw unfinishedRestore(dataDir, env);
+  const config = loadOrInitConfig(dataDir);
+  // The port joins the pid in the record, for the commands that will reach a
+  // running Hub through it (ADR-0127 §7).
+  serveLock?.recordPort(config.port);
+
+  // Per-launch operator secret (ADR-0037's first lane), which passes the gate
+  // whatever the password state (operatorSecretCustody). Embedded, the tray
+  // shell captures it from stdout for the console. A Headless Hub on Linux
+  // keeps it in `operator-token`, written just before the first bind below and
+  // removed at the teardown, so whatever answers /healthz has it on disk
+  // (ADR-0126 §8). A Headless Hub elsewhere mints none.
+  const custody = operatorSecretCustody(env);
+  const operatorSecret = custody === null ? null : mintOperatorSecret();
+  const operatorToken = custody === "file" ? operatorTokenPath(dataDir) : null;
   const auth = createHubAuth({ passwordHash: config.passwordHash, operatorSecret });
 
   // createSampleStore returns OwnedSampleStore (SampleStore + flush); type as
@@ -352,9 +593,10 @@ async function serve(): Promise<void> {
     // it live so the console's Access card re-renders on set/clear.
     passwordProtected: config.passwordHash !== null,
     // Provenance/display start empty (ADR-0036). POST /api/credential fills
-    // credentialUpdatedAt/credentialSource. `startedAt` is stamped ONCE here —
-    // this is daemon runtime, not pure tested logic, so a direct new Date() is
-    // fine — and the console renders real uptime from it.
+    // credentialUpdatedAt/credentialSource, and on Linux the boot's credential
+    // seed restores them from secrets.json (ADR-0126 §3). `startedAt` is
+    // stamped ONCE here — this is daemon runtime, not pure tested logic, so a
+    // direct new Date() is fine — and the console renders real uptime from it.
     credentialUpdatedAt: null,
     credentialSource: null,
     startedAt: new Date().toISOString(),
@@ -387,14 +629,13 @@ async function serve(): Promise<void> {
     onDiscoveryFailed: usageStatus.setDiscoveryFailed,
   });
 
-  const credstorePath = resolveCredstorePath();
-  if (credstorePath === null) {
-    console.warn(
-      "[hub] no credstore helper found — credential will be memory-only (set MAXPRICE_CREDSTORE_PATH or build credstore/)",
-    );
-  }
-  const credstore =
-    credstorePath === null ? createMemoryCredstore() : createCredstore(credstorePath);
+  // The key's store, by platform (ADR-0126 §1): on Linux
+  // `<data dir>/secrets.json`, read once by the boot's credential seed;
+  // elsewhere the keychain helper, else memory.
+  const credstore = openCredstore(dataDir, {
+    log: (line) => console.log(line),
+    warn: (line) => console.warn(line),
+  });
 
   const registry = createClientRegistry();
 
@@ -402,7 +643,7 @@ async function serve(): Promise<void> {
   // shell embedded us (it sets MAXPRICE_HUB_EMBEDDED=1): the Tauri webview origins
   // always, plus a dev renderer origin via MAXPRICE_HUB_ALLOWED_ORIGIN (the shell
   // sets it in dev, mirroring VITE_SIDECAR_ORIGIN). Headless serve ⇒ [] ⇒ no CORS.
-  const allowedOrigins = isEmbedded()
+  const allowedOrigins = embedded
     ? [
         "tauri://localhost",
         "http://tauri.localhost",
@@ -419,28 +660,41 @@ async function serve(): Promise<void> {
 
   // Boot-readiness gate (F1): the history load, the archive load, the credential
   // seed, and poller.start() — all BEHIND a single promise every /api/* route
-  // awaits (below, in buildHubApp). Bun.serve still binds immediately (the
-  // LISTENING handshake can't wait), but no data route answers until this
-  // resolves, so a client never observes a half-loaded store (a backfill hole
-  // its since-cursor then skips forever; a re-append of samples the unloaded
-  // file already holds) nor a not-yet-seeded credential (an auto-heal POST
-  // overwriting a healthy keychain key before the hub's own seed reads it).
-  // Started ONCE, fire-and-forget from serve()'s main line — the route
-  // middleware awaits it. runReadySequence NEVER rejects (see its comment).
-  // Because it's off serve()'s synchronous path, a hung credstore.get() can no
-  // longer stop the SIGINT/SIGTERM handlers below from registering (F26).
-  const ready = runReadySequence({
-    sampleStore,
-    fleetEvents,
-    credstore,
-    poller,
-    roster,
-    pollSet,
-    fanout,
-    onEventsUnusable: () => {
-      eventsUsable = false;
-    },
+  // awaits (below, in buildHubApp). Bun.serve still binds before it resolves
+  // (the tray's LISTENING handshake can't wait), but no data route answers
+  // until it does, so a client never observes a half-loaded store (a backfill
+  // hole its since-cursor then skips forever; a re-append of samples the
+  // unloaded file already holds) nor a not-yet-seeded credential (an auto-heal
+  // POST overwriting a healthy stored key before the hub's own seed reads
+  // it). Started ONCE, fire-and-forget, by startReadySequence the moment the
+  // first bind holds, with no await between the two: a failed first bind then
+  // exits before the history and the archive load, the credential is read or
+  // anything is polled (ADR-0127 §2). The route middleware awaits it.
+  // runReadySequence NEVER rejects (see its comment). Because it's off
+  // serve()'s synchronous path, a hung credstore.get() can no longer stop the
+  // signal handlers below from registering (F26).
+  let startReadySequence = (): void => {};
+  const ready = new Promise<void>((resolve) => {
+    startReadySequence = () =>
+      resolve(
+        runReadySequence({
+          sampleStore,
+          fleetEvents,
+          credstore,
+          poller,
+          roster,
+          pollSet,
+          fanout,
+          onEventsUnusable: () => {
+            eventsUsable = false;
+          },
+        }),
+      );
   });
+
+  // A Headless Hub's page (ADR-0124 §1), decided once: what mounts /page/ is
+  // also what logs it below.
+  const page = hubPageDeps(process.env, PAGE_MANIFEST, VERSION);
 
   const app = buildHubApp({
     auth,
@@ -460,7 +714,7 @@ async function serve(): Promise<void> {
       pollOnce: poller.pollOnce,
     },
     pollSet,
-    persistCredential: (cred) => credstore.set(cred),
+    persistCredential: (cred, provenance) => credstore.set(cred, provenance),
     registry,
     fleetEvents,
     // Request-time archive health (F3): false once the load above threw, which
@@ -479,39 +733,60 @@ async function serve(): Promise<void> {
     organizationRoster: () => roster.list(),
     allowedOrigins,
     ready,
+    page,
   });
 
-  // The bind reconciler owns every bind from here on (ADR-0074). Its FIRST pass
-  // runs synchronously, inside this call, and is deliberately UNGUARDED: a
-  // throw here is a fatal unhandled rejection, loud exit 1, no zombie. With
-  // presence gating in front of it that throw now means exactly one thing —
-  // another process owns the port, i.e. a second hub instance — because an
-  // address the machine doesn't have is never attempted. Every LATER pass is
-  // guarded and retries, which is what stops a hub launched at login from being
-  // stranded on loopback when it beats Tailscale to the interface.
-  const binds = startBindReconciler({
-    bind: config.bind,
-    port: config.port,
-    fetch: app.fetch,
-    onBoundChange: createBindStatusPatcher(fanout),
-    log: (line) => console.log(line),
-  });
-  // Stdout handshake (ADR-0036; mirrors the sidecar's ADR-0002). Phase 2's Rust
-  // shell reads `LISTENING <port>` to learn the port (get_hub_url) and captures
-  // `OPERATOR_TOKEN` for the webview's Authorization header WITHOUT echoing it.
-  // Every bind shares config.port — and the set of bound hosts now changes over
-  // the daemon's life — so the port is announced exactly once, from the config.
-  await writeLine(`LISTENING ${config.port}\n`);
-  // OPERATOR_TOKEN: the per-launch operator secret, for the embedding parent
-  // ONLY (ADR-0037). Gated on MAXPRICE_HUB_EMBEDDED so headless `serve` never
-  // prints a secret to its journal.
-  if (isEmbedded() && operatorSecret !== null) {
-    await writeLine(`OPERATOR_TOKEN ${operatorSecret}\n`);
+  // ADR-0126 §8: on disk before the first bind, over any a crash left, so
+  // the daemon that answers /healthz has its secret there. A failure is
+  // exit 1.
+  if (operatorToken !== null && operatorSecret !== null) {
+    writeOperatorToken(operatorToken, operatorSecret);
   }
-  // Human-readable logs (unchanged — preserved from the original block). This
-  // is the boot snapshot only; the reconciler logs every later bind and drop.
-  for (const hostname of binds.hosts()) {
-    console.log(`[hub] listening on http://${hostname}:${config.port}`);
+
+  // The bind reconciler owns every bind from here on (ADR-0074). Its FIRST pass
+  // runs synchronously, inside this call, and a throw from it is fatal: one
+  // line saying what holds the port, exit 1, no zombie (ADR-0127 §2). With
+  // presence gating in front of it that throw means another process owns the
+  // port, because an address the machine doesn't have is never attempted: a
+  // second hub instance on another data dir (serve.lock stops one on this dir,
+  // on Linux), or something that is no Hub at all, which a /healthz probe
+  // tells apart. Every LATER pass is guarded and retries, which is what stops a
+  // hub launched at login from being stranded on loopback when it beats
+  // Tailscale to the interface.
+  let binds: BindReconciler;
+  try {
+    binds = startBindReconciler({
+      bind: config.bind,
+      port: config.port,
+      fetch: app.fetch,
+      onBoundChange: createBindStatusPatcher(fanout),
+      log: (line) => console.log(line),
+    });
+  } catch (error) {
+    // No daemon came of this launch, so its secret goes before the exit.
+    if (operatorToken !== null) removeOperatorToken(operatorToken, (line) => console.error(line));
+    if (!(error instanceof FirstBindError)) throw error;
+    const inUse = error.code === "EADDRINUSE";
+    const hub = inUse && (await hubAnswersAt(error.host, error.port));
+    const holder = inUse ? findPortHolder(error.host, error.port) : null;
+    throw new CliError(EXIT.FAILURE, bindFailureLine(error, hub, holder));
+  }
+  startReadySequence();
+
+  const announced = bootAnnouncement({
+    embedded,
+    port: config.port,
+    hosts: binds.hosts(),
+    operatorSecret,
+  });
+  for (const line of announced.handshake) await writeLine(line);
+  // Human-readable logs. This is the boot snapshot only; the reconciler logs
+  // every later bind and drop.
+  for (const line of announced.listening) console.log(line);
+  if (page !== undefined) {
+    const pageLines = hubPageBootLines(config.port, page.manifest, config.pageUrl ?? null);
+    console.log(pageLines.log);
+    if (pageLines.warn !== null) console.warn(pageLines.warn);
   }
   console.log(
     config.passwordHash === null
@@ -542,6 +817,12 @@ async function serve(): Promise<void> {
       } catch (err) {
         console.error("[hub] shutdown teardown error:", err);
       }
+      // ADR-0126 §8: the secret goes with the daemon that minted it. Its own
+      // step, after the teardown, so a teardown error still removes it and a
+      // failed removal (one line) still exits.
+      if (operatorToken !== null) {
+        removeOperatorToken(operatorToken, (line) => console.error(line));
+      }
       process.exit(exitCode);
     })();
     return shutdownPromise;
@@ -552,53 +833,228 @@ async function serve(): Promise<void> {
   deferredShutdown.set(() => void shutdown());
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+  // ADR-0127 §2: closing a foreground serve's terminal stops a Headless Hub as
+  // SIGTERM does, through the teardown above, so the archive is closed and its
+  // WAL checkpointed. The tray app's daemon registers none.
+  if (!embedded) {
+    process.on("SIGHUP", () => {
+      console.log("[hub] SIGHUP: stopping as on SIGTERM");
+      void shutdown();
+    });
+  }
   process.on("unhandledRejection", (err) => {
     console.error("[hub] unhandled rejection:", err);
     void shutdown(1);
   });
-}
-
-// Set the hub password from the CLI (headless Linux; ADR-0037). The value may
-// ride argv or be prompted. Writes the argon2id hash to hub.json — a RUNNING
-// daemon holds config in memory, so restart it to apply.
-async function passwordSet(value: string | undefined): Promise<void> {
-  const pw = value ?? prompt("New hub password:") ?? "";
-  if (!isValidHubPassword(pw)) {
-    console.error("invalid password: printable ASCII, no spaces, 1-128 chars");
-    process.exit(2);
+  // ADR-0129 §6: a Headless Hub on Linux checks its channel at boot and
+  // every 6 h, in this process, writes update-check.json for `status`'s
+  // Update row, and logs a newer version once, after the boot lines above.
+  // It never installs anything (only `maxprice-hub update` does), and never
+  // throws: a failed check is recorded, a failed write logged. Its timers are
+  // unref'd, so they never keep a stopping daemon alive. An embedded daemon
+  // never checks (checksForUpdates).
+  if (checksForUpdates(env)) {
+    startUpdateChecks({
+      product: PRODUCT,
+      currentVersion: VERSION,
+      dataDir,
+      log: (line) => console.log(`[hub] ${line}`),
+    });
   }
-  savePasswordHash(defaultDataDir(), await Bun.password.hash(pw));
-  console.log("password set — restart the hub daemon to apply");
+  return EXIT.OK;
 }
 
-function passwordClear(): void {
-  savePasswordHash(defaultDataDir(), null);
-  console.log("password cleared — restart the hub daemon to apply");
+// Whether an offline password change applies: on Linux the verb held
+// serve.lock, so no Hub runs and the next one to start reads it; elsewhere a
+// running daemon holds its config in memory until it restarts. A Hub running
+// on Linux was sent the change live instead (livePasswordSet).
+function passwordApplies(locked: boolean): string {
+  return locked ? "the Hub applies it when it starts" : "restart the hub daemon to apply";
+}
+
+// `maxprice-hub password set`, offline (ADR-0037): hub.json gets the
+// password's argon2id hash. The password was read, never from argv, and
+// checked by readNewPassword (operator.ts, ADR-0128 §6) before the Hub was
+// reached, so an invalid one never gets here.
+export async function cliPasswordSet(
+  dataDir: string,
+  password: string,
+  locked: boolean,
+): Promise<string> {
+  savePasswordHash(dataDir, await Bun.password.hash(password));
+  return `password set — ${passwordApplies(locked)}`;
+}
+
+// `maxprice-hub password clear`, offline: the Hub opens.
+export async function cliPasswordClear(dataDir: string, locked: boolean): Promise<string> {
+  savePasswordHash(dataDir, null);
+  return `password cleared — ${passwordApplies(locked)}`;
 }
 
 // ── M7 operator CLI verbs (ADR-0041): headless parity for the console's
-// rename / merge / purge / compact. They mutate the DATA FILES directly —
-// the password set|clear pattern; file access is the authority — so they
-// require the daemon stopped: two writers on events.jsonl would corrupt it
-// (and Windows blocks the rewrite's rename over the daemon's open handle).
-// Each returns a success line; failures throw (the dispatcher exits 1/2).
+// rename / merge / purge / compact. Two writers on the data files would
+// corrupt them (and Windows blocks a rewrite's rename over the daemon's open
+// handle), so a running daemon stays their only writer: on Linux, while one
+// holds serve.lock, runOperatorVerb sends each verb to that daemon's own
+// route, the console's, and the change applies at once (ADR-0127 §7,
+// operator.ts's live twins). With the lock free, or off Linux once no daemon
+// answers on hub.json's port, the cli* functions below mutate the DATA FILES
+// directly, as the password verbs do: file access is the authority. Each
+// returns a success line; failures throw, and exit 2.
 
-// Manual timeout (NOT AbortSignal.timeout — the bun/win32 parked-loop bug,
-// commit 199c284): probe the configured port for a responding daemon.
+// Off Linux, where there is no serve.lock, the archive verbs' only check:
+// whether a daemon answers on hub.json's port, which may have changed under
+// it.
 export async function daemonRunning(
   port: number,
   fetchImpl: typeof fetch = fetch,
 ): Promise<boolean> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 1_500);
-  try {
-    const res = await fetchImpl(`http://127.0.0.1:${port}/healthz`, { signal: ctrl.signal });
-    return res.ok;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
+  return (await getHealthz(`http://127.0.0.1:${port}/healthz`, fetchImpl))?.ok === true;
+}
+
+// One command that acts on a Hub's data, both ways.
+export type OperatorVerb = {
+  // The edit of the data files, told whether it holds serve.lock.
+  offline: (dataDir: string, locked: boolean) => Promise<string>;
+  // The same operation through the running daemon's own route.
+  live: (hub: RunningHub) => Promise<string>;
+};
+
+export type OperatorVerbOptions = {
+  env?: Env;
+  platform?: NodeJS.Platform;
+  // rename, merge, purge-machine and compact, which open the fleet event
+  // archive: off Linux they first probe for a running daemon, and any failure
+  // of their offline edit exits 2. The password verbs keep no check there,
+  // and fail with their own codes.
+  opensArchive?: boolean;
+  // reachHub's, for a test: a short bound on the reach and each request, a
+  // holder's cgroup.
+  reach?: ReachOptions;
+  // Where the success line goes, console.log's stdout when unset. Setup's
+  // step 2 runs `password set|clear` with a writer that indents their lines
+  // under its own (ADR-0128 §3).
+  out?: Writer;
+};
+
+// The frame of every command that acts on a Hub's data. It refuses a data dir
+// with no hub.json before it creates anything: only serve or setup makes a
+// Hub, or restore brings one back from a backup (ADR-0127 §4, ADR-0128 §2,
+// ADR-0130). On Linux it asks reachHub (operator-client.ts, ADR-0127 §7): a
+// daemon holding serve.lock is sent the command `live`, through its own
+// route, whose refusals are the live function's CliErrors, and nothing here
+// touches a file; with the lock free the command runs `offline` under it, so
+// neither a serve nor another such command runs beside it (§3). Off Linux
+// there is no lock, and `offline` runs as it always has, after the archive
+// verbs' /healthz probe. Either returns the success line, printed here
+// through `terminalText` (ADR-0127 §11), as cli.ts prints an error: it
+// carries values from outside this process, a machine id from argv and a name
+// from the Machine directory, which clients register from their hostnames and
+// nothing strips of control characters. It goes to `out` when one is given,
+// else to console.log.
+export async function runOperatorVerb(
+  { offline, live }: OperatorVerb,
+  {
+    env = process.env,
+    platform = process.platform,
+    opensArchive = false,
+    reach,
+    out,
+  }: OperatorVerbOptions = {},
+): Promise<number> {
+  const print = (line: string): void => {
+    if (out === undefined) console.log(terminalText(line));
+    else out.write(`${terminalText(line)}\n`);
+  };
+  const dataDir = requireHub(env, platform);
+  let lock: ServeLock | null = null;
+  if (platform === "linux") {
+    const reached = await reachHub(dataDir, env, reach);
+    if (reached.kind === "live") {
+      print(await live(reached.hub));
+      return EXIT.OK;
+    }
+    lock = reached.lock;
   }
+  try {
+    if (lock === null && opensArchive) {
+      const { port } = loadOrInitConfig(dataDir);
+      if (await daemonRunning(port)) {
+        throw new CliError(
+          EXIT.FAILURE,
+          `a hub daemon is responding on port ${port} — stop it first (these commands edit the data files directly)`,
+        );
+      }
+    }
+    let line: string;
+    try {
+      line = await offline(dataDir, lock !== null);
+    } catch (error) {
+      if (!opensArchive || error instanceof CliError) throw error;
+      throw new CliError(EXIT.USAGE, error instanceof Error ? error.message : String(error));
+    }
+    print(line);
+    return EXIT.OK;
+  } finally {
+    lock?.release();
+  }
+}
+
+// `maxprice-hub password set` (ADR-0128 §6, ADR-0127 §7): the data dir
+// first, so a mistyped one costs no typing; then the password, read and
+// checked before the Hub is reached, so no prompt holds serve.lock, which a
+// `serve` starting meanwhile would lose with exit 5; then the change, live or
+// offline, its line printed as `options` say. Ctrl-C at a prompt is exit 130,
+// with nothing written.
+export async function runPasswordSet(
+  options: OperatorVerbOptions = {},
+  secret: SecretDeps = {},
+): Promise<number> {
+  requireHub(options.env, options.platform);
+  const password = await readNewPassword(secret);
+  if (password === null) return EXIT_INTERRUPTED;
+  return await runOperatorVerb(
+    {
+      offline: (dataDir, locked) => cliPasswordSet(dataDir, password, locked),
+      live: (hub) => livePasswordSet(hub, password),
+    },
+    options,
+  );
+}
+
+// `maxprice-hub password clear`, both ways: the command's, and setup's step
+// 2's (setupPasswordSteps).
+const PASSWORD_CLEAR: OperatorVerb = {
+  offline: (dataDir, locked) => cliPasswordClear(dataDir, locked),
+  live: (hub) => livePasswordClear(hub),
+};
+
+// Setup's step 2 (ADR-0128 §3): `password set` and `password clear`, this
+// module's code, which setup cannot import, since this module imports setup.
+// Each prints its line to the writer setup hands it, indented under the step,
+// and `password set` reads through setup's own prompts, as on a terminal.
+// `options` are a test's environment, platform and reach; production's
+// wiring passes none.
+export function setupPasswordSteps(
+  options: OperatorVerbOptions = {},
+): Pick<SetupDeps, "passwordSet" | "passwordClear"> {
+  return {
+    passwordSet: (read, out) =>
+      runPasswordSet({ ...options, out }, { readSecret: read, interactive: true }),
+    passwordClear: (out) => runOperatorVerb(PASSWORD_CLEAR, { ...options, out }),
+  };
+}
+
+// `purge-machine`'s typed name, asked on either path. The prompt shows the
+// name through `terminalText`, as runOperatorVerb prints its line, and the
+// typed answer is compared with the name as the Machine directory holds it.
+export function confirmPurge(
+  expected: string,
+  ask: (message: string) => string | null = prompt,
+): boolean {
+  const typed =
+    ask(`Type the machine's name ("${terminalText(expected)}") to confirm purge:`) ?? "";
+  return typed === expected;
 }
 
 function openDirectory(dataDir: string) {
@@ -731,59 +1187,74 @@ function armHubWatchdogs(): void {
 }
 
 if (import.meta.main) {
-  const [, , command, sub, value] = process.argv;
-  if (command === "password" && sub === "set") {
-    void passwordSet(value);
-  } else if (command === "password" && sub === "clear") {
-    passwordClear();
-  } else if (command === undefined || command === "serve") {
-    armHubWatchdogs();
-    void serve();
-  } else if (
-    command === "rename" ||
-    command === "merge" ||
-    command === "purge-machine" ||
-    command === "compact"
-  ) {
-    void (async () => {
-      const dataDir = defaultDataDir();
-      const config = loadOrInitConfig(dataDir);
-      if (await daemonRunning(config.port)) {
-        console.error(
-          `a hub daemon is responding on port ${config.port} — stop it first (these commands edit the data files directly)`,
-        );
-        process.exit(1);
-      }
-      try {
-        if (command === "rename") {
-          if (sub === undefined || value === undefined)
-            throw new Error("usage: maxprice-hub rename <machineId> <newName>");
-          console.log(await cliRenameMachine(dataDir, sub, value));
-        } else if (command === "merge") {
-          if (sub === undefined || value === undefined)
-            throw new Error("usage: maxprice-hub merge <sourceId> <targetId>");
-          console.log(await cliMergeMachine(dataDir, sub, value));
-        } else if (command === "purge-machine") {
-          if (sub === undefined) throw new Error("usage: maxprice-hub purge-machine <machineId>");
-          console.log(
-            await cliPurgeMachine(dataDir, sub, (expected) => {
-              const typed =
-                prompt(`Type the machine's name ("${expected}") to confirm purge:`) ?? "";
-              return typed === expected;
-            }),
-          );
-        } else {
-          console.log(await cliCompact(dataDir));
-        }
-      } catch (err) {
-        console.error(err instanceof Error ? err.message : String(err));
-        process.exit(2);
-      }
-    })();
-  } else {
-    console.error(
-      `unknown command: ${command}\nusage: maxprice-hub [serve | password set [value] | password clear | rename <id> <name> | merge <sourceId> <targetId> | purge-machine <id> | compact]`,
-    );
-    process.exit(2);
-  }
+  const archive = { opensArchive: true };
+  const code = await runHubCli(process.argv.slice(2), {
+    serve: async () => {
+      armHubWatchdogs();
+      return await serve();
+    },
+    // Its steps are the commands' own code; the two password commands are
+    // this module's, handed in with setup's reader and writer (ADR-0128 §3).
+    setup: (io) =>
+      runSetup(io, {
+        terminal: createSetupTerminal({ stdin: process.stdin, out: process.stdout }),
+        ...setupPasswordSteps(),
+        service: { hubAnswers: (port) => hubAnswersAt("127.0.0.1", port) },
+      }),
+    status: (json, io) => hubStatus(json, io),
+    passwordSet: () => runPasswordSet(),
+    passwordClear: () => runOperatorVerb(PASSWORD_CLEAR),
+    keySet: (io) => keySet(io),
+    keyClear: (io) => keyClear(io),
+    rename: (machineId, newName) =>
+      runOperatorVerb(
+        {
+          offline: (dataDir) => cliRenameMachine(dataDir, machineId, newName),
+          live: (hub) => liveRenameMachine(hub, machineId, newName),
+        },
+        archive,
+      ),
+    merge: (sourceId, targetId) =>
+      runOperatorVerb(
+        {
+          offline: (dataDir) => cliMergeMachine(dataDir, sourceId, targetId),
+          live: (hub) => liveMergeMachine(hub, sourceId, targetId),
+        },
+        archive,
+      ),
+    purgeMachine: (machineId) =>
+      runOperatorVerb(
+        {
+          offline: (dataDir) => cliPurgeMachine(dataDir, machineId, confirmPurge),
+          live: (hub) => livePurgeMachine(hub, machineId, confirmPurge),
+        },
+        archive,
+      ),
+    compact: () =>
+      runOperatorVerb(
+        { offline: (dataDir) => cliCompact(dataDir), live: (hub) => liveCompact(hub) },
+        archive,
+      ),
+    // Not runOperatorVerb's: restore wants a data dir with no Hub in it, and
+    // never runs beside one (ADR-0130 §5).
+    restore: (dir, samples) => restoreHub(dir, samples),
+    service: (args, io) =>
+      hubService(args, io, { hubAnswers: (port) => hubAnswersAt("127.0.0.1", port) }),
+    // Not runOperatorVerb's: it edits no data file, and reaches the restarted
+    // Hub's /page/view alone (ADR-0129 §5).
+    update: (check, json, io) => hubUpdate(check, json, io),
+    // Not runOperatorVerb's: none edits through the running Hub's operator
+    // routes or takes the lock, since the Hub reads pageUrl only at boot
+    // (ADR-0125 §3); `page` asks its /healthz alone.
+    page: (io) => cliPage({ io }),
+    pageSet: (url, io) => cliPageSet(url, { io }),
+    pageClear: (io) => cliPageClear({ io }),
+    pageSnippet: (io) => cliPageSnippet({ io }),
+  });
+  // serve returns 0 once the daemon is up, and the server it started keeps
+  // the process running; a command that finished lets the empty loop end it.
+  // Any other code ends the process now, whatever a serve that failed partway
+  // had started (the embedded stdin watchdog keeps a process alive).
+  if (code === EXIT.OK) process.exitCode = code;
+  else process.exit(code);
 }

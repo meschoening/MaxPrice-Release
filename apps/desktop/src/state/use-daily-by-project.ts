@@ -1,5 +1,9 @@
-import { dailyByProjectKey, dailyByProjectResponseSchema } from "@maxprice/shared";
-import { makeReportHook, type ReportQueryInput } from "./report-hook";
+import {
+  dailyByProjectKey,
+  dailyByProjectResponseSchema,
+  type ReportQueryInput,
+} from "@maxprice/shared";
+import { makeReportHook } from "./report-hook";
 
 // /api/daily-by-project — ADR-0004 four-piece split. Backs the cost chart's
 // `by project` group-by. See use-daily.ts.

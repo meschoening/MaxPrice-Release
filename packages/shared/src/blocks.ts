@@ -9,10 +9,10 @@ import { z } from "zod";
 // block; both are `null` on completed and gap rows. The Active block tile's
 // "typical" row is NOT carried on the wire — it derives client-side as the
 // MEDIAN `totalTokens` across the completed (non-gap, non-active) blocks
-// (`typicalBlockTokens`, `apps/desktop/src/lib/aggregate.ts`). Under a model
-// filter (ADR-0017), `entries` / `tokenCounts` / `totalTokens` / `costUSD` /
-// `models` count matching events only; `burnRate` / `projection` stay
-// all-model — they describe the real 5-hour quota window.
+// (`typicalBlockTokens`, `./aggregate`). Under a model filter (ADR-0017),
+// `entries` / `tokenCounts` / `totalTokens` / `costUSD` / `models` count
+// matching events only; `burnRate` / `projection` stay all-model — they
+// describe the real 5-hour quota window.
 const tokenCountsSchema = z.object({
   inputTokens: z.number(),
   outputTokens: z.number(),

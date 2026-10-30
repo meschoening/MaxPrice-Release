@@ -1,19 +1,17 @@
 import { matchPath, useLocation, useNavigate } from "react-router-dom";
 import { ArrowLeft, Monitor, Moon, Sun } from "lucide-react";
-import { deriveProjectPath } from "@maxprice/shared";
+import { deriveProjectPath, liveSubtitle, machineName, RANGE_LABEL } from "@maxprice/shared";
 import { useFilters } from "@/state/filters";
 import { themeChipLabel, useTheme } from "@/lib/theme";
 import { useSettings } from "@/state/use-settings";
 import { useLiveStatus, type ConnectionState } from "@/state/use-live-status";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useSessionRow } from "@/state/use-session-row";
-import { liveSubtitle, machineName } from "@/lib/machines";
 import { blocksSubtitleSuffix } from "@/lib/organization-scope-view";
 import { useQuotaSurface } from "@/state/use-quota-surface";
 import { RefreshPill } from "@/components/refresh-pill";
 import { TopbarScopeChip } from "@/components/topbar-scope-chip";
 import { cn } from "@/lib/utils";
-import { RANGE_LABEL } from "@/lib/list-format";
 
 const TITLES: Record<string, string> = {
   "/live": "Live",

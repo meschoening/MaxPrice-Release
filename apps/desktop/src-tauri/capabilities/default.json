@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability granting renderer access to the get_sidecar_url command. The sidecar process is spawned by Rust via app.shell().sidecar(), so the renderer does not need shell:allow-spawn. core:window:default is read-only, so show/set-focus are granted explicitly: the main window is created hidden and the renderer puts it on screen once the boot splash has painted (ADR-0066).",
+  "description": "Default capability granting renderer access to the get_sidecar_url command. The sidecar process is spawned by Rust via app.shell().sidecar(), so the renderer does not need shell:allow-spawn. core:window:default is read-only, so show/set-focus are granted explicitly: the main window is created hidden and the renderer puts it on screen once the boot splash has painted (ADR-0066). opener:allow-open-url is scoped to the User guide, which Settings › App info's User guide row opens in the default browser (#564); the Popout has no opener permission.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -10,6 +10,10 @@
     "core:window:allow-set-focus",
     "dialog:allow-open",
     "opener:allow-open-path",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://meschoening.github.io/MaxPrice-Release/*" }]
+    },
     "updater:default",
     "process:default"
   ]

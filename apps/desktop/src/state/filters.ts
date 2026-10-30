@@ -1,8 +1,7 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import { z } from "zod";
-import { parentProjectSlug, type Span, spanSchema, type WeekWindow } from "@maxprice/shared";
-import { ymdShift } from "@/lib/dates";
+import { parentProjectSlug, type DateRangePreset, type Span, spanSchema } from "@maxprice/shared";
 import { groupByAxisSchema, normalizeAxes, type GroupByAxis } from "@/lib/group-by";
 
 // `Span` + `spanSchema` are owned by the shared package (`./intraday`); they are
@@ -13,7 +12,6 @@ import { groupByAxisSchema, normalizeAxes, type GroupByAxis } from "@/lib/group-
 export type { Span };
 export type { GroupByAxis };
 
-export type DateRangePreset = "24h" | "week" | "30d" | "90d" | "all";
 export type Metric = "cost" | "tokens";
 export type ChartStyle = "bars" | "cumulative" | "trend";
 
@@ -222,57 +220,3 @@ export const useFilters = create<FiltersState>()(
     },
   ),
 );
-
-// Ranges are inclusive on both ends.
-// 24h covers today + yesterday; a ROLLING `week` covers today + 6 prior days
-// (7 total).
-// `tz` (the configured Timezone setting) makes the window edges line up with
-// the engine's tz-aware day bucketing; omitted = the host zone (f8).
-//
-// `all` is UNBOUNDED ON BOTH SIDES — it sends neither bound, so it means every
-// event rather than everything up to today. It used to keep `until = today`,
-// which made a FUTURE-DATED event invisible at the widest range the UI offers;
-// a clock-skewed peer on the fleet replica (ADR-0041) is enough to produce one.
-// That was tolerable while `/api/projects` carried an all-time cost column
-// beside the windowed one, and stopped being so when ADR-0068 deleted it and
-// left this preset as the only way to see lifetime spend. It also puts the app
-// back in agreement with its own oracle: `capture-golden.ts` has always defined
-// the `all` cell as "no since / no until".
-//
-// Safe for `/api/daily` despite ADR-0057's unbounded branch being a latent
-// path: no daily call site takes its window from here. The rolling daily call
-// sites bound both ends with explicit `ymdShift` dates (`use-chart-window`,
-// `use-chart-source` ×2, `use-live-data`'s 14-day tile window, and the Projects
-// strip's 30-day chart); the ONE open-ended daily query — `use-live-data`'s
-// anchored current-week window, `since` an instant with no `until` — reads its
-// bounds from `useWeekWindow` directly, and an anchored week is at most 7 days,
-// so the unbounded branch stays unreached.
-// `week` is the ONE preset that follows the Week setting (ADR-0083): a rolling
-// week keeps the local-date form, byte-identical to what shipped, while an
-// ANCHORED week (limit reset, or a custom weekday + time) sends the instant
-// form — the ISO start, and NO `until`, since the week runs to now and a
-// local-date right edge would round it out to the end of today.
-export function resolveDateRange(
-  preset: DateRangePreset,
-  tz?: string,
-  week?: WeekWindow,
-): { since?: string; until?: string } {
-  const until = ymdShift(0, tz);
-  switch (preset) {
-    case "24h":
-      return { since: ymdShift(-1, tz), until };
-    case "week":
-      if (week?.kind === "anchored") return { since: new Date(week.startMs).toISOString() };
-      return { since: ymdShift(-6, tz), until };
-    case "30d":
-      return { since: ymdShift(-29, tz), until };
-    case "90d":
-      return { since: ymdShift(-89, tz), until };
-    case "all":
-      return {};
-    default: {
-      const _exhaustive: never = preset;
-      throw new Error(`resolveDateRange: unknown preset ${String(_exhaustive)}`);
-    }
-  }
-}

@@ -11,10 +11,10 @@
 // here exactly as it reads there:
 //   - absent is Home, and so is anything that names nothing tracked, the Home
 //     uuid itself, and `all` on a machine that tracks only Home;
-//   - `all` is THIS machine's resolved tracked set (`trackedNow()` in main()),
-//     never every Organization the replica or the store happens to hold (#262
-//     item 4) — a fleet row tagged with an Organization this machine does not
-//     track stays out of All;
+//   - `all` is THIS machine's resolved tracked set (`trackedNow()` in
+//     bootSidecar()), never every Organization the replica or the store happens
+//     to hold (#262 item 4) — a fleet row tagged with an Organization this
+//     machine does not track stays out of All;
 //   - no Home (`home === null`, the ADR-0098 null set) narrows nothing.
 //
 // A resolved Home becomes `[home]`, not "no filter": on a machine that tracks

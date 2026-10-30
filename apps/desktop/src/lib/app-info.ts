@@ -5,8 +5,9 @@ import { UNPRICED_COST_NOTE } from "./unpriced";
 
 // Settings › App info — the four rows' derivations (map #100, T5; the grammar
 // and the frozen copy live here; the mock is history, ADR-0088).
-// Every user-visible string in the section is produced here rather than inline
-// in JSX, for two reasons: the Engine row's drift comparison is the section's
+// Every user-visible string in the section but the User guide row's (#564), a
+// label and the shared user-guide constants, is produced here rather than
+// inline in JSX, for two reasons: the Engine row's drift comparison is the section's
 // one piece of real logic, and the Pricing row has six states whose tone rules
 // are easy to get subtly wrong. The component that renders these is a dumb
 // mapper over the returned cells.

@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
-import type { BlockRow, TimeDisplay } from "@maxprice/shared";
-import { resolveDateRange, useFilters } from "@/state/filters";
+import type { BlockKind, BlockRow, BlocksAggregate, TimeDisplay } from "@maxprice/shared";
+import { useFilters } from "@/state/filters";
 import { useWeekWindow } from "@/state/use-week";
 import { useSettings, useTimeDisplay } from "@/state/use-settings";
 import { useOrganizationScope } from "@/state/use-organization-scope";
@@ -14,26 +14,25 @@ import { DataTable, type Column } from "@/components/data-table";
 import { StripPage } from "@/components/strip-page";
 import { DetailStrip, StripIdentity, StripSection, StripStat } from "@/components/detail-strip";
 import { ModelBadges } from "@/components/model-badges";
-import { aggregateBlocks, typicalBlockTokens, type BlocksAggregate } from "@/lib/aggregate";
-import { formatRelativeTime, formatWallDayMonth } from "@maxprice/shared";
-import { abbreviate, formatRange } from "@/lib/active-block";
-import { formatCost, RANGE_LABEL } from "@/lib/list-format";
+import {
+  abbreviate,
+  activeBlockOf,
+  aggregateBlocks,
+  blockKind,
+  blockRemainingLabel,
+  blockStartMs,
+  formatCost,
+  formatRange,
+  formatRelativeTime,
+  formatWallDayMonth,
+  RANGE_LABEL,
+  resolveDateRange,
+  typicalBlockTokens,
+} from "@maxprice/shared";
 import { WINDOW_SOURCE } from "@/components/window-source";
 import { useArrangement } from "@/state/use-arrangement";
 import { costBarColumn } from "@/components/cost-bar";
 import { cn } from "@/lib/utils";
-
-type BlockKind = "active" | "gap" | "done";
-
-function blockKind(b: BlockRow): BlockKind {
-  if (b.isGap) return "gap";
-  if (b.isActive) return "active";
-  return "done";
-}
-
-function startMs(b: BlockRow): number {
-  return Date.parse(b.startTime) || 0;
-}
 
 // "14:00 – 19:00 · May 14" / "2:00 PM – 7:00 PM · May 14" — `display` (ADR-0060)
 // carries the Settings timezone, so both the time range and the calendar day
@@ -44,18 +43,9 @@ function startMs(b: BlockRow): number {
 // through `formatWallDayMonth` (shared, cached, locale-independent) rather than
 // a host-locale `toLocaleDateString`.
 function windowLabel(b: BlockRow, display: TimeDisplay): string {
-  const s = startMs(b);
+  const s = blockStartMs(b);
   const e = Date.parse(b.endTime) || s;
   return `${formatRange(s, e, display)} · ${formatWallDayMonth(s, display)}`;
-}
-
-function remainingLabel(b: BlockRow, now: number): string {
-  const ms = (Date.parse(b.endTime) || 0) - now;
-  if (ms <= 0) return "";
-  const totalMin = Math.floor(ms / 60_000);
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  return h > 0 ? `${h}h ${m}m left` : `${m}m left`;
 }
 
 function StatusPill({ kind }: { kind: BlockKind }): React.ReactElement {
@@ -104,7 +94,7 @@ export function BlocksPage(): React.ReactElement {
   });
   const blocks = useMemo(() => query.data?.blocks ?? [], [query.data]);
 
-  const activeBlock = useMemo(() => blocks.find((b) => b.isActive && !b.isGap), [blocks]);
+  const activeBlock = useMemo(() => activeBlockOf(blocks), [blocks]);
   // The "typical" block — median tokens across the range's completed blocks —
   // the baseline the selected block's "tokens vs typical" bar measures against.
   const typical = useMemo(() => typicalBlockTokens(blocks), [blocks]);
@@ -144,9 +134,9 @@ export function BlocksPage(): React.ReactElement {
         // overflows its container — overflow is what clipped the right columns
         // and left their row background unpainted. The label truncates instead.
         width: "minmax(0,2fr)",
-        sortValue: (b) => startMs(b),
+        sortValue: (b) => blockStartMs(b),
         cell: (b) => {
-          const rem = b.isActive ? remainingLabel(b, now) : "";
+          const rem = b.isActive ? blockRemainingLabel(b, now) : "";
           return (
             <span className="lead">
               <span className="wcell">
@@ -310,7 +300,7 @@ function BlockDetailStrip({
 
   const statusText =
     kind === "active"
-      ? remainingLabel(block, now) || "—"
+      ? blockRemainingLabel(block, now) || "—"
       : kind === "done"
         ? `ended ${formatRelativeTime(endedIso, now)}`
         : "no activity in this window";

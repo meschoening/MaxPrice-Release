@@ -65,7 +65,7 @@ export type CreateLiveHubOptions = {
   // of a Partial, and both wire exits read the one object the hub holds. The
   // shared type's `pricing?` is consumer parse tolerance for a skewed producer
   // (ADR-0053); the producer's obligation is discharged here, so dropping
-  // `pricing` from the boot literal in index.ts is a compile error rather than
+  // `pricing` from the boot literal in boot.ts is a compile error rather than
   // a silent em dash in Settings' App info row.
   initialStatus: EmittedStatusSnapshot;
   // block:tick cadence — refreshes the active block's burn rate / projection

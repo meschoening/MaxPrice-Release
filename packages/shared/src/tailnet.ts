@@ -31,8 +31,8 @@ const EXPANDED_IPV6_LOOPBACK = /^0{1,4}(?::0{1,4}){6}:0{0,3}1$/;
 //   - an IPv4 loopback (127.*)
 //   - the IPv6 loopback in any spelling (::1, 0:0:0:0:0:0:0:1, zero-padded)
 // This is the single loopback rule for the repo: the hub daemon's bind warning
-// (apps/hub/src/bind.ts) and the operator console's reachability gates
-// (apps/hub-desktop/src/lib/presentation.ts) both call it, so a host can never
+// (apps/hub/src/bind.ts) and the Hub rows' reachability gates (hub-rows.ts,
+// which the operator console reads too) both call it, so a host can never
 // read as loopback in one place and as a reachable address in the other.
 export function isLoopbackHost(host: string): boolean {
   const h = host.toLowerCase();

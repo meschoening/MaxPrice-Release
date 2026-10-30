@@ -171,8 +171,8 @@ export type UnbackedInput = {
   // them.
   withheld?: (record: FleetRecord) => boolean;
   // The Organization an unbacked row counts under, for the per-Organization
-  // disclosure (#295) — main() wires `eventOrganization` against the live
-  // store's presumption, so a row answers here exactly as it does in every
+  // disclosure (#295) — bootSidecar() wires `eventOrganization` against the
+  // live store's presumption, so a row answers here exactly as it does in every
   // report: evidence, then assertion, then presumption. `undefined` = it
   // resolves to none (no Home to presume under), which suppresses the
   // breakdown rather than leaving a row out of it. Omitted = no breakdown.

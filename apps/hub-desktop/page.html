@@ -1,0 +1,21 @@
+<!doctype html>
+<!-- The Hub page (ADR-0124 §7), built by vite.page.config.ts into dist-page/
+     as index.html. Every URL is relative: the page is served under /page/ and
+     proxied under any prefix. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MaxPrice Hub</title>
+    <!-- The plain hub orb until the first poll settles; the page then swaps in
+         the orb badged with the Hub row's dot colour. -->
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <!-- Synchronous on purpose: stamps the resolved theme before first paint
+         (ADR-0043). Classic script — the CSP forbids inline scripts. -->
+    <script src="/theme-boot.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/page/main.tsx"></script>
+  </body>
+</html>
