@@ -562,9 +562,8 @@ kbd {
    pointer-events: none, so the pill never takes a click meant for the page
    under it — and only while .show: the hidden pill stays in the tree, and an
    unscoped rule would leave an invisible button just above the window's
-   bottom edge eating clicks on whatever sits there (toast.test.ts pins
-   both). No motion of its own; it fades with the pill, under the
-   reduced-motion kill like the pill. */
+   bottom edge eating clicks on whatever sits there. No motion of its own;
+   it fades with the pill, under the reduced-motion kill like the pill. */
 .toast:has(> .toast-action) {
   display: flex;
   align-items: center;

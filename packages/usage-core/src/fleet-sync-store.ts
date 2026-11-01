@@ -140,6 +140,8 @@ export type FleetStoreOptions = {
   retentionMs?: number;
   retentionBytes?: number;
   snapshotTtlMs?: number;
+  /** SQLite's busy_timeout: how long a locked database is waited on (5 s). */
+  busyTimeoutMs?: number;
   beforeCommit?: () => void;
 };
 type FleetStoreMode = "hub" | "replica" | "archive";
@@ -238,7 +240,10 @@ function openFleetDatabase<T extends { readonly seq: number }>(
       db = new Database(opts.path, { create: true, strict: true });
       openings++;
       if (opts.mode === "hub") db.exec("PRAGMA locking_mode=EXCLUSIVE;");
-      db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;");
+      const busyTimeoutMs = Math.trunc(opts.busyTimeoutMs ?? 5000);
+      db.exec(
+        `PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=${busyTimeoutMs};`,
+      );
       const check = db.query<{ quick_check: string }, []>("PRAGMA quick_check").get();
       if (check?.quick_check !== "ok")
         throw new FleetDatabaseInvalid("Fleet database integrity check failed");

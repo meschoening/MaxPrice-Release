@@ -81,7 +81,8 @@ export async function checkLive(check: LiveCheck): Promise<string[]> {
   return problems;
 }
 
-async function main(argv: string[]): Promise<number> {
+/** The script, given its arguments; its exit code. */
+export async function main(argv: string[]): Promise<number> {
   const version = (argv[0] ?? "").replace(/^v/, "");
   if (argv.length !== 1 || !/^\d+\.\d+\.\d+$/.test(version)) {
     console.error("usage: bun apps/guide/src/live-check.ts <version>");

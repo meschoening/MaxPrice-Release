@@ -15,6 +15,7 @@ import {
 } from "@maxprice/usage-core/serve-lock";
 import { CliError, EXIT, type Hint } from "./cli";
 import { loopbackRequest } from "./loopback-http";
+import { TEST_NO_ANSWER_MS } from "./no-answer";
 import { operatorTokenPath } from "./secrets";
 import { serveLockPath, takeLockOrHolder, UNIT } from "./serve-lock";
 import { HUB_PROTOCOL_MISMATCH } from "./server";
@@ -104,8 +105,9 @@ import { HUB_PROTOCOL_MISMATCH } from "./server";
 // other answer is the command's to read: a route's 409 is a refusal of its
 // own (a name in use, an alias cycle, a purge conflict), not skew.
 
-// The reach's bound, and each request's after it (above).
-export const NO_ANSWER_MS = 10_000;
+// The reach's bound, and each request's after it (above): 10 s, but in a
+// spawned test that defines a shorter one (no-answer.ts).
+export const NO_ANSWER_MS = TEST_NO_ANSWER_MS ?? 10_000;
 const POLL_MS = 100;
 
 // The journal pointer under every line about a Hub that did not answer, a

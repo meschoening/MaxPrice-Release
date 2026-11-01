@@ -11,6 +11,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import type { Subprocess } from "bun";
 import { HUB_DEFAULT_PORT } from "@maxprice/shared";
+import { clientPath } from "@maxprice/usage-core/test-loopback";
 import { UPDATE_CHECK_FILE } from "@maxprice/usage-core/update-check";
 import { MANIFEST_NAME, PRODUCT } from "./update-channel";
 
@@ -38,7 +39,10 @@ import { MANIFEST_NAME, PRODUCT } from "./update-channel";
 // sandbox's channel>`. By default that channel is an unroutable loopback port
 // under a throwaway key, so a Headless `serve`'s boot check fails at once and
 // never reaches the real channel; the dead HTTPS proxy below is the second
-// guard, for a URL the define does not cover.
+// guard, for a URL the define does not cover. A sandbox that names a
+// `noAnswerMs` defines the operator commands' answer bound too
+// (no-answer.ts), so a case that waits out a Hub that never answers waits
+// that long rather than the real 10 s.
 
 export const ENTRY = join(import.meta.dir, "index.ts");
 export const CASE_MS = 60_000;
@@ -53,6 +57,8 @@ export type Sandbox = {
   env: Record<string, string>;
   // The channel every spawn defines; a case may point it at its own.
   updateChannel: UpdateChannel;
+  // The answer bound every spawn defines, when a case sets one.
+  noAnswerMs?: number;
 };
 
 // Not a key: no channel a sandbox defines is ever installed from, so its
@@ -184,9 +190,15 @@ export type Spawned = {
   done: Promise<Ended>;
 };
 
-// The sandbox's channel as bun's build-time define (the header says why).
+// The sandbox's channel, and its answer bound if it names one, as bun's
+// build-time defines (the header says why).
 function define(sandbox: Sandbox): string[] {
-  return ["--define", `MAXPRICE_TEST_UPDATE_CHANNEL=${JSON.stringify(sandbox.updateChannel)}`];
+  const bound = sandbox.noAnswerMs;
+  return [
+    "--define",
+    `MAXPRICE_TEST_UPDATE_CHANNEL=${JSON.stringify(sandbox.updateChannel)}`,
+    ...(bound === undefined ? [] : ["--define", `MAXPRICE_TEST_NO_ANSWER_MS=${bound}`]),
+  ];
 }
 
 // `stdin` is what a headless child reads, all of it and then its end, as a
@@ -320,18 +332,21 @@ export const lockFile = (sandbox: Sandbox) => join(sandbox.dataDir, "serve.lock"
 export const updateCheckFile = (sandbox: Sandbox) => join(sandbox.dataDir, UPDATE_CHECK_FILE);
 
 // An update channel on loopback offering `version`, for a sandbox's
-// `updateChannel`, with every path it was asked, in order. Only the manifest
-// should be: a check never downloads the tarball, which is named on a closed
-// port. The cleanup stops it.
+// `updateChannel`, with every path it was asked of the two a Hub could ask
+// it, its manifest and its tarball, in order. Only the manifest should be: a
+// check never downloads the tarball, which is named on a closed port. Any
+// other request (a prober's `GET /`) is answered, never recorded (#596). The
+// cleanup stops it.
 export function offeringChannel(version: string): { channel: UpdateChannel; requests: string[] } {
   const requests: string[] = [];
   const tarball = `http://127.0.0.1:9/${PRODUCT.assetName(version)}`;
+  const asked = [`/${MANIFEST_NAME}`, `/${PRODUCT.assetName(version)}`];
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
-      requests.push(path);
+      if (clientPath(request, asked)) requests.push(path);
       if (path !== `/${MANIFEST_NAME}`) return new Response("no", { status: 404 });
       // A Tauri updater manifest with the one entry, as `MP-Updates` serves it.
       return Response.json({

@@ -28,7 +28,7 @@ import { editSettings, readSettingsObject } from "../settings";
 const HUB_CONFIG_PATH = "/api/hub/config";
 // ADR-0121 §8: how long `join` waits, from the POST's answer, for the daemon
 // to leave `connecting`, and how often it asks.
-const SETTLE_MS = 10_000;
+export const SETTLE_MS = 10_000;
 const POLL_MS = 100;
 
 // What a test replaces; production passes none.

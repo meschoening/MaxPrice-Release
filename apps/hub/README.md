@@ -413,7 +413,7 @@ systemctl --user start maxprice-hub
 
 Why a fresh epoch: a client knows a Hub's archive only by its epoch and by how far through its changes it has read, the Fleet change cursor. Under the old epoch, a client that comes back after other clients have pushed the restored Hub's cursor past its own would stall for good, its usage since the backup never reaching the Hub. Under a fresh one, every client sees a new archive, reseeds once and contributes its usage since the backup again, in any order.
 
-**1. Pre-check each client.** Before the restored Hub starts, each client's `fleet-forget.json` must be absent or hold `null`. The file sits beside the client's Fleet replica:
+**1. Pre-check each client of v0.9.0 or earlier.** Before the restored Hub starts, each such client's `fleet-forget.json` must be absent or hold `null`. A client newer than v0.9.0 needs no check: it completes a pending forget on the restored Hub at the same URL, and runs its Organization repair's Hub forgets there again. The file sits beside the client's Fleet replica:
 
 | Client                  | Its directory                                                                           |
 | ----------------------- | --------------------------------------------------------------------------------------- |
@@ -422,7 +422,7 @@ Why a fresh epoch: a client knows a Hub's archive only by its epoch and by how f
 | Desktop client, Windows | `%APPDATA%\com.maxprice.desktop`                                                        |
 | Headless client         | its data dir, `$XDG_DATA_HOME/maxprice`, by default `~/.local/share/maxprice`           |
 
-A file that holds anything else is a forget still pending on the old Hub, which records the Hub's URL and its epoch. At the same URL under a fresh epoch it would never complete, and meanwhile the usage it covers would stay barred from the Hub. So first point that client at the restored Hub under another URL, such as its tailnet address where it had the machine's name: there the forget is retargeted and completes, and the file reads `null` again.
+A file that holds anything else is a forget still pending on the old Hub, which records the Hub's URL and its epoch. On a client of v0.9.0 or earlier, at the same URL under a fresh epoch it would never complete, and meanwhile the usage it covers would stay barred from the Hub. So first point that client at the restored Hub under another URL, such as its tailnet address where it had the machine's name: there the forget is retargeted and completes, and the file reads `null` again. A newer client retargets it at the same URL, as it does under another.
 
 Two copies to take now, from the same directory, if you want them: each client's `usage-history.jsonl`, for `--samples` in step 2, since the Hub's own samples since the backup come back only that way; and the `fleet-events.sqlite` of a client whose Fleet replica may hold the events of a machine that will never connect again, taken by the old Hub after the backup. The reseed in step 4 discards them, and no other copy exists.
 
@@ -445,8 +445,9 @@ Restored the Hub at /backups/maxprice-hub into ~/.local/share/maxprice-hub.
   copied: machine-directory.json, identity-directory.json, organization-directory.json, organization-assertion-directory.json, organization-roster.json, usage-history.jsonl, events.sqlite, hub.json
   not copied: hub.json.lock, secrets.json, serve.lock, update-check.json
 Next steps:
-  1. Before it starts, check every client: its fleet-forget.json must be absent or null.
-     A client whose file holds a forget intent first reaches this Hub under another URL.
+  1. Before it starts, check every client of v0.9.0 or earlier: its fleet-forget.json
+     must be absent or null. One whose file holds a forget intent first reaches this Hub
+     under another URL. A newer client needs no check.
   2. Give it the session key: maxprice-hub key set, or maxprice-hub setup.
   3. Start it: maxprice-hub service install, or maxprice-hub serve.
   4. Redo by hand any operator edit made after the backup: a rename, a merge, a purge

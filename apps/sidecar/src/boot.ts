@@ -673,6 +673,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     trackedOrganizations: () => trackedNow(),
     foreignSessions: () => getEngineStore().foreignSessions(),
     hubTarget: () => hubTargetNow,
+    hubEpoch: (target) => fleet.hubEpoch(target),
     forgetOnHub: (sessions, target) => fleet.repairOrganizations(sessions, target),
     forgetExcludedFromLocalArchive: (sessions) => localArchive.forgetExcludedKeys(sessions),
     rebuild: () => fleet.rebuildEngine(),

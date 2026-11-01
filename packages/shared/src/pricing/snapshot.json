@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-10-30T02:29:48.669Z",
+  "capturedAt": "2026-10-31T22:29:21.280Z",
   "models": {
     "aihubmix/claude-fable-5": {
       "input_cost_per_token": 0.000011,
@@ -1686,6 +1686,13 @@
     "gradient_ai/anthropic-claude-3.7-sonnet": {
       "input_cost_per_token": 0.000003,
       "output_cost_per_token": 0.000015
+    },
+    "hostinger_router/claude-sonnet-5": {
+      "input_cost_per_token": 0.00000264,
+      "output_cost_per_token": 0.0000132,
+      "cache_creation_input_token_cost": 0.0000033,
+      "cache_read_input_token_cost": 2.64e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.00000528
     },
     "jp.anthropic.claude-haiku-4-5-20251001-v1:0": {
       "input_cost_per_token": 0.0000011,

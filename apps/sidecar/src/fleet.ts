@@ -207,8 +207,9 @@ export type FleetSyncDeps = {
 // not do it. `landed` says whether ANY batch was applied on the connected Hub
 // before the failure — the difference between "nothing happened" and "some of
 // it did", which decides whether the local replica still agrees with the
-// archive. A receipt from a Hub the intent was retargeted away from (#387) is
-// no landing here: that Hub's replica is not the one reconciling.
+// archive. A receipt from a Hub the intent was retargeted away from (#387),
+// another URL or another epoch at the same one (#515), is no landing here:
+// that Hub's replica is not the one reconciling.
 // `busy` is a third, and is "not in this state" rather than "try again in a
 // moment": a forget already running on this machine is doing the work the second
 // caller wants done.
@@ -265,6 +266,11 @@ export type FleetSync = {
     target: string,
     opts?: { keepLocalArchive?: boolean },
   ) => Promise<FleetForgetResult>;
+  // The events epoch of the Hub at `target` while connected to it, from its
+  // connect status and every hub:status frame since; null while disconnected,
+  // connected elsewhere, or connected to a Hub with no event archive. The
+  // Organization repair keys its Hub completion by it (#515, ADR-0098 §5).
+  hubEpoch: (target: string) => string | null;
   // ADR-0098: a full engine rebuild (fresh store → walk → archive + replica
   // seed → swap) WITHOUT unlinking the replica — for a tracked-set change and
   // the repair, where the replica is still valid but the engine's verdicts are
@@ -401,6 +407,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // moment later would re-latch it, silently disabling identity push and pull
   // against a hub that supports both.
   let connGen = 0;
+  // The connected Hub's events epoch as its status last reported it (#515).
+  let connEpoch: string | null = null;
   let shareEvents = deps.initial.shareEvents;
   let fleetReplica = deps.initial.fleetReplica;
   let hubConfigured = deps.initial.hubConfigured;
@@ -867,7 +875,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   let forgetInflight: Promise<FleetForgetResult> | null = null;
 
   // The connected Hub's events epoch, which a forget's intent is written
-  // against: a new intent's, or a retargeted one's (#387).
+  // against: a new intent's, or a retargeted one's (#387), and which every
+  // resume compares with its intent's (#515).
   async function readHubEpoch(connection: Conn): Promise<string> {
     const deadline = requestDeadline();
     try {
@@ -964,34 +973,45 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     }
     if (intent === null && sessions.length === 0)
       return { ok: true, sessionsRequested: 0, sessionsMatched: 0, rowsRemoved: 0 };
-    // Landed on the connected Hub: receipts an intent holds from another Hub
-    // are dropped by its retarget below.
-    let landed =
-      intent?.hub === connection.url && intent.batches.some((batch) => batch.receipt !== undefined);
+    // Landed on the connected Hub: an intent's receipts count only once its
+    // URL and epoch are found to be this Hub's (#515). Receipts from another
+    // Hub, or from an earlier archive at this URL, are dropped by its retarget
+    // below, and a failed epoch read leaves them unproven.
+    let landed = false;
     let retryable = true;
     eventSync.suspend();
     try {
-      if (intent !== null && intent.hub !== connection.url) {
-        // #387 (ADR-0100, amended 2026-10-13): the intent follows the machine
-        // to the Hub it is connected to, known only by its URL. It keeps its
-        // sessions, their batching, its mode and `localComplete`, and is
-        // written against this Hub's epoch with fresh operation ids and no
-        // receipts, so the Hub it left is not asked again unless the machine
-        // goes back to it while the intent is still pending. Rewritten only
-        // once that epoch is read: a failed read leaves it as it was, and the
-        // catch below answers retryable. On a Hub that already deleted the
-        // rows the batches match nothing and rewrite nothing (ADR-0063).
+      // #387 (ADR-0100, amended 2026-10-13 and for #515): the intent follows
+      // the machine to the Hub it is connected to, known by its URL AND its
+      // events epoch, which only an archive's creation or a restore changes
+      // (ADR-0130): a forget or purge raises the Deletion generation, never
+      // the epoch. A restored Hub at the same URL is another Hub here, since
+      // a receipt from the archive it replaced landed nowhere it still holds.
+      // So the epoch is read on every resume, not only when the URL moved.
+      // Retargeted, the intent keeps its sessions, their batching, its mode
+      // and `localComplete`, and is written against this Hub's epoch with
+      // fresh operation ids and no receipts, so the Hub it left is not asked
+      // again unless the machine goes back to it while the intent is still
+      // pending. Rewritten only once that epoch is read: a failed read leaves
+      // it as it was, and the catch below answers retryable. On a Hub that
+      // already deleted the rows the batches match nothing and rewrite
+      // nothing (ADR-0063).
+      if (intent !== null) {
         const epoch = await readHubEpoch(connection);
-        intent = {
-          ...intent,
-          hub: connection.url,
-          epoch,
-          batches: intent.batches.map((batch) => ({
-            operationId: crypto.randomUUID(),
-            sessions: batch.sessions,
-          })),
-        };
-        forgetIntent.write(intent);
+        if (intent.hub === connection.url && intent.epoch === epoch) {
+          landed = intent.batches.some((batch) => batch.receipt !== undefined);
+        } else {
+          intent = {
+            ...intent,
+            hub: connection.url,
+            epoch,
+            batches: intent.batches.map((batch) => ({
+              operationId: crypto.randomUUID(),
+              sessions: batch.sessions,
+            })),
+          };
+          forgetIntent.write(intent);
+        }
       }
       if (intent === null) {
         intent = {
@@ -1932,6 +1952,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     onConnected: (ctx) => {
       connGen += 1;
       conn = { url: ctx.url, headers: ctx.headers };
+      connEpoch = ctx.events?.epoch ?? null;
 
       resetRefreshSerializers();
       refreshDirectory();
@@ -1973,6 +1994,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // and repeat it on every retry flap.
       connGen += 1;
       conn = null;
+      connEpoch = null;
       resetRefreshSerializers();
       clearDirectorySweep();
       eventSync.disconnect();
@@ -1992,7 +2014,10 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       patchEventsDegraded(false);
     },
     onEventsPoke: (seq) => eventSync.onEventsPoke(seq),
-    onStatusEvents: (events) => eventSync.onStatusEvents(events),
+    onStatusEvents: (events) => {
+      if (conn !== null) connEpoch = events?.epoch ?? null;
+      eventSync.onStatusEvents(events);
+    },
     onMachinesPoke: () => refreshDirectory(),
     onOrganizationsPoke: () => refreshOrganizationLabels(),
     onOrganizationAssertionsPoke: () => refreshOrganizationAssertions(),
@@ -2081,6 +2106,10 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     forget,
     repairOrganizations: (sessions, target, opts) =>
       forget(sessions, target, opts?.keepLocalArchive === true ? "lossless" : "excluded"),
+    hubEpoch: (target) =>
+      conn !== null && conn.url.replace(/\/+$/, "") === target.replace(/\/+$/, "")
+        ? connEpoch
+        : null,
     rebuildEngine: requestRebuild,
     invalidateReports: pokeNow,
     setHome: (next) => {

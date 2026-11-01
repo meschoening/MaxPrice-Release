@@ -93,6 +93,8 @@ export function embedsPage(target: TargetSpec): boolean {
  * set, and check and install from that channel. A tray binary never checks
  * or updates (an embedded daemon checks nothing, and `update` is Linux
  * only), but it compiles the same module, so it folds the seam away too.
+ * The operator commands' answer bound has the same kind of seam
+ * (src/no-answer.ts), folded away the same way on every target.
  */
 export function compileArgs(target: TargetSpec, entryPath: string, outfile: string): string[] {
   return [
@@ -102,6 +104,8 @@ export function compileArgs(target: TargetSpec, entryPath: string, outfile: stri
     `--target=${target.bunTarget}`,
     "--define",
     "MAXPRICE_TEST_UPDATE_CHANNEL=undefined",
+    "--define",
+    "MAXPRICE_TEST_NO_ANSWER_MS=undefined",
     ...(embedsPage(target) ? [`--conditions=${PAGE_CONDITION}`] : []),
     entryPath,
     "--outfile",

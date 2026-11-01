@@ -108,8 +108,9 @@ export function unfinishedRestore(dataDir: string, env: Env): CliError {
 }
 
 const NEXT_STEPS = `Next steps:
-  1. Before it starts, check every client: its fleet-forget.json must be absent or null.
-     A client whose file holds a forget intent first reaches this Hub under another URL.
+  1. Before it starts, check every client of v0.9.0 or earlier: its fleet-forget.json
+     must be absent or null. One whose file holds a forget intent first reaches this Hub
+     under another URL. A newer client needs no check.
   2. Give it the session key: maxprice-hub key set, or maxprice-hub setup.
   3. Start it: maxprice-hub service install, or maxprice-hub serve.
   4. Redo by hand any operator edit made after the backup: a rename, a merge, a purge

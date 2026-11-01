@@ -13,8 +13,7 @@ import { GuideBuildError, renderPage, renderSite, type Site } from "./render";
  * The guide's Vite config for a site (ADR-0131 §6): every page in `site.pages`
  * becomes a flat .html file under dist/, and `base: "./"` makes every URL
  * relative, so the same output works under /MaxPrice-Release/, under any later
- * domain, and from file:// (ADR-0131 §4). vite.config.ts builds the real site;
- * the tests build a fixture site through it too.
+ * domain, and from file:// (ADR-0131 §4). vite.config.ts builds the real site.
  */
 export function guideConfig(appDir: string, site: Site): UserConfig {
   return {

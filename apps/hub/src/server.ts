@@ -626,8 +626,11 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     // latest pusher, and every ADR-0063 forget by a machine that is not (a
     // forget targets rows old enough to have lost their transcripts, so this is
     // the COMMON case, not the rare one). The composite key is correct for all
-    // three mutations: forget and purge bump the epoch (bust), compact preserves
-    // epoch AND durableSeq and genuinely leaves live rows untouched (valid).
+    // three mutations: a forget or purge that removes rows appends a deletion
+    // change, which advances durableSeq and the Deletion generation but never
+    // the epoch (bust); compact preserves epoch AND durableSeq and genuinely
+    // leaves live rows untouched (valid). Only an archive's creation or a
+    // restore changes the epoch (ADR-0130).
     // lastPushAt is joined LIVE below and is never part of this cached map.
     let statsMemo: {
       key: string;

@@ -1,6 +1,6 @@
 {
   "name": "@maxprice/usage-core",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "private": true,
   "type": "module",
   "main": "./src/index.ts",
@@ -20,6 +20,7 @@
     "./terminal-text": "./src/terminal-text.ts",
     "./test-systemd": "./src/test-systemd.ts",
     "./test-channel": "./src/test-channel.ts",
+    "./test-loopback": "./src/test-loopback.ts",
     "./update-check": "./src/update-check.ts"
   },
   "scripts": {

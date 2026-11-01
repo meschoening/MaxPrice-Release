@@ -195,7 +195,8 @@ export async function checkForUpdate(
  * The installed binary must also print `currentVersion` under the directory
  * lock, before any stale `.new` is removed; otherwise the swap refuses as
  * "swap", since another update may have replaced it. Both probes use the same
- * bounded wrapper, each with `versionTimeoutMs` (15 s), an option for tests.
+ * bounded wrapper, each with `versionTimeoutMs` (15 s), and wait at most
+ * `cleanupTimeoutMs` (5 s) for the wrapper to go; both are options for tests.
  *
  * One run at a time per directory: from before `.new` is touched until after
  * the rename and the directory fsync, a run holds flock(2) on the directory,
@@ -205,9 +206,20 @@ export async function checkForUpdate(
 export async function installUpdate(
   product: SelfUpdateProduct,
   release: ChannelRelease,
-  opts: { currentVersion: string; execPath: string; versionTimeoutMs?: number },
+  opts: {
+    currentVersion: string;
+    execPath: string;
+    versionTimeoutMs?: number;
+    cleanupTimeoutMs?: number;
+  },
 ): Promise<{ from: string; to: string }> {
-  const { execPath, currentVersion, versionTimeoutMs = VERSION_TIMEOUT_MS } = opts;
+  const {
+    execPath,
+    currentVersion,
+    versionTimeoutMs = VERSION_TIMEOUT_MS,
+    cleanupTimeoutMs = CLEANUP_TIMEOUT_MS,
+  } = opts;
+  const bounds = { versionMs: versionTimeoutMs, cleanupMs: cleanupTimeoutMs };
   parseVersion(currentVersion); // the caller's own version: a TypeError, not a refusal
   if (!VERSION.test(release.version)) {
     throw new SelfUpdateError("manifest", `the release's version ${release.version} is not x.y.z`);
@@ -269,7 +281,7 @@ export async function installUpdate(
     // before touching even a crash's leftover .new, with check 5's deadline
     // and identity-safe process cleanup. Never open execPath writable.
     try {
-      await expectVersion(execPath, currentVersion, versionTimeoutMs);
+      await expectVersion(execPath, currentVersion, bounds);
     } catch (err) {
       throw new SelfUpdateError(
         "swap",
@@ -302,7 +314,7 @@ export async function installUpdate(
     }
 
     // Check 5: the new binary runs here and is the version the signature named.
-    await expectVersion(next, release.version, versionTimeoutMs);
+    await expectVersion(next, release.version, bounds);
 
     // Same directory, so never EXDEV; a rename, so never ETXTBSY.
     try {
@@ -632,7 +644,12 @@ kill -s KILL 0`;
  * outside. All of this is Linux's: win32 never gets here, because the lock
  * fails first.
  */
-async function expectVersion(binary: string, version: string, timeoutMs: number): Promise<void> {
+async function expectVersion(
+  binary: string,
+  version: string,
+  bounds: { versionMs: number; cleanupMs: number },
+): Promise<void> {
+  const timeoutMs = bounds.versionMs;
   const nonce = randomBytes(16).toString("hex");
   let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
   try {
@@ -708,7 +725,7 @@ async function expectVersion(binary: string, version: string, timeoutMs: number)
       );
     }
   } finally {
-    await endCheck(proc);
+    await endCheck(proc, bounds.cleanupMs);
   }
 }
 
@@ -717,7 +734,10 @@ async function expectVersion(binary: string, version: string, timeoutMs: number)
  * for the wrapper to go. Never signals anything itself: if the wrapper is
  * still there after the bound, the check refuses rather than kill by number.
  */
-async function endCheck(proc: Bun.Subprocess<"pipe", "pipe", "pipe">): Promise<void> {
+async function endCheck(
+  proc: Bun.Subprocess<"pipe", "pipe", "pipe">,
+  cleanupMs: number,
+): Promise<void> {
   try {
     void Promise.resolve(proc.stdin.end()).catch(() => undefined);
   } catch {
@@ -727,7 +747,7 @@ async function endCheck(proc: Bun.Subprocess<"pipe", "pipe", "pipe">): Promise<v
   const gone = await Promise.race([
     proc.exited.then(() => true),
     new Promise<false>((resolve) => {
-      timer = setTimeout(resolve, CLEANUP_TIMEOUT_MS, false);
+      timer = setTimeout(resolve, cleanupMs, false);
     }),
   ]);
   clearTimeout(timer);

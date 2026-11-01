@@ -35,7 +35,21 @@ import type { FleetForgetResult } from "./fleet";
 // marker's own `dormantHubDone`, keyed by `dormant`, a digest of the dormant
 // session set. A different digest wipes that list only, and is persisted at
 // once for the same reason a tracked rekey is; a different hub target wipes it
-// with `hubDone`, and `reset()` wipes it with everything. A marker written
+// with `hubDone`, and `reset()` wipes it with everything.
+//
+// The hub target is a Hub's URL AND its events epoch (#515, ADR-0098 §5): a
+// Hub restored from a backup (ADR-0130) answers at the same URL with a new
+// epoch and none of the forgets made after the backup, so a different epoch
+// wipes `hubDone` and `dormantHubDone` exactly as a different URL does, and
+// leaves `archiveDone` alone. Only an archive's creation or a restore changes
+// the epoch; the repair's own forgets raise the Deletion generation, so they
+// never reset what they completed. The epoch is the live connection's
+// (`hubEpoch`): while it is unknown (disconnected, or a Hub with no event
+// archive) the Hub halves neither run nor record anything, and a marker of the
+// same URL keeps the lists and epoch it has until a run can compare them. A
+// marker written before #515 has no epoch, which is unknown, so it meets a
+// connected Hub as a different one once and repeats its Hub forgets, each an
+// empty deletion where it already ran (ADR-0100). A marker written
 // before #311 parses with both fields defaulted, which is the key of an empty
 // dormant set, so an upgraded machine with no assertion rewrites nothing.
 //
@@ -62,6 +76,7 @@ const markerSchema = z.object({
   version: z.literal(3),
   tracked: z.array(z.string()),
   hubTarget: z.string().nullable(),
+  hubEpoch: z.string().nullable().default(null),
   archiveDone: z.array(z.string()),
   hubDone: z.array(z.string()),
   dormant: z.string().default(""),
@@ -131,6 +146,9 @@ export type OrganizationRepairDeps = {
   trackedOrganizations: () => ReadonlySet<string> | null;
   foreignSessions: () => ForgetSessionRef[];
   hubTarget: () => string | null;
+  // The connected Hub's events epoch at that target, or null when it is not
+  // known (fleet.hubEpoch, #515).
+  hubEpoch: (target: string) => string | null;
   // Automatic fleet forget is independent of replica attachment. Transport,
   // server and receipt failures carry retryable=true; permanent refusals don't.
   forgetOnHub: (
@@ -215,11 +233,17 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
   // Runs and resets share one queue, including every marker write and rename.
   let operations: Promise<void> = Promise.resolve();
 
-  function freshMarker(tracked: string[], dormant: string, hubTarget: string | null): Marker {
+  function freshMarker(
+    tracked: string[],
+    dormant: string,
+    hubTarget: string | null,
+    hubEpoch: string | null,
+  ): Marker {
     return {
       version: 3,
       tracked,
       hubTarget,
+      hubEpoch,
       archiveDone: [],
       hubDone: [],
       dormant,
@@ -236,13 +260,19 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
     tracked: string[],
     dormant: string,
     hubTarget: string | null,
+    hubEpoch: string | null,
   ): Promise<{ marker: Marker; persistNow: boolean }> {
     try {
       const parsed = parseMarker(JSON.parse(await readFile(deps.markerPath, "utf8")));
       if (parsed !== null) {
         const { data, migrated } = parsed;
         if (sameKey(data.tracked, tracked)) {
-          const sameHub = data.hubTarget === hubTarget;
+          // #515: an unknown epoch at the marker's own URL judges nothing, so
+          // the marker keeps its epoch and lists; the Hub halves skip this run.
+          const epochUnknown = hubTarget !== null && hubEpoch === null;
+          const sameHub =
+            data.hubTarget === hubTarget &&
+            (hubTarget === null || epochUnknown || data.hubEpoch === hubEpoch);
           // #311: a different dormant set wipes only its own done list, and,
           // like a tracked rekey, is persisted at once, before any return.
           const sameDormant = data.dormant === dormant;
@@ -250,6 +280,7 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
             marker: {
               ...data,
               hubTarget,
+              hubEpoch: sameHub && epochUnknown ? data.hubEpoch : hubEpoch,
               hubDone: sameHub ? data.hubDone : [],
               dormant,
               dormantHubDone: sameHub && sameDormant ? data.dormantHubDone : [],
@@ -257,12 +288,15 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
             persistNow: migrated || !sameDormant,
           };
         }
-        return { marker: freshMarker(tracked, dormant, hubTarget), persistNow: true };
+        return {
+          marker: freshMarker(tracked, dormant, hubTarget, hubEpoch),
+          persistNow: true,
+        };
       }
     } catch {
       // Absent or unreadable: nothing has been repaired under this tracked set.
     }
-    return { marker: freshMarker(tracked, dormant, hubTarget), persistNow: false };
+    return { marker: freshMarker(tracked, dormant, hubTarget, hubEpoch), persistNow: false };
   }
 
   async function saveMarker(marker: Marker): Promise<void> {
@@ -303,15 +337,18 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
     const trackedKeyArr = tracked === null ? [] : trackedKey(tracked);
     const dormant = dormantDigest(deps.dormantSessions());
     const hubTarget = deps.hubTarget()?.replace(/\/+$/, "") ?? null;
+    const hubEpoch = hubTarget === null ? null : deps.hubEpoch(hubTarget);
+    // The Hub halves run only against a Hub known by URL and epoch (#515).
+    const hubKnown = hubTarget !== null && hubEpoch !== null;
     const { marker, persistNow } =
       generation === diskGeneration
-        ? await loadMarker(trackedKeyArr, dormant, hubTarget)
+        ? await loadMarker(trackedKeyArr, dormant, hubTarget, hubEpoch)
         : // A reset has been called whose wipe has not landed yet (or failed):
           // the file still carries the done lists it discarded. Start from an
           // empty marker instead of reading them — the wipe, when it lands,
           // only ever wipes, so nothing this run writes is trusted more than
           // it should be.
-          { marker: freshMarker(trackedKeyArr, dormant, hubTarget), persistNow: false };
+          { marker: freshMarker(trackedKeyArr, dormant, hubTarget, hubEpoch), persistNow: false };
     if (persistNow) {
       // A real marker exists for a different tracked set or dormant set: its
       // done lists (or, for the dormant set, its dormant list) don't apply to
@@ -336,6 +373,7 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
       version: 3,
       tracked: trackedKeyArr,
       hubTarget,
+      hubEpoch: marker.hubEpoch,
       archiveDone: [...archiveDone],
       hubDone: [...hubDone],
       dormant,
@@ -392,7 +430,14 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
       }
       if (hubTarget !== null) {
         const pendingHub = sessions.filter((s) => !hubDone.has(pairKey(s)));
-        if (pendingHub.length > 0) {
+        if (pendingHub.length > 0 && !hubKnown) {
+          // #515: the Hub's epoch is not known yet, so its completion cannot be
+          // recorded; retried as an unreachable Hub is, and on the next connect.
+          hubPending = true;
+          console.warn(
+            "[sidecar] organization repair: hub forget deferred (the hub's events epoch is not known)",
+          );
+        } else if (pendingHub.length > 0) {
           for (const s of pendingHub) evidenceAttempted.add(pairKey(s));
           const result = await deps.forgetOnHub(pendingHub, hubTarget);
           if (result.ok) {
@@ -440,7 +485,12 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
       const pending = deps
         .dormantPairs()
         .filter((s) => !dormantHubDone.has(pairKey(s)) && !evidenceAttempted.has(pairKey(s)));
-      if (pending.length > 0) {
+      if (pending.length > 0 && !hubKnown) {
+        hubPending = true;
+        console.warn(
+          "[sidecar] organization repair: dormant hub forget deferred (the hub's events epoch is not known)",
+        );
+      } else if (pending.length > 0) {
         const result = await deps.forgetDormantOnHub(pending, hubTarget);
         if (result.ok) {
           for (const s of pending) dormantHubDone.add(pairKey(s));
@@ -510,6 +560,7 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
             tracked === null ? [] : trackedKey(tracked),
             dormantDigest(deps.dormantSessions()),
             hubTarget,
+            hubTarget === null ? null : deps.hubEpoch(hubTarget),
           ),
         );
         diskGeneration = generation;
