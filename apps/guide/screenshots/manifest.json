@@ -63,24 +63,24 @@
     },
     "hub-page": {
       "light": {
-        "sha256": "a1c2e8802caec076335fa10f098e93b80e03fb1cac7122b9176b54396eb65370",
+        "sha256": "2d8355b932363e3db6d538c49182976358b191e9a98874d6a870a90cbe6aec58",
         "width": 1024,
         "height": 664
       },
       "dark": {
-        "sha256": "ba43c75919ce66c6a421d42af9ba7f19235af631011b309bd90eedaf1d8aac14",
+        "sha256": "115fcf11daa8a0d0e90e517d2ff5ee4ee603b8f201f703e037bc288fe6eb3f3d",
         "width": 1024,
         "height": 664
       }
     },
     "hub-tray-console": {
       "light": {
-        "sha256": "43fb1c2956103c8d30ccc1d1f1c3de948c06fb0f5e7f32bc89d324cf64692a9c",
+        "sha256": "8e5f0252f311a30be5b5a38e71489c8100cb1b897c3bb5e8133225e587640d9f",
         "width": 840,
         "height": 3138
       },
       "dark": {
-        "sha256": "941ac7342406374a2b8eb2e5307bb39e44c8d74f70a797320c6de7725190386c",
+        "sha256": "21cfff8f6d740574ee795e6584788a485cb10bd960933df7f088a1e32e1de71a",
         "width": 840,
         "height": 3138
       }
@@ -207,12 +207,12 @@
     },
     "settings-application": {
       "light": {
-        "sha256": "6bda925603d7dade4fb84fb765646e642d5341e277a285a2aaf94517d41dac25",
+        "sha256": "44fd2a036d34bf1d5f641b93dd758163ba1bf45eea5a99d652f0515bf9182246",
         "width": 1392,
         "height": 1770
       },
       "dark": {
-        "sha256": "fe8b1538a66a4f677ebd606f234858b6c5bb12022aa2b071244f182c2e4d6662",
+        "sha256": "62522a0db7e8fcbf394ebc21c1c2b24755826b8c6d114423f2591be440b31ced",
         "width": 1392,
         "height": 1770
       }

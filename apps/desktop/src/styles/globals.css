@@ -3050,34 +3050,10 @@ a.sb-footrow:hover .sb-label {
   align-items: flex-start;
 }
 
-/* Settings at wide (map #151 / T13 #164, ADR-0073) — the one place the map's
-   "prose keeps its measure; data takes the space" line has to be read
-   carefully. The page is NOT re-columned: it stays one reading order top to
-   bottom, because its clusters are deliberate and a two-column settings page
-   scans badly (built at 2256 as T6's variant B, and rejected there). What goes
-   wide is the ROW: the column stops centring, the form caps at 980 as a
-   measure rather than as a frame, and each section becomes text-beside-control
-   with the `.desc` 60-64ch cap untouched.
-
-   `.s-text` (Settings.tsx) exists only for this: CSS cannot pair two siblings
-   into one grid cell. It is inert at every other width, verified to the pixel,
-   and is permanent markup bought by a single arrangement's state. */
-@container content (min-width: 1520px) {
-  .settings-form {
-    max-width: 980px;
-    margin-left: 0;
-    margin-right: auto;
-  }
-  .s-section {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(280px, 400px);
-    align-items: center;
-    gap: 2px 36px;
-  }
-  .s-section .control {
-    margin-top: 0;
-  }
-}
+/* Settings has no wide state (ADR-0073's 2026-11-01 amendment): at every
+   width it is this one centred 680px column with stacked sections. A wide
+   state that capped the form at 980, pinned it left and set each section
+   text-beside-control read as a broken page in a maximized window. */
 
 /* --- section internals --- */
 .status-line {
