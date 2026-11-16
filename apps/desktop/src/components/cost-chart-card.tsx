@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { ChartCardBody } from "@/components/chart-card-body";
 import { composeSeries } from "@/lib/composed-series";
+import { blockSpanEmpty, type BlockSpanPick } from "@/lib/block-span-pick";
 import type { GroupByAxis } from "@/lib/group-by";
 import { useChartSource } from "@/state/use-chart-source";
 import { useWeekWindow } from "@/state/use-week";
@@ -22,6 +23,8 @@ export type ChartSourceProps = {
   onToggleGhost: () => void;
   logScale: boolean;
   onToggleLogScale: () => void;
+  // Whose Active block the Block span frames (#638; `useBlockSpanPick`).
+  blockPick: BlockSpanPick;
 };
 
 // The ghost-overlay legend label for a span's previous period. `today`'s ghost
@@ -69,9 +72,10 @@ export function CostChartCard(props: ChartSourceProps): React.ReactElement {
     onToggleGhost,
     logScale,
     onToggleLogScale,
+    blockPick,
   } = props;
   const week = useWeekWindow();
-  const source = useChartSource({ span, chartStyle, axes, ghostOverlay, week });
+  const source = useChartSource({ span, chartStyle, axes, ghostOverlay, week, blockPick });
   // The boot gate's chart publisher (ADR-0066), and the reason the gate needs
   // TWO: this card's query lives behind `useChartSource`, scoped away from the
   // five `useLiveData` queries, and on the intraday spans it is `/api/intraday`
@@ -97,7 +101,7 @@ export function CostChartCard(props: ChartSourceProps): React.ReactElement {
   );
   // ADR-0031: a null blockWindow on a block-span response means no active
   // block — render the empty state in place of the chart + foot.
-  if (source.isEmpty) return <BlockEmptyState />;
+  if (source.isEmpty || blockSpanEmpty(span, blockPick)) return <BlockEmptyState />;
   return (
     <ChartCardBody
       composed={composed}

@@ -1,0 +1,73 @@
+/* The Organization scope chip (topbar-scope-chip.tsx): a .chip leaf left of
+   the refresh pill, present only on an install whose Account filter is hidden
+   and that tracks two or more Organizations (#637). Imported after
+   globals.css (main.tsx), so it sits where its rules sat there.
+
+   Under All the quota half names the head Organization, and it is the half
+   that yields: "All organizations" keeps its width and the quota label
+   truncates, so no Home label can crowd the scope out. Below the narrow
+   threshold the quota half drops and the pill caps at 180px, so a long label
+   cannot wrap the right cluster onto a second topbar row. The pill clips
+   anything left over; its own focus outline sits outside the box and is not
+   clipped. The icon and caret never shrink: a flex item SVG otherwise takes
+   its share of the squeeze and dwindles. */
+.scope-chip,
+.scope-note {
+  max-width: 300px;
+  overflow: hidden;
+  font-weight: 600;
+}
+.scope-chip svg,
+.scope-note svg {
+  flex-shrink: 0;
+}
+.scope-chip .scope-chip-icon,
+.scope-note .scope-chip-icon {
+  width: 14px;
+  height: 14px;
+  opacity: 0.7;
+}
+/* A saved Account selection the window does not apply
+   (`ScopeView.hiddenSelection`): an info mark on the chip, or the note chip
+   alone where there is no chip; the full sentence is the title, the
+   accessible name and the menu's head. */
+.scope-chip .scope-chip-hidden {
+  width: 13px;
+  height: 13px;
+  color: var(--soft);
+}
+.scope-note {
+  color: var(--soft);
+  font-weight: 500;
+  cursor: default;
+}
+.scope-menu-note {
+  max-width: 260px;
+  padding: 5px 9px 7px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--soft);
+}
+.scope-chip-all {
+  flex-shrink: 0;
+}
+.scope-chip-quota {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-left: 7px;
+  border-left: 1px solid var(--panel-border);
+  color: var(--soft);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+@container content (max-width: 799.98px) {
+  .scope-chip,
+  .scope-note {
+    max-width: 180px;
+  }
+  .scope-chip-quota {
+    display: none;
+  }
+}

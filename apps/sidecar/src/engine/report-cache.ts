@@ -46,7 +46,8 @@ import { defaultTimeZone } from "./timezone";
 // from the memoized rest. Entries live per FAMILY (one per report kind —
 // sessions, projects, and the three dailies: daily, daily-by-project,
 // daily-by-machine), keyed on the JSON-encoded canonicalized filter axes
-// (mode, tz, projects, models, machines, organizations — see `familyKey` for
+// (mode, tz, projects, models, machines, organizations, accounts and whether
+// the Account selection holds Unknown — see `familyKey` for
 // why JSON) plus an optional family-specific `extra` component. A per-family
 // LRU (delete+set touch) caps entries at MAX_ENTRIES.
 //
@@ -166,11 +167,11 @@ import { defaultTimeZone } from "./timezone";
 // in force when its matcher compiled and its buckets partitioned, and a clean
 // bucket is never re-resolved. A Home change swaps that rule in-session, and
 // so does a peer's published Home arriving through the Machine directory (the
-// fleet's `installPublishedHomes` → `withPublishedHomes`, #281), and so does a
+// fleet's `installMachineDirectory` → `withMachineDirectory`, #281), and so does a
 // changed set of Organization assertions (`withAssertions`, #309 — the claims
 // ride in the same value); each swap mints a NEW object identity
-// (`withSelfHome` / `withPublishedHomes` / `withAssertions`, all through
-// `createPresumption`) — so the same `rebind()` that follows store
+// (`withSelfHome` / `withMachineDirectory` / `withAssertions`, each a fresh
+// object) — so the same `rebind()` that follows store
 // identity and pricing identity follows presumption identity too:
 // `store.presumption()` is compared to `boundPresumption`, and a change clears
 // ALL family entries — the corpus is untouched (a Home change, ours or a
@@ -267,10 +268,24 @@ export type ReportFilters = {
   machines: string[];
   // Organization uuids to scope to — exact matches on each event's
   // resolved-or-presumed Organization (store.ts's `organizations` axis).
-  // `[]` = every Organization. The handlers fill it from the `organization`
-  // query param through `scopeOrganizations` (#278). REQUIRED, not optional,
+  // `[]` = every Organization. The handlers fill it from the Scope through
+  // `requestScope` (#278, #632). REQUIRED, not optional,
   // so a call site cannot silently forget the scope.
   organizations: string[];
+  // Account keys to scope to (#632) — the Scope's Account axis, exact matches
+  // on each event's resolved Account (store.ts's `accounts` axis). `[]` =
+  // every Account, as is omitting it: every handler names it, and the many
+  // cache tests that predate the axis and narrow no Account omit it.
+  accounts?: string[];
+  // Whether a non-empty `accounts` selection also holds the rows whose Account
+  // resolves to none (store.ts's `unknownAccount`, #635): the default Scope's
+  // `[Home membership's Account]` does, an explicit `account=V` does not.
+  // Omitted is false. A KEY axis: the two select different rows.
+  unknownAccount?: boolean;
+  // The Scope as exact Memberships (store.ts's `memberships`, #637): null or
+  // omitted when the Scope is named by its axes, `[]` matching no row. A KEY
+  // axis: a pair-scoped answer never serves an axis-scoped one, or the reverse.
+  memberships?: readonly string[] | null;
 };
 
 // The date window a `daily` query may carry: `YYYYMMDD` local dates in the
@@ -347,6 +362,12 @@ type Canon = {
   models: string[];
   machines: string[];
   organizations: string[];
+  accounts: string[];
+  // Canonical: false whenever `accounts` is empty, where it selects nothing
+  // more, so `[]` keys one entry whatever the caller passed.
+  unknownAccount: boolean;
+  // Sorted and deduplicated; null is no Membership list (axes alone).
+  memberships: string[] | null;
   since?: string;
   until?: string;
   // The by-machine nesting flag — rides along like the window fields: only
@@ -365,6 +386,12 @@ function canonicalize(
     models: [...new Set(q.models.map((m) => m.toLowerCase()))].sort(),
     machines: [...new Set(q.machines)].sort(),
     organizations: [...new Set(q.organizations)].sort(),
+    accounts: [...new Set(q.accounts ?? [])].sort(),
+    unknownAccount: (q.accounts ?? []).length > 0 && q.unknownAccount === true,
+    memberships:
+      q.memberships === undefined || q.memberships === null
+        ? null
+        : [...new Set(q.memberships)].sort(),
     since: q.since,
     until: q.until,
     includeProjects: q.includeProjects,
@@ -389,6 +416,9 @@ function familyKey(c: Canon, extra?: string): string {
     c.models,
     c.machines,
     c.organizations,
+    c.accounts,
+    c.unknownAccount,
+    c.memberships,
   ]);
   return extra === undefined ? base : `${base}|${extra}`;
 }
@@ -878,8 +908,15 @@ export function createReportCache(opts: {
           models: c.models,
           machines: c.machines,
           organizations: c.organizations,
+          accounts: c.accounts,
+          unknownAccount: c.unknownAccount,
+          memberships: c.memberships,
         },
         boundPresumption,
+        // The bound store's tracked Account set (ADR-0137 §3's scope
+        // exclusion), as its own `query` applies it: a store swap clears
+        // every entry, so this is the set the cold build read too.
+        boundStore?.trackedAccounts() ?? null,
       ),
       buckets: new Map(),
       built: false,
@@ -912,6 +949,9 @@ export function createReportCache(opts: {
         models: entry.q.models,
         machines: entry.q.machines,
         organizations: entry.q.organizations,
+        accounts: entry.q.accounts,
+        unknownAccount: entry.q.unknownAccount,
+        memberships: entry.q.memberships,
       });
       let sinceYield = 0;
       for (const e of events) {

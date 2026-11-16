@@ -7,8 +7,8 @@ It is a Hub and nothing else: it reports no usage of its own. To count the usage
 ## What it is
 
 - **A Hub that starts with Windows.** It starts at login, hidden in the tray, and keeps the Hub running until you quit it.
-- **A Popout** that opens from its tray icon: one glance at whether the Hub is online, whether its claude.ai session key works, and how many clients are connected.
-- **A console window**, opened from the Popout, where you run the Hub: its status, its session key, its [Hub password](../concepts/hubs.md#hub-password), the machines in the fleet, and its updates.
+- **A Popout** that opens from its tray icon: one glance at whether the Hub is online, whether its claude.ai session keys work, and how many clients are connected.
+- **A console window**, opened from the Popout, where you run the Hub: its status, its session keys (one per Account, with each Account's Organizations), the [Gateways](popout-and-console.md#gateways) it drains, its [Hub password](../concepts/hubs.md#hub-password), the machines in the fleet, and its updates.
 
 Inside, it runs the same Hub as the [Headless Hub](../headless-hub/overview.md), so the two do the same job. The Headless Hub runs on a Linux server instead, with no window, and it can publish a read-only Hub page; the tray app has none. Run one Hub for all your machines.
 
@@ -17,7 +17,7 @@ Inside, it runs the same Hub as the [Headless Hub](../headless-hub/overview.md),
 - Windows x64.
 - A PC that stays on while your other machines run Claude Code, since a client falls back to its own polling while its Hub is away.
 - [Tailscale](https://tailscale.com) on that PC and on every machine that joins it. Clients reach the Hub over your tailnet ([why](../concepts/hubs.md#tailnet)).
-- A claude.ai session key, for your usage limits. You can paste one into the console, or let the first client that joins with [Auto-heal](../concepts/hubs.md#auto-heal) on send its own ([the session key](../concepts/blocks.md#the-claudeai-session-key)).
+- A claude.ai session key, for your usage limits. You can paste one into the console, or let the first client that joins with [Send keys to the Hub](../concepts/hubs.md#send-keys-to-the-hub) on send its own ([the session key](../concepts/blocks.md#the-claudeai-session-key)).
 
 ## Where to start
 

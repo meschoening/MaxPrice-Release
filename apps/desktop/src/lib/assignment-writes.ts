@@ -1,10 +1,9 @@
-import type { SessionRow } from "@maxprice/shared";
+import { byCodeUnit, type OrganizationAssertionsResponse, type SessionRow } from "@maxprice/shared";
 import { undoPlan, type ChooserOption, type UndoGroup } from "@/lib/session-assignment";
 import type { ToastOptions } from "@/lib/toast";
 
-// The writes behind the Sessions page's `Assign to…` and `Clear assignment`
-// (#312): what each one PUTs, how it is undone, and the order its effects run
-// in. No React — the page hands in the PUT, the query invalidation, the toast
+// The writes behind Settings › Unattributed usage's `Assign to…` (#312, #639)
+// and Settings › Accounts' Unassign (#672): what each one PUTs, how it is undone, and the order its effects run in. No React — the page hands in the PUT, the query invalidation, the toast
 // and its own state setters, so the sequencing is testable with plain mocks.
 //
 // Every write reads its Undo from the rows BEFORE it (#312 ruling 6), and only
@@ -15,19 +14,11 @@ export function countSessions(n: number): string {
   return `${n} session${n === 1 ? "" : "s"}`;
 }
 
-// What picking an Organization in the chooser does. The checked one — the
-// selection's `sharedTarget`, which every selected session is already
-// assigned to — does nothing: its PUT would change nothing, and clearing the
-// selection and offering an Undo would report a write that never happened. A
-// tracked one is written at once, with Undo; an Excluded one asks first,
-// because the usage then leaves every report on this machine. Home for a
-// presumed selection is never checked (sharedTarget is null), so picking it
-// writes: that pins the sessions there.
-export function assignmentAction(
-  option: Pick<ChooserOption, "uuid" | "tracked">,
-  sharedTarget: string | null,
-): "none" | "write" | "confirm" {
-  if (option.uuid === sharedTarget) return "none";
+// What picking a Membership in the chooser does: one in a tracked Organization
+// is written at once, with Undo; one in an Excluded Organization asks first,
+// because the usage then leaves every report on this machine. The list holds
+// presumed sessions only, which hold no claim, so no pick is a no-op.
+export function assignmentAction(option: Pick<ChooserOption, "tracked">): "write" | "confirm" {
   return option.tracked ? "write" : "confirm";
 }
 
@@ -35,6 +26,9 @@ export interface AssertionWrite {
   sessionIds: string[];
   // The claim written: an Organization's uuid, or null to clear.
   organizationUuid: string | null;
+  // The claim's Account (ADR-0137 §5's Membership assertion), beside an
+  // Organization only; absent for an Organization-only claim or a clear.
+  accountUuid?: string;
   // The PUTs that put every written session back (undoPlan).
   undo: UndoGroup[];
   // The success toast, which carries the Undo.
@@ -43,40 +37,73 @@ export interface AssertionWrite {
   failure: string;
 }
 
-// Assign every selected session's owner-less usage to `option`.
+// Assign every selected session's owner-less usage to the Membership `option`
+// names: a Membership assertion, its Organization and its Account.
 export function assignWrite(
   rows: readonly SessionRow[],
-  option: Pick<ChooserOption, "uuid" | "label">,
+  option: Pick<ChooserOption, "organizationUuid" | "accountUuid" | "label">,
 ): AssertionWrite {
   return {
     sessionIds: rows.map((row) => row.sessionId),
-    organizationUuid: option.uuid,
+    organizationUuid: option.organizationUuid,
+    accountUuid: option.accountUuid,
     undo: undoPlan(rows),
     message: `Assigned ${countSessions(rows.length)} to ${option.label}`,
     failure: "Couldn't assign sessions",
   };
 }
 
-// Clear the claims of the selected sessions that hold one — presumed sessions
-// hold none, so they are not written. Empty when nothing selected is assigned.
-// The toast counts assignments and names no Organization: a cleared session
-// is presumed under its producer's published Home, which for a peer's session
-// is not this machine's.
-export function clearWrite(rows: readonly SessionRow[]): AssertionWrite {
-  const cleared = rows.filter((row) => row.organizationResolution === "assigned");
-  const n = cleared.length;
+// The sessions assigned to an Organization (`assertions`' claims for it), in
+// session-id order.
+export function assignedTo(
+  assertions: OrganizationAssertionsResponse,
+  organizationUuid: string,
+): string[] {
+  return Object.keys(assertions.assertions)
+    .filter((sessionId) => assertions.assertions[sessionId] === organizationUuid)
+    .sort(byCodeUnit);
+}
+
+// Unassign (#672, answering #639's question 3): clear every claim naming
+// `organizationUuid`, through any Account, so each session counts under its
+// Presumed membership again and Unattributed usage lists it. Undo puts each
+// session's own claim back, its Account included (one PUT per Account, an
+// Organization-only claim first). Null when nothing is assigned there.
+export function unassignWrite(
+  assertions: OrganizationAssertionsResponse,
+  organizationUuid: string,
+): AssertionWrite | null {
+  const sessionIds = assignedTo(assertions, organizationUuid);
+  if (sessionIds.length === 0) return null;
+  const byAccount = new Map<string | undefined, string[]>();
+  for (const sessionId of sessionIds) {
+    const account = assertions.accounts[sessionId];
+    byAccount.set(account, [...(byAccount.get(account) ?? []), sessionId]);
+  }
+  const undo = [...byAccount]
+    .sort(([a], [b]) => (a === undefined ? -1 : b === undefined ? 1 : byCodeUnit(a, b)))
+    .map(
+      ([accountUuid, ids]): UndoGroup =>
+        accountUuid === undefined
+          ? { organizationUuid, sessionIds: ids }
+          : { organizationUuid, accountUuid, sessionIds: ids },
+    );
   return {
-    sessionIds: cleared.map((row) => row.sessionId),
+    sessionIds,
     organizationUuid: null,
-    undo: undoPlan(cleared),
-    message: `Cleared ${n} assignment${n === 1 ? "" : "s"}`,
-    failure: "Couldn't clear assignments",
+    undo,
+    message: `Unassigned ${countSessions(sessionIds.length)}`,
+    failure: "Couldn't unassign sessions",
   };
 }
 
 export interface AssertionUndoDeps {
   // putOrganizationAssertions: rejects with the envelope's error on a refusal.
-  put: (sessionIds: string[], organizationUuid: string | null) => Promise<unknown>;
+  put: (
+    sessionIds: string[],
+    organizationUuid: string | null,
+    accountUuid?: string,
+  ) => Promise<unknown>;
   // Invalidates the assertions query. The reports refresh without it, through
   // the usage:new round the sidecar ends every changed claim with.
   invalidate: () => void;
@@ -84,7 +111,7 @@ export interface AssertionUndoDeps {
 }
 
 export interface AssertionWriteDeps extends AssertionUndoDeps {
-  // Holds the bar's Assign and Clear disabled while the PUT is in flight.
+  // Holds the bar's Assign disabled while the PUT is in flight.
   setPending: (pending: boolean) => void;
   clearSelection: () => void;
 }
@@ -103,7 +130,7 @@ export async function runAssertionWrite(
   deps.setPending(true);
   try {
     try {
-      await deps.put(write.sessionIds, write.organizationUuid);
+      await deps.put(write.sessionIds, write.organizationUuid, write.accountUuid);
     } catch (error) {
       deps.toast(`${write.failure}: ${errorText(error)}`);
       return false;
@@ -121,21 +148,19 @@ export async function runAssertionWrite(
 
 export interface AssignPickDeps extends AssertionWriteDeps {
   // An Excluded pick: open the confirm over this write, labelled for the
-  // picked Organization.
+  // picked Membership.
   confirm: (write: AssertionWrite, label: string) => void;
 }
 
-// A pick in the `Assign to…` chooser, as the page runs it (assignmentAction):
-// the checked target runs nothing, so the selection stays and no toast
-// appears; an Excluded one opens the confirm; any other writes at once.
+// A pick in the `Assign to…` chooser, as the section runs it
+// (assignmentAction): one in an Excluded Organization opens the confirm; any
+// other writes at once.
 export function runAssignPick(
-  option: Pick<ChooserOption, "uuid" | "label" | "tracked">,
+  option: Pick<ChooserOption, "organizationUuid" | "accountUuid" | "label" | "tracked">,
   rows: readonly SessionRow[],
-  sharedTarget: string | null,
   deps: AssignPickDeps,
 ): void {
-  const action = assignmentAction(option, sharedTarget);
-  if (action === "none") return;
+  const action = assignmentAction(option);
   const write = assignWrite(rows, option);
   if (action === "confirm") deps.confirm(write, option.label);
   else void runAssertionWrite(write, deps);
@@ -151,7 +176,9 @@ export async function undoAssertionWrite(
 ): Promise<boolean> {
   const count = plan.reduce((n, group) => n + group.sessionIds.length, 0);
   try {
-    for (const group of plan) await deps.put(group.sessionIds, group.organizationUuid);
+    for (const group of plan) {
+      await deps.put(group.sessionIds, group.organizationUuid, group.accountUuid);
+    }
   } catch (error) {
     deps.invalidate();
     deps.toast(`Couldn't undo: ${errorText(error)}`);

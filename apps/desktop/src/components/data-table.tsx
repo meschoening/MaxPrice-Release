@@ -4,6 +4,7 @@ import { ArrowDown, ArrowUp, ChevronRight } from "lucide-react";
 import { hasDisclosableChildren } from "@maxprice/shared";
 import { cn } from "@/lib/utils";
 import { flattenTreeRows } from "@/lib/table-tree";
+import { searchDebouncer } from "@/lib/search-debounce";
 import { TableHeadBar } from "./table-head-bar";
 
 export type SortDir = "asc" | "desc";
@@ -79,6 +80,11 @@ export type DataTableProps<Row> = {
   // other caller behaves exactly as it did before this existed.
   tree?: TreeSpec<Row>;
   searchPlaceholder?: string;
+  // The search text the table is filtering by — the DEBOUNCED value, not each
+  // keystroke — so a page reading it (Projects' session list, #640) always
+  // agrees with the rows on screen. Fired once on mount with "". Pass a
+  // stable function: a fresh one each render re-fires it.
+  onSearchChange?: (search: string) => void;
   emptyMessage?: string;
   // The page query's error, rendered as the danger inset when there are no
   // rows to show — without it a report 5xx is indistinguishable from an empty
@@ -118,6 +124,7 @@ export function DataTable<Row>({
   rowClassName,
   tree,
   searchPlaceholder,
+  onSearchChange,
   emptyMessage = "No rows.",
   error,
   headerAction,
@@ -158,12 +165,16 @@ export function DataTable<Row>({
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // Debounce the search term by 100ms so a fast typist doesn't re-filter a
-  // multi-thousand-row list on every keystroke.
+  // The search the table filters by is the input's settled text
+  // (`searchDebouncer`), and `onSearchChange` hears that same text.
+  const debouncer = useMemo(() => searchDebouncer(setSearch), []);
   useEffect(() => {
-    const t = setTimeout(() => setSearch(searchInput), 100);
-    return () => clearTimeout(t);
-  }, [searchInput]);
+    debouncer.push(searchInput);
+    return debouncer.cancel;
+  }, [searchInput, debouncer]);
+  useEffect(() => {
+    onSearchChange?.(search);
+  }, [search, onSearchChange]);
 
   const pinnedId = pinnedRow ? rowId(pinnedRow) : undefined;
 

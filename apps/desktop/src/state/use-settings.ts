@@ -5,6 +5,7 @@ import { parseSettings, type Settings, type TimeDisplay, DEFAULT_SETTINGS } from
 import { insideTauri } from "@/lib/tauri";
 import { logClientEvent } from "@/lib/client-log";
 import { showToast } from "@/lib/toast";
+import { pruneScope } from "@/lib/scope-view";
 
 // useSettings — the renderer's single read/write surface for the durable
 // settings.json (ADR-0014). Settings travel to the engine as `mode`/`tz`/
@@ -25,9 +26,8 @@ export const settingsQueryKey = ["settings"] as const;
 //
 // It starts from `VITE_DEV_SETTINGS` when set: a JSON object laid over the
 // defaults and resolved by `parseSettings`, so the rig can hold a Home and a
-// tracked set (ADR-0106's scope chip needs two tracked) that no Settings
-// control writes yet, e.g.
-//   VITE_DEV_SETTINGS='{"homeOrganization":"<uuid>","trackedOrganizations":["<uuid>"]}'
+// tracked set that no Settings control writes yet, e.g.
+//   VITE_DEV_SETTINGS='{"homeMemberships":{"anthropic":{"organizationUuid":"<uuid>"}},"trackedOrganizations":["<uuid>"]}'
 // Malformed JSON is logged and reads as the defaults.
 let devSettings: Settings | null = null;
 export function __resetDevSettings(): void {
@@ -125,9 +125,9 @@ export type SettingsUpdate = Partial<Settings> | ((current: Settings) => Partial
 
 // Patch one or more settings fields. After writing, set the settings cache then
 // invalidate the settings query to reconcile with disk; report views refetch
-// automatically because `mode`, `tz` and `organization` are part of their query
-// keys, so a costMode/timezone/Organization scope change re-reads with the new
-// value once the settings data updates.
+// automatically because `mode`, `tz` and the Scope's params are part of their
+// query keys, so a costMode/timezone/Scope change re-reads with the new value
+// once the settings data updates.
 //
 // An edit derived from a list — track, exclude, `Make Home` — passes an
 // updater: it runs inside the chain on the settings as the write queued before
@@ -140,11 +140,14 @@ export function useUpdateSettings(): (update: SettingsUpdate) => Promise<void> {
       const current = qc.getQueryData<Settings>(settingsQueryKey) ?? DEFAULT_SETTINGS;
       const patch = typeof update === "function" ? update(current) : update;
       if (patch === null) return;
-      // Resolve before caching or writing, so the Organization scope in the cache
-      // and on disk is the one every query reads (ADR-0106 §1): a pick of the Home
-      // uuid is `null`, and a write that stops tracking the scoped Organization
-      // resets the scope in that same write.
-      const next = parseSettings({ ...current, ...patch });
+      // Parse, then prune the Scope against the tracked sets this write
+      // leaves (`pruneScope`, #637), before caching or writing: a write that
+      // stops tracking an Organization or Account the Scope names drops that
+      // token in the same write, and a Scope left naming nothing returns to the
+      // default. The Scope's tokens are otherwise passed through, unresolved:
+      // the sidecar resolves them.
+      const parsed = parseSettings({ ...current, ...patch });
+      const next = { ...parsed, scope: pruneScope(parsed.scope, parsed) };
       await writeSettings(next);
       qc.setQueryData(settingsQueryKey, next);
       await qc.invalidateQueries({ queryKey: settingsQueryKey });

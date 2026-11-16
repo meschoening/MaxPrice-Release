@@ -13,6 +13,15 @@ import { hubMachinesResponseSchema, type HubMachine } from "@maxprice/shared";
 // just starts empty and the next refresh repairs it — no .bak, no merge. The
 // disk write is a pure offline nicety, so a persist failure only warns while
 // RAM keeps serving.
+//
+// The file holds the Hub's `/api/machines` answer as `hubMachinesResponseSchema`
+// reads it, so each entry's published Home is `homeMemberships` (ADR-0139 §6,
+// #635). A file a v6 client cached carries `homeOrganization` instead, which
+// the schema passes through and nothing reads: offline, its peers' rows are
+// presumed as though they had published nothing (under this machine's Home
+// Organization, with no Account: its peers are still peers, as its
+// `mergedInto` chains say, ADR-0137 §4's 2026-11-09 note) until the first
+// refresh replaces the file. No migration, as the cache is disposable.
 
 export type MachineDirectoryCache = {
   load: () => void;

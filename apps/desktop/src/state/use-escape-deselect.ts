@@ -16,7 +16,7 @@ export interface EscapeToDeselectOptions {
   // document capture listener that runs before this window one, so closing
   // it leaves the selection alone. Read off the event rather than off the
   // layer's open state: React can commit the close before the event reaches
-  // the window. The Sessions page's owner-less review opts in (#312); the
+  // the window. Settings › Unattributed usage opts in (#312, #639); the
   // tables keep their shipped behaviour.
   skipHandled?: boolean;
 }

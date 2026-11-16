@@ -14,6 +14,17 @@
 //   reaches, byte for byte, and every `<img>` has alt text.
 // - Static accessibility: `<html lang>`, one `<h1>`, and no skipped heading
 //   level.
+// - Retired terms (#625 §8, #645): no page's text, the Reference pages and
+//   so both manuals included, and no `--help` of either binary (its top
+//   level and each command's) names "Organization scope" or "Organization
+//   directory", in any case or inflection. Only those two: "Home
+//   organization" and "Quota organization", retired too, are deliberately left
+//   out of the check (narrowed 2026-11-13), so the guide's plain wording for
+//   them is held by review alone. A page's text is what a reader meets: its text nodes,
+//   and the alt, aria-label and title attributes, which a screen reader reads
+//   (title too: a pointer shows it, and a screen reader reads it as the
+//   element's description). An id, a URL or a file name such as
+//   `organization-directory.json` is not read.
 //
 // Bun-only (HTMLRewriter): only the tests import it.
 import { readdirSync, readFileSync } from "node:fs";
@@ -23,12 +34,14 @@ import { APP_DIR, type Page } from "./pages";
 
 /**
  * A terminal binary as its `--help` lists it, read the way its readme.test.ts
- * reads it: apps/cli's COMMANDS or apps/hub's VERBS, each command with the
- * options its parser takes.
+ * reads it: apps/cli's COMMANDS or apps/hub's VERBS, each command with its
+ * help text and the options its parser takes.
  */
 export type Binary = {
   name: string;
-  commands: Record<string, { options: Record<string, { short?: string }> }>;
+  /** What `<name> --help` prints. */
+  help: string;
+  commands: Record<string, { help: string; options: Record<string, { short?: string }> }>;
 };
 
 export type Build = {
@@ -84,6 +97,7 @@ export function checkBuild(build: Build): string[] {
     const problem = (text: string) => problems.push(`${page.source} (${page.out}): ${text}`);
 
     if (!scan.lang?.trim()) problem("its <html> has no lang");
+    for (const term of retiredTerms(scan.text)) problem(term);
     const h1s = scan.headings.filter((h) => h.level === 1).length;
     if (h1s !== 1) problem(`has ${h1s} <h1> elements; a page has exactly one`);
     let level = 0;
@@ -118,6 +132,19 @@ export function checkBuild(build: Build): string[] {
         const wrong = commandProblem(binary, code);
         if (wrong !== null) problem(`\`${code}\`: ${wrong}`);
       }
+    }
+  }
+
+  for (const binary of build.binaries) {
+    const helps: [string, string][] = [
+      [binary.name, binary.help],
+      ...Object.entries(binary.commands).map(([name, command]): [string, string] => [
+        `${binary.name} ${name}`,
+        command.help,
+      ]),
+    ];
+    for (const [command, help] of helps) {
+      for (const term of retiredTerms(help)) problems.push(`${command} --help: ${term}`);
     }
   }
 
@@ -166,6 +193,11 @@ type PageScan = {
   fences: string[];
   /** Each `<code>` outside a `<pre>`, its whitespace collapsed. */
   inlineCode: string[];
+  /**
+   * The page's text: every text node, outside `<script>` and `<style>`, and
+   * every attribute in READ_ATTRIBUTES.
+   */
+  text: string;
 };
 
 function scanPage(html: string): PageScan {
@@ -177,6 +209,7 @@ function scanPage(html: string): PageScan {
     imagesWithoutAlt: [],
     fences: [],
     inlineCode: [],
+    text: "",
   };
   // The elements whose text is being read: headings, <pre>s and inline
   // <code>s, which nest (a heading may hold code).
@@ -190,6 +223,9 @@ function scanPage(html: string): PageScan {
     });
   };
   let inPre = false;
+  // The page's text, read whole once the page is.
+  let text = "";
+  let inScript = false;
 
   new HTMLRewriter()
     .on("html", {
@@ -199,6 +235,15 @@ function scanPage(html: string): PageScan {
     })
     .on("*", {
       element(element) {
+        // A tag parts words, so two elements' texts never run together, and
+        // a block's ends a phrase.
+        text += INLINE.has(element.tagName) ? " " : " ¶ ";
+        // The words an attribute gives a reader, each its own phrase. Raw:
+        // the page's text is undone once, whole.
+        for (const name of READ_ATTRIBUTES) {
+          const value = element.getAttribute(name);
+          if (value !== null) text += ` ${value} ¶ `;
+        }
         const id = attribute(element, "id");
         if (id !== null) scan.ids.add(id);
         for (const name of ["href", "src", "srcset"]) {
@@ -232,6 +277,14 @@ function scanPage(html: string): PageScan {
         });
       },
     })
+    .on("script, style", {
+      element(element) {
+        inScript = true;
+        element.onEndTag(() => {
+          inScript = false;
+        });
+      },
+    })
     .on("code", {
       element(element) {
         if (inPre) return;
@@ -241,9 +294,11 @@ function scanPage(html: string): PageScan {
     .onDocument({
       text(chunk) {
         for (const current of reading) current.text += chunk.text;
+        if (!inScript) text += chunk.text;
       },
     })
     .transform(html);
+  scan.text = htmlText(text);
   return scan;
 }
 
@@ -356,6 +411,57 @@ function commandProblem(binary: Binary, code: string): string | null {
     short === undefined ? [`--${option}`] : [`--${option}`, `-${short}`],
   );
   return unknown([...HELP_OPTIONS, ...options], `${binary.name} ${first}`);
+}
+
+// --- retired terms ----------------------------------------------------------------
+
+// The inline elements, which a phrase may span; any other element's start ends
+// one, as a heading's text does before the paragraph after it.
+const INLINE = new Set([
+  "a",
+  "abbr",
+  "b",
+  "code",
+  "em",
+  "i",
+  "kbd",
+  "mark",
+  "small",
+  "span",
+  "strong",
+  "sub",
+  "sup",
+]);
+
+// The attributes whose words a reader meets: an image's alt and an
+// aria-label, which a screen reader reads in place of what the element shows,
+// and a title, which a pointer shows as a tooltip and a screen reader reads as
+// the element's description (or its name, when it has none). An id, a URL or
+// a class is never read to anyone.
+const READ_ATTRIBUTES = ["alt", "aria-label", "title"];
+
+// The two of #625 §8's retired terms the check bans, each matched as a
+// phrase in any case and across any whitespace, so a plural or a possessive is
+// one too. Only a space joins the words, and no hyphen follows them or their
+// inflection: `organization-directory.json`, "scopes-wide" and
+// `organizationScope` are not the phrase. The guard after the inflection
+// refuses a word character too, so the inflection cannot give back letters to
+// put the hyphen out of its sight. "Home organization" and "Quota
+// organization", retired by #625 §8 too, are deliberately not here (narrowed
+// 2026-11-13): the check bans only these two.
+const RETIRED_TERMS = ["Organization scope", "Organization directory"];
+
+/** A problem for each retired term in `text`, quoting the words it uses. */
+function retiredTerms(text: string): string[] {
+  const found: string[] = [];
+  for (const term of RETIRED_TERMS) {
+    const [first, second] = term.split(" ");
+    const phrase = new RegExp(`\\b${first}\\s+${second}[\\w'’]*(?![\\w'’-])`, "gi");
+    for (const [words] of text.matchAll(phrase)) {
+      found.push(`uses the retired term "${term}": "${words.replace(/\s+/g, " ")}"`);
+    }
+  }
+  return found;
 }
 
 // --- files ------------------------------------------------------------------------

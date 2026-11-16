@@ -1,6 +1,8 @@
 import type { CostMode } from "./cost-mode";
 import type { Span } from "./intraday";
 import type { DailyByMachineQueryInput, IntradayQueryInput, QueryInput } from "./query-keys";
+import { SCOPE_HEAD_PATH } from "./scope-head";
+import type { ScopeQueryParams } from "./scope-params";
 
 // The pure pieces of the ADR-0004 report hooks (ADR-0118 §7): each report's
 // loose input, its normalization into the canonical query input, and its URL
@@ -23,9 +25,19 @@ export type ReportQueryInput = {
   // (the renderer expands merge-alias closures before calling). Serialized as
   // repeated `machine=` params, mirroring `models`.
   machines?: string[];
-  // The resolved Organization scope (#278) — a tracked uuid or "all"; absent =
-  // the Home organization. Serialized as one `organization=` param.
-  organization?: string;
+  // The Scope's Organization axis (#278, `./scope`) — tokens, each a uuid,
+  // "home" or "all", a union. Serialized as repeated `organization=` params.
+  organization?: string[];
+  // The Scope's Account axis (#632, `./scope`) — tokens, each an Account key,
+  // "home" or "all", a union. Serialized as repeated `account=` params. Both
+  // absent = the Home membership; one absent beside the other = any value on
+  // that axis. `scopeQueryParams` turns the persisted Scope into these three.
+  account?: string[];
+  // The Scope named as Memberships (#637, `./scope`): `membership` tokens
+  // (`formatMembershipToken`), serialized as repeated `membership=` params.
+  // Any present names the Scope alone (the sidecar ignores the two axes beside
+  // them); absent or empty sends none, so every other URL stays byte-identical.
+  memberships?: string[];
 };
 
 // Collapse a hook's loose input into the canonical QueryInput used for both
@@ -42,6 +54,8 @@ export function normalize(opts: ReportQueryInput): QueryInput {
     models: opts.models,
     machines: opts.machines,
     organization: opts.organization,
+    account: opts.account,
+    memberships: opts.memberships,
   };
 }
 
@@ -59,7 +73,9 @@ export function appendFilterParams(
     projects?: string[];
     models?: string[];
     machines?: string[];
-    organization?: string;
+    organization?: string[];
+    account?: string[];
+    memberships?: string[];
   },
 ): void {
   params.set("mode", input.mode);
@@ -71,9 +87,22 @@ export function appendFilterParams(
   // ADR-0041 (M6): the machine filter axis, repeated `machine=` params — absent
   // when unset, so non-machine URLs stay byte-identical to pre-M6.
   for (const m of input.machines ?? []) params.append("machine", m);
-  // #278: the Organization scope. Absent = Home, so a single-Organization
-  // machine's URLs stay byte-identical to before the scope existed.
-  if (input.organization) params.set("organization", input.organization);
+  appendScopeParams(params, input);
+}
+
+// The Scope's params (`./scope`), appended after every filter param; every
+// Scope-reading URL builder calls it, the session-events stream's included.
+// Each list sorted, so the URL is order-independent, and absent when empty:
+//   - #278, #637: the Organization axis, absent unless named (the Home
+//     membership), so a single-Organization machine's URLs stay byte-identical
+//     to before the scope existed, and one token is the one param the v0.9.x
+//     Organization scope sent;
+//   - #632: the Account axis, absent unless named;
+//   - #637: the Scope as Memberships.
+export function appendScopeParams(params: URLSearchParams, scope: ScopeQueryParams): void {
+  for (const o of [...(scope.organization ?? [])].sort()) params.append("organization", o);
+  for (const a of [...(scope.account ?? [])].sort()) params.append("account", a);
+  for (const m of [...(scope.memberships ?? [])].sort()) params.append("membership", m);
 }
 
 // Shared URL composer for every /api/<report> endpoint. The param shape is
@@ -123,9 +152,11 @@ export type IntradayHookInput = {
   // The machine filter axis (ADR-0041 M6) — raw machine ids, serialized as
   // repeated `machine=` params (same passthrough as `models`).
   machines?: string[];
-  // The resolved Organization scope (#278) — a tracked uuid or "all"; absent =
-  // the Home organization, and no `organization=` param is emitted.
-  organization?: string;
+  // The Scope's two axes (#278, #632) and its Membership list (#637), as on
+  // `ReportQueryInput`.
+  organization?: string[];
+  account?: string[];
+  memberships?: string[];
 };
 
 // Collapse the loose hook input into the canonical `IntradayQueryInput` used
@@ -146,6 +177,8 @@ export function normalizeIntradayInput(opts: IntradayHookInput): IntradayQueryIn
     models: opts.models,
     machines: opts.machines,
     organization: opts.organization,
+    account: opts.account,
+    memberships: opts.memberships,
   };
 }
 
@@ -194,6 +227,24 @@ export function buildDailyByMachineUrl(opts: DailyByMachineHookInput): string {
   appendFilterParams(params, input);
   if (input.byProject === true) params.set("byProject", "1");
   return `/api/daily-by-machine?${params.toString()}`;
+}
+
+// --- /api/membership-totals (#637) ------------------------------------------
+
+export const MEMBERSHIP_TOTALS_PATH = "/api/membership-totals";
+
+// The URL builder, the common report query's (`buildReportUrl`).
+export function buildMembershipTotalsUrl(opts: ReportQueryInput): string {
+  return buildReportUrl(MEMBERSHIP_TOTALS_PATH, normalize(opts));
+}
+
+// --- /api/scope-head (the renderer's `use-scope-head.ts`, #637) -------------
+
+export function buildScopeHeadUrl(base: string, scope: ScopeQueryParams): string {
+  const params = new URLSearchParams();
+  appendScopeParams(params, scope);
+  const search = params.toString();
+  return `${base}${SCOPE_HEAD_PATH}${search === "" ? "" : `?${search}`}`;
 }
 
 // --- /api/usage/current (the renderer's `use-usage-current.ts`) --------------

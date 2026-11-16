@@ -5,15 +5,18 @@ import {
   fleetDedupKey,
   fleetDedupTokenTotal,
   fleetFullnessPartsExceed,
+  formatMembershipToken,
   worktreeSlugPrefix,
   type FleetDedupTokens,
   type FleetEvent,
   type ForgetSessionRef,
 } from "@maxprice/shared";
 import { identityFromPath, parentSessionPath } from "../identity";
-import { collectUsageRecords } from "./jsonl";
+import { collectUsageRecords, type OnAccountPair } from "./jsonl";
 import { localDate } from "./local-date";
 import {
+  accountKeyOf,
+  eventAccount,
   eventOrganization,
   NO_DORMANT,
   NO_PRESUMPTION,
@@ -24,7 +27,12 @@ import { isInstantBound } from "./range";
 import type { ScanCache } from "./scan-cache";
 import { createSortedSnapshot } from "./sorted-snapshot";
 import { defaultTimeZone } from "./timezone";
-import type { UsageRecord } from "./types";
+import {
+  hasOwnEvidence,
+  NO_ACCOUNT_EVIDENCE,
+  type AccountEvidence,
+  type UsageRecord,
+} from "./types";
 
 // Part 4.5 — E4: the in-memory event store.
 //
@@ -64,6 +72,21 @@ import type { UsageRecord } from "./types";
 // foreign. The wire carries the tag (ADR-0103): `storedEventToWire`
 // projects it as owner evidence and `appendFleet` reads it back, so a replica
 // or archive row keeps the tag its producer resolved. Absent still means "no evidence".
+//
+// `accountUuid` / `accountEmailHash` on a stored row are the RESOLVED Account
+// evidence (ADR-0137 §2), never both: the record's Owner-record uuid, or its
+// Email record's hash resolved through the pair table snapshot the store was
+// built with, as `accountUuid`; a hash no pair maps stays `accountEmailHash`,
+// a Pending account (`accountKeyOf` keys it `pending:<hash>`). A subagent's row
+// takes both from its parent's owner points, as it takes its Organization. A
+// pair learned later re-resolves rows only by a rebuild from the scan cache,
+// which keeps the hash (#631 decision 4). A row whose Account key is outside
+// the store's tracked Account set never becomes a `StoredEvent` (ADR-0136 §3).
+// Since protocol v7 (#634, ADR-0137 §6) the wire carries the resolved
+// `accountUuid` as a tag beside the Organization's: `storedEventToWire`
+// projects it (never the hash) and `appendFleet` reads it back, so replica and
+// archive rows keep it. The merge rule reads `accountUuid` only, so a Pending
+// account's row competes as one with no Account tag.
 export type StoredEvent = UsageRecord & {
   projectSlug: string;
   sessionId: string;
@@ -88,6 +111,12 @@ export type StoredEvent = UsageRecord & {
   // This is a RAM-only field: `storedEventToWire` does not carry it, and the
   // fleet wire shape (`FleetEvent`) has no such member.
   ms: number;
+  // ADR-0141 §1: set only on a row this machine's own feeder tagged from a
+  // matched Gateway record (the Gateway evidence store), never from its
+  // transcript. RAM-only like `ms`: the wire, the archive and the replica
+  // carry the tags, not where they came from. Read by the Gateway signature
+  // (ADR-0141 §4, `sessions.ts`), which counts transcript evidence only.
+  viaGateway?: true;
 };
 
 // A `StoredEvent` as a FEEDER builds it — every field but the derived `ms`.
@@ -196,6 +225,29 @@ export type StoreQuery = {
   // matches a non-empty selection: it is absent from every scoped answer
   // rather than present in all of them.
   organizations?: string[];
+  // Account keys to include (ADR-0136 §2: the Account is one more axis to
+  // narrow by), each an account uuid or `pending:<hash>`. Empty / omitted =
+  // every Account. EXACT match on the event's resolved Account
+  // (`eventAccount`: evidence, then the assertion, then ADR-0137 §3/§4's
+  // query-time answer). With `organizations` it intersects, so one of each is
+  // a Membership. An event that resolves to no Account matches a selection
+  // only with `unknownAccount`. Every report endpoint fills it from the Scope
+  // since #632.
+  accounts?: string[];
+  // Whether a non-empty `accounts` selection also admits the events that
+  // resolve to no Account (`ResolvedScope.unknownAccount`, #635: the default
+  // Scope holds the Home membership's Account and Unknown). Omitted is false,
+  // a strict selection; with no `accounts` selection it changes nothing.
+  unknownAccount?: boolean;
+  // The Scope as exact Memberships (#637, `ResolvedScope.memberships`): the
+  // canonical `membership` tokens (`formatMembershipToken`), an event matching
+  // when the token of its resolved-or-presumed Organization and its resolved
+  // Account (`unknown` for none) is listed. Unlike every other axis an empty
+  // list is NOT "no filter": it matches no row (a Scope naming no Membership).
+  // Omitted or null = no filter. It intersects the other axes, which the
+  // Scope fills with its covering axes, so they narrow nothing it does not. An
+  // event that resolves to no Organization matches no list.
+  memberships?: readonly string[] | null;
 };
 
 // Case-insensitive substring match of one model name against a list of
@@ -232,7 +284,14 @@ export function matchesModelFilter(model: string, models: string[]): boolean {
 // applied separately by `query`).
 export type StoreAxisQuery = Pick<
   StoreQuery,
-  "projects" | "sessions" | "models" | "machines" | "organizations"
+  | "projects"
+  | "sessions"
+  | "models"
+  | "machines"
+  | "organizations"
+  | "accounts"
+  | "unknownAccount"
+  | "memberships"
 >;
 
 // The non-date filter axes compiled ONCE into a per-event predicate — the one
@@ -254,9 +313,19 @@ export type StoreAxisQuery = Pick<
 // compiled against different Homes. The default keeps every caller that filters
 // on no Organization — `identity-probe.ts` filters on `projects` alone —
 // one-argument and unaffected.
+//
+// `trackedAccounts` is the store's tracked Account set (ADR-0137 §3–§4): a row
+// with no Account evidence whose Account is resolved at query time to one
+// outside a non-null set is outside every Scope, so every report omits it.
+// Ingest gated every row WITH Account evidence already, on the same set. Only
+// a presumption that can answer such an Account (`resolvesOutside`: a claim
+// naming an untracked Account) costs a predicate, so a machine with no such
+// claim keeps its unfiltered fast path. The default (null) keeps every caller
+// that tracks no Account set unaffected.
 export function compileAxisMatcher(
   q: StoreAxisQuery,
   presumption: Presumption = NO_PRESUMPTION,
+  trackedAccounts: ReadonlySet<string> | null = null,
 ): ((e: StoredEvent) => boolean) | null {
   const projectFilter = q.projects && q.projects.length > 0 ? new Set(q.projects) : null;
   // The worktree half of the project axis (ADR-0061), precomputed: one prefix
@@ -294,20 +363,45 @@ export function compileAxisMatcher(
   // the retained one has to survive growth — which is this one.
   const organizationFilter =
     q.organizations && q.organizations.length > 0 ? new Set(q.organizations) : null;
+  // The Account axis (ADR-0136 §2), the same kind of predicate: never
+  // short-circuited, for the reason above; `query` takes its "covers
+  // everything" no-op per call (`coversEveryAccountPresent`).
+  const accountFilter = q.accounts && q.accounts.length > 0 ? new Set(q.accounts) : null;
+  const unknownAccount = q.unknownAccount === true;
+  // The exact Membership predicate (#637), never short-circuited either, and
+  // with no per-call no-op at all: an Organization and an Account both present
+  // never say the pair is, so only the pair can tell Blair in Team from Alex
+  // in Team beside Blair in Blair-max. `[]` is a predicate that admits
+  // nothing, never "no filter".
+  const membershipFilter =
+    q.memberships === undefined || q.memberships === null ? null : new Set(q.memberships);
   // Lowered ONCE here rather than per event (see `lowerModelNeedles`); the
   // `.length === 0` "unfiltered" check is unaffected by the mapping.
   const models = lowerModelNeedles(q.models ?? []);
+  // ADR-0137 §3's scope exclusion: the tracked Account set, when this
+  // presumption can resolve an evidence-less row outside it.
+  const accountScope =
+    trackedAccounts !== null && resolvesOutside(presumption, trackedAccounts)
+      ? trackedAccounts
+      : null;
   if (
     projectFilter === null &&
     sessionFilter === null &&
     machineFilter === null &&
     organizationFilter === null &&
+    accountFilter === null &&
+    membershipFilter === null &&
+    accountScope === null &&
     models.length === 0
   ) {
     return null;
   }
   return (e) => {
     if (!matchesProject(e.projectSlug)) return false;
+    if (accountScope !== null && accountKeyOf(e) === undefined) {
+      const account = eventAccount(e, presumption);
+      if (account !== undefined && !accountScope.has(account)) return false;
+    }
     if (machineFilter !== null && !machineFilter.has(e.machineId)) return false;
     if (sessionFilter !== null && !sessionFilter.has(e.sessionId)) return false;
     if (organizationFilter !== null) {
@@ -318,8 +412,30 @@ export function compileAxisMatcher(
       const organization = eventOrganization(e, presumption);
       if (organization === undefined || !organizationFilter.has(organization)) return false;
     }
+    if (accountFilter !== null) {
+      // An Account not known is in the selection only when it holds Unknown.
+      const account = eventAccount(e, presumption);
+      if (account === undefined ? !unknownAccount : !accountFilter.has(account)) return false;
+    }
+    if (membershipFilter !== null) {
+      const organization = eventOrganization(e, presumption);
+      if (organization === undefined) return false;
+      const token = formatMembershipToken(organization, eventAccount(e, presumption) ?? null);
+      if (!membershipFilter.has(token)) return false;
+    }
     return matchesLoweredModelFilter(e.model, models);
   };
+}
+
+// Whether `eventAccount` can answer an evidence-less row with an Account
+// outside `tracked` (ADR-0137 §3–§5): only through a claim naming one, since
+// an evidence-less row answers a claim's Account or none (#635), so when every
+// claimed Account is tracked, no row can be.
+function resolvesOutside(p: Presumption, tracked: ReadonlySet<string>): boolean {
+  for (const claim of p.assertedBySession.values()) {
+    if (claim.accountUuid !== undefined && !tracked.has(claim.accountUuid)) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,9 +451,9 @@ export function compileAxisMatcher(
 // `(messageId, requestId)` — 2–3 byte-identical content-block lines (E1 finding
 // #1) plus, for a streamed turn, an `output_tokens: 1` partial ahead of the
 // final row — and the store keeps exactly one per distinct tuple: the fullest
-// copy (the largest token-total; at an equal total, a copy carrying
-// Organization evidence over one carrying none, and of two different tags the
-// smaller uuid — ADR-0103, #374), ties first-seen (an absent requestId is a
+// copy (the largest token-total; at an equal total, the copy carrying more
+// tags, then the smaller Organization tag, then the smaller Account tag, a
+// present tag beating an absent one — ADR-0103, #374, ADR-0137 §6), ties first-seen (an absent requestId is a
 // DISTINCT key from an empty-string one — see fleet-dedup.ts).
 const dedupKey = fleetDedupKey;
 const supersedes = fleetCopySupersedes;
@@ -398,6 +514,29 @@ export type EventStore = {
   // replay owner evidence as well as changed rows. Batches are read-only to
   // subscribers. Fleet pages never emit here.
   onLocalAppend: (listener: (batch: LocalAppend) => void) => () => void;
+  // ADR-0141 §3 (D4): re-append local records this store has already read,
+  // through the same path `append` takes, after the Gateway evidence store
+  // learned a match for them: the admission gate, the excluded holder, the
+  // foreign evidence listeners and `onLocalAppend` all run as for any batch.
+  // A tag gained at an equal total is a replacement; a record whose new tags
+  // are Excluded evicts its row. Returns how many rows changed RAM.
+  reapply: (
+    records: readonly UsageRecord[],
+    projectSlug: string,
+    sessionId: string,
+    isSubagent: boolean,
+  ) => number;
+  // ADR-0141 §1: whether a local record carries transcript Attribution
+  // evidence as this store resolves it: its own Organization or Account
+  // evidence, or, for a subagent's, its parent session's owner point at its
+  // timestamp. Never Gateway evidence. A Gateway record matched to a line
+  // with evidence is ignored (the matcher asks this).
+  hasTranscriptEvidence: (
+    record: UsageRecord,
+    projectSlug: string,
+    sessionId: string,
+    isSubagent: boolean,
+  ) => boolean;
   // Remove a known hub deletion from a retained report view immediately.
   // No tombstone: a later local transcript may legitimately restore a row.
   removeMachineSessions: (machineId: string, sessions: readonly ForgetSessionRef[]) => void;
@@ -514,7 +653,18 @@ export type EventStore = {
   // Storage neither counts nor names what is excluded (ADR-0098), so Forget
   // never offers them. Another machine's row is never withheld: this machine
   // cannot forget it, and the classifier skips it before asking.
-  isWithheld: (row: { machineId: string; sessionId: string; organizationUuid?: string }) => boolean;
+  //
+  // Since #631 a row is also withheld when its Account key is outside a
+  // non-null tracked Account set (ADR-0136 §3). Since #634 replica and archive
+  // rows carry the Account tag their producer resolved, so either half can
+  // withhold one.
+  isWithheld: (row: {
+    machineId: string;
+    sessionId: string;
+    organizationUuid?: string;
+    accountUuid?: string;
+    accountEmailHash?: string;
+  }) => boolean;
   // ADR-0098: every Organization any record named, kept OR excluded — walked
   // transcripts and, since the wire carries the tag (ADR-0103), fleet rows too,
   // refused or not — split by whose record named it (#287). `machine`: walked
@@ -531,12 +681,46 @@ export type EventStore = {
   // mostly works under. Internal to the sidecar's first-launch seed; it never
   // leaves the process — the app shows no count of anything it hides.
   organizationSessionCounts: () => ReadonlyMap<string, number>;
+  // #631 (ADR-0136 §8): how many sessions each Account owned in
+  // `organizationUuid` when they ended — the Account key (uuid or
+  // `pending:<hash>`, resolved through this store's pair snapshot) of every
+  // session's LAST owner point, among the sessions whose last point names that
+  // Organization. Counted whether or not either tracked set excluded them, like
+  // `organizationSessionCounts`, so the upgrade and the first-launch seed can
+  // say which Account owns most of Home's sessions. A last point with no
+  // Account evidence counts for none. Internal to the sidecar's seeds.
+  accountSessionCounts: (organizationUuid: string) => ReadonlyMap<string, number>;
+  // #631: every Account any LOCAL record's evidence named, kept OR excluded
+  // (the walk and the watcher; fleet rows' Account tags are not read here), each
+  // with the Organizations it was seen under: the record's resolved Account
+  // key (a subagent's from its parent's owner point) and its Organization
+  // evidence, an Account seen with none holding an empty set. The Account
+  // roster's evidence (`/api/accounts`) and the upgrade's "each Account the
+  // evidence names" (ADR-0136 §8). Keys are resolved through THIS store's pair
+  // snapshot, so a pair learned since leaves a `pending:<hash>` key here
+  // until the next rebuild; a reader maps it through the live table. Live.
+  accountMemberships: () => ReadonlyMap<string, ReadonlySet<string>>;
+  // #631 (ADR-0137 §1): the Account evidence of every main transcript record
+  // as READ, before the pair table resolves it: the Owner records' account
+  // uuids and the Email records' hashes. A subagent's own evidence is none
+  // (ADR-0137 §2) and is not here. What a pair change is judged against (a
+  // hash here may move rows; one not here moves none) and what tells a Pending
+  // account's fold whether its Account was known apart from that hash. Live.
+  accountEvidenceSeen: () => { uuids: ReadonlySet<string>; hashes: ReadonlySet<string> };
+  // The pair table snapshot this store was built with (ADR-0137 §1), by
+  // identity, so a holder can tell a later table from it.
+  accountPairs: () => ReadonlyMap<string, string>;
   // The tracked set this store was built with (the #260 lifecycle decision,
   // item 7): the Organizations whose usage it counts, generalising ADR-0098's
   // single Home organization (#275; #299 records it in the ADR). `null` =
   // nothing is excluded (the golden corpus runs this way, and so does the
   // first-launch selection walk).
   trackedOrganizations: () => ReadonlySet<string> | null;
+  // The tracked Account set this store was built with (ADR-0136 §3), the
+  // Account half of the admission pair: account uuids and `pending:<hash>`
+  // keys, already unioned with the Home membership's Account by
+  // `resolveTrackedAccounts`. `null` = no Account is excluded (#631 decision 3).
+  trackedAccounts: () => ReadonlySet<string> | null;
   // The Presumed organization rule in force (#261 item 2, see
   // ./presumption.ts): how an owner-less event's Organization is answered at
   // query time. The store is the ONE source of it — a holder that needs the
@@ -548,6 +732,27 @@ export type EventStore = {
   // call).
   presumption: () => Presumption;
 };
+
+// ADR-0141 §1: one line's Gateway evidence as the store reads it, keyed by the
+// line's store session and its dedup key (`fleetDedupKey`): the matched
+// record's Organization and its Account, a uuid or (local only) the
+// credential's email hash, which the store resolves through its pair snapshot
+// as it resolves an Email record's.
+export type GatewayEvidence = {
+  organizationUuid: string | undefined;
+  accountUuid: string | undefined;
+  accountEmailHash: string | undefined;
+};
+export type GatewayEvidenceLookup = {
+  lookup: (sessionId: string, dedupKey: string) => GatewayEvidence | undefined;
+};
+
+// The pair table of a store built with none.
+const NO_ACCOUNT_PAIRS: ReadonlyMap<string, string> = new Map();
+
+// One owner point (ADR-0098 §3): a parent record's instant, its Organization
+// and its resolved Account evidence.
+type OwnerPoint = AccountEvidence & { ms: number; organizationUuid: string };
 
 // How many files the initial scan reads+parses concurrently. Parse work is
 // single-threaded JS either way — the pool's job is overlapping file I/O and
@@ -581,11 +786,37 @@ export function createEventStore(opts: {
   // `NO_PRESUMPTION`, under which an owner-less row resolves to no Organization
   // at all — today's behaviour, and the golden corpus's.
   getPresumption?: () => Presumption;
+  // The pair table (ADR-0137 §1) as it stood when this store was built: email
+  // hash -> account uuid (`account-pairs.ts`'s `snapshot()`). Every Email
+  // record's hash is resolved through it at ingest; one it does not map is a
+  // Pending account. A construction-time constant, like the tracked sets: a
+  // new pair re-resolves rows by a rebuild (#631 decision 4). Omitted = no
+  // pairs.
+  accountPairs?: ReadonlyMap<string, string>;
+  // The tracked Account set (ADR-0136 §3): account uuids and `pending:<hash>`
+  // keys, already unioned with the Home membership's Account by
+  // `resolveTrackedAccounts`. A row whose Account evidence keys outside it is
+  // dropped at the feeder like a row of an Excluded organization. A row with
+  // no Account evidence is gated on its Organization alone (ADR-0137 §3).
+  // `null`/omitted = no Account is excluded (#631 decision 3), so every corpus
+  // that carries `ownerAccountUuid` and names no set admits as before.
+  trackedAccounts?: ReadonlySet<string> | null;
+  // Hears the pair observations (ADR-0137 §1) of every main transcript the
+  // scan parses (a scan-cache hit yields none), for bootSidecar() to teach the
+  // pair table (account-pairs.ts). A subagent's file is never read with it:
+  // its own Email record is no evidence (ADR-0137 §2). It changes no row.
+  onAccountPair?: OnAccountPair;
+  // ADR-0141 §1 (D1): the Gateway evidence store, read LIVE at every append,
+  // unlike the construction-time inputs above: a match learned after this
+  // store was built applies to its line on the line's next append (the
+  // matcher's `reapply`, or a rebuild's walk). Omitted = no Gateway evidence.
+  gatewayEvidence?: GatewayEvidenceLookup;
 }): EventStore {
   // The machine id every locally-scanned/watched row is tagged with (ADR-0041).
   // The fleet feeder carries each replica row's own hub-minted id instead.
   const selfMachineId = opts.selfMachineId;
   const scanCache = opts.scanCache;
+  const gatewayEvidence = opts.gatewayEvidence;
   const getPresumption = opts.getPresumption ?? ((): Presumption => NO_PRESUMPTION);
 
   // The deduped event set, keyed by `(messageId, requestId)`. A Map (not an
@@ -624,6 +855,12 @@ export function createEventStore(opts: {
   // rebuild both sets exactly.
   const taggedOrganizations = new Set<string>();
   const untaggedMachines = new Set<string>();
+  // The Account axis's two halves (#632), kept the same way and for the same
+  // job: the distinct Account keys of rows with Account evidence, and whether
+  // any row has none (its Account a claim's or not known, #635). Add-only
+  // between rebuilds, so they can only ever lose the no-op.
+  const taggedAccounts = new Set<string>();
+  let accountlessPresent = false;
 
   // Record one newly-stored event in every derived set. The single definition
   // of what those sets hold, so the incremental path and the rebuild below
@@ -632,6 +869,9 @@ export function createEventStore(opts: {
     modelsSeen.add(event.model);
     if (event.organizationUuid !== undefined) taggedOrganizations.add(event.organizationUuid);
     else untaggedMachines.add(event.machineId);
+    const accountKey = accountKeyOf(event);
+    if (accountKey !== undefined) taggedAccounts.add(accountKey);
+    else accountlessPresent = true;
   }
 
   // Re-derive every add-only set from `events`. THE response to a shrinking
@@ -645,20 +885,44 @@ export function createEventStore(opts: {
     modelsSeen.clear();
     taggedOrganizations.clear();
     untaggedMachines.clear();
+    taggedAccounts.clear();
+    accountlessPresent = false;
     for (const event of events.values()) recordDerived(event);
   }
 
   const trackedOrganizations = opts.trackedOrganizations ?? null;
+  const trackedAccounts = opts.trackedAccounts ?? null;
+  const accountPairs = opts.accountPairs ?? NO_ACCOUNT_PAIRS;
 
-  // The ONE admission test (ADR-0098, #275), shared by the walk and the Local
-  // archive feed: an Organization outside a non-null tracked set is excluded.
-  // No evidence (`undefined`) never is, and a null set excludes nothing.
-  function outsideTrackedSet(organizationUuid: string | undefined): boolean {
+  // The ONE admission test (ADR-0098, #275; ADR-0136 §3), shared by the walk
+  // and the Local archive feed. Two conjunctive levels: a row is excluded when
+  // its Organization is outside a non-null tracked set OR its Account key is
+  // outside a non-null tracked Account set. On each level no evidence
+  // (`undefined`) never is, and a null set excludes nothing; so a row with
+  // Organization evidence and no Account evidence is gated on its Organization
+  // alone (ADR-0137 §3), and one with Account evidence alone on its Account.
+  function outsideTrackedSet(
+    organizationUuid: string | undefined,
+    accountKey: string | undefined,
+  ): boolean {
     return (
-      trackedOrganizations !== null &&
-      organizationUuid !== undefined &&
-      !trackedOrganizations.has(organizationUuid)
+      (trackedOrganizations !== null &&
+        organizationUuid !== undefined &&
+        !trackedOrganizations.has(organizationUuid)) ||
+      (trackedAccounts !== null && accountKey !== undefined && !trackedAccounts.has(accountKey))
     );
+  }
+
+  // A record's Account evidence, resolved (ADR-0137 §1–§2): an Owner-record
+  // uuid as read; an Email record's hash through the pair table, a uuid when a
+  // pair maps it and the hash itself (a Pending account) when none does. The
+  // record itself when nothing needs resolving, so the common path allocates
+  // nothing.
+  function resolveAccount(record: AccountEvidence): AccountEvidence {
+    const hash = record.accountEmailHash;
+    if (hash === undefined) return record;
+    const accountUuid = accountPairs.get(hash);
+    return accountUuid === undefined ? record : { accountUuid, accountEmailHash: undefined };
   }
 
   // #311 (ADR-0107 §12): the dormant snapshot, beside the tracked set and, like
@@ -683,10 +947,12 @@ export function createEventStore(opts: {
     return own && organizationUuid === undefined && dormant.has(sessionId);
   }
 
-  // ADR-0098 state. `ownerPoints`: per session, the (ms, organization) of every
-  // TAGGED record its parent transcript carried, ascending — a subagent record,
-  // which carries no Attribution evidence of its own (ADR-0109 §5), resolves
-  // against these by timestamp.
+  // ADR-0098 state. `ownerPoints`: per session, the (ms, organization, Account)
+  // of every TAGGED record its parent transcript carried, ascending — a
+  // subagent record, which carries no Attribution evidence of its own (ADR-0109
+  // §5, ADR-0137 §2), resolves against these by timestamp and takes the
+  // point's Account with its Organization. A point's Account is the parent
+  // record's resolved Account evidence, possibly none.
   // Filled from every record BEFORE the exclusion below, so a parent outside
   // the tracked set still teaches the store who owns its subagents.
   // `foreignSessions`: the repair's forget list; the name predates the tracked
@@ -699,12 +965,24 @@ export function createEventStore(opts: {
   // an excluded copy holds it, and every feeder (another walked transcript,
   // the Local archive, the replica, the Hub before the repair lands) offers a
   // copy that takes the key back only when it supersedes that holder. A
-  // holder is always tagged (no evidence is never excluded), and the map
+  // holder is always tagged on the level that excluded it (no evidence is never
+  // excluded), and it keeps both its Organization and its Account key so the
+  // scoped repair can say which entity excluded it (ADR-0136 §3). The map
   // never shares a key with `events`.
   // `organizationsSeen`: the roster's "seen on this machine / the fleet".
-  const ownerPoints = new Map<string, Array<{ ms: number; organizationUuid: string }>>();
+  const ownerPoints = new Map<string, OwnerPoint[]>();
   const foreignSessions = new Map<string, ForgetSessionRef>();
-  const excludedHolders = new Map<string, { total: number; organizationUuid: string }>();
+  const excludedHolders = new Map<
+    string,
+    {
+      total: number;
+      organizationUuid: string | undefined;
+      // The holder's Account TAG (fullness: a uuid, never a Pending hash),
+      // beside `accountKey`, the key that may have excluded it.
+      accountUuid: string | undefined;
+      accountKey: string | undefined;
+    }
+  >();
   // #370: every pair a walk or watcher read yielded at least one record for,
   // at any time in this process. An unreadable file, an empty one and an
   // unlink flush each arrive as an empty batch and mark nothing (#370
@@ -718,6 +996,11 @@ export function createEventStore(opts: {
   // restart stays marked. Since #375 that costs no admitted row: the archive
   // forget keeps them, and the resync re-pushes them from it.
   const walkedPairs = new Set<string>();
+  // #631: the Account evidence accessors' state (`accountMemberships`,
+  // `accountEvidenceSeen`), filled from every local record before the gate.
+  const accountMemberships = new Map<string, Set<string>>();
+  const evidenceUuids = new Set<string>();
+  const evidenceHashes = new Set<string>();
   const foreignListeners = new Set<(sessions: readonly ForgetSessionRef[]) => void>();
   const organizationsSeen = { machine: new Set<string>(), fleet: new Set<string>() };
 
@@ -725,7 +1008,12 @@ export function createEventStore(opts: {
     return `${projectSlug}\u0000${sessionId}`;
   }
 
-  function addOwnerPoint(key: string, ms: number, organizationUuid: string): void {
+  function addOwnerPoint(
+    key: string,
+    ms: number,
+    organizationUuid: string,
+    account: AccountEvidence,
+  ): void {
     if (Number.isNaN(ms)) return;
     let points = ownerPoints.get(key);
     if (points === undefined) {
@@ -733,30 +1021,52 @@ export function createEventStore(opts: {
       ownerPoints.set(key, points);
     }
     // Sorted insert; an identical point is a re-presented record (rescan,
-    // scan/watcher overlap) and is not duplicated.
+    // scan/watcher overlap) and is not duplicated. Identical means the whole
+    // Membership: two points at one instant naming one Organization under two
+    // Accounts are both kept, as two Organizations are, so every point at the
+    // instant is compared, not only the last (#631): re-presenting the earlier
+    // of two must not re-append it and move the instant's answer.
     let i = points.length;
-    while (i > 0 && (points[i - 1] as { ms: number }).ms > ms) i -= 1;
-    const prev = points[i - 1];
-    if (prev !== undefined && prev.ms === ms && prev.organizationUuid === organizationUuid) return;
-    points.splice(i, 0, { ms, organizationUuid });
+    while (i > 0 && (points[i - 1] as OwnerPoint).ms > ms) i -= 1;
+    for (let j = i - 1; j >= 0; j -= 1) {
+      const prev = points[j] as OwnerPoint;
+      if (prev.ms !== ms) break;
+      if (
+        prev.organizationUuid === organizationUuid &&
+        prev.accountUuid === account.accountUuid &&
+        prev.accountEmailHash === account.accountEmailHash
+      ) {
+        return;
+      }
+    }
+    points.splice(i, 0, {
+      ms,
+      organizationUuid,
+      accountUuid: account.accountUuid,
+      accountEmailHash: account.accountEmailHash,
+    });
   }
 
   // The owner in effect at `ms` for a session: the last point at or before it,
   // or the earliest known owner for a record that precedes every point (a
   // subagent line stamped a moment before its parent's first assistant line).
-  function resolveOwner(key: string, ms: number): string | undefined {
+  // The whole point, so the Account comes with the Organization (ADR-0137 §2).
+  function resolveOwner(key: string, ms: number): OwnerPoint | undefined {
     const points = ownerPoints.get(key);
     if (points === undefined || points.length === 0 || Number.isNaN(ms)) return undefined;
-    let owner = (points[0] as { organizationUuid: string }).organizationUuid;
+    let owner = points[0] as OwnerPoint;
     for (const p of points) {
-      if (p.ms <= ms) owner = p.organizationUuid;
+      if (p.ms <= ms) owner = p;
       else break;
     }
     return owner;
   }
 
   // #374: offer one excluded copy of `key` (`total` tokens, tagged
-  // `organizationUuid`) to the competition for it. It loses to a holder or an
+  // `organizationUuid` and `accountUuid`, keyed `accountKey`; its Organization
+  // or its Account key excluded it) to the competition for it. Fullness is the
+  // one merge rule over both tags (ADR-0103 §2, ADR-0137 §6), and reads the
+  // Account tag, never the key: a Pending key is no tag. It loses to a holder or an
   // admitted incumbent at least as full, and changes nothing. Otherwise it
   // becomes the key's holder; an admitted incumbent it supersedes is evicted
   // (its contribution with it), so the caller can list a walked pair whose
@@ -767,16 +1077,27 @@ export function createEventStore(opts: {
   function offerExcluded(
     key: string,
     total: number,
-    organizationUuid: string,
+    organizationUuid: string | undefined,
+    accountUuid: string | undefined,
+    accountKey: string | undefined,
     changes: StoreChange[],
   ): StoredEvent | null | undefined {
     const holder = excludedHolders.get(key);
     if (holder !== undefined) {
       if (
-        fleetFullnessPartsExceed(total, organizationUuid, holder.total, holder.organizationUuid)
+        fleetFullnessPartsExceed(
+          total,
+          organizationUuid,
+          accountUuid,
+          holder.total,
+          holder.organizationUuid,
+          holder.accountUuid,
+        )
       ) {
         holder.total = total;
         holder.organizationUuid = organizationUuid;
+        holder.accountUuid = accountUuid;
+        holder.accountKey = accountKey;
       }
       return undefined;
     }
@@ -786,13 +1107,15 @@ export function createEventStore(opts: {
       !fleetFullnessPartsExceed(
         total,
         organizationUuid,
+        accountUuid,
         fleetDedupTokenTotal(incumbent),
         incumbent.organizationUuid,
+        incumbent.accountUuid,
       )
     ) {
       return undefined;
     }
-    excludedHolders.set(key, { total, organizationUuid });
+    excludedHolders.set(key, { total, organizationUuid, accountUuid, accountKey });
     if (contributions.delete(key)) contributionChanged(null);
     if (incumbent === undefined) return null;
     events.delete(key);
@@ -809,6 +1132,7 @@ export function createEventStore(opts: {
     key: string,
     candidate: FleetDedupTokens,
     organizationUuid: string | undefined,
+    accountUuid: string | undefined,
   ): boolean {
     const holder = excludedHolders.get(key);
     return (
@@ -816,8 +1140,10 @@ export function createEventStore(opts: {
       fleetFullnessPartsExceed(
         fleetDedupTokenTotal(candidate),
         organizationUuid,
+        accountUuid,
         holder.total,
         holder.organizationUuid,
+        holder.accountUuid,
       )
     );
   }
@@ -881,8 +1207,9 @@ export function createEventStore(opts: {
   // function, and the local contributions map applies the same rule. When a
   // record's dedup key is already present the store keeps whichever event is
   // fuller (`supersedes`): the larger token total — the golden oracle's dedup
-  // rule — or, at an equal total, the copy carrying Organization evidence over
-  // one carrying none (ADR-0103). A new record replaces the stored one only
+  // rule — or, at an equal total, the copy carrying more tags, then the better
+  // Organization tag, then the better Account tag (ADR-0103, ADR-0137 §6; the
+  // Account tag is the resolved `accountUuid`, never a Pending hash). A new record replaces the stored one only
   // when strictly fuller, so equal-total duplicates (the byte-identical
   // content-block lines) keep first-seen, a streamed message's final row
   // replaces the `output_tokens: 1` partial regardless of which the scan reads
@@ -947,15 +1274,27 @@ export function createEventStore(opts: {
     // unlink flush, and none of them recovered a row of the transcript.
     if (batch.length > 0) walkedPairs.add(key);
     // Pass 1 — learn the session's owner points from every tagged record of a
-    // parent transcript. A subagent's tag teaches no point (ADR-0109 §5) and
-    // still marks its Organization seen on this machine.
+    // parent transcript, each with the record's resolved Account evidence. A
+    // subagent's tag teaches no point (ADR-0109 §5) and still marks its
+    // Organization seen on this machine.
     // ADR-0098's ONE sanctioned Date.parse on ingest: this is the RAW record's
     // timestamp, classified before `upsert` derives `ms` (ADR-0089 governs
     // stored events, which these are not yet).
     for (const record of batch) {
+      if (!isSubagent) {
+        if (record.accountUuid !== undefined) evidenceUuids.add(record.accountUuid);
+        if (record.accountEmailHash !== undefined) evidenceHashes.add(record.accountEmailHash);
+      }
       if (record.organizationUuid !== undefined) {
         organizationsSeen.machine.add(record.organizationUuid);
-        if (!isSubagent) addOwnerPoint(key, Date.parse(record.timestamp), record.organizationUuid);
+        if (!isSubagent) {
+          addOwnerPoint(
+            key,
+            Date.parse(record.timestamp),
+            record.organizationUuid,
+            resolveAccount(record),
+          );
+        }
       }
     }
     // Pass 2 — resolve, exclude, upsert.
@@ -963,11 +1302,48 @@ export function createEventStore(opts: {
       // A subagent transcript carries no Attribution evidence of its own (ADR-0109
       // §5): its Login record is a copy of the parent's raw login-cache value at
       // spawn, which no `/login` gates, so the parser's tag is ignored and the row
-      // takes the parent session's owner point at its timestamp.
-      const organizationUuid = isSubagent
-        ? resolveOwner(key, Date.parse(record.timestamp))
-        : record.organizationUuid;
-      if (outsideTrackedSet(organizationUuid)) {
+      // takes the parent session's owner point at its timestamp. Its Email
+      // record is no evidence either (ADR-0137 §2): the point's Account comes
+      // with the point's Organization.
+      const owner = isSubagent ? resolveOwner(key, Date.parse(record.timestamp)) : undefined;
+      let organizationUuid = isSubagent ? owner?.organizationUuid : record.organizationUuid;
+      let account: AccountEvidence = isSubagent
+        ? (owner ?? NO_ACCOUNT_EVIDENCE)
+        : resolveAccount(record);
+      // ADR-0141 §1 (D1): a line the transcript leaves with no evidence at all
+      // takes its matched Gateway record's, looked up live so a match made
+      // after this store was built applies on the line's next append. Never
+      // written onto the record, so Pass 1 never turns it into an owner point
+      // (a subagent inherits no Gateway tag, ADR-0109 §5). Its email hash and
+      // uuid join the evidence a pair change is judged against, as an Email
+      // record's do, so a pair learned later re-resolves it by a rebuild.
+      let viaGateway = false;
+      if (gatewayEvidence !== undefined && !hasOwnEvidence({ organizationUuid, ...account })) {
+        const found = gatewayEvidence.lookup(
+          sessionId,
+          dedupKey(record.messageId, record.requestId),
+        );
+        if (found !== undefined) {
+          viaGateway = true;
+          organizationUuid = found.organizationUuid;
+          if (found.organizationUuid !== undefined) {
+            organizationsSeen.machine.add(found.organizationUuid);
+          }
+          if (found.accountUuid !== undefined) evidenceUuids.add(found.accountUuid);
+          if (found.accountEmailHash !== undefined) evidenceHashes.add(found.accountEmailHash);
+          account = resolveAccount(found);
+        }
+      }
+      const accountKey = accountKeyOf(account);
+      if (accountKey !== undefined) {
+        let organizations = accountMemberships.get(accountKey);
+        if (organizations === undefined) {
+          organizations = new Set();
+          accountMemberships.set(accountKey, organizations);
+        }
+        if (organizationUuid !== undefined) organizations.add(organizationUuid);
+      }
+      if (outsideTrackedSet(organizationUuid, accountKey)) {
         // The pair holds an excluded record whether or not its copy wins the
         // key: an earlier build that tracked this Organization may have
         // archived or pushed its rows.
@@ -977,7 +1353,9 @@ export function createEventStore(opts: {
         const incumbent = offerExcluded(
           dedupKey(record.messageId, record.requestId),
           fleetDedupTokenTotal(record),
-          organizationUuid as string,
+          organizationUuid,
+          account.accountUuid,
+          accountKey,
           changes,
         );
         if (incumbent !== undefined) newForeignEvidence = true;
@@ -1012,7 +1390,7 @@ export function createEventStore(opts: {
       // (ADR-0107 §12).
       if (excludedHolders.size > 0) {
         const recordKey = dedupKey(record.messageId, record.requestId);
-        if (!beatsExcludedHolder(recordKey, record, organizationUuid)) {
+        if (!beatsExcludedHolder(recordKey, record, organizationUuid, account.accountUuid)) {
           foreignSessions.set(key, { projectSlug, sessionId });
           continue;
         }
@@ -1020,7 +1398,16 @@ export function createEventStore(opts: {
       }
       if (
         upsert(
-          { ...record, organizationUuid, projectSlug, sessionId, machineId: selfMachineId },
+          {
+            ...record,
+            organizationUuid,
+            accountUuid: account.accountUuid,
+            accountEmailHash: account.accountEmailHash,
+            projectSlug,
+            sessionId,
+            machineId: selfMachineId,
+            ...(viaGateway ? { viaGateway: true as const } : {}),
+          },
           changes,
           true,
         )
@@ -1103,11 +1490,15 @@ export function createEventStore(opts: {
       // feeder cannot win the key only because the Organization is excluded.
       // No walk read its pair, so its own pair is never listed. Replica rows
       // are never filtered by their tag — exclusion is producer-side.
-      if (source === "archive" && outsideTrackedSet(row.organizationUuid)) {
+      // Since #634 a line carries its Account tag too, so a line of an
+      // Excluded account is refused the same way (healing #631's residual).
+      if (source === "archive" && outsideTrackedSet(row.organizationUuid, row.accountUuid)) {
         const incumbent = offerExcluded(
           rowKey,
           fleetDedupTokenTotal(row),
-          row.organizationUuid as string,
+          row.organizationUuid,
+          row.accountUuid,
+          row.accountUuid,
           changes,
         );
         if (incumbent !== undefined && incumbent !== null) {
@@ -1129,7 +1520,10 @@ export function createEventStore(opts: {
       }
       // ADR-0098, #374: a copy of a key an excluded copy holds (archive,
       // replica, hub; tagged or not) enters only when it supersedes the holder.
-      if (excludedHolders.size > 0 && !beatsExcludedHolder(rowKey, row, row.organizationUuid))
+      if (
+        excludedHolders.size > 0 &&
+        !beatsExcludedHolder(rowKey, row, row.organizationUuid, row.accountUuid)
+      )
         continue;
       // #311: a dormant row is refused from every feeder; only the archive's
       // pair is recorded, because only the archive (of the fleet feeders) is
@@ -1156,6 +1550,10 @@ export function createEventStore(opts: {
         costUSD: row.costUSD,
         cwd: row.cwd,
         organizationUuid: row.organizationUuid,
+        // The producer's resolved Account tag (protocol v7, #634, ADR-0137
+        // §6); the wire never carries the email hash.
+        accountUuid: row.accountUuid,
+        accountEmailHash: undefined,
         projectSlug: row.projectSlug,
         sessionId: row.sessionId,
         machineId: row.machineId,
@@ -1189,7 +1587,12 @@ export function createEventStore(opts: {
     try {
       // Gather the full file list across every root first, so parsing can fan
       // out over the whole corpus regardless of how files split across roots.
-      const files: Array<{ path: string; projectSlug: string; sessionId: string }> = [];
+      const files: Array<{
+        path: string;
+        projectSlug: string;
+        sessionId: string;
+        isSubagent: boolean;
+      }> = [];
       for (const root of roots) {
         // Each root is a `<config>/projects` dir. Sessions live at
         // `<root>/<slug>/<session>.jsonl`, but Claude Code also nests subagent
@@ -1221,7 +1624,12 @@ export function createEventStore(opts: {
           // does — via the shared `identityFromPath` — so a scan-tagged event
           // and a watcher-tagged event for the same file are never split.
           const { projectSlug, sessionId } = identityFromPath(path, roots);
-          files.push({ path, projectSlug, sessionId });
+          files.push({
+            path,
+            projectSlug,
+            sessionId,
+            isSubagent: parentSessionPath(path, roots) !== null,
+          });
         }
       }
 
@@ -1258,10 +1666,11 @@ export function createEventStore(opts: {
           // cache's readRecords keeps that contract — it stats then either
           // returns cached records or delegates to collectUsageRecords.
           try {
+            const onPair = file.isSubagent ? undefined : opts.onAccountPair;
             parsed[i] =
               scanCache !== undefined
-                ? await scanCache.readRecords(file.path)
-                : await collectUsageRecords(file.path);
+                ? await scanCache.readRecords(file.path, onPair)
+                : await collectUsageRecords(file.path, onPair);
           } catch (err) {
             console.warn(`[store] scan skipped ${file.path}: ${String(err)}`);
             parsed[i] = [];
@@ -1280,7 +1689,7 @@ export function createEventStore(opts: {
           parsed[i] ?? [],
           file.projectSlug,
           file.sessionId,
-          parentSessionPath(file.path, roots) !== null,
+          file.isSubagent,
         );
       }
     } finally {
@@ -1316,9 +1725,27 @@ export function createEventStore(opts: {
       const organization = presumedOrganization(presumption, machineId);
       if (organization === undefined || !selected.has(organization)) return false;
     }
-    for (const organization of presumption.assertedBySession.values()) {
-      if (!selected.has(organization)) return false;
+    for (const claim of presumption.assertedBySession.values()) {
+      if (!selected.has(claim.organizationUuid)) return false;
     }
+    return true;
+  }
+
+  // Does `selection` cover every Account the stored events resolve under RIGHT
+  // NOW (#632)? The Account axis's twin of the check above, and as
+  // conservative: `false` whenever a row could resolve to an Account outside
+  // the selection, or to none. A row with Account evidence answers its own
+  // key. One without answers a claim's Account or none (`eventAccount`, #635),
+  // and none is what no selection names, so any such row loses the no-op: an
+  // install whose every row carries Account evidence keeps it. A selection
+  // holding Unknown (`unknownAccount`) needs no rule of its own: `true` here
+  // means no row answers none, so dropping the axis drops the flag with
+  // nothing to admit (#635, ADR-0136 §6's 2026-11-09 note).
+  function coversEveryAccountPresent(selection: readonly string[] | undefined): boolean {
+    if (selection === undefined || selection.length === 0) return false;
+    if (accountlessPresent) return false;
+    const selected = new Set(selection);
+    for (const account of taggedAccounts) if (!selected.has(account)) return false;
     return true;
   }
 
@@ -1347,12 +1774,16 @@ export function createEventStore(opts: {
     // and this call site re-reads the present set every query: the two agree at
     // every instant, and the only copy that could go stale is recomputed
     // immediately before each use.
-    const axes: StoreAxisQuery = coversEveryOrganizationPresent(q.organizations, presumption)
+    // The Account axis takes the same per-call no-op (#632), for the same
+    // reason: a selection of every Account present covers every row on a
+    // machine whose every row carries Account evidence.
+    let axes: StoreAxisQuery = coversEveryOrganizationPresent(q.organizations, presumption)
       ? { ...q, organizations: undefined }
       : q;
+    if (coversEveryAccountPresent(axes.accounts)) axes = { ...axes, accounts: undefined };
     // The non-date axes as ONE compiled predicate; `null` = every one of them
     // is unfiltered (see `compileAxisMatcher`).
-    const matches = compileAxisMatcher(axes, presumption);
+    const matches = compileAxisMatcher(axes, presumption, trackedAccounts);
 
     // Unfiltered fast path — every axis is "no filter", so the result IS the
     // shared sorted snapshot (f27). Return it DIRECTLY rather than copying it
@@ -1424,6 +1855,17 @@ export function createEventStore(opts: {
       localAppendListeners.add(listener);
       return () => localAppendListeners.delete(listener);
     },
+    reapply: (records, projectSlug, sessionId, isSubagent) =>
+      appendInternal(records, projectSlug, sessionId, isSubagent),
+    hasTranscriptEvidence: (record, projectSlug, sessionId, isSubagent) => {
+      if (isSubagent) {
+        return (
+          resolveOwner(sessionKey(projectSlug, sessionId), Date.parse(record.timestamp)) !==
+          undefined
+        );
+      }
+      return hasOwnEvidence(record);
+    },
     removeMachineSessions: (machineId, sessions) => {
       const keys = new Set(sessions.map((s) => sessionKey(s.projectSlug, s.sessionId)));
       const changes: StoreChange[] = [];
@@ -1461,7 +1903,10 @@ export function createEventStore(opts: {
         const key = dedupKey(row.messageId, row.requestId);
         // #374: a contribution of a key an excluded copy holds is withheld
         // unless it supersedes the holder, as every feeder's copy is.
-        if (excludedHolders.size > 0 && !beatsExcludedHolder(key, row, row.organizationUuid))
+        if (
+          excludedHolders.size > 0 &&
+          !beatsExcludedHolder(key, row, row.organizationUuid, row.accountUuid)
+        )
           continue;
         // #311: a dormant row is withheld from push, whatever store offers it.
         if (dormantRow(row.sessionId, row.organizationUuid, row.machineId === selfMachineId))
@@ -1515,6 +1960,19 @@ export function createEventStore(opts: {
       }
       return counts;
     },
+    accountSessionCounts: (organizationUuid) => {
+      const counts = new Map<string, number>();
+      for (const points of ownerPoints.values()) {
+        const last = points[points.length - 1];
+        if (last === undefined || last.organizationUuid !== organizationUuid) continue;
+        const key = accountKeyOf(last);
+        if (key !== undefined) counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+      return counts;
+    },
+    accountMemberships: () => accountMemberships,
+    accountEvidenceSeen: () => ({ uuids: evidenceUuids, hashes: evidenceHashes }),
+    accountPairs: () => accountPairs,
     onForeignEvidence: (listener) => {
       foreignListeners.add(listener);
       return () => {
@@ -1528,8 +1986,9 @@ export function createEventStore(opts: {
     isWithheld: (row) =>
       row.machineId === selfMachineId &&
       (dormantRow(row.sessionId, row.organizationUuid, true) ||
-        outsideTrackedSet(row.organizationUuid)),
+        outsideTrackedSet(row.organizationUuid, accountKeyOf(row))),
     trackedOrganizations: () => trackedOrganizations,
+    trackedAccounts: () => trackedAccounts,
     presumption: getPresumption,
   };
 }

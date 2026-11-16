@@ -292,6 +292,7 @@ body {
   --sb-fields-op-delay: 0.08s;
   --sb-fields-vis: visible;
   --sb-fields-vis-delay: 0s;
+  --sb-fields-overflow: auto;
   --sb-footsep-op: 1;
   --sb-foot-pl: 4px;
   --sb-foot-gap: 6px;
@@ -339,6 +340,7 @@ body {
     --sb-fields-op-delay: 0s;
     --sb-fields-vis: hidden;
     --sb-fields-vis-delay: 0.14s;
+    --sb-fields-overflow: hidden;
     --sb-footsep-op: 0;
     --sb-foot-pl: 16.5px;
     --sb-foot-gap: 0px;
@@ -393,6 +395,7 @@ body {
     --sb-fields-op-delay: 0s;
     --sb-fields-vis: hidden;
     --sb-fields-vis-delay: 0.14s;
+    --sb-fields-overflow: hidden;
     --sb-footsep-op: 0;
     --sb-foot-pl: 16.5px;
     --sb-foot-gap: 0px;
@@ -612,13 +615,23 @@ body {
 }
 
 /* The fields. 560px is the animation's endpoint and therefore also a
-   ceiling: the rail measures ~300px with all three selects present. */
+   ceiling: the rail measures ~410px with the Account field and all three
+   selects present.
+
+   THE FIELDS ARE THE ONE PART OF THE PANEL THAT GIVES. Expanded they shrink
+   and scroll inside the panel, so the foot (status lines + Collapse) stays at
+   the window's foot at every height; with the Account field (#637) the rail
+   outgrew an 800px window and the panel's own scroll pushed Collapse out of
+   sight. Collapsed they stay `hidden`, which is what clips the max-height
+   morph. `min-height: 0` is what lets a flex child shrink below its content. */
 .sb-fields {
   max-height: var(--sb-fields-max);
   opacity: var(--sb-fields-op);
   visibility: var(--sb-fields-vis);
-  overflow: hidden;
-  flex-shrink: 0;
+  overflow-x: hidden;
+  overflow-y: var(--sb-fields-overflow);
+  flex-shrink: 1;
+  min-height: 0;
   transition:
     max-height 0.26s var(--ease-glass),
     opacity 0.12s ease var(--sb-fields-op-delay),
@@ -764,6 +777,321 @@ a.sb-footrow:hover .sb-label {
 .select.placeholder {
   color: var(--soft);
 }
+/* The rail's Account menu (#637, account-filter.tsx): the .menu/.opt leaf,
+   wider, with a search field past six Accounts, a ranked body that scrolls,
+   and a footer. Rows carry an avatar, a two-line name, use and money, a hover
+   "only" and a chevron to their Memberships. */
+.am-menu {
+  display: flex;
+  flex-direction: column;
+  max-height: min(78vh, 640px);
+}
+.am-scroll {
+  overflow: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.am-search {
+  position: relative;
+  padding: 4px 4px 6px;
+}
+.am-search svg {
+  position: absolute;
+  left: 15px;
+  top: 50%;
+  transform: translateY(-58%);
+  width: 12px;
+  height: 12px;
+  color: var(--soft);
+}
+.am-search .input {
+  padding-left: 30px;
+}
+.am-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 8px 3px;
+}
+.am-headbtn {
+  margin-left: auto;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 11.5px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.am-order {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 2px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.am-order button {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  color: var(--soft);
+}
+.am-order button.active {
+  background: color-mix(in oklch, var(--accent) 20%, transparent);
+  color: var(--text);
+  font-weight: 600;
+}
+.opt.am-row {
+  gap: 4px;
+  padding: 0 4px 0 0;
+}
+.opt.am-row.am-nested {
+  padding-left: 22px;
+  font-size: 12px;
+}
+/* Some of an Account's Memberships checked: the box half-filled. */
+.opt.am-row.half .box {
+  background: color-mix(in oklch, var(--accent) 40%, transparent);
+  border-color: var(--accent);
+}
+.am-hit {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 0 5px 9px;
+  text-align: left;
+}
+.am-hit em {
+  font-style: normal;
+  color: var(--soft);
+  font-size: 11px;
+  flex: none;
+}
+.am-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.25;
+}
+.am-name > * {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.am-name b {
+  font-weight: 600;
+}
+.am-sub {
+  font-size: 11px;
+  color: var(--soft);
+}
+.am-av {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text);
+  background: color-mix(in oklch, var(--accent) 28%, transparent);
+}
+.am-av.pending {
+  background: transparent;
+  border: 1.5px dashed var(--soft);
+  color: var(--soft);
+}
+.am-av.unknown {
+  background: color-mix(in oklch, var(--text) 8%, transparent);
+  color: var(--soft);
+}
+.am-av.unknown svg {
+  width: 12px;
+  height: 12px;
+}
+.am-metrics {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  font-size: 11.5px;
+}
+.am-metrics b {
+  min-width: 52px;
+  text-align: right;
+  font-weight: 600;
+}
+.am-use {
+  min-width: 78px;
+  text-align: right;
+  color: var(--soft);
+}
+.am-use.warn {
+  color: var(--warn);
+  font-weight: 700;
+}
+.am-use.bad {
+  color: var(--bad);
+  font-weight: 700;
+}
+/* "only": shown on the row's hover, and whenever it has keyboard focus. */
+.am-only {
+  visibility: hidden;
+  font-size: 10.5px;
+  color: var(--accent);
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.am-row:hover .am-only,
+.am-row:focus-within .am-only {
+  visibility: visible;
+}
+.am-chev {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 40px;
+  gap: 2px;
+  color: var(--soft);
+  font-size: 10.5px;
+  padding: 3px 4px;
+  border-radius: 6px;
+}
+.am-chev svg {
+  width: 13px;
+  height: 13px;
+}
+.am-chev:hover,
+.am-only:hover {
+  background: color-mix(in oklch, var(--text) 8%, transparent);
+}
+.opt.am-more {
+  justify-content: center;
+  color: var(--soft);
+  font-size: 11.5px;
+}
+.am-empty {
+  padding: 14px 12px;
+  color: var(--soft);
+  font-size: 12px;
+}
+.am-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 4px;
+  margin-top: 4px;
+  border-top: 1px solid var(--hairline);
+  font-size: 11px;
+  color: var(--soft);
+}
+.am-foot button {
+  color: var(--accent);
+  font-weight: 600;
+  flex: none;
+}
+/* The ⌘K finder (#640, finder.tsx): the .menu leaf as a palette, centred
+   high over the dialog scrim, a search pill over grouped .opt rows. The
+   active row (arrows, hover) takes the hover tint; Enter takes it. */
+.finder {
+  position: fixed;
+  z-index: 50;
+  top: 14vh;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(640px, calc(100vw - 32px));
+  max-height: min(70vh, 560px);
+  display: flex;
+  flex-direction: column;
+  outline: none;
+}
+.finder-search {
+  position: relative;
+  padding: 4px 4px 6px;
+}
+.finder-search svg {
+  position: absolute;
+  left: 16px;
+  top: calc(50% - 1px);
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  color: var(--soft);
+  pointer-events: none;
+}
+.finder-search .search {
+  padding: 8px 14px 8px 36px;
+  font-size: 13px;
+}
+.finder-scroll {
+  overflow: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.finder-empty {
+  padding: 12px;
+  color: var(--soft);
+  font-size: 12px;
+}
+.finder-empty b {
+  color: var(--text);
+  font-weight: 600;
+}
+.opt.finder-row {
+  gap: 10px;
+  min-width: 0;
+}
+.opt.finder-row.active {
+  background: color-mix(in oklch, var(--accent) 14%, transparent);
+}
+.finder-id {
+  flex: none;
+  font-weight: 700;
+}
+.finder-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+b.finder-name {
+  font-weight: 600;
+}
+.finder-path {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--soft);
+  font-size: 11.5px;
+}
+.finder-models {
+  flex: none;
+  font-size: 11.5px;
+}
+.finder-end {
+  margin-left: auto;
+  flex: none;
+  font-weight: 600;
+}
+em.finder-end {
+  font-weight: 400;
+}
+.opt .finder-when {
+  flex: none;
+  min-width: 64px;
+  text-align: right;
+}
+/* The topbar's Find chip: its chord as a quiet key cap. */
+.finder-chip kbd {
+  padding: 0 5px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  color: var(--soft);
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+}
 /* Any chip trigger's caret rotates while its menu is open (Radix stamps
    data-state on the trigger). */
 .chip .caret {
@@ -844,52 +1172,6 @@ a.sb-footrow:hover .sb-label {
   gap: 8px;
   flex-wrap: wrap;
 }
-/* The Organization scope chip: a .chip leaf left of the refresh pill,
-   present only while two or more Organizations are tracked. Under All the
-   quota half names the Quota organization, and it is the half that yields:
-   "All organizations" keeps its width and the quota label truncates, so no
-   Home label can crowd the scope out. Below the narrow threshold the quota
-   half drops and the pill caps at 180px, so a long label cannot wrap the
-   right cluster onto a second topbar row. The pill clips anything left over;
-   its own focus outline sits outside the box and is not clipped. The icon and
-   caret never shrink: a flex item SVG otherwise takes its share of the
-   squeeze and dwindles. */
-.scope-chip {
-  max-width: 300px;
-  overflow: hidden;
-  font-weight: 600;
-}
-.scope-chip svg {
-  flex-shrink: 0;
-}
-.scope-chip .scope-chip-icon {
-  width: 14px;
-  height: 14px;
-  opacity: 0.7;
-}
-.scope-chip-all {
-  flex-shrink: 0;
-}
-.scope-chip-quota {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  padding-left: 7px;
-  border-left: 1px solid var(--panel-border);
-  color: var(--soft);
-  font-size: 11px;
-  font-weight: 500;
-  white-space: nowrap;
-}
-@container content (max-width: 799.98px) {
-  .scope-chip {
-    max-width: 180px;
-  }
-  .scope-chip-quota {
-    display: none;
-  }
-}
-
 /* --- floating stat tiles ---
 
    TWO arrangements (map #151 / T2 #153, ADR-0073):
@@ -981,6 +1263,391 @@ a.sb-footrow:hover .sb-label {
     grid-template-columns: minmax(236px, 1fr) minmax(270px, 1fr) minmax(285px, 1fr);
     grid-template-areas: "today block week";
   }
+}
+/* Two or more Memberships in the Scope (#613 §4–§5, #637): the limit area
+   takes the Active block's place and always spans the row under Today and
+   This week, whatever the width, since its cards need the whole row. Placed
+   after the 3-up rules and at their specificity or above, so it wins them. */
+.tiles.tiles-many,
+.tiles.tiles-many:has(> [data-block-state="idle"]) {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-areas:
+    "today week"
+    "block block";
+}
+
+/* --- split money tiles (#637 D6) -------------------------------------------
+   One bar under the tile's sub-line: widths by each segment's exact money, a
+   legend of apportioned amounts that sum to the tile. The palette is
+   restrained and token-built [proposed, #613 left it open]: an Account split
+   walks the Aurora pair (--accent-a → --accent-b), an Organization split one
+   accent hue in falling strength, so the two splits never read as the same
+   kind; Account not known and the folded rest are neutral. */
+.money-split {
+  margin-top: 9px;
+  min-width: 0;
+}
+.money-split-bar {
+  display: flex;
+  gap: 2px;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--ring-track);
+}
+.money-split-bar i {
+  flex-basis: 0;
+  min-width: 3px;
+  height: 100%;
+}
+.money-split-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11px;
+  color: var(--soft);
+}
+.money-split-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+}
+.money-split-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 18ch;
+}
+.money-split-legend b {
+  color: var(--text);
+  font-weight: 700;
+}
+.money-split-legend u {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+.money-split[data-split="account"] [data-tone="0"] {
+  background: var(--accent-a);
+}
+.money-split[data-split="account"] [data-tone="1"] {
+  background: var(--accent-b);
+}
+.money-split[data-split="account"] [data-tone="2"] {
+  background: color-mix(in oklch, var(--accent-a) 50%, var(--accent-b));
+}
+.money-split[data-split="account"] [data-tone="3"] {
+  background: color-mix(in oklch, var(--accent-a) 45%, transparent);
+}
+.money-split[data-split="organization"] [data-tone="0"] {
+  background: var(--accent);
+}
+.money-split[data-split="organization"] [data-tone="1"] {
+  background: color-mix(in oklch, var(--accent) 66%, transparent);
+}
+.money-split[data-split="organization"] [data-tone="2"] {
+  background: color-mix(in oklch, var(--accent) 42%, transparent);
+}
+.money-split[data-split="organization"] [data-tone="3"] {
+  background: color-mix(in oklch, var(--accent) 24%, transparent);
+}
+.money-split [data-tone="more"] {
+  background: color-mix(in oklch, var(--soft) 35%, transparent);
+}
+.money-split [data-tone="unknown"] {
+  background: repeating-linear-gradient(
+    135deg,
+    color-mix(in oklch, var(--soft) 55%, transparent) 0 2px,
+    color-mix(in oklch, var(--soft) 25%, transparent) 2px 4px
+  );
+}
+
+/* --- Live's limit area (#610, #637 D7) ------------------------------------
+   A card per Membership, most used first; four at most until Show all. Each
+   card is a tile panel: name, ring (the most used percent), a meter per live
+   window and one closing line. An idle window draws "—" on an empty bar; an
+   expired key's last-known reading is greyed. */
+.limit-area {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.limit-cards {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+}
+.limit-card {
+  gap: 2px;
+  min-width: 0;
+}
+.limit-card.hot-bad {
+  box-shadow:
+    var(--panel-shadow),
+    inset 0 0 0 1.5px color-mix(in oklch, var(--bad) 45%, transparent);
+}
+.limit-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 2px;
+}
+.limit-card-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.limit-card-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-size: 13.5px;
+}
+.limit-card-title b {
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.limit-card-account {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.limit-home {
+  color: var(--accent);
+  font-size: 11.5px;
+  font-weight: 700;
+}
+.limit-note {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.limit-note.mute {
+  color: var(--soft);
+  background: var(--ring-track);
+}
+.limit-note.warn {
+  color: var(--warn);
+  background: color-mix(in oklch, var(--warn) 16%, transparent);
+}
+.limit-card-row {
+  margin-top: 6px;
+}
+.limit-card-row label {
+  flex: 0 0 82px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* In a card the bar takes the room the grid gives it: the card is a grid
+   item, never shrink-to-fit, so WebKit's zero-width measure (see
+   `.limit-meter`) cannot bite. */
+.limit-card .limit-meter {
+  flex: 1 1 60px;
+  width: auto;
+  min-width: 60px;
+}
+.limit-card-row b {
+  flex: 0 0 34px;
+  text-align: right;
+}
+.limit-card-row.idle b,
+.limit-board-window.idle b {
+  color: var(--soft);
+}
+.limit-meter i[data-tone="warn"] {
+  background: var(--warn);
+  box-shadow: none;
+}
+.limit-meter i[data-tone="bad"] {
+  background: var(--bad);
+  box-shadow: none;
+}
+.limit-meter i[data-tone="stale"] {
+  background: color-mix(in oklch, var(--soft) 45%, transparent);
+  box-shadow: none;
+}
+.limit-card[data-state="stale"] .limit-card-row {
+  opacity: 0.7;
+}
+.limit-card-foot {
+  margin-top: auto;
+  padding-top: 9px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--soft);
+}
+.limit-card-foot.warn {
+  color: var(--warn);
+}
+.limit-reconnect {
+  color: var(--accent);
+  font-weight: 600;
+}
+.limit-reconnect:hover {
+  text-decoration: underline;
+}
+.limit-ring {
+  flex-shrink: 0;
+}
+.limit-ring-track {
+  fill: none;
+  stroke: var(--ring-track);
+  stroke-width: 5;
+}
+.limit-ring-fill {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 5;
+  stroke-linecap: round;
+  transition: stroke-dasharray 0.45s var(--ease-glass);
+}
+.limit-ring[data-tone="warn"] .limit-ring-fill {
+  stroke: var(--warn);
+}
+.limit-ring[data-tone="bad"] .limit-ring-fill {
+  stroke: var(--bad);
+}
+.limit-ring[data-tone="stale"] .limit-ring-fill {
+  stroke: color-mix(in oklch, var(--soft) 55%, transparent);
+}
+.limit-ring-label {
+  font-size: 10.5px;
+  font-weight: 800;
+  fill: var(--text);
+}
+.limit-ring[data-tone="stale"] .limit-ring-label {
+  fill: var(--soft);
+}
+.limit-note.good {
+  color: var(--good);
+  background: color-mix(in oklch, var(--good) 15%, transparent);
+}
+.limit-note.bad {
+  color: var(--bad);
+  background: color-mix(in oklch, var(--bad) 14%, transparent);
+}
+
+/* Five or more: one board, a row per Membership (#610's resolution). The
+   table's layout is fixed, so a column's width never waits on its bars'
+   measure (see `.limit-meter`'s WebKit note). */
+.limit-board {
+  gap: 8px;
+}
+.limit-board-head,
+.limit-board-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+  min-width: 0;
+}
+.limit-board-sub {
+  margin-left: auto;
+  color: var(--soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.limit-board-foot .limit-note {
+  margin-top: 0;
+  font-size: 11px;
+}
+.limit-board-foot .view-all {
+  margin-left: auto;
+}
+.limit-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.limit-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: middle;
+}
+.limit-name-cell {
+  width: 30%;
+}
+.limit-window-cell {
+  width: 23%;
+}
+.limit-board-name {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+}
+.limit-board-name b {
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+  max-width: 60%;
+}
+.limit-board-account {
+  color: var(--soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.limit-board-row.hot td:first-child {
+  box-shadow: inset 3px 0 0 var(--bad);
+}
+.limit-board-window {
+  margin-top: 0;
+}
+.limit-board-window label {
+  flex: 0 0 30px;
+}
+.limit-board-window .limit-meter {
+  flex: 1 1 40px;
+  width: auto;
+  min-width: 40px;
+}
+.limit-board-window b {
+  flex: 0 0 32px;
+  text-align: right;
+}
+.limit-board-row[data-state="stale"] .limit-board-window {
+  opacity: 0.7;
+}
+.limit-na {
+  font-size: 11px;
+  color: var(--soft);
+}
+.limit-reset-cell {
+  font-size: 11px;
+  color: var(--soft);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.limit-row-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+.limit-table .limit-note {
+  margin-top: 0;
 }
 
 .tile {
@@ -1314,6 +1981,108 @@ a.sb-footrow:hover .sb-label {
   contain: inline-size;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* A Membership's name in its two parts (`MembershipNameView`, #638): the
+   Organization part ellipsizes first, so the Account half, which tells two
+   Memberships of one Organization apart (#619), stays whole. That half
+   ellipsizes too, from its start, only when it alone outgrows the room,
+   always leaving the Organization a stub. Every surface that lists Memberships draws it: the
+   Popout's rows and head, the Blocks tabs, the Block span's picker. */
+.mname {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.mname-org {
+  /* Shrinks a thousandfold faster than a yielding collision suffix, so it is
+     all but gone before that suffix gives up anything. */
+  flex: 0 1000 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* An Organization label's collision suffix (` · 1a2b3c4d`), the part that
+   tells two Organizations on one plan word apart (#647): never cut while the
+   label ellipsizes. With an Account half after it, which is whole up to its
+   own cap, it yields once the label is gone, clipped rather than ellipsized
+   (a fraction of a px given up must not draw "…"), so the Account half is
+   never pushed out of `.mname`. */
+.mname-suffix {
+  flex-shrink: 0;
+  white-space: pre;
+}
+.mname-suffix.mname-suffix-yields {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.mname-sep {
+  flex-shrink: 0;
+  /* A flex item's leading space: kept, not collapsed. */
+  white-space: pre;
+}
+/* The Account half: whole while it fits beside an Organization stub; past
+   that it ellipsizes from its start (right-to-left overflow over an isolated
+   left-to-right label), keeping the end that differs. */
+.mname-acct {
+  flex: 0 0 auto;
+  max-width: calc(100% - 2.2em);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+/* The Block span's Membership picker (#619 variant 1, #638): the note's slot,
+   holding a trigger that shrinks to it. The Membership's name ellipsizes,
+   never "'s block" or the caret, so the head never wraps for it. */
+.chart-span-picker {
+  margin-left: 4px;
+  overflow: visible;
+}
+.chart-span-pick {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 3px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--soft);
+  cursor: pointer;
+}
+.chart-span-pick:hover,
+.chart-span-pick[data-state="open"] {
+  color: var(--text);
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+}
+.chart-span-pick-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+  color: var(--text);
+}
+.chart-span-pick-rest {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.chart-span-pick svg {
+  width: 12px;
+  height: 12px;
+  margin-left: 3px;
+  flex-shrink: 0;
+}
+.chart-span-opt em {
+  margin-left: auto;
+  padding-left: 12px;
+}
+.chart-span-opt em.tone-warn {
+  color: var(--warn);
+}
+.chart-span-opt em.tone-bad {
+  color: var(--bad);
 }
 .legend-row {
   display: flex;
@@ -1874,40 +2643,24 @@ a.sb-footrow:hover .sb-label {
   background: color-mix(in oklch, var(--accent) 18%, transparent);
   border-color: color-mix(in oklch, var(--accent) 55%, var(--panel-border));
 }
-/* The Sessions page's selection bar (#312, owner-less-review.tsx), in the
-   strip's place while owner-less sessions are selected: its actions sit at the
-   strip's end, `Assign to…` carrying the caret of the chooser it opens, and the
-   partly owned note reads in the warn tint — only part of those sessions
-   moves. */
-.strip-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
-}
-/* Glass gives a disabled chip no look of its own; here `Clear assignment` is
-   disabled whenever nothing selected is assigned, which must read at a glance,
-   and both it and `Assign to…` while a write is in flight. */
-.strip-actions .chip:disabled,
-.strip-action.assign-trigger:disabled {
-  opacity: 0.45;
-}
-.strip-action.assign-trigger {
+/* `Assign to…` (#312; Settings › Unattributed usage's bar since #639): a chip
+   carrying the caret of the Membership chooser it opens, dimmed while a write
+   is in flight (Glass gives a disabled chip no look of its own). */
+.chip.assign-trigger {
   gap: 6px;
 }
-.strip-action.assign-trigger svg {
-  width: 11px;
-  height: 11px;
+.chip.assign-trigger:disabled {
+  opacity: 0.45;
 }
 /* The caret turns while the chooser is open, as a chip trigger's does. */
-.strip-action.assign-trigger .caret {
+.chip.assign-trigger .caret {
   transition: transform 0.2s;
 }
-.strip-action.assign-trigger[data-state="open"] .caret {
+.chip.assign-trigger[data-state="open"] .caret {
   transform: rotate(180deg);
 }
-/* The chooser's head (organization-chooser.tsx): whose usage a pick moves,
-   above the scope chip's options. */
+/* The chooser's head (membership-chooser.tsx): whose usage a pick moves,
+   above its options. */
 .menu-head {
   padding: 5px 9px 6px;
   font-size: 10.5px;
@@ -1916,15 +2669,110 @@ a.sb-footrow:hover .sb-label {
   text-transform: uppercase;
   color: var(--soft);
 }
-/* Unlike a plain hint it may wrap onto two lines: kept on one, it pushed the
-   actions onto a second strip line at the default window width. The small
-   basis is what lets it share their line (a wrapping flex row breaks by basis,
-   before anything shrinks); the cap keeps it from spreading into their room. */
-.strip-note {
-  flex: 1 1 160px;
-  max-width: 300px;
-  line-height: 1.4;
-  color: var(--warn);
+/* The Projects strip's third row (#640, project-session-list.tsx): the
+   selected project's sessions, one flat hairline row each, the whole row a
+   link to the session page. Five rows add about 150px to the strip; All and
+   a long match list scroll inside a cap of about seven rows, so the table
+   below keeps its room at the default window. */
+.strip-sessions {
+  flex: 1 1 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.strip-sessions-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.strip-sessions-head .eyebrow {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.strip-sessions-head .needle {
+  margin-left: -6px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.strip-sessions-head .count {
+  font-size: 11px;
+  color: var(--soft);
+  white-space: nowrap;
+}
+.strip-sessions-head .view-all {
+  margin-left: auto;
+}
+.strip-sessions-empty {
+  font-size: 11.5px;
+  color: var(--soft);
+  padding: 6px 0 2px;
+}
+.strip-sessions-list.scrolls {
+  max-height: 198px;
+  overflow-y: auto;
+}
+.strip-sessions-list li + li {
+  border-top: 1px solid var(--hairline);
+}
+.strip-session {
+  display: grid;
+  grid-template-columns: minmax(96px, 200px) minmax(0, 1fr) 84px 96px auto;
+  align-items: center;
+  gap: 0 16px;
+  padding: 5.5px 6px;
+  border-radius: 6px;
+  font-size: 12px;
+  transition: background-color 0.15s;
+}
+.strip-session.with-machine {
+  grid-template-columns: minmax(96px, 200px) minmax(0, 180px) minmax(0, 1fr) 84px 96px auto;
+}
+.strip-session:hover,
+.strip-session:focus-visible {
+  background: color-mix(in oklch, var(--accent) 8%, transparent);
+}
+.strip-session .sid {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.strip-session .models {
+  min-width: 0;
+  overflow: hidden;
+}
+.strip-session .cost {
+  font-weight: 800;
+  text-align: right;
+}
+.strip-session .day {
+  font-size: 11px;
+  color: var(--soft);
+  text-align: right;
+  white-space: nowrap;
+}
+.strip-session .open {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+  opacity: 0.55;
+  transition: opacity 0.15s;
+}
+.strip-session:hover .open,
+.strip-session:focus-visible .open {
+  opacity: 1;
 }
 
 /* the model split bar — flat data fills on glass, never frosted */
@@ -2268,17 +3116,10 @@ a.sb-footrow:hover .sb-label {
 .row.pinned .trunc {
   font-weight: 600;
 }
-/* The Sessions table's Organization attribution (#312, past one tracked
-   Organization): the `presumed` / `assigned` pill after an owner-less
-   session's short id, soft for a presumption and accent for an assertion,
-   and the All-scope Organization cell of a partly owned session — its owned
-   label over its owner-less part, a `.lead` that needs no rule of its own
-   until the narrow run below (session-attribution.tsx). */
-.cell .lead b.attr-id-line {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-}
+/* A sessions list's Organization attribution (#312, past one tracked
+   Organization): the `presumed` / `assigned` pill beside an owner-less
+   session's id, soft for a presumption and accent for an assertion
+   (session-attribution.tsx). */
 .attr-tag {
   padding: 1px 7px;
   border-radius: 999px;
@@ -2297,8 +3138,36 @@ a.sb-footrow:hover .sb-label {
   font-weight: 500;
   opacity: 0.8;
 }
-/* The owner-less review list (#312, owner-less-review.tsx), in the Sessions
-   table's place: one row per project, its sessions disclosed beneath on the
+/* Settings › Unattributed usage (#639, unattributed-review.tsx): a hairlined
+   box spanning the control column, its bar (the selection's actions or a hint,
+   then the search) over the list, which scrolls inside a cap so a long list
+   never pushes the rest of Settings away. */
+.unattributed-review {
+  align-self: stretch;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.unattributed-bar {
+  min-height: 52px;
+  padding: 9px 12px 9px 18px;
+}
+.unattributed-list {
+  max-height: 420px;
+  overflow-y: auto;
+}
+.unattributed-list .review-group:last-child {
+  border-bottom: none;
+}
+/* The Gateway hint (ADR-0141 §4): a neutral inset, its button beside the line. */
+.unattributed-gateway {
+  align-self: stretch;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+}
+/* The list (#312's owner-less review, moved): one row per project, its
+   sessions disclosed beneath on the
    child tint and indented past the project's checkbox and chevron. Selected
    rows take the accent tint; a project reads selected only when every session
    it shows is. The rows are flex runs, not table grid rows — each carries its
@@ -2425,9 +3294,9 @@ a.sb-footrow:hover .sb-label {
               page's whole subject — past the right edge.
               The row takes a second line. Nothing is dropped and
               nothing scrolls; the price is height (Blocks 91px,
-              Sessions 118px, Projects 160px per row).
+              the retired Sessions page 118px, Projects 160px per row).
 
-     wide     there is MORE. At content 2256 the sessions table is
+     wide     there is MORE. At content 2256 the sessions table was
               578px of ink in 2245, and a row whose label and value
               are 1300px apart is not spacious, it is untrackable.
               The void inside the row fills with ink: a cost bar in
@@ -2499,14 +3368,6 @@ a.sb-footrow:hover .sb-label {
      the run wraps rather than clipping. */
   .row > .cell:not(:first-child) .trunc {
     display: inline;
-  }
-  /* The same fault in a partly owned session's Organization cell (#312): its
-     owned label over its owner-less part stood two lines tall inside one
-     labelled slot. On the run the two read side by side. */
-  .row > .cell:not(:first-child) .org-cell-split {
-    flex-direction: row;
-    align-items: baseline;
-    gap: 6px;
   }
   /* A cell holding only a control has no text baseline, so baseline alignment
      falls back to its bottom margin edge and drops it 3.17px below its
@@ -2699,6 +3560,100 @@ a.sb-footrow:hover .sb-label {
   gap: 5px;
   font-size: 11px;
   color: var(--soft);
+}
+
+/* --- Blocks: a tab per Membership (#619 A, #638) ---
+   The row is the `.seg` recipe; a tab is its button with the Membership's
+   name and a `.pill` badge. The "‹N› more" menu is `.menu`/`.opt`. */
+.blocks-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.blocks-tablist {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.blocks-tablist button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  /* A tab grows to its name, so a row with room never ellipsizes one. */
+  max-width: 360px;
+}
+.blocks-tab-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.blocks-tab-badge {
+  padding: 0 7px;
+  flex-shrink: 0;
+}
+.blocks-tab-badge.tone-warn {
+  color: var(--warn);
+}
+.blocks-tab-badge.tone-bad {
+  color: var(--bad);
+}
+.blocks-tab-badge[data-stale] {
+  opacity: 0.7;
+}
+.blocks-tabs-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 6.5px 12px;
+  font-size: 12px;
+  color: var(--soft);
+}
+.blocks-tabs-more svg {
+  width: 12px;
+  height: 12px;
+}
+.blocks-tabs-opt {
+  justify-content: space-between;
+}
+/* What the row's fit measures (#645, `MembershipTabs`): each tab, each name in
+   readable form and the "more" button at their natural widths. Out of flow,
+   unseen, and clipped to nothing, so it never adds to a scroll area. */
+.blocks-tabs-measure {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.blocks-tabs-measure > * {
+  width: max-content;
+  max-width: none;
+}
+/* The Membership strip's Limits: a meter per window, stacked. */
+.blocks-limits {
+  display: flex;
+  flex-direction: column;
+  min-width: 240px;
+}
+.blocks-limits .limit-row {
+  margin-top: 2px;
+}
+.blocks-limits .limit-row label {
+  flex: 0 0 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.blocks-limits .limit-row.idle b {
+  color: var(--soft);
+}
+.blocks-limits[data-stale] .limit-row {
+  opacity: 0.7;
 }
 
 /* --- status pills (active / gap / done / stale) --- */
@@ -3037,6 +3992,11 @@ a.sb-footrow:hover .sb-label {
   font-size: 13.5px;
   font-weight: 600;
 }
+/* A section's heading badge (Unattributed usage's count pill, #639). */
+.s-section h2 .pill {
+  margin-left: 8px;
+  vertical-align: 1px;
+}
 .s-section .desc {
   font-size: 11.5px;
   color: var(--soft);
@@ -3232,62 +4192,309 @@ a.sb-footrow:hover .sb-label {
   flex: none;
 }
 
-/* --- the Organizations list (Claude account, past one Organization): the
-   Storage sample's flat-tint table recipe (`.st-sample`) at row scale. A row
-   is two lines — the label and its tags, then the plan word and the Limits
-   answer — beside `Make Home` and the tracked switch; the chevron opens the
-   row's facts in the App info pairs grammar. Excluded rows go soft. Every
-   control keeps the global `:focus-visible` ring, so each carries a radius. --- */
-.org-list {
-  width: 100%;
-  border-radius: 12px;
-  overflow: hidden;
-  background: color-mix(in oklch, var(--text) 3.5%, transparent);
-  border: 1px solid var(--panel-border);
-  box-shadow: var(--panel-inner);
+/* --- Settings › Accounts (#621's variant A, #639): attention strips, the
+   Home select, each Provider's Account cards with their nested Memberships,
+   the inline Connect flow and the Gateways rows. On Glass tokens throughout,
+   so both themes follow; every control keeps the global `:focus-visible`
+   ring, so each carries a radius. Rows wrap rather than overflow at the
+   window's minimum width. --- */
+.s-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
-.org-list-item + .org-list-item {
-  border-top: 1px solid color-mix(in oklch, var(--hairline) 70%, transparent);
+.s-head h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-right: auto;
+  min-width: 0;
 }
-.org-list-row {
+.acct-section .control,
+.accounts-cluster .s-section .control {
+  align-items: stretch;
+}
+.acct-stack {
+  gap: 10px !important;
+}
+.acct-strips {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 22px 2px;
+}
+.acct-strip-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.acct-strip {
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 9px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  background: color-mix(in oklch, var(--accent) 7%, transparent);
+  border: 1px solid color-mix(in oklch, var(--accent) 18%, transparent);
 }
-.org-list-chevron {
-  display: inline-flex;
+.acct-strip.warn {
+  background: color-mix(in oklch, var(--warn) 10%, transparent);
+  border-color: color-mix(in oklch, var(--warn) 28%, transparent);
+}
+.acct-strip > span:first-child {
+  flex: 1;
+  min-width: 0;
+}
+.acct-strip b {
+  font-weight: 700;
+}
+.acct-strip .toggle {
   flex: none;
-  padding: 4px;
-  margin: -4px -6px -4px -4px;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+.acct-strip .chip {
+  flex: none;
+}
+.acct-home-row {
+  width: 100%;
+}
+.acct-home-select {
+  flex: 1;
+  min-width: 0;
+  max-width: 460px;
+}
+.acct-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border-radius: 5px;
+  font-size: 9.5px;
+  font-weight: 800;
+  color: var(--text);
+  background: color-mix(in oklch, var(--accent) 22%, transparent);
+}
+.acct-filter {
+  width: 100%;
+}
+.acct-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--panel-border);
+  background: color-mix(in oklch, var(--text) 3%, transparent);
+  box-shadow: var(--panel-inner);
+}
+/* Past six Accounts a folded card is one line, so it costs one line. */
+.acct-card.folded {
+  padding: 6px 12px;
+}
+.acct-card.compact {
+  padding: 4px 2px;
+  border: none;
+  background: none;
+  box-shadow: none;
+}
+.acct-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.acct-fold {
+  display: inline-grid;
+  flex: none;
+  padding: 3px;
+  margin: -3px -4px -3px -3px;
   border-radius: 6px;
   color: var(--soft);
 }
-.org-list-chevron:hover {
+.acct-fold:hover {
   background: color-mix(in oklch, var(--text) 6%, transparent);
 }
-.org-list-chevron svg {
-  width: 12px;
-  height: 12px;
-  transition: transform 0.15s var(--ease-glass);
+.acct-fold svg {
+  width: 14px;
+  height: 14px;
 }
-.org-list-item.open .org-list-chevron svg {
-  transform: rotate(90deg);
+/* The Account menu's avatar (`.am-av`) at card scale. */
+.acct-av {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  background: color-mix(in oklch, var(--accent) 28%, transparent);
 }
-.org-list-main {
-  flex: 1;
-  min-width: 0;
+.acct-av.compact {
+  width: 22px;
+  height: 22px;
+  font-size: 10px;
+}
+.acct-av.pending {
+  background: transparent;
+  border: 1.5px dashed var(--soft);
+  color: var(--soft);
+}
+.acct-who {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
 }
-.org-list-name {
+.acct-title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.acct-card.off .acct-title,
+.acct-card.off .acct-line {
+  color: var(--soft);
+}
+.acct-sub,
+.acct-fact {
+  font-size: 11.5px;
+  color: var(--soft);
+  overflow-wrap: anywhere;
+}
+.acct-line {
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acct-right {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-left: auto;
+  flex: none;
+  max-width: 60%;
+}
+.acct-conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.acct-conn .dot {
+  width: 7px;
+  height: 7px;
+}
+.acct-conn.good {
+  color: var(--text);
+}
+.acct-conn.warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+.acct-conn.bad {
+  color: var(--bad);
+}
+.acct-conn.soft {
+  color: var(--soft);
+}
+.acct-tools {
   display: flex;
   align-items: center;
-  gap: 7px;
   flex-wrap: wrap;
+  gap: 4px 12px;
+  padding-left: 38px;
 }
-.org-list-label {
+.acct-card.compact .acct-tools {
+  padding-left: 32px;
+}
+.acct-link {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+  border-radius: 4px;
+}
+.acct-link:hover:not(:disabled) {
+  text-decoration: underline;
+}
+.acct-link:disabled {
+  opacity: 0.5;
+}
+.acct-seen {
+  padding-left: 38px;
+  font-size: 11px;
+  color: var(--soft);
+}
+.acct-note {
+  font-size: 11.5px;
+  line-height: 1.45;
+  padding: 6px 10px;
+  border-radius: 10px;
+  color: var(--text);
+  background: color-mix(in oklch, var(--warn) 10%, transparent);
+}
+.acct-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--soft);
+  background: color-mix(in oklch, var(--text) 7%, transparent);
+}
+.acct-pill.new {
+  color: var(--up);
+  background: color-mix(in oklch, var(--up) 14%, transparent);
+}
+.acct-pill.warn {
+  color: var(--warn);
+  background: color-mix(in oklch, var(--warn) 16%, transparent);
+}
+.acct-home {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.acct-mems {
+  display: flex;
+  flex-direction: column;
+  margin: 2px 0 0 38px;
+  border-top: 1px solid var(--hairline);
+}
+.acct-mem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  font-size: 12.5px;
+  border-bottom: 1px solid color-mix(in oklch, var(--hairline) 60%, transparent);
+}
+.acct-mem:last-child {
+  border-bottom: none;
+}
+.acct-org {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 7px;
+  flex: 1;
+  min-width: 0;
+}
+.acct-org-name {
   min-width: 0;
   font-size: 12.5px;
   font-weight: 600;
@@ -3296,82 +4503,156 @@ a.sb-footrow:hover .sb-label {
   overflow-wrap: anywhere;
   border-radius: 4px;
 }
-.org-list-label:hover {
+button.acct-org-name:hover {
   text-decoration: underline dotted;
   text-underline-offset: 3px;
 }
-.org-list-meta {
-  font-size: 11px;
+.acct-mem.off .acct-org-name {
   color: var(--soft);
+  font-weight: 500;
 }
-.org-list-row.off .org-list-label {
-  color: var(--soft);
+.acct-fact.stale {
+  white-space: normal;
 }
-.org-list-limits {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.org-list-limits .dot {
-  width: 6px;
-  height: 6px;
-}
-.org-list-reading {
-  color: var(--accent);
-  animation: glass-pulse 2.4s ease-in-out infinite;
-}
-.org-list-tag {
-  padding: 1px 7px;
-  border-radius: 999px;
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--soft);
-  background: color-mix(in oklch, var(--text) 7%, transparent);
-  white-space: nowrap;
-}
-.org-list-tag.home {
-  color: var(--accent);
-  background: color-mix(in oklch, var(--accent) 14%, transparent);
-}
-.org-list-tag.new {
-  color: var(--up);
-  background: color-mix(in oklch, var(--up) 14%, transparent);
-}
-.org-list-link {
-  flex: none;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--accent);
-  white-space: nowrap;
-  border-radius: 4px;
-}
-.org-list-link:hover {
-  text-decoration: underline;
-}
-.org-list-row .toggle {
-  flex: none;
-}
-.org-list-rename {
+.acct-rename {
   display: inline-flex;
   flex-direction: column;
   gap: 3px;
   max-width: 100%;
 }
-.org-list-rename .input {
-  width: 190px;
+.acct-rename .input {
+  width: 220px;
   max-width: 100%;
   padding-top: 3px;
   padding-bottom: 3px;
   font-size: 12px;
 }
-.org-list-facts {
-  padding: 4px 12px 12px 31px;
+.acct-off {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
-.org-list-facts .ai-pairs {
-  row-gap: 5px;
+.acct-off-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--text);
+  text-align: left;
+  border-radius: 6px;
 }
-.org-list-facts .ai-pairs dd {
+.acct-off-head svg {
+  width: 14px;
+  height: 14px;
+  color: var(--soft);
+}
+.acct-off-head b {
+  font-weight: 600;
+}
+/* The Connect flow, inline under whatever opened it (#621). */
+.acct-flow {
+  padding: 12px;
+  border-radius: 12px;
+  background: color-mix(in oklch, var(--accent) 5%, transparent);
+  border: 1px solid color-mix(in oklch, var(--accent) 16%, transparent);
+}
+.connect-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.connect-flow > .input {
+  width: 100%;
+}
+.connect-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
+}
+.connect-lead {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--soft);
+}
+.connect-mismatch {
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: color-mix(in oklch, var(--warn) 10%, transparent);
+  border: 1px solid color-mix(in oklch, var(--warn) 25%, transparent);
+}
+.connect-orgs-head {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 2px;
+  font-size: 12.5px;
+}
+.connect-orgs-head b {
+  font-weight: 600;
+}
+.connect-orgs-head span {
   font-size: 11.5px;
+  color: var(--soft);
+}
+.acct-mems.connect-orgs {
+  margin-left: 0;
+}
+.connect-done {
+  display: flex;
+  justify-content: flex-end;
+}
+/* Gateways (ADR-0141 §8): one row per Gateway, Remove at its end. */
+.gw-rows {
+  display: flex;
+  flex-direction: column;
+  border-radius: 12px;
+  overflow: hidden;
+  background: color-mix(in oklch, var(--text) 3%, transparent);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--panel-inner);
+}
+.gw-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+}
+.gw-row + .gw-row {
+  border-top: 1px solid color-mix(in oklch, var(--hairline) 70%, transparent);
+}
+.gw-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+.gw-host {
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.gw-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 11px;
+  color: var(--soft);
+}
+.gw-accounts {
+  font-size: 11px;
+  color: var(--soft);
+}
+.gw-warnings {
+  align-self: stretch;
+  gap: 6px;
 }
 
 /* The timezone/currency selects are fixed-width fields, not row fills. */
@@ -3401,6 +4682,10 @@ a.sb-footrow:hover .sb-label {
   background: color-mix(in oklch, var(--text) 3.5%, transparent);
   border: 1px solid var(--panel-border);
   box-shadow: var(--panel-inner);
+}
+/* #679's hint: a folder path wraps anywhere rather than widening the inset. */
+.path-hint p {
+  overflow-wrap: anywhere;
 }
 .path-row .p {
   flex: 1;
@@ -4555,6 +5840,16 @@ body.popout-window {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* The ranked head's eyebrow (#638): its words, then the Membership's name,
+   whose Organization part yields first (`.mname`); still one 14.25px line. */
+.popout-root .a-head .eyebrow-named {
+  display: flex;
+}
+.popout-root .a-head .eyebrow-named .eyebrow-lead,
+.popout-root .a-head .eyebrow-named .eyebrow-sep {
+  flex-shrink: 0;
+  white-space: pre;
+}
 .popout-root .a-head .hd {
   min-width: 0;
 }
@@ -4639,6 +5934,62 @@ body.popout-window {
   display: inline-block;
   min-width: 34px;
   text-align: right;
+}
+
+/* --- the ranked popout (#638; #610's "head + ranked") ---
+   A row per Membership, and the `+N more` row, are each one `.prow`: 30px
+   and the column's 1px gap, the 31px a limit row costs the shell
+   (popout.rs `ranked_popout_content_height`). Nothing here may change a
+   row's height: the name ellipsizes, never wraps, and the notes sit in the
+   12px line the percent would. */
+.popout-root .prow .pname {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.popout-root .prow .pname-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.popout-root .prow .pwtag {
+  flex-shrink: 0;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--soft);
+}
+.popout-root .prow .pname + .state {
+  flex-shrink: 0;
+}
+.popout-root .prow .pnote {
+  font-size: 10.5px;
+}
+/* A dead key's last-known percent: greyed, never in a live tone. */
+.popout-root .prow.stale .state b {
+  color: var(--soft);
+}
+.popout-root .prow.stale .pnote {
+  color: var(--warn);
+  font-weight: 600;
+}
+.popout-root .prow.pmore {
+  opacity: 0.8;
+}
+.popout-root .prow.pmore .name {
+  font-weight: 500;
+}
+.popout-root .prow.pmore.hot .state {
+  color: var(--bad);
+  font-weight: 700;
+}
+/* The `Most used:` Membership drawn idle (#622 item 6): the head's words in
+   place of its numbers, quieter than a cost. */
+.popout-root .a-head .hd .idle-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--soft);
 }
 .popout-root .pdivider {
   height: 1px;

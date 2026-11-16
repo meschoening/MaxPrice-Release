@@ -1,6 +1,6 @@
 {
   "name": "@maxprice/usage-core",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "private": true,
   "type": "module",
   "main": "./src/index.ts",
@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./fake-claude": "./src/fake-claude.ts",
+    "./fake-cliproxyapi": "./src/fake-cliproxyapi.ts",
     "./self-update": "./src/self-update.ts",
     "./flock": "./src/flock.ts",
     "./secrets-file": "./src/secrets-file.ts",
@@ -25,7 +26,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "TZ=America/Chicago bun test"
+    "test": "TZ=America/Chicago BUN_JSC_useConcurrentJIT=0 bun test"
   },
   "dependencies": {
     "@maxprice/shared": "workspace:*",

@@ -131,8 +131,8 @@ export function deriveProjectName(path: string): string {
 // The project a session belongs to, which for a worktree session is the
 // repository above it (ADR-0061). Derived from the session's own `path` — no
 // project list needed, so this can never disagree with a row that hasn't loaded.
-// The Desktop's Sessions table and the Headless client's `sessions` report
-// both name a session's project with it.
+// The Desktop's ⌘K finder and Settings › Unattributed usage, and the Headless client's
+// `sessions` report, all name a session's project with it.
 export function sessionProjectName(row: { path: string }): string {
   return deriveProjectName(parentProjectPath(row.path));
 }

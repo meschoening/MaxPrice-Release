@@ -67,14 +67,25 @@ export function formatRemaining(ms: number): string {
   return `${h}:${pad(m)}`;
 }
 
+// A duration's whole minutes split into days, hours of the day and minutes of
+// the hour: the arithmetic every "3d 4h" / "2h 04m" / "3h 18m" readout shares
+// (`formatRemainingLong`, `formatElapsed`, the limit area's `resetIn`), each
+// keeping its own output format. Unclamped: a caller that prints a negative
+// duration as zero clamps `ms` first.
+export function minuteParts(ms: number): { days: number; hours: number; mins: number } {
+  const totalMin = Math.floor(ms / 60_000);
+  return {
+    days: Math.floor(totalMin / (60 * 24)),
+    hours: Math.floor((totalMin % (60 * 24)) / 60),
+    mins: totalMin % 60,
+  };
+}
+
 // Like formatRemaining but for windows that can span days (the weekly usage
 // limit) — "3d 4h" / "5h" / "23m". Minute precision is dropped above an hour
 // because a multi-day countdown doesn't need it.
 export function formatRemainingLong(ms: number): string {
-  const totalMin = Math.floor(ms / 60_000);
-  const days = Math.floor(totalMin / (60 * 24));
-  const hours = Math.floor((totalMin % (60 * 24)) / 60);
-  const mins = totalMin % 60;
+  const { days, hours, mins } = minuteParts(ms);
   if (days > 0) return `${days}d ${hours}h`;
   if (hours > 0) return `${hours}h`;
   return `${mins}m`;

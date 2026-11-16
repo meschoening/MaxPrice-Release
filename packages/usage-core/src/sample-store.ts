@@ -13,34 +13,54 @@ import { usageSampleSchema, type UsageSample } from "@maxprice/shared";
 // later present-dated local append. Mirrors the engine's event store: cheap
 // in-memory range queries, no database.
 //
-// IDENTITY (GLOSSARY.md [[Usage sample]]): a sample's key is
-// (organizationUuid ?? legacy, capturedAt), so two Organizations read at the
-// same millisecond are two samples. Admitting one incoming sample is the same
-// everywhere: (a) its exact key is held → dropped; (b) it is unstamped and ANY
-// stamped sample is held at its capturedAt → dropped, the stamped copy wins;
-// (c) it is stamped and an unstamped sample is held at its capturedAt → it
-// REPLACES that incumbent in memory and its line is appended to disk like any
-// new one — the file then holds both lines, and load's same rules resolve
-// either file order to the stamped copy; (d) otherwise it is added. Hence an
-// unstamped sample held at t means no stamped sample is held at t. Membership
-// is kept in persistent per-key buckets (the unstamped one, and one per
-// Organization: a capturedAt Map beside that key's sorted array), so admission
-// costs O(Organizations held), never a rebuild, and a scoped read never scans
-// the whole history. The local poll is the single writer, but load tolerates
-// concurrent appends via those same rules.
+// IDENTITY (GLOSSARY.md [[Usage sample]], ADR-0139 §8): a sample's key is
+// (accountUuid ?? none, organizationUuid ?? none, capturedAt), so two
+// Organizations, or two Accounts reading one Organization, at the same
+// millisecond are two samples. One sample COVERS another at the same instant
+// when it carries every stamp the other carries, with the same value, and at
+// least one more: an Organization-stamped sample covers the unstamped one, and
+// an Account-stamped one the same Organization's Account-less one. Admitting
+// one incoming sample is the same everywhere: (a) its exact key is held →
+// dropped; (b) a held sample at its capturedAt covers it → dropped, the
+// stamped copy wins; (c) it covers held samples at its capturedAt → it
+// REPLACES them in memory and its line is appended to disk like any new one —
+// the file then holds both lines, and load's same rules resolve either file
+// order to the stamped copy; (d) otherwise it is added. Hence a sample held at
+// t means no sample covering it is held at t. Membership is kept in persistent
+// per-key buckets (one per (Organization, Account) stamp pair, each a
+// capturedAt Map beside that key's sorted array) and an instant index, so
+// admission costs O(samples held at that instant), never a rebuild, and a
+// scoped read never scans the whole history. The local poll is the single
+// writer, but load tolerates concurrent appends via those same rules.
 //
-// STAMPING: stampUnstamped() is the only rewrite of the append-only file. One
-// link on the write chain rewrites it text-preservingly — each unstamped line
-// gains only `organizationUuid`, every other line stays byte-verbatim — through
+// STAMPING: stampUnstamped() (the Organization, ADR-0104) and
+// stampAccountless() (the Account, ADR-0139 §8) are the only rewrites of the
+// append-only file. One link on the write chain rewrites it
+// text-preservingly — each line lacking the stamp gains only that field, every
+// other line stays byte-verbatim, and a line a held sample covers goes — through
 // a synced `${path}.stamp-tmp` and a rename, and only then stamps the same
-// samples in memory, so a failed stamp stamps nothing anywhere. Disk and memory
-// then agree with one exception (stampHeld): a stamped copy for ANOTHER
-// Organization merged at a stamped line's instant while the rewrite is in
-// flight replaces the unstamped sample in memory (rule c), but the file keeps
-// both stamped lines, so a reload holds one sample more. Production reaches it
-// only after a failed load: the Hub stamps at boot before its routes open, and
-// a client merges only samples newer than its latest — unless the load failed,
-// its latest is null, and a full Hub backfill lands during the re-read stamp.
+// samples in memory, so a failed stamp stamps nothing anywhere. Memory is then
+// re-indexed by the identity rules, so it holds what a reload of the file
+// would, with one exception: a stamped copy merged at a line's instant while
+// the rewrite is in flight replaces the sample in memory (rule c), and a
+// reload of a file holding both may keep one sample more where the two do not
+// cover each other. Production reaches it only when the merged copy's stamp
+// differs from the one the rewrite gives: an Organization stamp after a failed
+// load (the Hub stamps it at boot before its routes open, and a client merges
+// only samples newer than its latest — unless the load failed, its latest is
+// null, and a full Hub backfill lands during the re-read stamp), or an Account
+// stamp of another Account than the move's, merged during the move's stamp by
+// the cursorless sample exchange (hub-client.ts, #634) or a push to the Hub. A
+// copy of the rewrite's own stamp is the rewritten line's twin on reload.
+//
+// LOCAL STAMP TIME (ADR-0139 §8, #634): `localSamplesStampedAt` is when this
+// store's own stamping (either stamp above) last stamped a sample — never a
+// merge, which only carries another side's stamps here. A client's cursorless
+// sample exchange (hub-client.ts) runs again once it moves. With `stampsPath`
+// it is durable: the link writes it there (a synced temp and a rename) BEFORE
+// the history's rename, so a crash between the two can only make it newer than
+// the stamp — one exchange too many, never one too few — and loadHistory()
+// reads it back. Without one it lives in memory.
 //
 // ACCEPTED UNBOUNDED GROWTH (ADR-0024 "In-memory growth is unbounded"): the
 // in-memory `samples` array and usage-history.jsonl grow append-only forever
@@ -58,7 +78,18 @@ import { usageSampleSchema, type UsageSample } from "@maxprice/shared";
 // is presumed the Home organization's AT QUERY TIME — the store holds no Home —
 // so a Home change re-answers only the unstamped samples and moves no stamped
 // one. `home: null` presumes the unstamped samples nobody's.
-export type SampleScope = { organization: string; home: string | null };
+//
+// `membership` narrows the read to one Membership (#633): the samples its
+// Account's key read, plus the Account-less ones when that Account is the Home
+// membership's (`homeAccount`; ADR-0137 §3's presumption at query time), or
+// when no Home membership's Account is known (`homeAccount: null`), since an
+// Account-less sample then has no presumption to lose. Without it every
+// Account's samples of the Organization answer, as before.
+export type SampleScope = {
+  organization: string;
+  home: string | null;
+  membership?: { account: string; homeAccount: string | null };
+};
 
 export type SampleStore = {
   // Resolves once loadHistory() has FIRST completed — the success path, the
@@ -75,13 +106,16 @@ export type SampleStore = {
   append: (sample: UsageSample) => void;
   // Two-way-sync entry point (ADR-0035): admit externally-captured samples
   // (hub backfill / live stream) by the identity rules above — the key is
-  // (organizationUuid, capturedAt), see GLOSSARY.md [[Usage sample]] — keep the
-  // in-memory array sorted, and append each admitted sample to disk through the
-  // same ordered write chain. Returns how many incoming samples changed the
-  // store: those added plus stamped copies that replaced an unstamped
-  // incumbent. Callers validate at the wire boundary; the store trusts its
-  // input shape.
-  merge: (incoming: UsageSample[]) => number;
+  // (accountUuid, organizationUuid, capturedAt), see GLOSSARY.md [[Usage
+  // sample]] — keep the in-memory array sorted, and append each admitted
+  // sample to disk through the same ordered write chain. `changed` counts the
+  // incoming samples that changed the store: those added plus stamped copies
+  // that replaced a less-stamped incumbent. `stamped` counts, among those
+  // replacements, the ones that gave a held Account-less sample its Account
+  // (the Hub's `samplesStampedAt`, ADR-0139 §8): a report only, the store
+  // keeps the same either way. Callers validate at the wire boundary; the
+  // store trusts its input shape.
+  merge: (incoming: UsageSample[]) => MergeResult;
   // Unscoped: the newest sample held, across every Organization. Scoped: the
   // tail of all(scope).
   latest: {
@@ -109,7 +143,17 @@ export type SampleStore = {
   // before this returns: an append made after the call is written after the
   // rewrite, and stays unstamped.
   stampUnstamped: (organizationUuid: string) => Promise<number>;
+  // The same for the Account (ADR-0139 §8, #633): stamps every Account-less
+  // sample with `accountUuid`, by stampUnstamped's contract above, run once at
+  // ADR-0138 §12's move from the key's Account. No file I/O when no
+  // Account-less sample is held and the load read the file.
+  stampAccountless: (accountUuid: string) => Promise<number>;
+  // When this store's own stamping last stamped a sample (LOCAL STAMP TIME
+  // above); null until then, and before loadHistory() read `stampsPath`.
+  localSamplesStampedAt: () => string | null;
 };
+
+export type MergeResult = { changed: number; stamped: number };
 
 // The factory returns a superset of the consumer contract: `flush()` resolves
 // once every disk write queued so far has settled. The consumers (poller,
@@ -119,19 +163,40 @@ export type SampleStore = {
 type OwnedSampleStore = SampleStore & { flush: () => Promise<void> };
 
 // One identity key's samples: `byTime` is the membership index (capturedAt →
-// the sample held under this key there) and `sorted` the same samples ascending.
-type Bucket = { byTime: Map<string, UsageSample>; sorted: UsageSample[] };
+// the sample held under this key there) and `sorted` the same samples
+// ascending. `org` and `account` are the key's stamps (undefined: none).
+type Bucket = {
+  key: string;
+  org: string | undefined;
+  account: string | undefined;
+  byTime: Map<string, UsageSample>;
+  sorted: UsageSample[];
+};
 
 // What admitting one sample did, by the rule letters in the header.
 type Admission =
   | { kind: "dropped" } // (a) or (b)
   | { kind: "added"; into: Bucket } // (d)
-  | { kind: "replaced"; into: Bucket; incumbent: UsageSample }; // (c)
+  | { kind: "replaced"; into: Bucket; incumbents: UsageSample[] }; // (c)
+
+type StampField = "organizationUuid" | "accountUuid";
 
 const DROPPED: Admission = { kind: "dropped" };
 const NONE: readonly UsageSample[] = Object.freeze([]);
 
-const newBucket = (): Bucket => ({ byTime: new Map(), sorted: [] });
+// The identity key less the instant. NUL separates: no stamp holds one.
+const identityKey = (s: Pick<UsageSample, "organizationUuid" | "accountUuid">): string =>
+  `${s.organizationUuid ?? ""}\u0000${s.accountUuid ?? ""}`;
+
+// Whether `a` covers `b` (header): every stamp `b` carries `a` carries alike,
+// and the two are not the same key.
+function covers(a: UsageSample, b: UsageSample): boolean {
+  return (
+    (b.organizationUuid === undefined || b.organizationUuid === a.organizationUuid) &&
+    (b.accountUuid === undefined || b.accountUuid === a.accountUuid) &&
+    identityKey(a) !== identityKey(b)
+  );
+}
 
 // capturedAt is fixed-width ISO-8601 UTC (producers use new Date().toISOString()),
 // so a plain string compare is chronological — no Date.parse needed. Exported
@@ -194,9 +259,13 @@ function mergeSorted(a: readonly UsageSample[], b: readonly UsageSample[]): Usag
   return out;
 }
 
-// The object of a history line that is a valid UNSTAMPED sample, else null —
-// blank, corrupt, schema-invalid and already-stamped lines all stay verbatim.
-function unstampedLine(line: string): { raw: Record<string, unknown>; capturedAt: string } | null {
+// The object of a history line that is a valid sample lacking `field`, else
+// null — blank, corrupt, schema-invalid and already-stamped lines all stay
+// verbatim.
+function unstampedLine(
+  line: string,
+  field: StampField,
+): { raw: Record<string, unknown>; sample: UsageSample } | null {
   const trimmed = line.trim();
   if (trimmed === "") return null;
   let raw: unknown;
@@ -206,25 +275,67 @@ function unstampedLine(line: string): { raw: Record<string, unknown>; capturedAt
     return null;
   }
   const parsed = usageSampleSchema.safeParse(raw);
-  if (!parsed.success || parsed.data.organizationUuid !== undefined) return null;
-  return { raw: raw as Record<string, unknown>, capturedAt: parsed.data.capturedAt };
+  if (!parsed.success || parsed.data[field] !== undefined) return null;
+  return { raw: raw as Record<string, unknown>, sample: parsed.data };
 }
 
 function isMissingFile(err: unknown): boolean {
   return (err as { code?: unknown } | null)?.code === "ENOENT";
 }
 
-export function createSampleStore(opts: { path: string }): OwnedSampleStore {
+async function syncedWrite(path: string, text: string): Promise<void> {
+  const file = await open(path, "w");
+  try {
+    await file.writeFile(text);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+}
+
+// A small file replaced whole: a synced temp beside it, then a rename.
+async function writeDurably(path: string, text: string): Promise<void> {
+  const tmp = `${path}.tmp`;
+  try {
+    await syncedWrite(tmp, text);
+    await rename(tmp, path);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
+}
+
+// The persisted LOCAL STAMP TIME, or null: missing, unreadable or malformed
+// reads as never stamped (the next stamp writes it whole).
+async function readStampedAt(path: string): Promise<string | null> {
+  try {
+    const raw = JSON.parse(await readFile(path, "utf8")) as { localSamplesStampedAt?: unknown };
+    const value = raw?.localSamplesStampedAt;
+    return typeof value === "string" && !Number.isNaN(Date.parse(value)) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function createSampleStore(opts: {
+  path: string;
+  // Where `localSamplesStampedAt` persists (LOCAL STAMP TIME); none: memory.
+  stampsPath?: string;
+  now?: () => number;
+}): OwnedSampleStore {
   const path = opts.path;
+  const stampsPath = opts.stampsPath;
+  const now = opts.now ?? Date.now;
+  let localStampedAt: string | null = null;
   // Every sample held, ascending — all()'s array, never reassigned.
   const samples: UsageSample[] = [];
-  // The per-key buckets over `samples`, kept in lockstep with it: `legacy` for
-  // the unstamped samples, `stamped` one per Organization. A bucket, once made,
-  // is never deleted (a stamped sample is never removed).
-  const legacy = newBucket();
-  const stamped = new Map<string, Bucket>();
-  // Memoized scoped reads that had to interleave an Organization's bucket with
-  // the unstamped one, by Organization; every mutation clears them.
+  // The per-key buckets over `samples`, kept in lockstep with it, by
+  // identityKey. A bucket, once made, is never deleted.
+  const buckets = new Map<string, Bucket>();
+  // Every sample held at each instant: admission's index.
+  const atTime = new Map<string, UsageSample[]>();
+  // Memoized scoped reads that had to interleave several buckets, by the
+  // buckets' keys; every mutation clears them.
   const views = new Map<string, readonly UsageSample[]>();
   // Serializes the async disk writes so append ORDER is preserved on disk
   // without blocking the serving event loop. A failed append must not reject
@@ -234,7 +345,7 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
   // Readiness deferred (F6): resolved by the FIRST loadHistory() completion,
   // whichever path it takes. Idempotent — later loadHistory() calls don't
   // re-signal — and never rejects (load swallows every error). `loaded` lets
-  // stampUnstamped() queue its link synchronously once it has settled.
+  // a stamp queue its link synchronously once it has settled.
   let loaded = false;
   // Set when the load could not read an existing file (any failure but
   // ENOENT, which is a first launch): memory then does not mirror the file, so
@@ -246,45 +357,70 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
     markReady = resolve;
   });
 
-  function stampedAt(capturedAt: string): boolean {
-    for (const bucket of stamped.values()) if (bucket.byTime.has(capturedAt)) return true;
-    return false;
+  function bucketFor(s: UsageSample): Bucket {
+    const key = identityKey(s);
+    let bucket = buckets.get(key);
+    if (bucket === undefined) {
+      bucket = {
+        key,
+        org: s.organizationUuid,
+        account: s.accountUuid,
+        byTime: new Map(),
+        sorted: [],
+      };
+      buckets.set(key, bucket);
+    }
+    return bucket;
+  }
+
+  // Whether a held sample covers `s` at its instant: a line lacking a stamp
+  // that memory already holds a stamped copy of.
+  function covered(s: UsageSample): boolean {
+    return (atTime.get(s.capturedAt) ?? NONE).some((held) => covers(held, s));
+  }
+
+  // How many held samples lack `field`.
+  function lacking(field: StampField): number {
+    let count = 0;
+    for (const bucket of buckets.values()) {
+      const stamp = field === "organizationUuid" ? bucket.org : bucket.account;
+      if (stamp === undefined) count += bucket.byTime.size;
+    }
+    return count;
   }
 
   // The identity rules (header), applied to the membership indexes only — the
   // caller places the sample in the sorted arrays and owns the write chain.
   function admit(s: UsageSample): Admission {
     const t = s.capturedAt;
-    const org = s.organizationUuid;
-    if (org === undefined) {
-      if (legacy.byTime.has(t) || stampedAt(t)) return DROPPED;
-      legacy.byTime.set(t, s);
-      return { kind: "added", into: legacy };
-    }
-    let into = stamped.get(org);
-    if (into === undefined) {
-      into = newBucket();
-      stamped.set(org, into);
-    } else if (into.byTime.has(t)) {
-      return DROPPED;
-    }
+    const key = identityKey(s);
+    const held = atTime.get(t) ?? [];
+    for (const h of held) if (identityKey(h) === key || covers(h, s)) return DROPPED;
+    const incumbents = held.filter((h) => covers(s, h));
+    const into = bucketFor(s);
     into.byTime.set(t, s);
-    const incumbent = legacy.byTime.get(t);
-    if (incumbent === undefined) return { kind: "added", into };
-    legacy.byTime.delete(t);
-    return { kind: "replaced", into, incumbent };
+    for (const incumbent of incumbents) bucketFor(incumbent).byTime.delete(t);
+    atTime.set(t, [...held.filter((h) => !incumbents.includes(h)), s]);
+    return incumbents.length === 0
+      ? { kind: "added", into }
+      : { kind: "replaced", into, incumbents };
   }
 
   // append()/merge()'s single-sample path: admit, place in the sorted arrays,
-  // and queue the line. Returns whether the sample changed the store.
-  function admitOne(s: UsageSample, failure: string): boolean {
+  // and queue the line. Returns what the admission did.
+  function admitOne(s: UsageSample, failure: string): Admission {
     const admission = admit(s);
-    if (admission.kind === "dropped") return false;
+    if (admission.kind === "dropped") return admission;
     if (admission.kind === "replaced") {
-      // The incumbent is the only sample held at its capturedAt (rule b), so
-      // the stamped copy takes its exact slot in the time order.
-      samples[indexOf(samples, admission.incumbent)] = s;
-      legacy.sorted.splice(indexOf(legacy.sorted, admission.incumbent), 1);
+      // The stamped copy takes its first incumbent's exact slot in the time
+      // order; any other incumbent (one it covers on another axis) goes.
+      const [first, ...rest] = admission.incumbents;
+      samples[indexOf(samples, first!)] = s;
+      for (const incumbent of rest) samples.splice(indexOf(samples, incumbent), 1);
+      for (const incumbent of admission.incumbents) {
+        const own = bucketFor(incumbent).sorted;
+        own.splice(indexOf(own, incumbent), 1);
+      }
     } else {
       insertSorted(samples, s);
     }
@@ -296,7 +432,7 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
       .catch((err) => {
         console.warn(failure, err);
       });
-    return true;
+    return admission;
   }
 
   // Public loader: wraps the read/parse in a `finally` so `ready` settles on
@@ -311,6 +447,7 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
   }
 
   async function loadHistoryInner(): Promise<void> {
+    if (stampsPath !== undefined) localStampedAt = await readStampedAt(stampsPath);
     let text: string;
     try {
       text = await readFile(path, "utf8");
@@ -339,15 +476,25 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
         // skip a corrupt line (e.g. a crash mid-write)
       }
     }
-    // Admit every line against the indexes, bulk-push the admitted ones, drop
-    // the replaced incumbents in one pass, then sort once — a binary insert per
-    // line is O(n²) over a whole history while the poller appends.
+    admitBulk(parsedLines);
+  }
+
+  // Admits many samples at once: every one against the indexes, a bulk push
+  // of the admitted ones, one pass dropping the replaced incumbents, then one
+  // sort — a binary insert per line is O(n²) over a whole history.
+  function admitBulk(incoming: readonly UsageSample[]): void {
     const replaced = new Set<UsageSample>();
     const grown = new Set<Bucket>();
-    for (const s of parsedLines) {
+    const shrunk = new Set<Bucket>();
+    for (const s of incoming) {
       const admission = admit(s);
       if (admission.kind === "dropped") continue;
-      if (admission.kind === "replaced") replaced.add(admission.incumbent);
+      if (admission.kind === "replaced") {
+        for (const incumbent of admission.incumbents) {
+          replaced.add(incumbent);
+          shrunk.add(bucketFor(incumbent));
+        }
+      }
       samples.push(s);
       admission.into.sorted.push(s);
       grown.add(admission.into);
@@ -355,7 +502,7 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
     if (grown.size === 0) return;
     if (replaced.size > 0) {
       removeAll(samples, replaced);
-      removeAll(legacy.sorted, replaced);
+      for (const bucket of shrunk) removeAll(bucket.sorted, replaced);
     }
     samples.sort(byCapturedAt);
     for (const bucket of grown) bucket.sorted.sort(byCapturedAt);
@@ -369,29 +516,55 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
     admitOne(sample, "[usage-core] usage-history append failed:");
   }
 
-  function merge(incoming: UsageSample[]): number {
+  function merge(incoming: UsageSample[]): MergeResult {
     let changed = 0;
+    let stamped = 0;
     for (const s of incoming) {
       // A merged sample can land anywhere in time (future-dated remote samples,
       // out-of-order backfill); admitOne sorts it into place.
-      if (admitOne(s, "[usage-core] usage-history merge append failed:")) changed += 1;
+      const admission = admitOne(s, "[usage-core] usage-history merge append failed:");
+      if (admission.kind === "dropped") continue;
+      changed += 1;
+      if (
+        admission.kind === "replaced" &&
+        s.accountUuid !== undefined &&
+        admission.incumbents.some((incumbent) => incumbent.accountUuid === undefined)
+      ) {
+        stamped += 1;
+      }
     }
-    return changed;
+    return { changed, stamped };
+  }
+
+  // The buckets a scope reads (SampleScope), in creation order.
+  function scoped(scope: SampleScope): Bucket[] {
+    const m = scope.membership;
+    const presumeAccount =
+      m !== undefined && (m.homeAccount === null || m.homeAccount === m.account);
+    return [...buckets.values()].filter(
+      (b) =>
+        (b.org === scope.organization ||
+          (b.org === undefined && scope.organization === scope.home)) &&
+        (m === undefined || b.account === m.account || (b.account === undefined && presumeAccount)),
+    );
   }
 
   function all(): UsageSample[];
   function all(scope: SampleScope): readonly UsageSample[];
   function all(scope?: SampleScope): readonly UsageSample[] {
     if (scope === undefined) return samples; // READ-ONLY — callers must not mutate
-    const own = stamped.get(scope.organization)?.sorted ?? NONE;
-    const presumed = scope.organization === scope.home ? legacy.sorted : NONE;
-    if (own.length + presumed.length === samples.length) return samples;
-    if (presumed.length === 0) return own;
-    if (own.length === 0) return presumed;
-    let view = views.get(scope.organization);
+    const read = scoped(scope).filter((b) => b.sorted.length > 0);
+    const count = read.reduce((n, b) => n + b.sorted.length, 0);
+    if (count === samples.length) return samples;
+    if (read.length === 0) return NONE;
+    if (read.length === 1) return read[0]!.sorted;
+    const memo = read.map((b) => b.key).join("\u0001");
+    let view = views.get(memo);
     if (view === undefined) {
-      view = mergeSorted(own, presumed);
-      views.set(scope.organization, view);
+      view = read
+        .slice(1)
+        .reduce<readonly UsageSample[]>((acc, b) => mergeSorted(acc, b.sorted), read[0]!.sorted);
+      views.set(memo, view);
     }
     return view;
   }
@@ -400,19 +573,20 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
   function latest(scope: SampleScope): UsageSample | null;
   function latest(scope?: SampleScope): UsageSample | null {
     if (scope === undefined) return samples[samples.length - 1] ?? null;
-    // all(scope)'s tail without building it: the two tails never share an
-    // instant (an unstamped sample held at t means no stamped one is), so the
-    // later of them is the merged tail.
-    const own = stamped.get(scope.organization)?.sorted.at(-1) ?? null;
-    const presumed = scope.organization === scope.home ? (legacy.sorted.at(-1) ?? null) : null;
-    if (own === null || presumed === null) return own ?? presumed;
-    return presumed.capturedAt > own.capturedAt ? presumed : own;
+    // all(scope)'s tail without building it: the latest of the buckets' tails,
+    // a later bucket winning a tie as mergeSorted's order does.
+    let best: UsageSample | null = null;
+    for (const bucket of scoped(scope)) {
+      const tail = bucket.sorted.at(-1);
+      if (tail !== undefined && (best === null || tail.capturedAt >= best.capturedAt)) best = tail;
+    }
+    return best;
   }
 
-  async function stampUnstamped(organizationUuid: string): Promise<number> {
+  async function stamp(field: StampField, value: string): Promise<number> {
     if (!loaded) await ready;
-    if (legacy.byTime.size === 0 && !loadFailed) return 0;
-    const link = writeChain.then(() => stampLink(organizationUuid));
+    if (lacking(field) === 0 && !loadFailed) return 0;
+    const link = writeChain.then(() => stampLink(field, value));
     // The chain continues past a failed stamp; the caller sees the rejection.
     writeChain = link.then(
       () => {},
@@ -421,13 +595,13 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
     return link;
   }
 
-  // The write-chain link behind stampUnstamped(): every write queued before it
-  // has settled, so the file holds every line it will ever hold before this
-  // point. Reads memory at run time — a stamped copy merged since the link was
-  // queued has already superseded its unstamped line.
-  async function stampLink(organizationUuid: string): Promise<number> {
+  // The write-chain link behind a stamp: every write queued before it has
+  // settled, so the file holds every line it will ever hold before this point.
+  // Reads memory at run time — a stamped copy merged since the link was queued
+  // has already superseded its line.
+  async function stampLink(field: StampField, value: string): Promise<number> {
     // A link queued behind another stamp may find nothing left: still no I/O.
-    if (legacy.byTime.size === 0 && !loadFailed) return 0;
+    if (lacking(field) === 0 && !loadFailed) return 0;
     let text: string;
     try {
       text = await readFile(path, "utf8");
@@ -444,26 +618,33 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
       // and memory mirrors the file whether the rewrite then succeeds or fails.
       admitHistory(text);
       loadFailed = false;
-      if (legacy.byTime.size === 0) return 0;
+      if (lacking(field) === 0) return 0;
     }
-    const stampedTimes = new Set<string>();
+    // The identities stamped on disk: instant, then the line's own key.
+    const stampedIds = new Set<string>();
     const out: string[] = [];
     let count = 0;
     const lines = text.split("\n");
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i]!;
       const eol = i < lines.length - 1 ? "\n" : ""; // keeps the trailing newline as found
-      const unstamped = unstampedLine(line);
+      const unstamped = unstampedLine(line, field);
       if (unstamped === null) {
         out.push(line + eol);
         continue;
       }
       // Superseded by rule (c): a stamped copy is held at this instant, so the
       // line goes (with its newline) rather than become a second sample.
-      if (stampedAt(unstamped.capturedAt)) continue;
-      out.push(JSON.stringify({ ...unstamped.raw, organizationUuid }) + eol);
-      stampedTimes.add(unstamped.capturedAt);
+      if (covered(unstamped.sample)) continue;
+      out.push(JSON.stringify({ ...unstamped.raw, [field]: value }) + eol);
+      stampedIds.add(`${unstamped.sample.capturedAt}\u0001${identityKey(unstamped.sample)}`);
       count += 1;
+    }
+    // LOCAL STAMP TIME: durable before the history's rename, and a failure
+    // here fails the stamp like any other.
+    const stampedAt = count > 0 ? new Date(now()).toISOString() : null;
+    if (stampedAt !== null && stampsPath !== undefined) {
+      await writeDurably(stampsPath, `${JSON.stringify({ localSamplesStampedAt: stampedAt })}\n`);
     }
     const tmp = `${path}.stamp-tmp`;
     try {
@@ -471,57 +652,34 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
       // compaction kept, until #396 deleted it): the rename replaces the whole
       // history, the only copy there is, so a crash in the writeback window
       // must not leave it truncated.
-      const file = await open(tmp, "w");
-      try {
-        await file.writeFile(out.join(""));
-        await file.sync();
-      } finally {
-        await file.close();
-      }
+      await syncedWrite(tmp, out.join(""));
       await rename(tmp, path);
     } catch (err) {
       // Best effort, then the original error: no temp file outlives a failure.
       await unlink(tmp).catch(() => {});
       throw err;
     }
-    stampHeld(organizationUuid, stampedTimes);
+    stampHeld(field, value, stampedIds);
+    if (stampedAt !== null) localStampedAt = stampedAt;
     return count;
   }
 
-  // Memory's half of a stamp, after the rename: every unstamped sample whose
-  // capturedAt was stamped on disk moves to the Organization's bucket as a
-  // stamped copy, keeping its slot in the time order.
-  function stampHeld(organizationUuid: string, times: ReadonlySet<string>): void {
-    const restamped = new Map<UsageSample, UsageSample>();
-    for (const t of times) {
-      const s = legacy.byTime.get(t);
-      // Gone only if a stamped copy was merged while the rewrite was in flight
-      // (rule c already replaced it); the file then holds both stamped lines.
-      if (s === undefined) continue;
-      restamped.set(s, { ...s, organizationUuid });
-      legacy.byTime.delete(t);
-    }
-    if (restamped.size === 0) return;
-    let into = stamped.get(organizationUuid);
-    if (into === undefined) {
-      into = newBucket();
-      stamped.set(organizationUuid, into);
-    }
-    const kept: UsageSample[] = [];
-    const moved: UsageSample[] = [];
-    for (const s of legacy.sorted) {
-      const copy = restamped.get(s);
-      if (copy === undefined) kept.push(s);
-      else moved.push(copy);
-    }
-    legacy.sorted = kept;
-    for (const copy of moved) into.byTime.set(copy.capturedAt, copy);
-    into.sorted = mergeSorted(into.sorted, moved);
-    for (let i = 0; i < samples.length; i += 1) {
-      const copy = restamped.get(samples[i]!);
-      if (copy !== undefined) samples[i] = copy;
-    }
-    views.clear();
+  // Memory's half of a stamp, after the rename: every held sample whose
+  // identity was stamped on disk becomes its stamped copy, keeping its slot in
+  // the time order, and the indexes are rebuilt by the identity rules, so a
+  // copy that now covers another held sample replaces it as a reload would.
+  function stampHeld(field: StampField, value: string, ids: ReadonlySet<string>): void {
+    let changed = false;
+    const next = samples.map((s) => {
+      if (s[field] !== undefined || !ids.has(`${s.capturedAt}\u0001${identityKey(s)}`)) return s;
+      changed = true;
+      return { ...s, [field]: value };
+    });
+    if (!changed) return;
+    samples.length = 0;
+    buckets.clear();
+    atTime.clear();
+    admitBulk(next);
   }
 
   // Ensure the parent dir exists once at creation, not on every append.
@@ -538,7 +696,9 @@ export function createSampleStore(opts: { path: string }): OwnedSampleStore {
     merge,
     latest,
     all,
-    stampUnstamped,
+    stampUnstamped: (organizationUuid) => stamp("organizationUuid", organizationUuid),
+    stampAccountless: (accountUuid) => stamp("accountUuid", accountUuid),
+    localSamplesStampedAt: () => localStampedAt,
     flush: () => writeChain,
   };
 }

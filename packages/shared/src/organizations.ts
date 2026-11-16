@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { accountUuidSchema } from "./accounts";
+import { editedAtSchema } from "./newest-wins";
 import type { SessionRow } from "./sessions";
 import {
   orgLimitsAnswerSchema,
@@ -82,7 +84,7 @@ export type OrganizationsResponse = z.infer<typeof organizationsResponseSchema>;
 
 // PUT /api/organizations/:uuid body: the new label, or null to clear the rename
 // back to the resolved default. The sidecar trims and checks it
-// (`checkOrganizationLabel`) and refuses one another Organization already uses.
+// (`checkLabel`, ./accounts.ts) and refuses one another Organization already uses.
 export const organizationRenameRequestSchema = z.object({ label: z.string().nullable() });
 export type OrganizationRenameRequest = z.infer<typeof organizationRenameRequestSchema>;
 
@@ -172,9 +174,28 @@ export function displayOrganizationLabels(
   return new Map(
     entries.map(({ uuid, label }) => [
       uuid,
-      (counts.get(label.toLowerCase()) ?? 0) > 1 ? `${label} · ${uuid.slice(0, 8)}` : label,
+      (counts.get(label.toLowerCase()) ?? 0) > 1
+        ? `${label}${COLLISION_SEPARATOR}${uuid.slice(0, 8)}`
+        : label,
     ]),
   );
+}
+
+const COLLISION_SEPARATOR = " · ";
+// The collision suffix of a rendered label: the separator and an organization
+// UUID's first 8, which are lowercase hex. The separator has no regex syntax.
+const COLLISION_SUFFIX = new RegExp(`^(.+)${COLLISION_SEPARATOR}([0-9a-f]{8})$`);
+
+// A rendered Organization label in two parts: the label, and the first 8
+// `displayOrganizationLabels` added to tell it from a namesake (null when it
+// carries none). The suffix is the part that differs between two
+// Organizations on one plan word, as two Accounts' personal Organizations on the Max plan are, so
+// a surface that cuts a long name short cuts the label and keeps the suffix
+// (#647). A rename that happens to end in ` · ` and 8 hex digits splits the
+// same way, which changes only which part is cut first.
+export function organizationLabelParts(label: string): { label: string; suffix: string | null } {
+  const match = label.match(COLLISION_SUFFIX);
+  return match === null ? { label, suffix: null } : { label: match[1]!, suffix: match[2]! };
 }
 
 // uuid → the label to render, collision-suffixed across the WHOLE roster, so
@@ -233,9 +254,11 @@ export interface OrganizationCellLabels {
   ownerlessLabel?: string;
 }
 
-// The Sessions table's Organization cell under All organizations. A partly
-// owned session leads with the Organization its Owner records name, never the
-// row's own (its latest event's, which may be the owner-less half).
+// A session's Organization cell under All organizations: the Headless
+// client's `sessions` report prints it (the Desktop's owner-less review
+// searched by it until #639). A partly owned session leads with the Organization its Owner
+// records name, never the row's own (its latest event's, which may be the
+// owner-less half).
 export function organizationCellLabels(
   row: SessionRow,
   labels: ReadonlyMap<string, string>,
@@ -260,9 +283,9 @@ export function seenOnText(seenOn: OrganizationEntry["seenOn"]): string {
   return places.length === 0 ? "—" : places.join(" · ");
 }
 
-// Home first, then the rest in their own order: how the Desktop client's
-// Organizations list (`organizationListRows`) and `maxprice org list` both
-// order their rows. A null Home, or one the entries lack, leaves the order
+// Home first, then the rest in their own order: how `maxprice org list`
+// orders its rows, as the Desktop client's Organizations list did before
+// Settings › Accounts replaced it (#639). A null Home, or one the entries lack, leaves the order
 // as it is.
 export function homeFirst<T extends { uuid: string }>(
   entries: readonly T[],
@@ -274,45 +297,7 @@ export function homeFirst<T extends { uuid: string }>(
   ];
 }
 
-// The rename limits: trimmed, 1 to 40 code points (not UTF-16 units, so an
-// emoji counts once). Uniqueness needs a roster, so it belongs to whichever
-// machine edits (ADR-0105 §8): the sidecar's rename checks it against its own
-// roster, the Hub's PUT against its roster and its directory.
-export const ORGANIZATION_LABEL_MAX = 40;
-
-export type OrganizationLabelCheck =
-  | { ok: true; label: string }
-  | { ok: false; reason: "empty" | "too-long" };
-
-export function checkOrganizationLabel(raw: string): OrganizationLabelCheck {
-  const label = raw.trim();
-  const length = Array.from(label).length;
-  if (length === 0) return { ok: false, reason: "empty" };
-  if (length > ORGANIZATION_LABEL_MAX) return { ok: false, reason: "too-long" };
-  return { ok: true, label };
-}
-
-// An edit's time as every user-authored directory stamps it — the label
-// entry's (#288) and the assertion entry's (#310): exactly toISOString()'s
-// shape, so string order is time order (./newest-wins.ts).
-export const editedAtSchema = z.string().datetime({ precision: 3 });
-
-// One entry of the user's renames, as held by organization-labels.json, the
-// Hub's Organization directory and the wire between them (#288): a label the
-// rename rules accept unchanged, or null for a cleared one (a tombstone). The
-// `editedAt` shape is exactly toISOString()'s, so newest-wins can compare
-// strings (./newest-wins.ts). A key is an organization uuid (opaque; 1–64).
-export const organizationLabelEntrySchema = z.object({
-  label: z
-    .string()
-    .refine((label) => {
-      const check = checkOrganizationLabel(label);
-      return check.ok && check.label === label;
-    }, "not a label a rename could write")
-    .nullable(),
-  editedAt: editedAtSchema,
-});
-export type OrganizationLabelEntry = z.infer<typeof organizationLabelEntrySchema>;
+// An Organization uuid as a key or field holds it: opaque, 1 to 64.
 export const organizationUuidKeySchema = z.string().min(1).max(64);
 
 // ── Organization assertions (#310, ADR-0107 §11) ──
@@ -324,41 +309,67 @@ export const organizationUuidKeySchema = z.string().min(1).max(64);
 export const SESSION_ID_KEY_MAX = 128;
 export const sessionIdKeySchema = z.string().min(1).max(SESSION_ID_KEY_MAX);
 
-// One Organization assertion, as held by organization-assertions.json, the
-// Hub's Organization assertion directory and the wire between them: the
-// Organization a session's owner-less usage is claimed for, or null for a
-// cleared claim — a tombstone, so an older copy can never resurrect it.
-export const organizationAssertionEntrySchema = z.object({
-  organizationUuid: organizationUuidKeySchema.nullable(),
-  editedAt: editedAtSchema,
-});
-export type OrganizationAssertionEntry = z.infer<typeof organizationAssertionEntrySchema>;
+// One Membership assertion (ADR-0137 §5, ADR-0139 §7), as held by
+// organization-assertions.json, the Hub's Membership assertion directory and
+// the wire between them: the Organization a session's owner-less usage is
+// claimed for and, optionally, the Account, or a null Organization for a
+// cleared claim (a tombstone, so an older copy can never resurrect it). A
+// claim made before Accounts names none and carries over unchanged, taking
+// its Account by ADR-0137 §3 at query time. An Account without an
+// Organization is refused: a tombstone names nothing. The Account is an
+// account uuid (`accountUuidSchema`), never a Pending key or an address.
+export const membershipAssertionEntrySchema = z
+  .object({
+    organizationUuid: organizationUuidKeySchema.nullable(),
+    accountUuid: accountUuidSchema.optional(),
+    editedAt: editedAtSchema,
+  })
+  .refine((entry) => entry.organizationUuid !== null || entry.accountUuid === undefined, {
+    message: "a cleared claim names no Account",
+    path: ["accountUuid"],
+  });
+export type MembershipAssertionEntry = z.infer<typeof membershipAssertionEntrySchema>;
 
 // Bounds the fleet's union of assertions, tombstones included — a count of
 // SESSIONS, not of Organizations. At the cap the compact file, like a push, is
 // ~2.7 MB when every id is a 36-character UUID (137 bytes a live entry) and
-// ~5.1 MB when every key is at its schema limit (257 bytes an entry). The
-// Hub refuses (409) a push whose merged union would pass it, and a local set
-// that would grow the file past it is refused whole, so every answer fits the
-// wire's cap. Declared here rather than in ./hub.ts because the sidecar's PUT
-// body below is bounded by it too, and ./hub.ts imports this module.
-export const ORGANIZATION_ASSERTION_DIRECTORY_MAX = 20_000;
+// ~5.1 MB when every key is at its schema limit (257 bytes an entry); an
+// Account adds at most 80 bytes an entry. The Hub refuses (409) a push whose
+// merged union would pass it, and a local set that would grow the file past
+// it is refused whole, so every answer fits the wire's cap. Declared here
+// rather than in ./hub.ts because the sidecar's PUT body below is bounded by
+// it too, and ./hub.ts imports this module.
+export const MEMBERSHIP_ASSERTION_DIRECTORY_MAX = 20_000;
 
 // GET /api/organization-assertions — this machine's resolved claims: live
-// entries only, no tombstones, no edit times. PUT sets or clears claims in bulk.
+// entries only, no tombstones, no edit times. `assertions` maps each claimed
+// session to its Organization, and `accounts` each claim that names an Account
+// (a Membership assertion, ADR-0137 §5) to that Account, so Settings ›
+// Accounts' Unassign can undo to the very claims it cleared (#672). PUT sets
+// or clears claims in bulk.
 export const ORGANIZATION_ASSERTIONS_PATH = "/api/organization-assertions";
 
 export const organizationAssertionsResponseSchema = z.object({
   assertions: z.record(sessionIdKeySchema, organizationUuidKeySchema),
+  accounts: z.record(sessionIdKeySchema, accountUuidSchema),
 });
 export type OrganizationAssertionsResponse = z.infer<typeof organizationAssertionsResponseSchema>;
 
 // PUT body: claim every listed session for `organizationUuid`, or clear each
-// one's claim (`null`). Duplicates are allowed and collapse to one.
-export const organizationAssertRequestSchema = z.object({
-  sessionIds: z.array(sessionIdKeySchema).min(1).max(ORGANIZATION_ASSERTION_DIRECTORY_MAX),
-  organizationUuid: organizationUuidKeySchema.nullable(),
-});
+// one's claim (`null`). Duplicates are allowed and collapse to one. A claim
+// may name an Account too (ADR-0137 §5's Membership assertion), an account
+// uuid as the Membership assertion directory holds it: Settings › Unattributed
+// usage's Assign sends one (#639). A clear names none.
+export const organizationAssertRequestSchema = z
+  .object({
+    sessionIds: z.array(sessionIdKeySchema).min(1).max(MEMBERSHIP_ASSERTION_DIRECTORY_MAX),
+    organizationUuid: organizationUuidKeySchema.nullable(),
+    accountUuid: accountUuidSchema.optional(),
+  })
+  .refine((body) => body.organizationUuid !== null || body.accountUuid === undefined, {
+    message: "a cleared claim names no Account",
+    path: ["accountUuid"],
+  });
 export type OrganizationAssertRequest = z.infer<typeof organizationAssertRequestSchema>;
 
 // PUT 200 body: how many sessions' entries the request wrote — 0 when every

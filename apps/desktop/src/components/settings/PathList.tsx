@@ -8,6 +8,11 @@ import { insideTauri } from "@/lib/tauri";
 // are never frosted — the blur budget), reveal/remove icon buttons, an "Add
 // path" chip, and the no-paths case as a T1 warn inset.
 //
+// `unlisted` is the status's `unlistedConfigDirRoots` (#679): the `projects`
+// folders `$CLAUDE_CONFIG_DIR` names that this list leaves out. The list wins
+// over the variable (ADR-0014's 2026-11-14 note), so each gets a neutral inset
+// with an Add button, which appends it as a path like any other.
+//
 // The dialog/opener plugin calls throw outside a Tauri host (standalone Vite),
 // so the two plugin-backed buttons ("Add path", "Open in <file manager>") are
 // rendered `disabled` + dimmed there — a legible degraded state rather than a
@@ -24,9 +29,11 @@ const FILE_MANAGER =
 
 export function PathList({
   paths,
+  unlisted = [],
   onChange,
 }: {
   paths: string[];
+  unlisted?: readonly string[];
   onChange: (next: string[]) => void;
 }): React.ReactElement {
   // The folder picker / reveal-in-file-manager plugins need a Tauri host.
@@ -95,6 +102,28 @@ export function PathList({
           ))}
         </ul>
       )}
+
+      {/* Exact matches are dropped here too, so a just-added folder's hint
+          goes at once rather than when the sidecar's next status lands. */}
+      {unlisted
+        .filter((root) => !paths.includes(root))
+        .map((root) => (
+          <div key={root} className="inset self-stretch path-hint">
+            <p>
+              <b>CLAUDE_CONFIG_DIR</b> points Claude Code at <b>{root}</b>, which isn't in this
+              list.
+            </p>
+            <button
+              type="button"
+              className="chip"
+              aria-label={`Add ${root}`}
+              onClick={() => onChange([...paths, root])}
+            >
+              <Plus aria-hidden />
+              Add
+            </button>
+          </div>
+        ))}
 
       <button
         type="button"

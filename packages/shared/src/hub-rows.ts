@@ -1,14 +1,27 @@
+import { accountLabel, type LabelEntry } from "./accounts";
 import { formatRelativeTime } from "./relative-time";
 import { isLoopbackHost } from "./tailnet";
-import type { HubClient, HubRowStatus, HubStatus } from "./hub";
+import {
+  hubKeyCounts,
+  hubKeyHeld,
+  type HubAccount,
+  type HubMembership,
+  type HubClient,
+  type HubKeyCounts,
+  type HubKeys,
+  type HubProvider,
+  type HubRowStatus,
+} from "./hub";
+import { mostUsedWindow, usageTone, windowTag } from "./membership-rank";
 import type { UsageConnection } from "./usage-limits";
+import { usageConnectionDot } from "./usage-status";
 
 // The Hub rows (ADR-0124 §4/§7, route #458 Q9): the pure derivation from a Hub
 // status to the hub Popout's three rows (Hub, claude.ai, Access) and its
 // clients line, so the hub tray app's Popout, the Hub page
 // (apps/hub-desktop/src/page/) and `maxprice-hub status` (apps/hub/src/
 // status.ts, #498) derive them once. The console's cards read the same
-// helpers, and the console's Key row (`hubKeyLabel`) is `status`'s too. The
+// helpers, and the console's Key row (`hubKeyProvenance`) is `status`'s too. The
 // dot helpers keep their load-bearing `bg-*` class names (see
 // usage-status.ts's header); `status` reads them as its glyphs. No React
 // here: the rows' one markup is the hub tray app's HubStatusRows component.
@@ -240,34 +253,179 @@ export function hubClientsLine(
   return { count, noun: connectedClientsNoun(count) };
 }
 
-// ── The Key row (ADR-0036, ADR-0126 §3) ──────────────────────────────────────
+// ── The key rows (ADR-0139 §10, #614 §8–§12) ────────────────────────────────
 
-// Credential provenance line (ADR-0036). Never includes the key. `source`
-// "local" is the console's own write; any other value is the machine that
-// auto-healed the fleet's key.
-export function formatProvenance(
-  updatedAt: string | null | undefined,
-  source: string | null | undefined,
-  now: number,
-): string {
-  if (updatedAt === null || updatedAt === undefined) return "Key set (time unknown)";
-  const rel = formatRelativeTime(updatedAt, now);
-  if (source === "local" || source === null || source === undefined)
-    return `Key set ${rel} locally`;
-  return `Key set ${rel}, healed by ${source}`;
+// The host a Provider's key row is named by: `claude.ai` (#614 §8). v7
+// carries one Provider (ADR-0136 §1), so one row.
+export const HUB_PROVIDER_HOST: Readonly<Record<HubProvider, string>> = { anthropic: "claude.ai" };
+
+// One Provider's keys, as its row reads them (#614 §8): how many Accounts are
+// in each connection, and what the row says of them. It counts and never
+// names an Account, because the Hub page shows the same row from a view that
+// holds no Account (ADR-0124 §4, ADR-0139 §9).
+//
+// - `state`: `hubAccountsConnection`'s summary (any connected, else any
+//   expired, else any failing, else none), for one key that key's own.
+// - `words` and `dot` (a load-bearing `bg-*` class name, or null for the
+//   soft dot): the Popout's and the page's state. One key, or none, reads
+//   today's words and dot (`usageConnectionShortLabel`). Several: `N connected`
+//   while every one works; `No key works` (red) when the Hub is `keyless`
+//   (ADR-0138 §7) as far as counts tell it: none connected and none failing,
+//   since a failing key keeps the clients on the Hub (`hubKeyless`); else the
+//   one problem by name (`1 key expired`, `1 poll failing`, `1 needs a key`),
+//   or `N need a key` (amber). Counts cannot tell a held key pending its first
+//   read from a missing one, so it counts as needing a key here.
+// - `healthy`: whether the row is good, so the tray tooltip carries it not.
+export type HubKeyRow = {
+  provider: HubProvider;
+  counts: HubKeyCounts;
+  state: UsageConnection;
+  words: string;
+  dot: string | null;
+  healthy: boolean;
+};
+
+// How many Accounts a Provider's counts hold.
+export function hubKeyTotal(counts: HubKeyCounts): number {
+  return counts.connected + counts.expired + counts.error + counts.disconnected;
 }
 
-// The console's Key row and `maxprice-hub status`'s (ADR-0127 §8): what a Hub
-// reveals about its key, set or not, when and by whom (ADR-0126 §3), and
-// never any part of the value. A status that has not arrived reads as no
-// key, as the console's card always read it.
-export function hubKeyLabel(
-  status:
-    | Pick<HubStatus, "credentialPresent" | "credentialUpdatedAt" | "credentialSource">
-    | undefined,
+const STATE_ORDER = ["connected", "expired", "error"] as const;
+
+// One problem among several keys, by name.
+const ONE_PROBLEM: Record<Exclude<UsageConnection, "connected">, string> = {
+  expired: "1 key expired",
+  error: "1 poll failing",
+  disconnected: "1 needs a key",
+};
+
+function keyRowWords(
+  counts: HubKeyCounts,
+  state: UsageConnection,
+): Pick<HubKeyRow, "words" | "dot" | "healthy"> {
+  const total = hubKeyTotal(counts);
+  if (total <= 1) {
+    return {
+      words: usageConnectionShortLabel(state),
+      dot: usageConnectionDot(state),
+      healthy: state === "connected",
+    };
+  }
+  if (counts.connected === total) {
+    return { words: `${total} connected`, dot: usageConnectionDot("connected"), healthy: true };
+  }
+  if (counts.connected === 0 && counts.error === 0) {
+    return { words: "No key works", dot: "bg-bad", healthy: false };
+  }
+  const bad = total - counts.connected;
+  const [only] = (["expired", "error", "disconnected"] as const).filter((c) => counts[c] > 0);
+  return {
+    words: bad === 1 ? ONE_PROBLEM[only!] : `${bad} need a key`,
+    dot: "bg-warn",
+    healthy: false,
+  };
+}
+
+// From the status's Accounts (the console, the Popout, `status`'s report
+// keys), or from the Hub page view's counts, which carry no Account
+// (ADR-0139 §9): one row per Provider, every Provider present, so a Hub that
+// knows no Account still shows `claude.ai` as `No key`.
+export function hubKeyRow(
+  input: ReadonlyArray<Pick<HubAccount, "provider" | "connection">> | HubKeys,
+): HubKeyRow[] {
+  const keys: HubKeys = Array.isArray(input)
+    ? hubKeyCounts(input as ReadonlyArray<Pick<HubAccount, "provider" | "connection">>)
+    : (input as HubKeys);
+  return (Object.keys(keys) as HubProvider[]).map((provider) => {
+    const counts = keys[provider];
+    const state = STATE_ORDER.find((s) => counts[s] > 0) ?? "disconnected";
+    return { provider, counts: { ...counts }, state, ...keyRowWords(counts, state) };
+  });
+}
+
+// A key row's clause in the tray tooltip (#614 §11), null for a good row.
+// One key, or none, keeps today's clause (`key expired`); several are named by
+// host, `claude.ai: 1 key expired`.
+export function hubKeyClause(row: HubKeyRow): string | null {
+  if (row.healthy) return null;
+  const words = row.words.toLowerCase();
+  return hubKeyTotal(row.counts) <= 1 ? words : `${HUB_PROVIDER_HOST[row.provider]}: ${words}`;
+}
+
+// ── The Accounts card's Membership lines (#614 §3) ───────────────────────────
+
+// What one Membership's line says, its dot (a `bg-*` class, null for soft)
+// and whether it is a dead key's last reading, greyed (ADR-0138 §8). A
+// Readable membership keeps today's Limits answers apart: its most used live
+// window (`91%`, `82% wk`), `Idle` when none is in flight (an idle 5-hour
+// window is no reading, #610), `No limits`, `Error` when its last read failed,
+// `Not read yet` before any answer. An expired key's Membership shows its last
+// reading, `64% wk · stale`, `Stale` with none; a forbidden one `Can't read
+// limits`; a Membership of an Account with no key `Not connected`.
+export type HubMembershipState = { text: string; dot: string | null; stale: boolean };
+
+export function hubMembershipState(
+  connection: UsageConnection,
+  membership: Pick<HubMembership, "limits" | "current">,
+  nowMs: number,
+): HubMembershipState {
+  if (connection === "disconnected") return { text: "Not connected", dot: null, stale: false };
+  const used = mostUsedWindow(membership.current ?? null, nowMs);
+  const percent =
+    used === null
+      ? null
+      : `${Math.round(used.utilizationPct)}%${windowTag(used.kind) === null ? "" : " wk"}`;
+  if (connection === "expired") {
+    return { text: percent === null ? "Stale" : `${percent} · stale`, dot: null, stale: true };
+  }
+  switch (membership.limits) {
+    case null:
+      return { text: "Not read yet", dot: null, stale: false };
+    case "forbidden":
+      return { text: "Can't read limits", dot: null, stale: false };
+    case "error":
+      return { text: "Error", dot: "bg-warn", stale: false };
+    case "none":
+      return { text: "No limits", dot: "bg-good", stale: false };
+    case "windows": {
+      if (used === null || percent === null) return { text: "Idle", dot: "bg-good", stale: false };
+      const tone = usageTone(used.utilizationPct);
+      return { text: percent, dot: tone === null ? "bg-good" : `bg-${tone}`, stale: false };
+    }
+  }
+}
+
+// ── The Key row (ADR-0036, ADR-0126 §3) ──────────────────────────────────────
+
+// The console's Key row and `maxprice-hub status`'s (ADR-0127 §8), for one
+// Account: what a Hub reveals about its key, set or not, when and by whom
+// (ADR-0126 §3), never any part of the value. `source` "local" is the
+// console's or the terminal's own write; any other value is the machine that
+// auto-healed the key. An entry with no key, or none at all (a status that has
+// not arrived), reads as no key, as the console's card always read it.
+export function hubKeyProvenance(
+  account: Pick<HubAccount, "accountUuid" | "setAt" | "source"> | undefined,
   now: number,
 ): string {
-  return status?.credentialPresent === true
-    ? formatProvenance(status.credentialUpdatedAt, status.credentialSource, now)
-    : "No key set";
+  if (account === undefined || !hubKeyHeld(account)) return "No key set";
+  if (account.setAt === null) return "Key set (time unknown)";
+  const rel = formatRelativeTime(account.setAt, now);
+  if (account.source === "local" || account.source === null) return `Key set ${rel} locally`;
+  return `Key set ${rel}, healed by ${account.source}`;
+}
+
+// The label a Hub surface gives one of its Accounts (ADR-0138 §9, ADR-0139
+// §9): `accountLabel` of the Label directory's account entry, so a user's
+// label where one is set, else `Account <first 8>`, and "Session key" for the
+// unmoved legacy key, which has no Account to name (ADR-0138 §12). Never an
+// email: the Hub keeps none. `labels` is the directory's `accounts` map; a
+// surface that has not read it resolves as though it held nothing.
+export const HUB_LEGACY_KEY_LABEL = "Session key";
+export function hubAccountLabel(
+  accountUuid: string | null,
+  labels: Readonly<Record<string, LabelEntry>> = {},
+): string {
+  if (accountUuid === null) return HUB_LEGACY_KEY_LABEL;
+  const entry = Object.hasOwn(labels, accountUuid) ? labels[accountUuid] : undefined;
+  return accountLabel(accountUuid, null, entry?.label ?? null);
 }

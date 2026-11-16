@@ -1,6 +1,11 @@
 import { isIP } from "node:net";
 import type { Context, Hono } from "hono";
-import { hubPageViewSchema, type ErrorResponse, type HubStatus } from "@maxprice/shared";
+import {
+  hubKeyCounts,
+  hubPageViewSchema,
+  type ErrorResponse,
+  type HubStatus,
+} from "@maxprice/shared";
 import type { PageManifest } from "./page-manifest";
 import { isLoopbackPeer, socketPeerAddress } from "./peer";
 
@@ -90,13 +95,22 @@ export function mountHubPage(app: Hono, opts: MountHubPageOptions): void {
   });
 
   // The page's data (ADR-0124 §4): hubPageViewSchema strips every other status
-  // key, so no usage reading, Organization id or credential provenance leaves.
+  // key, so no usage reading, Organization id, Account or credential
+  // provenance leaves.
   // Outside /api/*, so no password, protocol or CSRF gate applies; it awaits
   // `ready` as /api/status does, so a booting Hub holds the request and the
   // page reads "Starting…". The page's files never wait.
   app.get("/page/view", async (c) => {
     if (ready !== undefined) await ready;
-    const view = hubPageViewSchema.safeParse({ ...status(), liveClients: liveClients(), version });
+    const full = status();
+    // The claude.ai row's data is counts the Hub makes (ADR-0139 §9): no
+    // Account, label or reading leaves.
+    const view = hubPageViewSchema.safeParse({
+      ...full,
+      keys: hubKeyCounts(full.accounts),
+      liveClients: liveClients(),
+      version,
+    });
     if (view.success) return c.json(view.data, 200, pageHeaders(NO_STORE));
     // The app's ordinary 500 (server.ts's onError), with §8's headers.
     console.error("[hub] route error:", view.error);

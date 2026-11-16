@@ -38,6 +38,17 @@ export const PRICING_OVERRIDES: Record<string, ModelPricing> = {
     cache_creation_input_token_cost: 1.25e-5,
     cache_read_input_token_cost: 1e-6,
   },
+  // claude-fable-5-2 — Anthropic-published pricing ($8 input / $10 5-minute
+  // cache write / $0.20 cache hit / $40 output per Mtok; the cache hit is 0.025x
+  // input), https://platform.claude.com/docs/en/about-claude/pricing, read
+  // 2026-11-13. Standard rates cover the whole 1M context window, so there is
+  // no long-context tier to vendor. Remove once upstream LiteLLM carries the key.
+  "claude-fable-5-2": {
+    input_cost_per_token: 8e-6,
+    output_cost_per_token: 4e-5,
+    cache_creation_input_token_cost: 1e-5,
+    cache_read_input_token_cost: 2e-7,
+  },
 };
 
 // Merge the overrides into a snapshot, snapshot-wins. Identity-preserving:

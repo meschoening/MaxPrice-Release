@@ -20,18 +20,18 @@ The Hub's address is its computer's Tailscale name or address and the port, as `
 
 The status line above the address reads **Connected — hub is polling** once the Hub answers.
 
-![Settings › Usage hub: Connected — hub is polling, the Hub's address, the password field with Save and Disconnect, and the three switches, each on](../../screenshots/join-a-hub-connected.light.png "Settings › Usage hub, connected")
+![Settings › Usage hub: Connected — hub is polling, the Hub's address, the password field with Save and Disconnect, and the three switches, Send keys to the Hub, Share usage events and Fleet replica, each on](../../screenshots/join-a-hub-connected.light.png "Settings › Usage hub, connected")
 
 The first time, MaxPrice copies the other machines' usage from the Hub, and a **Syncing fleet history** bar shows how far it has got. Once it is done, every report can show each machine's usage: Live's chart can be grouped **by machine**, and a **Machine** filter appears (see [the Machine filter](../concepts/hubs.md#the-machine-filter-and-grouping-by-machine)).
 
-While you are joined, Settings › Claude account shows the state of the Hub's [session key](../concepts/blocks.md#the-claudeai-session-key), not this computer's. Keep a key of your own anyway: this computer reads your limits with it whenever it [can't use the Hub](../concepts/hubs.md#fallback-polling).
+While you are joined, [Settings › Accounts](settings.md#accounts) shows the state of the Hub's [session keys](../concepts/blocks.md#the-claudeai-session-key), not this computer's: each card reads **Connected through the Hub**, **Key expired at the Hub** or **No key at the Hub**, and says whether this machine also holds a key. While the Hub is connected, a notice at the top, **Limits come from the Hub**, names the Hub and carries the **Send keys to the Hub** switch, the same one as in Usage hub. Keep a key of your own anyway: this computer reads your limits with it whenever it [can't use the Hub](../concepts/hubs.md#fallback-polling), and with Send keys to the Hub on it gives the Hub its key for any Account the Hub holds none for.
 
 ## The three switches
 
-Under the password are three switches, each on by default: [Auto-heal](../concepts/hubs.md#auto-heal), [Share usage events](../concepts/hubs.md#share-usage-events) and [Fleet replica](../concepts/hubs.md#fleet-replica). Leave them on unless you have a reason not to; [Hubs and the fleet](../concepts/hubs.md#the-clients-switches) explains what each one does and what turning it off changes.
+Under the password are three switches, each on by default: [Send keys to the Hub](../concepts/hubs.md#send-keys-to-the-hub), [Share usage events](../concepts/hubs.md#share-usage-events) and [Fleet replica](../concepts/hubs.md#fleet-replica). Leave them on unless you have a reason not to; [Hubs and the fleet](../concepts/hubs.md#the-clients-switches) explains what each one does and what turning it off changes.
 
 > [!WARNING]
-> If the address isn't a tailnet or loopback one, MaxPrice warns under it. Traffic to a Hub isn't encrypted, and with **Auto-heal** on your session key may be sent to that address. Join a Hub over your tailnet.
+> If the address isn't a tailnet or loopback one, MaxPrice warns under it. Traffic to a Hub isn't encrypted, and with **Send keys to the Hub** on your session key may be sent to that address. Join a Hub over your tailnet.
 
 ## Change the address or password
 

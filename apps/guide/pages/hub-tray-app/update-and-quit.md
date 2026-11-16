@@ -24,7 +24,7 @@ You can also install a release over the running app: download its `MaxPrice.Hub_
 
 Closing the console window only hides it. To stop the Hub, open the Popout and choose **Quit MaxPrice Hub**.
 
-While the Hub is stopped, no client can reach it. Each one reads **Hub unreachable — polling locally**, reads its usage limits from claude.ai itself, and keeps its own usage on its machine ([fallback polling](../concepts/hubs.md#fallback-polling)). When the Hub is back, each client reconnects on its own and sends up what it held meanwhile.
+While the Hub is stopped, no client can reach it. Each one reads **Hub unreachable — polling locally**, reads its usage limits from claude.ai itself, reads any Gateway it holds itself, and keeps its own usage on its machine ([fallback polling](../concepts/hubs.md#fallback-polling)). When the Hub is back, each client reconnects on its own and sends up what it held meanwhile.
 
 To start it again, choose **MaxPrice Hub** in the Start menu. It also starts at your next login.
 

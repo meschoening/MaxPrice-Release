@@ -28,6 +28,13 @@ export type LiveMessage =
   // signal for GET /api/organizations. Broadcast when a settings edit starts
   // applying and again when its walk ends, and after a rename that wrote.
   | { type: typeof SSE_EVENT.organizationsChanged; data: Record<string, never> }
+  | { type: typeof SSE_EVENT.accountsChanged; data: Record<string, never> }
+  // Held-keyset poke (#633) — empty data, a pure refetch signal for GET
+  // /api/usage/keys.
+  | { type: typeof SSE_EVENT.usageKeysChanged; data: Record<string, never> }
+  // Held-Gateways poke (ADR-0141, #651) — empty data, a pure refetch signal
+  // for GET /api/gateways.
+  | { type: typeof SSE_EVENT.gatewaysChanged; data: Record<string, never> }
   | { type: typeof SSE_EVENT.heartbeat };
 
 export type LiveSubscriber = (message: LiveMessage) => void;
@@ -48,6 +55,15 @@ export type LiveHub = {
   // Broadcast an organizations:changed poke (empty payload) so subscribers
   // refetch GET /api/organizations (#287, ADR-0105).
   emitOrganizationsChanged: () => void;
+  // Broadcast an accounts:changed poke (empty payload) so subscribers refetch
+  // GET /api/accounts (#631).
+  emitAccountsChanged: () => void;
+  // Broadcast a usage-keys:changed poke (empty payload) so subscribers refetch
+  // GET /api/usage/keys (#633).
+  emitUsageKeysChanged: () => void;
+  // Broadcast a gateways:changed poke (empty payload) so subscribers refetch
+  // GET /api/gateways (ADR-0141, #651).
+  emitGatewaysChanged: () => void;
   getStatus: () => StatusSnapshot;
   setStatus: (status: StatusSnapshot) => void;
   // Merge a partial update into the current status and broadcast it. Unlike a
@@ -163,6 +179,9 @@ export function createLiveHub(opts: CreateLiveHubOptions): LiveHub {
     emitMachinesChanged: () => broadcast({ type: SSE_EVENT.machinesChanged, data: {} }),
     emitIdentityChanged: () => broadcast({ type: SSE_EVENT.identityChanged, data: {} }),
     emitOrganizationsChanged: () => broadcast({ type: SSE_EVENT.organizationsChanged, data: {} }),
+    emitAccountsChanged: () => broadcast({ type: SSE_EVENT.accountsChanged, data: {} }),
+    emitUsageKeysChanged: () => broadcast({ type: SSE_EVENT.usageKeysChanged, data: {} }),
+    emitGatewaysChanged: () => broadcast({ type: SSE_EVENT.gatewaysChanged, data: {} }),
     getStatus: () => status,
     setStatus: (next) => {
       status = next;

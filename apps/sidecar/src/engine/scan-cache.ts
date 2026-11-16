@@ -1,6 +1,6 @@
 import { rename, rm, stat, writeFile } from "node:fs/promises";
 import { internRowStrings } from "@maxprice/shared";
-import { collectUsageRecords } from "./jsonl";
+import { collectUsageRecords, type OnAccountPair } from "./jsonl";
 import { SCAN_CACHE_VERSION, type UsageRecord } from "./types";
 
 // The on-disk parse cache (ADR-0048, startup-readiness T8).
@@ -28,8 +28,10 @@ export type ScanCache = {
   // (size, mtimeMs) match, else `collectUsageRecords`. Either way the entry is
   // staged for the next `save`. Throws what stat/read throws — the scan
   // worker's per-file catch owns that failure, and a file that failed is
-  // simply not staged (re-tried next boot).
-  readRecords: (path: string) => Promise<UsageRecord[]>;
+  // simply not staged (re-tried next boot). `onPair` hears a miss's pair
+  // observations (`collectUsageRecords`'s); a hit yields none, since the pair
+  // table that learned them is persisted itself (account-pairs.ts).
+  readRecords: (path: string, onPair?: OnAccountPair) => Promise<UsageRecord[]>;
   // Atomically rewrite the cache file with every entry staged since process
   // start — files the scans of THIS process observed; entries for files no
   // longer present simply drop. tmp + rename, so a torn write never becomes
@@ -42,6 +44,12 @@ export type ScanCache = {
   // path itself: only the owner can also stop the pending `save` that would
   // write the in-memory copy straight back.
   drop: () => Promise<number>;
+  // Serve nothing from the file this process loaded, so every file the scans
+  // read re-parses, and the next `save` writes the cache again whole. The
+  // file stays until that save replaces it. bootSidecar() calls it before the
+  // boot walk when the pair table was lost (account-pairs.ts), because a hit
+  // teaches no pair and the re-parse is what learns them again.
+  discard: () => void;
 };
 
 export function createScanCache(opts: { path: string }): ScanCache {
@@ -71,7 +79,7 @@ export function createScanCache(opts: { path: string }): ScanCache {
   // allowed to rebuild the cache it was asked to discard.
   let dropped = false;
 
-  async function readRecords(filePath: string): Promise<UsageRecord[]> {
+  async function readRecords(filePath: string, onPair?: OnAccountPair): Promise<UsageRecord[]> {
     // Stat BEFORE read: if the file grows between the stat and the read, the
     // stored stamp is older than the records — a stale stamp re-parses next
     // boot (safe). Stat-after would stamp newer than the records and silently
@@ -84,7 +92,7 @@ export function createScanCache(opts: { path: string }): ScanCache {
     }
     // A miss means a real parse — the cache content changed, so mark dirty.
     dirty = true;
-    const records = await collectUsageRecords(filePath);
+    const records = await collectUsageRecords(filePath, onPair);
     staged.set(filePath, { size: s.size, mtimeMs: s.mtimeMs, records });
     return records;
   }
@@ -112,6 +120,11 @@ export function createScanCache(opts: { path: string }): ScanCache {
     // indistinguishable from the benign case.
     await rm(path, { force: true });
     return bytes;
+  }
+
+  function discard(): void {
+    staged.clear();
+    loadedPromise = Promise.resolve(new Map());
   }
 
   async function save(): Promise<void> {
@@ -146,7 +159,7 @@ export function createScanCache(opts: { path: string }): ScanCache {
     await rename(tmpPath, path);
   }
 
-  return { readRecords, save, drop };
+  return { readRecords, save, drop, discard };
 }
 
 // Hydrate the cache file. Any anomaly — missing file, unreadable JSON — yields

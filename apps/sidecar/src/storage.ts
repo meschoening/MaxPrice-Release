@@ -2,11 +2,16 @@ import { readdir, stat } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
 import type { StorageCleanResponse, StorageReport, StorageSegment } from "@maxprice/shared";
 import type { FleetRecord, FleetReplicaStore, LocalArchiveStore } from "@maxprice/usage-core";
-import { eventOrganization, type OrganizationResolvable } from "./engine/presumption";
+import {
+  eventMembership,
+  type AccountResolvable,
+  type OrganizationResolvable,
+} from "./engine/presumption";
 import type { EventStore } from "./engine/store";
 import {
   backedSessionsFromPaths,
   classifyUnbacked,
+  type ForgetMembership,
   type UnbackedSession,
 } from "./storage-unbacked";
 
@@ -56,8 +61,28 @@ export const STORAGE_FILE = {
   // never touches `other`.
   organizations: "organizations.json",
   organizationLabels: "organization-labels.json",
+  // #635: the user's Account labels, beside the Organization labels and as
+  // durable, a few hundred bytes, in `other` too.
+  accountLabels: "account-labels.json",
   organizationAssertions: "organization-assertions.json",
   organizationRepair: "organization-repair.json",
+  // ADR-0137 §1 (#631): the pair table, a few hundred bytes, in `other` too.
+  // Local only: no wire, Hub, archive or directory carries it.
+  accountPairs: "account-pairs.json",
+  // ADR-0139 §8 (#634): when the usage history's own stamping last stamped a
+  // sample, and the hub-client's last cursorless sample exchange. A few dozen
+  // bytes each, in `other` too.
+  sampleStamps: "sample-stamps.json",
+  hubSampleExchange: "hub-sample-exchange.json",
+  // ADR-0141 §1, §5 (#651): the Gateway evidence store and the pending Gateway
+  // records with the fallback drain's outbox. Local only, written only once a
+  // Gateway record was offered, in `other` too.
+  gatewayEvidence: "gateway-evidence.json",
+  gatewayPending: "gateway-pending.json",
+  // ADR-0141 §5, §7 (#651): per Hub, the Gateway record feed's cursor and
+  // the Gateways already sent up to it. Local only, written only once a feed
+  // page carried a record or a Gateway was sent up, in `other` too.
+  gatewayRelay: "gateway-relay.json",
 } as const;
 
 // The durable log directory (ADR-0056) — the Rust shell owns the file, we only
@@ -311,11 +336,11 @@ export type StorageReporterDeps = {
   // them: they stay in the file and in the bytes. Asked of a replica record
   // and of a Local archive row alike.
   withheld?: (row: OrganizationResolvable) => boolean;
-  // The Organization an unbacked row counts under, for Forget's
-  // per-Organization disclosure (#295; `UnbackedInput.organizationOf`). Wired
-  // to `eventOrganization` over the live store's presumption. Omitted = the
-  // report never carries `forget.organizations`.
-  organizationOf?: (record: FleetRecord) => string | undefined;
+  // The Membership an unbacked row counts under, for Forget's per-Membership
+  // disclosure (#295, #631; `UnbackedInput.membershipOf`). Wired to
+  // `forgetMembershipOf` over the live store. Omitted = the report never
+  // carries `forget.memberships`.
+  membershipOf?: (record: FleetRecord) => ForgetMembership | undefined;
   concurrency?: number;
   // Test seam, handed to every `walkTree` this snapshot runs. It exists for one
   // assertion the suite could not otherwise make: that a per-file stat failure
@@ -326,24 +351,32 @@ export type StorageReporterDeps = {
   statImpl?: (path: string) => Promise<{ size: number }>;
 };
 
-// The breakdown's resolver over the live store (#295): each unbacked row's
-// Organization the way every report answers it (`eventOrganization`), except
-// one the store does not track. The tracked set is fixed when a store is built,
-// but `installAssertions` swaps the presumption live, ahead of the rebuild it
-// queues; in that window a claim on an Excluded organization resolves an
-// owner-less row to it while `withheld` still lets the row through. Answering
-// `undefined` drops the whole breakdown (the classifier's every-row rule)
-// rather than naming what is excluded (ADR-0098); the counts stay the store's
-// until its successor lands.
-export function forgetOrganizationOf(
-  store: Pick<EventStore, "presumption" | "trackedOrganizations">,
-  row: OrganizationResolvable,
-): string | undefined {
-  const organization = eventOrganization(row, store.presumption());
-  const tracked = store.trackedOrganizations();
-  return organization !== undefined && tracked !== null && !tracked.has(organization)
-    ? undefined
-    : organization;
+// The breakdown's resolver over the live store (#295, per Membership since
+// #631): each unbacked row's Membership the way every report answers it
+// (`eventMembership`: its Organization and its Account, each by evidence, then
+// assertion, then presumption), except one the store does not track at either
+// level. The tracked sets are fixed when a store is built, but
+// `installAssertions` swaps the presumption live, ahead of the rebuild it
+// queues; in that window a claim on an Excluded organization or an Excluded
+// account resolves an owner-less row to it while `withheld` still lets the row
+// through. Answering `undefined` drops the whole breakdown (the classifier's
+// every-row rule) rather than naming what is excluded (ADR-0098, ADR-0136 §3);
+// the counts stay the store's until its successor lands. An Account that
+// resolves to none is `null`: a Home membership whose Account is unknown is
+// still a Membership the rows count under.
+export function forgetMembershipOf(
+  store: Pick<EventStore, "presumption" | "trackedOrganizations" | "trackedAccounts">,
+  row: AccountResolvable,
+): ForgetMembership | undefined {
+  const { organizationUuid, accountUuid } = eventMembership(row, store.presumption());
+  if (organizationUuid === undefined) return undefined;
+  const organizations = store.trackedOrganizations();
+  if (organizations !== null && !organizations.has(organizationUuid)) return undefined;
+  const accounts = store.trackedAccounts();
+  if (accountUuid !== undefined && accounts !== null && !accounts.has(accountUuid)) {
+    return undefined;
+  }
+  return { organizationUuid, accountKey: accountUuid ?? null };
 }
 
 // What one measurement produces. The wire carries `report` only; `forgetSessions`
@@ -534,7 +567,7 @@ export async function buildStorageSnapshot(deps: StorageReporterDeps): Promise<S
     missingRoots: corpus.missingRoots,
     emptyRoots: corpus.emptyRoots,
     withheld: deps.withheld,
-    organizationOf: deps.organizationOf,
+    membershipOf: deps.membershipOf,
   });
 
   return {

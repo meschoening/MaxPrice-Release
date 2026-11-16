@@ -1,10 +1,18 @@
-// Newest-edit-wins merge for the Hub's user-authored directories: #288's
-// Organization directory and #310's Organization assertion directory. Each
-// entry carries the ISO `editedAt` of the edit that made it; its schema pins
-// toISOString()'s exact shape, so string order is time order. A cleared entry
-// is a tombstone that still carries its `editedAt`, so an older copy can never
-// resurrect it.
+import { z } from "zod";
+
+// Newest-edit-wins merge for the Hub's user-authored directories: the Label
+// directory (#288, #635) and the Membership assertion directory (#310, #635).
+// Each entry carries the ISO `editedAt` of the edit that made it; its schema
+// pins toISOString()'s exact shape, so string order is time order. A cleared
+// entry is a tombstone that still carries its `editedAt`, so an older copy can
+// never resurrect it.
 export type EditedEntry = { readonly editedAt: string };
+
+// An edit's time as every user-authored directory stamps it, the label
+// entry's and the assertion entry's: exactly toISOString()'s shape, so string
+// order is time order. Here, not beside either entry, so ./accounts.ts and
+// ./organizations.ts both import it without importing each other.
+export const editedAtSchema = z.string().datetime({ precision: 3 });
 
 // True when `incoming` must replace `incumbent`. The newer edit wins; an equal
 // `editedAt` is broken by the entry's canonical JSON, the larger one winning,

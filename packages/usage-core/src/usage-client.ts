@@ -322,6 +322,65 @@ export async function discoverOrg(opts: DiscoverOrgOptions): Promise<ListOrgsRes
   }
 }
 
+// GET /api/account (ADR-0138 §2, #633): the Account a session key belongs to.
+// `uuid` names it; `email_address` is what the pair table learns (ADR-0137
+// §1), hashed by the caller. The address is returned to the caller alone and
+// never logged here: no failure path below prints the body. Failures read as
+// the listing's do: a 401 or any 403 is the key unable to name its own
+// Account, which is `expired`; a challenge, another status, a shape mismatch
+// or the network is `error`.
+export type FetchAccountResult =
+  | { ok: true; accountUuid: string; email: string | null }
+  | { ok: false; kind: DiscoverFailKind };
+
+const upstreamAccountSchema = z
+  .object({
+    uuid: z.string().min(1),
+    email_address: z.string().nullable().optional().catch(null),
+  })
+  .passthrough();
+
+export async function fetchAccount(opts: {
+  sessionKey: string;
+  baseUrl?: string;
+  signal?: AbortSignal;
+  fetchImpl?: FetchLike;
+  timeoutMs?: number;
+}): Promise<FetchAccountResult> {
+  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const base = opts.baseUrl ?? DEFAULT_CLAUDE_BASE_URL;
+  if (!isHeaderSafe(opts.sessionKey)) return { ok: false, kind: "error" };
+  try {
+    const res = await fetchImpl(`${base}/account`, {
+      headers: authHeaders(opts.sessionKey),
+      signal: opts.signal
+        ? AbortSignal.any([opts.signal, AbortSignal.timeout(timeoutMs)])
+        : AbortSignal.timeout(timeoutMs),
+    });
+    if (isChallenge(res)) return { ok: false, kind: "error" };
+    if (res.status === 401 || res.status === 403) return { ok: false, kind: "expired" };
+    if (!res.ok) return { ok: false, kind: "error" };
+    const parsed = upstreamAccountSchema.safeParse(await res.json());
+    if (!parsed.success) {
+      // No detail: a parse message can quote the body, which holds the address.
+      console.warn("[usage-core] account shape mismatch");
+      return { ok: false, kind: "error" };
+    }
+    return {
+      ok: true,
+      accountUuid: parsed.data.uuid,
+      email: parsed.data.email_address ?? null,
+    };
+  } catch (err) {
+    console.warn(
+      "[usage-core] account read failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+    return { ok: false, kind: "error" };
+  }
+}
+
 // The Limits answer a read gives, for discovery and the poller alike. A 200
 // answers `windows` when it reports any limit, a window in flight or an idle
 // one, and `none` only when it reports no limit at all: both primary windows

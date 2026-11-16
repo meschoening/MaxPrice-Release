@@ -2,7 +2,8 @@
 // the 1/min poller, and the on-disk sample store — consumed by BOTH the
 // sidecar (apps/sidecar) and the hub (apps/hub). fake-claude.ts is deliberately
 // NOT re-exported here: it is a test/dev fixture, reachable only via the
-// "./fake-claude" subpath so compiled binaries never bundle it.
+// "./fake-claude" subpath so compiled binaries never bundle it, as is
+// fake-cliproxyapi.ts via "./fake-cliproxyapi".
 // self-update.ts is likewise reachable only via "./self-update": the headless
 // products update themselves, the sidecar and the Desktop client never do.
 // flock.ts, the headless products' lock binding, only via "./flock".
@@ -36,3 +37,8 @@ export * from "./sse-pump";
 export * from "./parent-watchdog";
 export * from "./mono-clock";
 export * from "./constant-time";
+// The one Gateway adapter, CLIProxyAPI's (ADR-0141 §7); its fake is reachable
+// only via "./fake-cliproxyapi".
+export * from "./gateway/cliproxyapi";
+// The per-Gateway drain step the Hub and a client's fallback drain share.
+export * from "./gateway/drain-step";

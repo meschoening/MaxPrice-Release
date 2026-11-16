@@ -1,76 +1,117 @@
 import { useMemo, useRef, useState } from "react";
-import { Building2, Check, ChevronDown } from "lucide-react";
-import { ALL_ORGANIZATIONS } from "@maxprice/shared";
-import { buildScopeView, optionScope, type ScopeView } from "@/lib/organization-scope-view";
-import { useOrganizations } from "@/state/use-organizations";
+import { Building2, Check, ChevronDown, Info } from "lucide-react";
+import { accountFilterVisible, ALL_ORGANIZATIONS } from "@maxprice/shared";
+import {
+  buildScopeChipView,
+  chipScope,
+  HIDDEN_SELECTION_NOTE,
+  HIDDEN_SELECTION_SHORT,
+  optionScope,
+  type ScopeChipView,
+} from "@/lib/organization-scope-view";
+import { nextOptionIndex } from "@/lib/option-keys";
+import { useAccounts, useOrganizations } from "@/state/use-organizations";
+import { useScope } from "@/state/use-scope";
 import { useSettings, useUpdateSettings } from "@/state/use-settings";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 
-// The Organization scope chip (ADR-0106): the first chip in the topbar's right
-// cluster, on every page, answering "whose numbers are these". It exists only
-// while two or more Organizations are tracked (`buildScopeView`), so a
-// single-Organization machine renders exactly what it did before. Under All it
-// also names the Quota organization, whose limits and blocks the page still
-// shows.
+// The Organization scope chip (ADR-0106; kept by #637 for one-Account
+// installs): the first chip in the topbar's right cluster, on every page,
+// answering "whose numbers are these". It exists only while the Account
+// filter is hidden (fewer than two tracked Accounts) and two or more
+// Organizations are tracked (`buildScopeChipView`), so a single-Organization
+// machine, and every several-Account one, renders no chip. Under All it also
+// names the head Organization, whose limits and blocks the page still shows.
 //
-// A pick writes `organizationScope` and nothing else — the option's
-// `optionScope`, so Home as `null` and All as `ALL_ORGANIZATIONS` — and
-// invalidates no report query: every money query keys on the scope, so the new
-// scope is new keys.
+// A pick writes `scope` on the Organization axis alone (`chipScope`): Home as
+// `null`, All as `all`, another Organization as its uuid. It invalidates no
+// report query: every money query keys on the Scope, so the new Scope is new
+// keys.
+//
+// While the Account filter is hidden a saved Scope naming Accounts or
+// Memberships is read as the default (`ScopeView.hiddenSelection`): the chip
+// shows Home and carries the note, and an install with no chip shows the note
+// alone (`ScopeHiddenNote`). Neither rewrites the file.
 export function TopbarScopeChip(): React.ReactElement | null {
   const { data: settings } = useSettings();
   const { data: roster } = useOrganizations();
+  const { data: accounts } = useAccounts();
+  const { selection, hiddenSelection } = useScope();
   const update = useUpdateSettings();
+  // Undecided until /api/accounts answers, so a several-Account install never
+  // flashes the chip.
+  const filterHidden = accounts !== undefined && !accountFilterVisible(accounts.accounts);
   const view = useMemo(
-    () => (settings ? buildScopeView(settings, roster?.organizations ?? []) : null),
-    [settings, roster],
+    () =>
+      settings && filterHidden
+        ? buildScopeChipView(settings, roster?.organizations ?? [], selection, hiddenSelection)
+        : null,
+    [settings, filterHidden, roster, selection, hiddenSelection],
   );
-  if (view === null) return null;
+  if (view === null) return filterHidden && hiddenSelection ? <ScopeHiddenNote /> : null;
   return (
     <TopbarScopeChipContent
       view={view}
-      onPick={(scope) => {
-        void update({ organizationScope: scope });
+      onPick={(selected) => {
+        void update({ scope: chipScope(selected) });
       }}
     />
+  );
+}
+
+// The note alone, for an install with no chip to carry it: a saved Account
+// selection the window does not apply.
+export function ScopeHiddenNote(): React.ReactElement {
+  return (
+    <span role="note" className="chip scope-note" title={HIDDEN_SELECTION_NOTE}>
+      <Info aria-hidden className="scope-chip-icon" />
+      <span className="truncate" aria-hidden>
+        {HIDDEN_SELECTION_SHORT}
+      </span>
+      <span className="sr-only">{HIDDEN_SELECTION_NOTE}</span>
+    </span>
   );
 }
 
 // The pure composition — the view handed in so the trigger is testable under
 // static rendering. The menu opens on the selected option, and closes on a pick
 // or Escape with focus back on the trigger (Radix). Under All the label holds
-// its width (`scope-chip-all`) and the quota half is what truncates.
+// its width (`scope-chip-all`) and the quota half is what truncates. With a
+// hidden selection the trigger wears an info mark, its accessible name and
+// title carry the note, and the menu heads with it.
 export function TopbarScopeChipContent({
   view,
   onPick,
 }: {
-  view: ScopeView;
-  onPick: (scope: string | null) => void;
+  view: ScopeChipView;
+  onPick: (selected: string | null) => void;
 }): React.ReactElement {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
-  const label = view.isAll
-    ? `Organization scope: All organizations, quota ${view.quotaLabel}`
-    : `Organization scope: ${view.chipLabel}`;
+  const base = view.isAll
+    ? `Organization: All organizations, limits from ${view.quotaLabel}`
+    : `Organization: ${view.chipLabel}`;
+  const label = view.hiddenSelection ? `${base}. ${HIDDEN_SELECTION_NOTE}` : base;
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
         className="chip scope-chip"
         aria-haspopup="listbox"
         aria-label={label}
-        title="Organization scope"
+        title={view.hiddenSelection ? HIDDEN_SELECTION_NOTE : "Organization"}
       >
         <Building2 aria-hidden className="scope-chip-icon" />
         <span className={cn("truncate", view.isAll && "scope-chip-all")}>{view.chipLabel}</span>
         {view.isAll ? (
           <span className="scope-chip-quota">{`quota · ${view.quotaLabel}`}</span>
         ) : null}
+        {view.hiddenSelection ? <Info aria-hidden className="scope-chip-hidden" /> : null}
         <ChevronDown aria-hidden className="caret" />
       </PopoverTrigger>
       <PopoverContent
         ref={menuRef}
-        aria-label="Organization scope"
+        aria-label="Organization"
         align="end"
         sideOffset={8}
         className="menu w-auto min-w-[230px] gap-0 rounded-[14px] border-[var(--panel-border)] p-[5px] shadow-none ring-0"
@@ -81,11 +122,12 @@ export function TopbarScopeChipContent({
             ?.focus({ preventScroll: true });
         }}
       >
+        {view.hiddenSelection ? <p className="scope-menu-note">{HIDDEN_SELECTION_NOTE}</p> : null}
         <ScopeOptionList
           view={view}
-          onPick={(scope) => {
+          onPick={(selected) => {
             setOpen(false);
-            onPick(scope);
+            onPick(selected);
           }}
         />
       </PopoverContent>
@@ -99,18 +141,18 @@ export function TopbarScopeChipContent({
 // focused element carries `role="option"` and `aria-selected`, so a screen
 // reader announces the selection — and the selected one is the list's only
 // tab stop. Arrow keys move between the options, wrapping; Home and End jump
-// to the ends.
+// to the ends (`nextOptionIndex`).
 export function ScopeOptionList({
   view,
   onPick,
 }: {
-  view: ScopeView;
-  onPick: (scope: string | null) => void;
+  view: ScopeChipView;
+  onPick: (selected: string | null) => void;
 }): React.ReactElement {
   return (
     <ul
       role="listbox"
-      aria-label="Organization scope"
+      aria-label="Organization"
       className="flex flex-col"
       onKeyDown={(event) => {
         const buttons = [
@@ -124,12 +166,12 @@ export function ScopeOptionList({
       }}
     >
       {view.options.map((option) => {
-        const scope = optionScope(option);
+        const value = optionScope(option);
         return (
           <ScopeOptionItem
             key={option.uuid}
-            selected={view.selected === scope}
-            onPick={() => onPick(scope)}
+            selected={view.selected === value}
+            onPick={() => onPick(value)}
           >
             <span className="truncate">{option.label}</span>
             {option.isHome ? <em>(home)</em> : null}
@@ -176,24 +218,4 @@ function ScopeOptionItem({
       </button>
     </li>
   );
-}
-
-// The option to focus for a key, or null when the key is not the list's.
-// `current` is -1 when no option has focus. It belongs beside the list it
-// drives; a file of its own would cost more than fast refresh does.
-// eslint-disable-next-line react-refresh/only-export-components
-export function nextOptionIndex(key: string, current: number, count: number): number | null {
-  if (count === 0) return null;
-  switch (key) {
-    case "ArrowDown":
-      return (current + 1) % count;
-    case "ArrowUp":
-      return current <= 0 ? count - 1 : current - 1;
-    case "Home":
-      return 0;
-    case "End":
-      return count - 1;
-    default:
-      return null;
-  }
 }

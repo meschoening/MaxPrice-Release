@@ -9,11 +9,12 @@ import {
 import { useLiveStatus } from "@/state/use-live-status";
 import { useSettings, useUpdateSettings } from "@/state/use-settings";
 import {
-  readHubPassword,
+  readStoredHubPassword,
   writeHubPassword,
   pushHubConfigToSidecar,
   disconnectHub,
 } from "@/lib/hub-config";
+import { applyHubAutoHeal } from "@/lib/hub-auto-heal";
 import { hubConnectionDot, hubConnectionTextClass } from "@/lib/hub-status";
 import { isStale, STALE_HUB_LINE } from "@/lib/stale-status";
 import { insideTauri } from "@/lib/tauri";
@@ -167,20 +168,6 @@ export function HubSection(): React.ReactElement {
     }
   }, [url]);
 
-  // Read the stored keychain password (Tauri-only; null outside Tauri or when
-  // unset) and reject a value poisoned by an earlier bad paste — one that can't
-  // form a valid Authorization header fails every push opaquely as a generic
-  // "unreachable" (F18). Throws a user-facing Error on a corrupted value; both
-  // connect() and applyAutoHeal() catch it into the section error and skip the
-  // push (self-healing the keychain by prompting a re-entry).
-  async function readStoredHubPassword(): Promise<string | null> {
-    const stored = insideTauri() ? await readHubPassword() : null;
-    if (stored !== null && stored !== "" && !isValidHubPassword(stored)) {
-      throw new Error("The stored hub password looks corrupted — re-enter it.");
-    }
-    return stored;
-  }
-
   async function connect(): Promise<void> {
     setBusy(true);
     setError(null);
@@ -241,23 +228,20 @@ export function HubSection(): React.ReactElement {
     }
   }
 
-  // Toggling auto-heal persists the setting and — when a hub is configured —
-  // re-pushes the config immediately with the stored password, mirroring
-  // connect()'s keychain handling. Outside Tauri (standalone dev) there is no
-  // keychain: persist only; the env-driven sidecar picks its own value.
+  // "Send keys to the Hub" (`hubAutoHeal`): the helper Settings › Accounts'
+  // hub strip shares (lib/hub-auto-heal) persists it and, with a Hub
+  // configured, re-pushes the config with the stored password. Outside Tauri
+  // there is no keychain: the push goes passwordless.
   async function applyAutoHeal(next: boolean): Promise<void> {
     setBusy(true);
     setError(null);
     try {
-      await update({ hubAutoHeal: next });
-      if (configured) {
-        // Same corrupted-keychain guard connect() applies — auto-heal can POST
-        // this machine's claude.ai key, so a poisoned stored password must
-        // surface the corrupted-password error (the toggle update above already
-        // stands) rather than an opaque "unreachable" from the sidecar (F18).
-        const stored = await readStoredHubPassword();
-        await pushHubConfigToSidecar((settings?.hubUrl ?? "").trim(), stored, next);
-      }
+      await applyHubAutoHeal(next, {
+        hubUrl: settings?.hubUrl ?? "",
+        update,
+        readPassword: readStoredHubPassword,
+        push: pushHubConfigToSidecar,
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -303,8 +287,8 @@ export function HubSection(): React.ReactElement {
         <div className="inset warn self-stretch">
           <p className="lead">
             <code>{unrecognizedHubHost}</code> isn&apos;t a recognizable tailnet or loopback
-            address. With auto-heal on, this machine&apos;s claude.ai credential may be sent to it
-            over plain HTTP.
+            address. With Send keys to the Hub on, this machine&apos;s claude.ai session keys may be
+            sent to it over plain HTTP.
           </p>
         </div>
       ) : null}
@@ -343,7 +327,8 @@ export function HubSection(): React.ReactElement {
         disabled={busy}
         onToggle={(next) => void applyAutoHeal(next)}
       >
-        Auto-heal: push this machine&apos;s Claude credential when the hub&apos;s key dies
+        Send keys to the Hub: when the Hub holds no working key for an Account, send it this
+        machine&apos;s
       </SwitchRow>
 
       <SwitchRow
@@ -380,9 +365,10 @@ export function HubSection(): React.ReactElement {
         The hub URL is stored in settings.json; the password (if the hub has one) is stored in the
         OS keychain. Leave the password blank when re-saving to keep the stored one. Set or clear
         the hub&apos;s password on the hub machine — from the MaxPrice Hub console, or{" "}
-        <code>maxprice-hub password set</code> on a headless hub. While connected, the Claude
-        account status above reflects the hub&apos;s credential. With auto-heal on (the default),
-        this machine re-keys the hub automatically when the hub&apos;s Claude session key expires.
+        <code>maxprice-hub password set</code> on a headless hub. While connected, Settings ›
+        Accounts shows each Account&apos;s connection at the Hub. With Send keys to the Hub on (the
+        default), this machine sends the Hub its key for any Account the Hub holds no working key
+        for, or whose key there expired.
       </p>
     </>
   );

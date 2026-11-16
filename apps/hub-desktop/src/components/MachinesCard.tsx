@@ -1,15 +1,18 @@
 import { useEffect, useState } from "react";
 import type { HubMachine } from "@maxprice/shared";
 import { useHubMachines } from "@/state/use-hub-machines";
+import { useHubLabelDirectory } from "@/state/use-hub-label-directory";
 import { useHubOrganizations } from "@/state/use-hub-organizations";
+import { useHubStatus } from "@/state/use-hub-status";
 import { useMergeMachine, usePurgeMachine, useRenameMachine } from "@/state/use-machine-mutations";
 import { useNowTick } from "@/state/use-now-tick";
 import { dotVariant } from "@/lib/dot-variant";
 import { showToast } from "@/lib/toast";
 import {
   formatCount,
-  homeLineLabels,
-  machineHomeLine,
+  homeLineContext,
+  machineHomeLines,
+  type HomeLineContext,
   machineStateDot,
   machineSubline,
   resolveMergeTargetName,
@@ -33,6 +36,8 @@ type Flow = { machineId: string; kind: "menu" | "rename" | "merge" | "purge" };
 export function MachinesCard(): React.ReactElement {
   const { data, isError, isPending } = useHubMachines();
   const { data: organizations } = useHubOrganizations();
+  const { data: status } = useHubStatus();
+  const { data: labels } = useHubLabelDirectory();
   const now = useNowTick();
   const rename = useRenameMachine();
   const merge = useMergeMachine();
@@ -43,7 +48,12 @@ export function MachinesCard(): React.ReactElement {
   const [purgeConfirm, setPurgeConfirm] = useState("");
 
   const machines = data !== undefined && data !== null ? sortMachines(data.machines) : [];
-  const homeLabels = homeLineLabels(organizations?.organizations, machines);
+  const homeContext = homeLineContext(
+    organizations?.organizations,
+    machines,
+    status?.accounts,
+    labels?.accounts,
+  );
 
   const openFlow = (next: Flow, m: HubMachine): void => {
     setFlow(next);
@@ -110,7 +120,7 @@ export function MachinesCard(): React.ReactElement {
                   </button>
                 </div>
                 <p className="msub">{machineSubline(m, now, machines)}</p>
-                <MachineHomeLine machine={m} labels={homeLabels} />
+                <MachineHomeLines machine={m} context={homeContext} />
 
                 {active?.kind === "menu" ? (
                   <div className="kmenu" role="menu">
@@ -291,18 +301,26 @@ export function MachinesCard(): React.ReactElement {
   );
 }
 
-// The machine's published Home, a second secondary line. `labels` is the
-// card's gate (homeLineLabels): null hides every line; a machine that
-// published no Home gets none either.
-export function MachineHomeLine({
+// The machine's published Home membership, one secondary line per Provider
+// (#614 §6). `context` is the card's gate (homeLineContext): null hides every
+// line.
+export function MachineHomeLines({
   machine,
-  labels,
+  context,
 }: {
   machine: HubMachine;
-  labels: Map<string, string> | null;
+  context: HomeLineContext | null;
 }): React.ReactElement | null {
-  const line = labels === null ? null : machineHomeLine(machine, labels);
-  return line === null ? null : <p className="msub">{line}</p>;
+  if (context === null) return null;
+  return (
+    <>
+      {machineHomeLines(machine, context).map((line) => (
+        <p key={line} className="msub">
+          {line}
+        </p>
+      ))}
+    </>
+  );
 }
 
 // The glass select's soft caret (the .select-wrap overlay).

@@ -1,18 +1,23 @@
 import {
+  ACCOUNT_NOT_KNOWN,
   abbreviate,
   type BlockRow,
+  type BlocksAggregate,
   blockState,
   formatCost,
   formatElapsed,
   formatRange,
   formatRemainingLong,
   formatWallClock,
+  type OrganizationEntry,
   type PopoutHead,
   type PopoutViewState,
+  type RankedPopoutViewState,
   type TimeDisplay,
   type UsageWindow,
 } from "@maxprice/shared";
 import { terminalText } from "@maxprice/usage-core/terminal-text";
+import { limitsText, type MembershipRow } from "./membership-limits";
 import type { Style } from "./style";
 import type { Output } from "./table";
 
@@ -41,6 +46,9 @@ export type LiveReport = {
   weekly: UsageWindow | null;
   now: number;
   display: TimeDisplay;
+  // The usage whose Account is not known in the blocks window, yesterday and
+  // today, outside the Active block (`unknownAccountUsage`, #635), else null.
+  unknown: BlocksAggregate | null;
 };
 
 // The popout's first-launch copy.
@@ -60,8 +68,9 @@ type Dash = Extract<LiveView, { kind: "dash" }>;
 // which is no Active block.
 function activeBlock(
   head: PopoutHead,
-  report: LiveReport,
+  report: Pick<LiveReport, "block" | "now" | "display">,
   s: Style,
+  tag: string | null = head.kind === "ring" ? head.eyebrowTag : null,
 ): { title: string; lines: Line[] } | null {
   if (head.kind !== "ring") return null;
   const state = blockState(report.block, report.now);
@@ -86,8 +95,7 @@ function activeBlock(
       value: `${formatCost(block.projection.totalCost)} by ${formatWallClock(endMs, display)}`,
     });
   }
-  const title =
-    head.eyebrowTag === null ? "Active block" : `Active block · ${terminalText(head.eyebrowTag)}`;
+  const title = tag === null ? "Active block" : `Active block · ${terminalText(tag)}`;
   return { title, lines };
 }
 
@@ -149,5 +157,80 @@ export function renderLive(report: LiveReport, out: Output): string {
     `  ${s.dim(l.key)}${" ".repeat(width - Bun.stringWidth(l.key))}${l.value}`;
   const top =
     block === null ? [s.dim(NO_ACTIVE_BLOCK)] : [s.bold(block.title), ...block.lines.map(row)];
-  return [...top, "", ...limits.map(row)].join("\n") + "\n";
+  // #635: the usage whose Account is not known, as `maxprice blocks` and the
+  // Desktop's Blocks strip name it, under the panel: it is in neither the
+  // Active block nor the limits above. A line of its own, so the panel's key
+  // column keeps its width.
+  const unknown =
+    report.unknown === null
+      ? []
+      : [
+          "",
+          `${ACCOUNT_NOT_KNOWN}: ${formatCost(report.unknown.totalCost)}  ` +
+            s.dim(
+              `${abbreviate(report.unknown.totalTokens)} tok since yesterday, outside these limits`,
+            ),
+        ];
+  return [...top, "", ...limits.map(row), ...unknown].join("\n") + "\n";
+}
+
+// --- The ranked panel (ADR-0140 §3, #642) ------------------------------------
+//
+// While the Scope holds two or more of the Memberships the Desktop's ranked
+// Popout lists (`rankedPopoutView`, #638), the panel is that Popout's, with
+// nothing folded: the head Membership's Active block, named in full, or, with
+// no 5-hour window in flight, the most used Membership over `No active
+// block`; then `Limits`, a line per Membership in the Scope, most used first,
+// every window with its reset, an expired key's last reading marked `stale`,
+// else its state's words; then Today, the Scope's day, named for the Scope.
+
+export type RankedLiveReport = {
+  view: Extract<RankedPopoutViewState, { kind: "no-data" } | { kind: "ranked" }>;
+  // The head's row (`popoutHeadMembership`), null with none.
+  head: MembershipRow | null;
+  // The head's Active block, for its window, burn rate and projection.
+  block: BlockRow | null;
+  // Every Membership in the Scope, most used first.
+  rows: readonly MembershipRow[];
+  roster: readonly OrganizationEntry[];
+  // The header's scope label, which Today's key carries.
+  scopeLabel: string | null;
+  now: number;
+  display: TimeDisplay;
+};
+
+export const LIMITS = "Limits";
+const MOST_USED = "Most used";
+
+export function renderRankedLive(report: RankedLiveReport, out: Output): string {
+  const { view } = report;
+  if (view.kind === "no-data") return `${NO_DATA}\n`;
+  const s = out.style;
+  const headLabel = report.head === null ? null : report.head.label;
+  const block = view.head.kind === "ring" ? activeBlock(view.head, report, s, headLabel) : null;
+  const options = { roster: report.roster, now: report.now, display: report.display, resets: true };
+  const limits: Line[] = report.rows.map((row) => ({
+    key: terminalText(row.label),
+    value: limitsText(row, options, s),
+  }));
+  const today: Line = {
+    key: report.scopeLabel === null ? "Today" : `Today · ${terminalText(report.scopeLabel)}`,
+    value: `${s.bold(view.todayText)}  ${s.dim(view.todayTokensText)}`,
+  };
+  // Two key columns: the Active block's keeps the one-Membership panel's
+  // width, so a long Membership name widens only the list it is in.
+  const rowsAt = (lines: readonly Line[]) => {
+    const width = Math.max(KEY_MIN, ...lines.map((l) => Bun.stringWidth(l.key) + 2));
+    return lines.map(
+      (l) => `  ${s.dim(l.key)}${" ".repeat(width - Bun.stringWidth(l.key))}${l.value}`,
+    );
+  };
+  const listed = rowsAt([...limits, today]);
+  const top =
+    block !== null
+      ? [s.bold(block.title), ...rowsAt(block.lines)]
+      : view.head.kind === "idle-ring" && headLabel !== null
+        ? [s.bold(`${MOST_USED} · ${terminalText(headLabel)}`), `  ${s.dim(NO_ACTIVE_BLOCK)}`]
+        : [s.dim(NO_ACTIVE_BLOCK)];
+  return [...top, "", s.bold(LIMITS), ...listed.slice(0, -1), "", listed.at(-1)!].join("\n") + "\n";
 }

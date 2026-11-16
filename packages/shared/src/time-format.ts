@@ -183,9 +183,6 @@ function lookupOf(formatter: Intl.DateTimeFormat, at: Date): PartLookup {
 // The guard lives HERE and not in `tz-clock.ts`: that module's `tzClockParts` is
 // the engine's per-event hot path, where a NaN branch would be dead weight on
 // every record parsed.
-//
-// (`usage-connection-section.tsx` hand-rolls its own check because it falls back
-// to the RAW STRING rather than an em dash — an intentional difference.)
 const NO_TIME = "—";
 
 function validInstant(instant: number | string | Date): Date | null {

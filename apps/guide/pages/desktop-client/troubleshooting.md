@@ -43,13 +43,14 @@ On macOS and Windows, **MaxPrice isn't responding — open the window to retry.*
 
 - **No Claude usage data yet** on every page: MaxPrice found no usage in the folders it reads. See [No usage yet](first-run.md#no-usage-yet).
 - **A report is empty, but others aren't:** the [filters](filters.md) leave nothing. Widen the Date range, or clear the Project, Model and [Machine](../concepts/hubs.md#the-machine-filter-and-grouping-by-machine) filters.
-- **Some usage is missing:** it may belong to an [Excluded organization](../concepts/organizations.md#tracked-and-excluded-organizations), whose usage MaxPrice drops on purpose. Track it in Settings › Claude account. Or Claude Code may have deleted the logs before MaxPrice first read them, and those can't be counted.
+- **Some usage is missing:** it may belong to an [Excluded organization](../concepts/organizations.md#tracked-and-excluded-organizations), whose usage MaxPrice drops on purpose. Track it in [Settings › Accounts](settings.md#claude). It may belong to another claude.ai login than the ones MaxPrice counts: since its first launch or a Reset, MaxPrice counts one [Account](../concepts/organizations.md#accounts) until you track another, which sits under **Not tracked** in Settings › Accounts until you do. Or Claude Code may have deleted the logs before MaxPrice first read them, and those can't be counted.
 - **A Settings warning reads No Claude data paths configured:** every folder was removed from **Claude data paths**. Add one, or choose **Reset to defaults** in Settings › Reset.
 
 ## Usage limits don't show
 
-- **⚠ Session expired — reconnect →** on Live's tiles, or **Session expired** at the bottom of the sidebar: claude.ai session keys expire every few weeks. Copy a fresh [session key](../concepts/blocks.md#the-claudeai-session-key) and connect it in Settings › Claude account.
-- **That session key looks invalid or expired.** when you connect: the key was mistyped, or it is old. Copy it again, the whole `sessionKey` value.
+- **⚠ Session expired — reconnect →** (or **⚠ 2 Accounts need reconnecting →**) on Live's tiles, or **Session expired** at the bottom of the sidebar: claude.ai session keys expire every few weeks. Choose the link: with one Account's key expired it opens that Account's Connect, and with more, [Settings › Accounts](settings.md#accounts), where a notice names each Account that needs reconnecting. Choose **Reconnect** on its card, or its name in the notice, and paste a fresh [session key](../concepts/blocks.md#the-claudeai-session-key) from a browser signed in as that Account. Live's **Reconnect** beside a stale limit reading opens that Account's Connect directly.
+- **claude.ai didn't accept this key.** when you connect: the key was mistyped, cut short or has expired. Copy it again, the whole `sessionKey` value.
+- **This is a Claude Code token, not a claude.ai session key.** when you connect: you pasted Claude Code's own token. Paste the `sessionKey` cookie from your browser instead.
 - **Couldn't reach Anthropic — check your connection and try again.**: claude.ai couldn't be reached from this computer.
 - **reports no 5-hour limit — blocks are estimated.** after an Organization's name: claude.ai reports no 5-hour limit for it, so its Blocks are [estimated](../concepts/blocks.md#exact-ended-early-and-estimated-windows).
 - **Limits for … aren't readable:** claude.ai doesn't let this key read that Organization's limits, so its Blocks are estimated.
@@ -59,12 +60,12 @@ On macOS and Windows, **MaxPrice isn't responding — open the window to retry.*
 
 Settings › Usage hub says why your [Hub](../concepts/hubs.md) doesn't connect. Each status ends **polling locally**, because MaxPrice reads your limits itself until it can use the Hub ([fallback polling](../concepts/hubs.md#fallback-polling)).
 
-| Status                                                       | What to do                                                                                                                                     |
-| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Hub unreachable — polling locally**                        | Check that the Hub is running, that both computers are on your [tailnet](../concepts/hubs.md#tailnet), and that the address and port are right |
-| **Hub password rejected — polling locally**                  | Type the Hub's password again and choose **Save**                                                                                              |
-| **Hub has no working Claude key — polling locally**          | Give the Hub a fresh session key, or leave [Auto-heal](../concepts/hubs.md#auto-heal) on so this computer sends it its own                     |
-| **Hub version mismatch — update both apps; polling locally** | [Update](update.md#with-a-hub) the Hub and this computer to the same release                                                                   |
+| Status                                                       | What to do                                                                                                                                       |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Hub unreachable — polling locally**                        | Check that the Hub is running, that both computers are on your [tailnet](../concepts/hubs.md#tailnet), and that the address and port are right   |
+| **Hub password rejected — polling locally**                  | Type the Hub's password again and choose **Save**                                                                                                |
+| **Hub has no working Claude key — polling locally**          | Give the Hub a fresh session key, or leave [Send keys to the Hub](../concepts/hubs.md#send-keys-to-the-hub) on so this computer sends it its own |
+| **Hub version mismatch — update both apps; polling locally** | [Update](update.md#with-a-hub) the Hub and this computer to the same release                                                                     |
 
 **Fleet event sync is unavailable on this hub** means the Hub reads limits but can't sync usage. Update the Hub if it is older than this computer's MaxPrice; otherwise check its console and restart it.
 
@@ -78,4 +79,4 @@ SmartScreen shows **Windows protected your PC** because the installer is not cod
 
 ## Start over with the settings
 
-**Reset to defaults**, in Settings › Reset, puts every setting back to its default and disconnects from your Hub. That includes your [Home and Tracked organizations](../concepts/organizations.md#home-organization): with more than one Organization, set them again in Settings › Claude account. To rebuild the Local archive from the logs instead, see [Starting the archive over](../concepts/archive.md#starting-the-archive-over).
+**Reset to defaults**, in Settings › Reset, puts every setting back to its default and disconnects from your Hub. That includes your [Home](../concepts/organizations.md#home) and the Accounts and Organizations you track: set them again in [Settings › Accounts](settings.md#accounts). To rebuild the Local archive from the logs instead, see [Starting the archive over](../concepts/archive.md#starting-the-archive-over).

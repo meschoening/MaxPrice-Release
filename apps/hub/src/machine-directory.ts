@@ -1,10 +1,11 @@
 // Exported via a package.json subpath solely for the sidecar fleet test rig (apps/sidecar/src/test-hub.ts) — keep signatures stable, a cross-app test contract.
 import { readFileSync, renameSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
-import { hubMachineSchema, type HubMachine } from "@maxprice/shared";
+import { hubMachineSchema, type HubHomeMemberships, type HubMachine } from "@maxprice/shared";
 
 // The hub-persisted machine directory (ADR-0041): machineId → {name,
-// registeredAt, mergedInto, homeOrganization}, its own small file beside
+// registeredAt, mergedInto, homeMemberships}, its own small file beside
 // events.jsonl, atomic whole-file rewrite. Events never carry names — ids
 // resolve at render time (the project-slug pattern). Registration is implicit
 // on any authenticated contact; the default name is the self-reported hostname
@@ -13,10 +14,70 @@ import { hubMachineSchema, type HubMachine } from "@maxprice/shared";
 // history). Names are unique, enforced case-insensitively at write time:
 // registration collisions get a numeric suffix, renames get a 409 upstream.
 // `mergedInto` stays null until M7's merge route; it persists now so M7 is
-// additive. `homeOrganization` is the machine's own published Home (#281),
-// written only by its self PUT and stored verbatim; absent = never published.
+// additive. `homeMemberships` is the machine's own published Home membership
+// per Provider (#281, ADR-0139 §6), written only by its self PUT and stored
+// verbatim; absent = never published.
 
 const directoryFileSchema = z.object({ machines: z.array(hubMachineSchema) }).passthrough();
+
+// The v6 directory published a Home organization alone (`homeOrganization:
+// X`). ADR-0139 §6: such an entry becomes `homeMemberships: { anthropic: {
+// organizationUuid: X, accountUuid: null } }`, the machine republishing its
+// Account on its first v7 contact; a null one is a null map, and an entry
+// that already has `homeMemberships` keeps it. The old key goes either way:
+// the entry schema passes unknown keys through, so a kept one would be served
+// on every GET. Pure, on the file as parsed, so the boot (below) and `restore`
+// of a v6 backup (restore.ts) convert one way. `migrated` counts the entries
+// it changed; at zero `file` is the input itself and nothing need be written.
+export function migrateMachineDirectoryFile(raw: unknown): { file: unknown; migrated: number } {
+  if (typeof raw !== "object" || raw === null || !("machines" in raw)) {
+    return { file: raw, migrated: 0 };
+  }
+  const machines = (raw as { machines: unknown }).machines;
+  if (!Array.isArray(machines)) return { file: raw, migrated: 0 };
+  let migrated = 0;
+  const next = machines.map((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null || !Object.hasOwn(entry, "homeOrganization")) {
+      return entry;
+    }
+    migrated += 1;
+    const { homeOrganization, ...rest } = entry as Record<string, unknown>;
+    if (Object.hasOwn(rest, "homeMemberships")) return rest;
+    return {
+      ...rest,
+      homeMemberships:
+        homeOrganization === null || homeOrganization === undefined
+          ? null
+          : { anthropic: { organizationUuid: homeOrganization, accountUuid: null } },
+    };
+  });
+  return migrated === 0 ? { file: raw, migrated } : { file: { ...raw, machines: next }, migrated };
+}
+
+// The file's bytes, as every write lays them out.
+function machineDirectoryText(machines: readonly HubMachine[]): string {
+  return `${JSON.stringify({ machines }, null, 2)}\n`;
+}
+
+// A file's text with its v6 Homes converted, laid out as the boot's own
+// rewrite lays it out, for `restore` of a v6 backup (restore.ts): null when
+// nothing in it migrates, or when the Hub's loader would not read it (its
+// boot then keeps it as `.bak`, as before).
+export function convertMachineDirectoryText(
+  text: string,
+): { text: string; migrated: number } | null {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const migration = migrateMachineDirectoryFile(raw);
+  if (migration.migrated === 0) return null;
+  const parsed = directoryFileSchema.safeParse(migration.file);
+  if (!parsed.success) return null;
+  return { text: machineDirectoryText(parsed.data.machines), migrated: migration.migrated };
+}
 
 // Deterministic, frozen-at-registration cleaning: trim, strip a trailing
 // .local (mDNS noise on macOS), collapse whitespace runs to "-", cap at 63
@@ -38,12 +99,17 @@ export type MachineDirectory = {
     machineId: string,
     into: string,
   ) => "ok" | "self" | "cycle" | "unknown-source" | "unknown-target";
-  // Absent and null are the same "nothing published": re-setting either, or
-  // the value already stored, is "unchanged" and rewrites nothing. "invalid"
-  // is a value this directory's own loader would reject (`""`, over the
-  // schema's cap): refused untouched, because one entry that fails
-  // `hubMachineSchema` sends the whole file to `.bak` at the next boot.
-  setHome: (machineId: string, home: string | null) => "ok" | "unchanged" | "unknown" | "invalid";
+  // The machine's whole published map. Absent and null are the same "nothing
+  // published": re-setting either, or a map deep-equal to the one stored, is
+  // "unchanged" and rewrites nothing, since every client republishes on every
+  // connect. "invalid" is a value this directory's own loader would reject
+  // (an empty uuid, over the schema's cap, a Pending key): refused untouched,
+  // because one entry that fails `hubMachineSchema` sends the whole file to
+  // `.bak` at the next boot.
+  setHome: (
+    machineId: string,
+    home: HubHomeMemberships | null,
+  ) => "ok" | "unchanged" | "unknown" | "invalid";
   remove: (machineId: string) => boolean;
   has: (machineId: string) => boolean;
   list: () => HubMachine[];
@@ -69,13 +135,16 @@ export function createMachineDirectory(opts: {
   } catch {
     // ENOENT — first boot
   }
+  let migrated = 0;
   if (rawBytes !== null) {
     let loaded = false;
     try {
-      const parsed = directoryFileSchema.safeParse(JSON.parse(rawBytes));
+      const migration = migrateMachineDirectoryFile(JSON.parse(rawBytes));
+      const parsed = directoryFileSchema.safeParse(migration.file);
       if (parsed.success) {
         for (const m of parsed.data.machines) machines.set(m.machineId, m);
         loaded = true;
+        migrated = migration.migrated;
       }
     } catch {
       // fall through to the recovery path
@@ -95,7 +164,7 @@ export function createMachineDirectory(opts: {
   // Atomic whole-file rewrite (the config.ts writeConfig pattern): tmp +
   // rename so a crash mid-write never truncates the directory.
   function persist(next = machines): void {
-    const serialized = `${JSON.stringify({ machines: [...next.values()] }, null, 2)}\n`;
+    const serialized = machineDirectoryText([...next.values()]);
     const tmp = `${path}.tmp`;
     (opts.writeFileImpl ?? writeFileSync)(tmp, serialized);
     const fd = openSync(tmp, "r+");
@@ -105,6 +174,22 @@ export function createMachineDirectory(opts: {
       closeSync(fd);
     }
     renameSync(tmp, path);
+  }
+
+  // A v6 file's Homes, converted once: the file is rewritten only when an
+  // entry migrated, so the next boot reads a v7 file and writes nothing. A
+  // failed write keeps the converted entries in memory, and the next write,
+  // or the next boot's conversion, lands them; it never stops the boot.
+  if (migrated > 0) {
+    const homes = `the Homes of ${migrated} machine${migrated === 1 ? "" : "s"}`;
+    try {
+      persist();
+      console.log(`[hub] machine directory: converted ${homes} to Home memberships`);
+    } catch (err) {
+      console.warn(
+        `[hub] machine directory: could not write ${homes} converted to Home memberships: ${err}`,
+      );
+    }
   }
 
   function nameTaken(candidate: string, excludeMachineId?: string): boolean {
@@ -157,11 +242,12 @@ export function createMachineDirectory(opts: {
     },
     setHome: (machineId, home) => {
       // The loader's own field, so the two can never disagree.
-      if (!hubMachineSchema.shape.homeOrganization.safeParse(home).success) return "invalid";
+      const parsed = hubMachineSchema.shape.homeMemberships.safeParse(home);
+      if (!parsed.success) return "invalid";
       const entry = machines.get(machineId);
       if (entry === undefined) return "unknown";
-      if ((entry.homeOrganization ?? null) === home) return "unchanged";
-      machines.set(machineId, { ...entry, homeOrganization: home });
+      if (isDeepStrictEqual(entry.homeMemberships ?? null, parsed.data ?? null)) return "unchanged";
+      machines.set(machineId, { ...entry, homeMemberships: parsed.data ?? null });
       persist();
       return "ok";
     },

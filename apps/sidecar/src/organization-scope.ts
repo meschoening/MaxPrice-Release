@@ -1,88 +1,146 @@
-// The Organization scope (GLOSSARY.md, #278) as the store sees it: the
-// `organization` query param every money endpoint reads, resolved to the
-// store's `organizations` axis (`StoreQuery.organizations`,
-// `ReportFilters.organizations`). The same param also names the Quota
-// organization (`quotaOrganization`, below), which /api/usage/current, the
-// readout's utilization half, /api/blocks and the `block` span answer — the
-// last two through `quotaSampleScope`, which Block formation reads.
+// The Scope (GLOSSARY.md, ADR-0136 §6, ADR-0140 §1) as the store sees it: the
+// repeated `account` and `organization` query params every report endpoint
+// reads, resolved to the store's `accounts` and `organizations` axes
+// (`StoreQuery`, `ReportFilters`), whose intersection is the Scope's
+// Memberships. The rule is `resolveScope`'s (@maxprice/shared), the one the
+// Headless client applies too:
+//   - neither param is the Home membership; one named leaves the other axis
+//     matching any tracked value;
+//   - `all` on the Organization axis is THIS machine's resolved tracked set
+//     (`trackedNow()` in bootSidecar()), never every Organization the replica
+//     or the store happens to hold (#262 item 4);
+//   - an Organization that names nothing tracked is dropped, and an axis left
+//     empty is Home's part, so a stale Organization scope still answers as
+//     Home; an explicit Account key is kept as named, tracked or not, so a
+//     stale Account selection matches no row rather than widening to Home's
+//     default (#635);
+//   - no Home (`home === null`, the ADR-0098 null set) narrows nothing;
+//   - any repeated `membership` param (#637) names the Scope alone, as exact
+//     Memberships, and the two axis params beside it are ignored.
 //
-// The resolution rule is `resolveOrganizationScope`'s (@maxprice/shared) — the
-// one the renderer's `parseSettings` applies too — so a stale value answers
-// here exactly as it reads there:
-//   - absent is Home, and so is anything that names nothing tracked, the Home
-//     uuid itself, and `all` on a machine that tracks only Home;
-//   - `all` is THIS machine's resolved tracked set (`trackedNow()` in
-//     bootSidecar()), never every Organization the replica or the store happens
-//     to hold (#262 item 4) — a fleet row tagged with an Organization this
-//     machine does not track stays out of All;
-//   - no Home (`home === null`, the ADR-0098 null set) narrows nothing.
+// A resolved Home organization becomes `[home]`, not "no filter", and the Home
+// membership's Account `[account]`. The single-Account, single-Organization
+// machine keeps its unfiltered fast path anyway: Home's part covering the
+// whole tracked Account set resolves to any (`resolveScope`), and the store's
+// "covers everything present" no-op drops `[Home]` (#261/#262), so the answer
+// is byte-identical to no filter.
 //
-// A resolved Home becomes `[home]`, not "no filter": on a machine that tracks
-// more than Home, Home's answer is Home's rows. The single-Organization machine
-// keeps its unfiltered fast path anyway, because the "covers everything
-// present" no-op lives in `store.query` (#261/#262) — `[Home]` there covers
-// every row, so the axis drops and the answer is byte-identical to no filter.
+// The Quota organization retired with #632 (ADR-0136 §6): no single
+// Organization answers for every quota surface. Blocks form per Membership
+// (`createBlockReports`), and the surfaces that still read one Organization's
+// usage-limits reading take the Scope's head Organization below.
 
-import { ALL_ORGANIZATIONS, resolveOrganizationScope } from "@maxprice/shared";
+import {
+  effectiveScope,
+  persistedScopeShown,
+  resolveScope,
+  scopeHeadOrganization,
+  type AccountEntry,
+  type ResolvedScope,
+  type ScopeHeadResponse,
+  type ScopeSetting,
+  type ScopeState,
+} from "@maxprice/shared";
 import type { Presumption } from "./engine/presumption";
 
-// What the scope resolves against: the installed Home and the resolved tracked
-// set, both read live per request. While settings work queues, Home remains
-// the installed presumption's Home; the admission set changes at arrival.
-export type OrganizationScopeState = {
-  home: string | null;
-  tracked: ReadonlySet<string> | null;
-};
+export type { ScopeState } from "@maxprice/shared";
 
-// Share the store's presumption cell: settings arrival can precede its queued
-// installation by an entire rebuild. Reading the requested Home would filter
-// owner-less rows under a different Home from the one that resolves them.
+// What the Scope resolves against, read live per request: the installed Home
+// membership and the two resolved tracked sets. While settings work queues,
+// Home remains the installed presumption's Home; the admission sets change at
+// arrival. The Home is shared with the store's presumption cell: settings
+// arrival can precede its queued installation by an entire rebuild, and reading
+// the requested Home would filter owner-less rows under a different Home from
+// the one that resolves them.
 export function createOrganizationScope(
   getPresumption: () => Presumption,
   trackedNow: () => ReadonlySet<string> | null,
-): () => OrganizationScopeState {
-  return () => ({ home: getPresumption().selfHome, tracked: trackedNow() });
+  trackedAccountsNow: () => ReadonlySet<string> | null,
+): () => ScopeState {
+  return () => ({
+    home: getPresumption().selfHome,
+    trackedOrganizations: trackedNow(),
+    trackedAccounts: trackedAccountsNow(),
+  });
 }
 
-// The `organizations` list one request hands the store. `[]` = no narrowing
-// (no Home); otherwise sorted and never empty.
-export function scopeOrganizations(
-  param: string | undefined,
-  { home, tracked }: OrganizationScopeState,
-): string[] {
-  if (home === null || tracked === null) return [];
-  const scope = resolveOrganizationScope(param, home, tracked);
-  if (scope === null) return [home];
-  if (scope === ALL_ORGANIZATIONS) return [...tracked].sort();
-  return [scope];
+// A request's raw Scope tokens: the repeated `account`, `organization` and
+// `membership` params, each possibly absent (`membership` optional for the
+// callers that name axes alone).
+export type ScopeTokens = {
+  account: readonly string[];
+  organization: readonly string[];
+  membership?: readonly string[];
+};
+
+// The persisted Scope (`Settings.scope`, #637) as the tokens a request with
+// the renderer's params for it carries (`scopeQueryParams`): none for the
+// default Scope, a Membership list alone when it names one.
+export function settingScopeTokens(scope: ScopeSetting | null): ScopeTokens {
+  if (scope === null) return { account: [], organization: [] };
+  if (scope.membership !== undefined) {
+    return { account: [], organization: [], membership: scope.membership };
+  }
+  return { account: scope.account ?? [], organization: scope.organization ?? [] };
 }
 
-// The Quota organization (GLOSSARY.md, #262 item 6): the ONE Organization every
-// quota-shaped surface describes. Money sums across All organizations; quota
-// cannot, so under All it is Home, and otherwise it is whatever the scope
-// resolved to — Home for anything that names nothing tracked. Resolved from
-// the same param and the same `OrganizationScopeState` as
-// `scopeOrganizations`, so one response never pairs its money scope with a
-// different Home. `null` only when there is no Home: the poller's no-Home
-// answer (`getCurrent(null)`), which names no Organization.
-export function quotaOrganization(
-  param: string | undefined,
-  { home, tracked }: OrganizationScopeState,
+// A request's tokens as the persisted Scope they carry: `settingScopeTokens`'
+// inverse, empty lists dropped, so no token at all is the default Scope.
+export function tokensScopeSetting(tokens: ScopeTokens): ScopeSetting | null {
+  const membership = tokens.membership ?? [];
+  if (membership.length > 0) return { membership: [...membership] };
+  const out: ScopeSetting = {};
+  if (tokens.account.length > 0) out.account = [...tokens.account];
+  if (tokens.organization.length > 0) out.organization = [...tokens.organization];
+  return Object.keys(out).length === 0 ? null : out;
+}
+
+// The persisted Scope as a reader applies it (#637): the shared rule
+// (`effectiveScope`, @maxprice/shared) over the Account roster's tracked
+// entries (GET /api/accounts, the count the renderer's Account filter
+// takes). `roster` is asked only when the Scope names Accounts or
+// Memberships, the one case the count decides; undefined (not known yet, or
+// no roster) applies the Scope as written, as the renderer does before
+// /api/accounts answers. The status's head reads it synchronously (boot.ts)
+// and the readout through `effectiveScopeTokens`.
+export function effectivePersistedScope(
+  setting: ScopeSetting | null,
+  roster: () => readonly Pick<AccountEntry, "tracked">[] | undefined,
+): ScopeSetting | null {
+  if (effectiveScope(setting, false) === setting) return setting;
+  return effectiveScope(setting, persistedScopeShown(roster()));
+}
+
+// `effectivePersistedScope` over a request's tokens, the roster read async.
+export async function effectiveScopeTokens(
+  tokens: ScopeTokens,
+  roster: () => Promise<readonly Pick<AccountEntry, "tracked">[] | undefined>,
+): Promise<ScopeTokens> {
+  const setting = tokensScopeSetting(tokens);
+  if (effectiveScope(setting, false) === setting) return tokens;
+  const accounts = await roster();
+  return settingScopeTokens(effectivePersistedScope(setting, () => accounts));
+}
+
+// Resolve one request's tokens. `[]` on an axis is no narrowing.
+export function requestScope(tokens: ScopeTokens, state: ScopeState): ResolvedScope {
+  return resolveScope(tokens.account, tokens.organization, state, tokens.membership ?? []);
+}
+
+// The Organization the status's usage connection describes (#637): the
+// persisted Scope's head, by the app's own head rule (`SidecarApp.scopeHead`)
+// over the tokens a request carrying that Scope sends, so the status names
+// the Organization /api/scope-head, /api/usage/current and /api/blocks name
+// for the renderer's requests. Computed at each status publish, synchronously
+// over the store and samples as they stand: no cached head to keep in step.
+// Before the app exists (`scopeHead` null) no store is readable, so the rule
+// runs over no candidates. `null` only with no Home.
+export function statusHeadOrganization(
+  scopeHead: ((tokens: ScopeTokens) => ScopeHeadResponse) | null,
+  setting: ScopeSetting | null,
+  state: ScopeState,
 ): string | null {
-  if (home === null) return null;
-  const scope = resolveOrganizationScope(param, home, tracked ?? []);
-  return scope === null || scope === ALL_ORGANIZATIONS ? home : scope;
-}
-
-// The Quota organization as Block formation takes it (the sample store's
-// `SampleScope`): the Organization, and the Home its unstamped samples presume
-// under — both from ONE state read, so a request never pairs one Home's samples
-// with another Home's Organization. `null` exactly when `quotaOrganization` is
-// (no Home): formation then reads every row and every sample.
-export function quotaSampleScope(
-  param: string | undefined,
-  state: OrganizationScopeState,
-): { organization: string; home: string } | null {
-  const organization = quotaOrganization(param, state);
-  return organization === null || state.home === null ? null : { organization, home: state.home };
+  const tokens = settingScopeTokens(setting);
+  if (scopeHead !== null) return scopeHead(tokens).organizationUuid;
+  return scopeHeadOrganization(requestScope(tokens, state), state.home, []);
 }

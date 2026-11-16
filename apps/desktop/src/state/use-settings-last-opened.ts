@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
-// When Settings was last open, for the Organizations list's `New` tag: an
-// untracked Organization first seen since then is new. Presentation only, so
+// When Settings was last open, for Settings › Accounts' `New` pills (#639):
+// an untracked Organization first seen since then is new. Presentation only, so
 // the stamp is this renderer's own localStorage key, never a setting. The
 // visit is read once per mount — the previous one — and this one is stamped
 // after, so every Organization new at open stays marked until the next visit.

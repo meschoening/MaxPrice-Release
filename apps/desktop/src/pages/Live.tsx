@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Check, ChevronDown } from "lucide-react";
 import { deriveProjectName, deriveProjectPath } from "@maxprice/shared";
@@ -16,7 +16,14 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { TodayTile } from "@/components/today-tile";
 import { ThisWeekTile } from "@/components/this-week-tile";
 import { ActiveBlockTile } from "@/components/active-block-tile";
-import { ChartSpanNote } from "@/components/chart-span-note";
+import { LimitAreaView } from "@/components/limit-area";
+import { useLimitArea } from "@/state/use-limit-area";
+import { useNowTick } from "@/state/use-now-tick";
+import { useOrganizationLabels } from "@/state/use-organizations";
+import { useBlockSpanPick } from "@/state/use-block-span-pick";
+import { useScopeMemberships } from "@/state/use-scope-memberships";
+import type { SplitInput } from "@/lib/money-split";
+import { ChartSpanControl } from "@/components/chart-span-note";
 import { CostChartCard } from "@/components/cost-chart-card";
 import { ListRow } from "@/components/list-row";
 import { useFlipList } from "@/state/use-flip-list";
@@ -118,17 +125,49 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
   // a note beside the controls says whose.
   const { tag: quotaTag } = useQuotaSurface();
 
+  // #637: the Scope's Memberships decide the money tiles' split bars (D6) and
+  // the limit area (D7). One Membership keeps today's tiles exactly; two or
+  // more put a card per Membership where the Active Block tile was, and This
+  // week's weekly meter moves into those cards.
+  const nowMs = useNowTick(60_000);
+  const area = useLimitArea(nowMs);
+  const { accounts } = useScopeMemberships();
+  const organizationLabels = useOrganizationLabels();
+  const many = area.kind !== "single";
+  // #619 variant 1, #638: whose Active block the Block span frames, picked
+  // among the Scope's Memberships with a live Block; `single` on a
+  // one-Account install, which keeps today's span.
+  const blockPick = useBlockSpanPick(nowMs);
+  const splits = useMemo(() => {
+    const rule = data.splitRule;
+    if (rule === "none") return { today: undefined, week: undefined };
+    const base = { rule, accounts: accounts ?? [], organizationLabels };
+    const today: SplitInput = { ...base, rows: data.todaySplitRows };
+    const week: SplitInput = { ...base, rows: data.weekSplitRows };
+    return { today, week };
+  }, [data.splitRule, data.todaySplitRows, data.weekSplitRows, accounts, organizationLabels]);
+
   return (
     <>
-      <section className="tiles" aria-label="Usage summary">
-        <TodayTile row={data.todayRow} yesterday={data.yesterdayRow} />
-        <ActiveBlockTile block={data.activeBlock} typicalBlockTokens={data.typicalBlockTokens} />
+      <section className={cn("tiles", many && "tiles-many")} aria-label="Usage summary">
+        <TodayTile row={data.todayRow} yesterday={data.yesterdayRow} split={splits.today} />
+        {many ? (
+          <LimitAreaView area={area} nowMs={nowMs} />
+        ) : (
+          <ActiveBlockTile
+            block={data.activeBlock}
+            typicalBlockTokens={data.typicalBlockTokens}
+            accountNotKnown={data.activeBlockAccountNotKnown}
+          />
+        )}
         <ThisWeekTile
           rows={data.weekRows}
           prevRows={data.prevWeekRows}
           rollingStart={data.rollingWeekStart}
           week={week}
           display={display}
+          split={splits.week}
+          meterMoved={many}
         />
       </section>
 
@@ -143,7 +182,12 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
               setGroupByAxes={setGroupByAxes}
               visibleAxes={visibleAxes}
             />
-            <ChartSpanNote span={span} quotaTag={quotaTag} />
+            <ChartSpanControl
+              span={span}
+              quotaTag={quotaTag}
+              pick={blockPick.pick}
+              onPick={blockPick.setPick}
+            />
           </div>
           <div className="seg" role="tablist" aria-label="Span">
             {SPAN_TABS.map((tab) => (
@@ -170,6 +214,7 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
           onToggleGhost={() => setGhostOverlay(!ghostOverlay)}
           logScale={logScale}
           onToggleLogScale={() => setLogScale(!logScale)}
+          blockPick={blockPick.pick}
         />
       </section>
 
@@ -177,7 +222,8 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
         <section className="panel rail-card" aria-label="Top sessions">
           <div className="rail-head">
             <h2>Top sessions</h2>
-            <button type="button" onClick={() => navigate("/sessions")} className="view-all">
+            {/* Projects lists each project's sessions (#640). */}
+            <button type="button" onClick={() => navigate("/projects")} className="view-all">
               View all →
             </button>
           </div>

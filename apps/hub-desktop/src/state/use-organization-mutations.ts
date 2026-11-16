@@ -2,8 +2,8 @@ import { useMutation, useQueryClient, type UseMutationResult } from "@tanstack/r
 import { hubOrganizationsQueryKey, renameOrganization } from "@/lib/hub-api";
 
 // The operator's Organization rename (#294); `label: null` clears it. Success
-// refreshes the Organizations card at once rather than waiting on the
-// hub:organizations frame. Errors surface via mutation.error in the Hub's words.
+// refreshes the Accounts card's lines at once rather than waiting on the
+// hub:labels frame. Errors surface via mutation.error in the Hub's words.
 export function useRenameOrganization(): UseMutationResult<
   void,
   Error,

@@ -1,47 +1,32 @@
 import {
-  CLAUDE_CODE_TOKEN_REFUSAL,
   hubCompactResponseSchema,
   hubMachinesResponseSchema,
-  isClaudeCodeToken,
   isValidHubPassword,
-  sessionKeyListingFailure,
 } from "@maxprice/shared";
-import { discoverOrg, type ListOrgsResult } from "@maxprice/usage-core";
-import { displayPath, type Env } from "@maxprice/usage-core/home-path";
-import { EXIT_INTERRUPTED, readSecret } from "@maxprice/usage-core/secret-input";
-import { fsErrorName, removeSecretFile } from "@maxprice/usage-core/secrets-file";
-import { terminalText } from "@maxprice/usage-core/terminal-text";
-import { CliError, EXIT, type Io, type Writer } from "./cli";
-import { requireHub } from "./config";
-import {
-  type HubAnswer,
-  reachHub,
-  type ReachOptions,
-  refusal,
-  type RunningHub,
-  unreadable,
-} from "./operator-client";
-import { createFileCredstore, secretsPath } from "./secrets";
+import { readSecret } from "@maxprice/usage-core/secret-input";
+import { CliError, EXIT, type Io } from "./cli";
+import { type HubAnswer, refusal, type RunningHub, unreadable } from "./operator-client";
 import { cleanRenameName } from "./server";
 
 // The operator commands' side of a running Hub (ADR-0127 §7): the live twin
 // of each command that edits a Hub's data, which runOperatorVerb (index.ts)
 // calls once reachHub finds a daemon holding serve.lock; `password set`'s
-// input, a secret read before the Hub is reached; and `key set|clear`, whole.
+// input, a secret read before the Hub is reached, and the reader `key set`
+// shares (key-commands.ts).
 //
 // A live twin calls the route the console calls (hub-desktop's hub-api.ts),
 // so the daemon performs those commands' writes and applies each change at
 // once, with no restart. Page commands write config separately, serialized
 // with the daemon's config writes by config.ts. A store verb's refusal is
-// exit 2 on both paths, in the route's words, which are the offline edit's but for a rename's
-// collision, where the route names the name already in use as it is
-// written. The password and key commands' refusals are exit 1. Each live
-// twin returns its success line; every refusal throws a CliError.
+// exit 2 on both paths, in the route's words, which are the offline edit's
+// but for a rename's collision, where the route names the name already in
+// use as it is written. The password commands' refusals are exit 1, as `key
+// set`'s are (key-commands.ts). Each live twin returns its success line;
+// every refusal throws a CliError.
 
 const MACHINES_PATH = "/api/machines";
 const COMPACT_PATH = "/api/store/compact";
 const PASSWORD_PATH = "/api/password";
-const CREDENTIAL_PATH = "/api/credential";
 
 function machinePath(machineId: string): string {
   return `${MACHINES_PATH}/${encodeURIComponent(machineId)}`;
@@ -147,11 +132,13 @@ export type ReadSecret = (prompt: string) => Promise<string | null>;
 export type SecretDeps = {
   // In place of the real stdin: the value, or null for Ctrl-C.
   readSecret?: ReadSecret;
-  // Whether stdin is a terminal, which asks for a password twice.
+  // Whether stdin is a terminal, which asks for a password twice, and has
+  // `key set` ask for the Account's label.
   interactive?: boolean;
 };
 
-function secretReader(deps: SecretDeps, io?: Io): ReadSecret {
+// The reader `password set` and `key set` read their secret with.
+export function secretReader(deps: SecretDeps, io?: Io): ReadSecret {
   return (
     deps.readSecret ??
     ((prompt) => readSecret(prompt, { stdin: process.stdin, stderr: io?.stderr ?? process.stderr }))
@@ -181,130 +168,4 @@ export async function readNewPassword(deps: SecretDeps = {}): Promise<string | n
     }
   }
   return password;
-}
-
-// What `key set|clear` take from a test, beside the reader.
-export type KeyDeps = SecretDeps & {
-  // The key's Organizations, from claude.ai; discoverOrg by default, at
-  // MAXPRICE_CLAUDE_BASE_URL when it is set, as `serve` lists them.
-  discover?: (sessionKey: string) => Promise<ListOrgsResult>;
-  // The clock an offline write's `setAt` is read from.
-  now?: () => number;
-  // reachHub's bound on the reach and each request, its polling and its
-  // cgroup reader.
-  reach?: ReachOptions;
-};
-
-// One line of `key set|clear`'s output. A path the environment names rides
-// these, so each goes through `terminalText` (ADR-0127 §11), as
-// runOperatorVerb prints the other commands' lines.
-function say(out: Writer, line: string): void {
-  out.write(`${terminalText(line)}\n`);
-}
-
-// ADR-0126 §9: the key's file and the operator token are Linux's; elsewhere
-// the Hub keeps its key in the keychain and the console sets it.
-function linuxOnly(platform: NodeJS.Platform): void {
-  if (platform !== "linux") {
-    throw new CliError(EXIT.USAGE, "Linux only; re-key from the console");
-  }
-}
-
-// `maxprice-hub key set` (ADR-0126 §6, ADR-0127 §7), in §6's order: the key
-// is read and checked in this process, and only then is the Hub reached, so
-// neither a prompt nor a claude.ai listing is spent holding serve.lock, which
-// a `serve` starting meanwhile would lose with exit 5. With a daemon running
-// the key goes to its own route, which stores it in secrets.json, its only
-// writer while it runs (§4), and lists and polls with it at once. With the
-// lock free this process writes the file through the daemon's own store,
-// under the lock, and the next start reads it. No line carries any part of
-// the key.
-export async function keySet(
-  io: Io,
-  env: Env = process.env,
-  platform: NodeJS.Platform = process.platform,
-  deps: KeyDeps = {},
-): Promise<number> {
-  linuxOnly(platform);
-  const dataDir = requireHub(env, platform);
-  const sessionKey = await secretReader(deps, io)("Session key: ");
-  if (sessionKey === null) return EXIT_INTERRUPTED;
-  if (sessionKey === "") throw new CliError(EXIT.USAGE, "no session key was given");
-  // §6.2: Claude Code's credential is named, never sent to claude.ai.
-  if (isClaudeCodeToken(sessionKey)) throw new CliError(EXIT.FAILURE, CLAUDE_CODE_TOKEN_REFUSAL);
-  const discover =
-    deps.discover ??
-    ((key: string) => discoverOrg({ sessionKey: key, baseUrl: env.MAXPRICE_CLAUDE_BASE_URL }));
-  const listed = await discover(sessionKey);
-  // The Desktop client's words, as the Headless client's `key set` gives them.
-  if (!listed.ok) throw new CliError(EXIT.FAILURE, sessionKeyListingFailure(listed.kind));
-  const path = secretsPath(dataDir);
-  const shown = displayPath(path, env);
-  const reached = await reachHub(dataDir, env, deps.reach);
-  let stored: string;
-  if (reached.kind === "live") {
-    const answer = await reached.hub.request("POST", CREDENTIAL_PATH, { sessionKey });
-    if (!answer.ok) {
-      throw new CliError(
-        EXIT.FAILURE,
-        `the running Hub refused the key: ${refusal(answer, CREDENTIAL_PATH)}`,
-      );
-    }
-    stored = `Stored in ${shown} (0600).`;
-  } else {
-    try {
-      // `set` logs nothing: its two lines are the boot read's.
-      const store = createFileCredstore(path, { log: () => {}, warn: () => {} });
-      const setAt = new Date((deps.now ?? Date.now)()).toISOString();
-      await store.set({ sessionKey }, { setAt, source: "local" });
-    } finally {
-      reached.lock.release();
-    }
-    stored = `Stored in ${shown} (0600); the Hub reads it when it starts.`;
-  }
-  const count = listed.orgs.length;
-  say(io.stdout, `Connected: ${count} Organization${count === 1 ? "" : "s"} found.`);
-  say(io.stderr, stored);
-  return EXIT.OK;
-}
-
-// `maxprice-hub key clear` (ADR-0126 §7) checks nothing: a running daemon is
-// sent the clear, a literal null, and removes its file and stops polling;
-// with the lock free this process removes the file under it.
-export async function keyClear(
-  io: Io,
-  env: Env = process.env,
-  platform: NodeJS.Platform = process.platform,
-  deps: Pick<KeyDeps, "reach"> = {},
-): Promise<number> {
-  linuxOnly(platform);
-  const dataDir = requireHub(env, platform);
-  const path = secretsPath(dataDir);
-  const shown = displayPath(path, env);
-  const reached = await reachHub(dataDir, env, deps.reach);
-  if (reached.kind === "live") {
-    const answer = await reached.hub.request("POST", CREDENTIAL_PATH, null);
-    if (!answer.ok) {
-      throw new CliError(
-        EXIT.FAILURE,
-        `the running Hub refused the clear: ${refusal(answer, CREDENTIAL_PATH)}`,
-      );
-    }
-    say(io.stdout, "session key cleared — the running Hub stops polling at once");
-    return EXIT.OK;
-  }
-  let removed: boolean;
-  try {
-    removed = removeSecretFile(path);
-  } catch (error) {
-    // Named by its errno alone, as secrets.ts names its own.
-    throw new Error(`cannot remove ${shown} (${fsErrorName(error)})`);
-  } finally {
-    reached.lock.release();
-  }
-  say(
-    io.stdout,
-    removed ? `session key cleared — removed ${shown}` : `no session key was stored in ${shown}`,
-  );
-  return EXIT.OK;
 }

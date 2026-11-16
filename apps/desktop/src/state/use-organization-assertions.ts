@@ -12,14 +12,15 @@ import { getSidecarUrl } from "@/lib/sidecar";
 import { usageAuthHeaders } from "@/lib/usage-credential";
 
 // /api/organization-assertions (#310, ADR-0107 §11) — this machine's resolved
-// Organization assertions, sessionId → the Organization its owner-less usage is
-// claimed for. No query params → a plain useQuery (four-piece split per
-// ADR-0004). PUT claims or clears sessions in bulk.
+// Membership assertions: sessionId → the Organization its owner-less usage is
+// claimed for, and → the Account for a claim that names one. No query params →
+// a plain useQuery (four-piece split per ADR-0004). PUT claims or clears
+// sessions in bulk.
 //
-// Read only for Settings' Excluded fact line (#312 ruling 2): a session
-// asserted to an Excluded Organization is dormant and appears in no sessions
-// list, so the map is the only place its claim shows. Tags, the chooser and
-// Undo read the rows instead.
+// Read only for Settings › Accounts' "N sessions assigned · Unassign" on each
+// Organization row (#672): a session asserted to an Excluded Organization is
+// dormant and appears in no sessions list, so the map is the only place its
+// claim shows. Tags, the chooser and Assign's Undo read the rows instead.
 
 export function organizationAssertionsQueryKey(): [string] {
   return ["organization-assertions"];
@@ -38,8 +39,10 @@ export async function fetchOrganizationAssertions(
   return organizationAssertionsResponseSchema.parse(await res.json());
 }
 
-// Claim every listed session's owner-less usage for `organizationUuid`, or
-// clear each claim with `null`, in one request. Resolves how many sessions'
+// Claim every listed session's owner-less usage for `organizationUuid`, and
+// with `accountUuid` for that Account in it (a Membership assertion, ADR-0137
+// §5: Settings › Unattributed usage, #639), or clear each claim with `null`,
+// in one request. Resolves how many sessions'
 // entries changed. The route is behind `usageAuthGuard`, so the per-launch
 // token rides along. A refusal (an unknown Organization, a full directory, an
 // invalid body) rejects with the envelope's `error` as its message, so the
@@ -51,10 +54,15 @@ export async function fetchOrganizationAssertions(
 export async function putOrganizationAssertions(
   sessionIds: string[],
   organizationUuid: string | null,
+  accountUuid?: string,
 ): Promise<OrganizationAssertResponse> {
   const base = await getSidecarUrl();
   const headers = await usageAuthHeaders();
-  const body: OrganizationAssertRequest = { sessionIds, organizationUuid };
+  const body: OrganizationAssertRequest = {
+    sessionIds,
+    organizationUuid,
+    ...(accountUuid === undefined ? {} : { accountUuid }),
+  };
   const res = await fetch(buildOrganizationAssertionsUrl(base), {
     method: "PUT",
     headers: { ...headers, "content-type": "application/json" },
@@ -69,23 +77,12 @@ export async function putOrganizationAssertions(
   return organizationAssertResponseSchema.parse(await res.json());
 }
 
-// One frozen empty map, so a disabled or still-loading query hands consumers a
-// stable identity rather than a fresh `{}` every render.
-const NO_ASSERTIONS: Readonly<Record<string, string>> = Object.freeze({});
-
-// sessionId → uuid. Enabled only while a consumer needs it (the Settings list
-// showing an Excluded Organization); a disabled query never fetches, and the
-// live-stream round's invalidation does not refetch an inactive one, so a
-// machine that never enables it sends no request. Empty until it answers.
-export function useOrganizationAssertions({
-  enabled,
-}: {
-  enabled: boolean;
-}): Readonly<Record<string, string>> {
+// The claims, undefined until the query answers. The live stream's usage:new
+// round, which ends every write that changed a claim, invalidates it.
+export function useOrganizationAssertions(): OrganizationAssertionsResponse | undefined {
   const { data } = useQuery({
     queryKey: organizationAssertionsQueryKey(),
     queryFn: ({ signal }) => fetchOrganizationAssertions(signal),
-    enabled,
   });
-  return data?.assertions ?? NO_ASSERTIONS;
+  return data;
 }

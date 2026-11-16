@@ -32,9 +32,11 @@ Tailscale isn't connected on the Hub's PC, so the Hub serves the PC alone. Start
 
 ## The claude.ai row reads Key expired, No key or Poll failing
 
-- **Key expired:** claude.ai refused the session key, which happens when that browser session ends. Paste a fresh key with **Replace key…** in the console's Claude account card ([Claude account](popout-and-console.md#claude-account)). A client with Auto-heal on sends the Hub its own key when its works.
-- **No key:** the Hub has no session key. Set one the same way, or join a client with Auto-heal on.
+- **Key expired:** claude.ai refused the session key, which happens when that browser session ends. Paste a fresh key with **Replace key…** in the Claude account card ([Claude account](popout-and-console.md#claude-account)), or on that Account's row of the [Accounts card](popout-and-console.md#accounts) when the Hub has several. A client with Send keys to the Hub on sends the Hub its own key for that Account when its works, unless you removed the Account's key at the Hub after that key was set.
+- **No key:** the Hub has no session key. Set one the same way, or join a client with Send keys to the Hub on.
 - **Poll failing:** the Hub couldn't read your limits from claude.ai, for a reason other than the key, such as the PC's network. It keeps trying once a minute, and the row recovers on its own when a read succeeds.
+
+With keys for several Accounts the row counts them instead, as in **1 key expired**, **2 need a key** or **No key works**. The console's [Accounts card](popout-and-console.md#accounts) lists the Accounts that need a key first, each with what it needs.
 
 ## The Hub row reads Not responding
 

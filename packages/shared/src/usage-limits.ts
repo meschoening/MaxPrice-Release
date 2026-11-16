@@ -66,6 +66,12 @@ export const usageSampleSchema = z.object({
   // before samples were stamped, presumed the Home organization's at query
   // time (the store holds no Home). OPTIONAL by the forward-compat rule above.
   organizationUuid: z.string().min(1).optional(),
+  // The Account (GLOSSARY.md) whose session key read it (ADR-0139 §8, #633).
+  // Absent = a line written before samples carried an Account, or read by a
+  // key whose Account was not yet known; resolved at query time by ADR-0137
+  // §3's presumption, until the store's one-time stamp gives it the key's
+  // Account. OPTIONAL by the forward-compat rule above.
+  accountUuid: z.string().min(1).optional(),
 });
 export type ModelScopedWindow = NonNullable<UsageSample["weeklyModel"]>;
 export type UsageSample = z.infer<typeof usageSampleSchema>;
@@ -146,6 +152,102 @@ export const storedUsageCredentialSchema = z.object({
 });
 export type StoredUsageCredential = z.infer<typeof storedUsageCredentialSchema>;
 
+// One Account's stored credential (ADR-0138 §2, §6, #633): the pasted key, its
+// kind — a session key is the only one today, and a ChatGPT credential fits
+// later without a reshape — and `setAt`, which a Hub's per-Account removal
+// time is compared with (§7). `orgId` is the pre-#283 stamp evidence a legacy
+// entry carried, moved with the key into its Account's entry (§12) and
+// dropped once the stamp is acknowledged, as `storedUsageCredentialSchema`'s
+// is. Strict: a field this does not name is a caller holding another shape.
+export const ACCOUNT_CREDENTIAL_KIND = "claude-session-key";
+export const accountCredentialSchema = z
+  .object({
+    sessionKey: z.string().min(1),
+    kind: z.literal(ACCOUNT_CREDENTIAL_KIND),
+    setAt: z.string().datetime({ offset: true }),
+    orgId: z.string().min(1).optional(),
+  })
+  .strict();
+export type AccountCredential = z.infer<typeof accountCredentialSchema>;
+
+// The whole keyset a host pushes to its sidecar (ADR-0138 §6, #633): every
+// Account's key, and the one legacy key whose Account is not yet known (the
+// upgrade's single key before §12's move, read from its old entry). Pushing it
+// replaces the sidecar's keyset; nothing persists it there. Strict, as the
+// credential it replaces is.
+export const usageKeysetSchema = z
+  .object({
+    keys: z.array(accountCredentialSchema.extend({ accountUuid: z.string().min(1) }).strict()),
+    legacy: z
+      .object({ sessionKey: z.string().min(1), orgId: z.string().min(1).optional() })
+      .strict()
+      .nullable(),
+  })
+  .strict();
+export type UsageKeyset = z.infer<typeof usageKeysetSchema>;
+
+// GET /api/usage/keys (#633, ADR-0138 §12): the keyset the sidecar holds, as
+// its host needs it to finish the move. `keys` are the pushed Accounts' keys,
+// each with its connection; `legacy` is the pushed legacy key, with the
+// Account its `/api/account` resolved (null until it does: the network is
+// down, or the key is expired) and its connection. A host that sees
+// `legacy.accountUuid` writes that Account's entry, deletes the legacy one and
+// pushes the keyset again. Never a key. Kept fresh by `usage-keys:changed`.
+export const USAGE_KEYS_PATH = "/api/usage/keys";
+export const usageKeysResponseSchema = z.object({
+  keys: z.array(z.object({ accountUuid: z.string().min(1), connection: usageConnectionSchema })),
+  legacy: z
+    .object({ accountUuid: z.string().min(1).nullable(), connection: usageConnectionSchema })
+    .nullable(),
+});
+export type UsageKeysResponse = z.infer<typeof usageKeysResponseSchema>;
+
+// GET /api/usage/hub-keys (#642, ADR-0140 §6): what the Hub this client is
+// joined to holds for each Account, as the Hub's last status reported it, for
+// the Headless client's `key list` (its At Hub column) and `key remove` (the
+// line saying the Hub still holds a key). Loopback only, behind the usage
+// guard as GET /api/usage/keys is; not part of the hub protocol, so no
+// version moves. `accounts` is null while the client holds no status from a
+// Hub: none is configured, or the configured one has not answered yet. Each
+// entry is one Account of the Hub's status (`hubKeyState`, hub.ts): `none`
+// once its key was removed there or it is named only by an event's tag,
+// `pending` while a held key awaits its first read, else the held key's
+// connection. An Account the status does not list holds no key there either.
+// Never a key.
+export const USAGE_HUB_KEYS_PATH = "/api/usage/hub-keys";
+export const hubKeyStateSchema = z.enum(["connected", "expired", "error", "pending", "none"]);
+export type HubKeyState = z.infer<typeof hubKeyStateSchema>;
+export const usageHubKeysResponseSchema = z.object({
+  accounts: z
+    .array(z.object({ accountUuid: z.string().min(1), state: hubKeyStateSchema }))
+    .nullable(),
+});
+export type UsageHubKeysResponse = z.infer<typeof usageHubKeysResponseSchema>;
+
+// Its TanStack key and URL (ADR-0004's split), so the SSE poke and any host
+// reach it from outside React.
+export function usageKeysQueryKey(): ["usage-keys"] {
+  return ["usage-keys"];
+}
+export function buildUsageKeysUrl(base: string): string {
+  return `${base}${USAGE_KEYS_PATH}`;
+}
+
+// Whether a pasted key for `keyAccount` also replaces the legacy key: the
+// legacy key resolved to that same Account, or it is expired and its Account
+// was never learned — ADR-0138 §12's "the next paste replaces it". A working
+// legacy key not yet resolved (the network was down) stays, and moves itself.
+// The Desktop client's Connect and the Headless client's `key set` both ask.
+export function legacyReplacedBy(
+  report: UsageKeysResponse | undefined,
+  keyAccount: string,
+): boolean {
+  const legacy = report?.legacy ?? null;
+  if (legacy === null) return false;
+  if (legacy.accountUuid !== null) return legacy.accountUuid === keyAccount;
+  return legacy.connection === "expired";
+}
+
 // What one org's usage endpoint answered in discovery or polling (#270/282):
 // `windows` — 200 reporting at least one limit, a window in flight or an idle
 // one (the Enterprise shape, an idle `five_hour` beside `seven_day: null`,
@@ -172,6 +274,35 @@ export const organizationUsageStatusSchema = z.object({
 export const usageOrganizationsSchema = z.record(organizationUsageStatusSchema);
 export type OrganizationUsageStatus = z.infer<typeof organizationUsageStatusSchema>;
 export type UsageOrganizations = z.infer<typeof usageOrganizationsSchema>;
+
+// A Membership's readability (ADR-0138 §8, GLOSSARY.md): whether its Account's
+// key can read that Membership's limits now. `readable` — the key works and
+// the Organization's last Limits answer was `windows` or `none`; `unreadable`
+// — the key works and the Organization refuses it (`forbidden`, retried
+// hourly). Readability belongs only to a Membership of a working key, so null
+// otherwise: no key, a dead key (that is the Account's connection, shown on
+// the Account, not here), a transient `error`, or no answer yet. A key whose
+// only Organizations refuse it reads `error` as a connection, and its
+// Memberships are still Unreadable: only `expired` and `disconnected` say the
+// key is not working.
+export const membershipReadabilitySchema = z.enum(["readable", "unreadable"]);
+export type MembershipReadability = z.infer<typeof membershipReadabilitySchema>;
+export function membershipReadability(
+  connection: UsageConnection,
+  limits: OrgLimitsAnswer | null,
+): MembershipReadability | null {
+  if (connection === "expired" || connection === "disconnected") return null;
+  if (limits === "windows" || limits === "none") return "readable";
+  return limits === "forbidden" ? "unreadable" : null;
+}
+
+// The prompt beside a dead key (ADR-0138 §8): one dead key keeps today's
+// words, the usage tiles' `UsageExpiredHint`; several are counted, since a
+// prompt per Account would repeat itself. `count` is the number of Accounts
+// whose key is expired.
+export function reconnectHint(count: number): string {
+  return count <= 1 ? "Session expired — reconnect" : `${count} Accounts need reconnecting`;
+}
 
 // What the listing says about an Organization that a label may use (#268's
 // resolver, #287): never its `name`, which is free text that can embed the
@@ -212,9 +343,14 @@ export type UsageFailureKind = z.infer<typeof usageFailureKindSchema>;
 // status-kind channel — deliberately distinct from the pinned error envelope
 // `{ error: string }` (packages/shared/src/error.ts), which is a human message
 // on non-2xx only (ADR-0023; review f23).
+//
+// `account` (#633, ADR-0138 §2) is the key's Account as its `/api/account`
+// names it, or null when that read failed. Never the email: the sidecar
+// learns its pair (ADR-0137 §1) and drops it.
 export const discoverOrgsResponseSchema = z.object({
   orgs: z.array(discoveredOrgSchema),
   failureKind: usageFailureKindSchema.nullable(),
+  account: z.object({ accountUuid: z.string().min(1) }).nullable(),
 });
 export type DiscoverOrgsResponse = z.infer<typeof discoverOrgsResponseSchema>;
 

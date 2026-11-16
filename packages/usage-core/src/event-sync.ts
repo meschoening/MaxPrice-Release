@@ -25,7 +25,7 @@ export type EventSyncConnection = {
 
 // The structural subset of an engine row the stamp predicate (and the prune
 // below) read — (messageId, requestId) identity + the four token totals + the
-// Organization evidence (ADR-0103), and the timestamp a pass of changed keys
+// Organization and Account evidence (ADR-0103, ADR-0137 §6), and the timestamp a pass of changed keys
 // sends in (#364). Both the raw engine `StoredEvent` and the wire
 // `StoredEventWire` satisfy it, so the push pass scans RAW store rows and
 // projects ONLY the survivors onto the wire shape via `toWire` (no full-corpus
@@ -39,6 +39,7 @@ export type StampableRow = {
   cacheCreationTokens: number;
   cacheReadTokens: number;
   organizationUuid?: string;
+  accountUuid?: string;
 };
 
 // The contribution source's change feed (#364), so that an ordinary push pass
@@ -122,14 +123,15 @@ export type EventSync = {
 };
 
 // The acknowledged fullness per key, held as a token total per key and the
-// Organization of each key acknowledged tagged: one number and at most one map
-// entry per pushed row, never one `FleetFullness` object each (#361). The tag
-// is the row's own string, held by reference, because the tag order (#374)
-// compares its value. Read only through `fleetFullnessPartsExceed`, the one
-// fullness order.
+// Organization and the Account of each key acknowledged tagged: one number and
+// at most two map entries per pushed row, never one `FleetFullness` object
+// each (#361). A tag is the row's own string, held by reference, because the
+// tag order (#374, ADR-0137 §6) compares its value. Read only through
+// `fleetFullnessPartsExceed`, the one fullness order.
 function createAckedFullness() {
   const totals = new Map<string, number>();
   const tags = new Map<string, string>();
+  const accounts = new Map<string, string>();
   return {
     /** `row` is strictly fuller than the acknowledged copy of `key`, or none was acknowledged. */
     exceededBy(key: string, row: StampableRow): boolean {
@@ -139,8 +141,10 @@ function createAckedFullness() {
         fleetFullnessPartsExceed(
           fleetDedupTokenTotal(row),
           row.organizationUuid,
+          row.accountUuid,
           total,
           tags.get(key),
+          accounts.get(key),
         )
       );
     },
@@ -148,10 +152,13 @@ function createAckedFullness() {
       totals.set(key, fleetDedupTokenTotal(row));
       if (row.organizationUuid !== undefined) tags.set(key, row.organizationUuid);
       else tags.delete(key);
+      if (row.accountUuid !== undefined) accounts.set(key, row.accountUuid);
+      else accounts.delete(key);
     },
     delete(key: string): void {
       totals.delete(key);
       tags.delete(key);
+      accounts.delete(key);
     },
     /** Forgets every key `live` does not hold. */
     keepOnly(live: ReadonlySet<string>): void {
@@ -160,6 +167,7 @@ function createAckedFullness() {
     clear(): void {
       totals.clear();
       tags.clear();
+      accounts.clear();
     },
   };
 }
@@ -416,8 +424,8 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
     fullPass = false;
     dirty = new Set();
     // A row is unstamped only while it is strictly fuller (ADR-0103: a larger
-    // total; at an equal total a tag against none, or a smaller tag against a
-    // larger one, #374) than both the replica's held copy and the acked copy —
+    // total; at an equal total more tags, or a better Organization then
+    // Account tag, #374, ADR-0137 §6) than both the replica's held copy and the acked copy —
     // so a tag gained at an equal total is sent once, and a copy held tagged is
     // never re-sent untagged.
     // Fuller than both is fuller than the better of the two, so the pass
@@ -430,8 +438,10 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
         !fleetFullnessPartsExceed(
           fleetDedupTokenTotal(row),
           row.organizationUuid,
+          row.accountUuid,
           held.total,
           held.organizationUuid,
+          held.accountUuid,
         )
       )
         return false;

@@ -18,10 +18,16 @@ import {
   renameSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { usageSampleSchema, type UsageSample } from "@maxprice/shared";
+import {
+  LABEL_DIRECTORY_MAX,
+  MEMBERSHIP_ASSERTION_DIRECTORY_MAX,
+  usageSampleSchema,
+  type UsageSample,
+} from "@maxprice/shared";
 import {
   byCapturedAt,
   createSampleStore,
@@ -35,6 +41,17 @@ import { describeHolder, type ReadCgroup } from "@maxprice/usage-core/serve-lock
 import { CliError, EXIT, type Writer } from "./cli";
 import { defaultDataDir, hubFileConfigSchema, parseHubConfigText } from "./config";
 import { prepareDataDir } from "./data-dir";
+import {
+  LABEL_DIRECTORY_FILE,
+  LEGACY_ORGANIZATION_DIRECTORY_FILE,
+  migrateOrganizationDirectoryFile,
+} from "./label-directory";
+import { convertMachineDirectoryText } from "./machine-directory";
+import {
+  LEGACY_ORGANIZATION_ASSERTION_DIRECTORY_FILE,
+  MEMBERSHIP_ASSERTION_DIRECTORY_FILE,
+  migrateOrganizationAssertionDirectoryFile,
+} from "./membership-assertion-directory";
 import { readOnlyLockHolder, serveLockPath, takeVerbLock, UNIT } from "./serve-lock";
 
 // `maxprice-hub restore <dir> [--samples <usage-history.jsonl>]...` (ADR-0130):
@@ -61,16 +78,55 @@ import { readOnlyLockHolder, serveLockPath, takeVerbLock, UNIT } from "./serve-l
 // What restore copies, in the order it renames them into the data dir.
 // hub.json goes last: a data dir holds a Hub once it holds hub.json (hasHub),
 // so the other verbs never act on a restore cut short.
+//
+// Not `sample-stamps.json` (ADR-0139 §8, sample-stamps.ts), though it
+// describes the history restored: the backup's value is one the clients may
+// already have recorded, so they would not re-run the cursorless sample
+// exchange that brings back the stamps they pushed after the backup. The
+// restored Hub starts at null, which every client that recorded a stamp time
+// differs from, so each exchanges once.
+//
+// Nor the Gateways (ADR-0141 §7, #651). `gateway-records.json` is a 7-day
+// feed, like the sample stamps a thing of the Hub that served it: under a
+// new epoch every client replays the restored Hub's feed from its start, and
+// the records a backup missed are on no Hub; a client's outbox already
+// dropped what the old Hub acked, so those lines keep what they had. And
+// `gateways.json` names Gateways whose management keys are not restored, as
+// session keys are not (secrets.json, the keychain): restored alone it would
+// list Gateways the Hub cannot drain. A Gateway is connected again at the
+// restored Hub. Both show under the report's `not copied`.
 const RESTORED = [
   "machine-directory.json",
   "identity-directory.json",
-  "organization-directory.json",
-  "organization-assertion-directory.json",
+  LABEL_DIRECTORY_FILE,
+  MEMBERSHIP_ASSERTION_DIRECTORY_FILE,
   "organization-roster.json",
   "usage-history.jsonl",
   "events.sqlite",
   "hub.json",
 ] as const;
+
+// A v6 backup's directories, under their v6 names (ADR-0139 §7): each is
+// staged and converted to its v7 file by the Hub's own boot conversion, so
+// the restored data dir holds only v7 files and its first boot rewrites
+// nothing. A backup holding both names restores the v7 one, and the report
+// says the v6 one was not copied. The Machine directory keeps its name, and
+// its v6 Homes are converted in place (`convertMachineDirectoryText`).
+const CONVERTED = [
+  {
+    from: LEGACY_ORGANIZATION_DIRECTORY_FILE,
+    to: LABEL_DIRECTORY_FILE,
+    max: LABEL_DIRECTORY_MAX,
+    convert: migrateOrganizationDirectoryFile,
+  },
+  {
+    from: LEGACY_ORGANIZATION_ASSERTION_DIRECTORY_FILE,
+    to: MEMBERSHIP_ASSERTION_DIRECTORY_FILE,
+    max: MEMBERSHIP_ASSERTION_DIRECTORY_MAX,
+    convert: migrateOrganizationAssertionDirectoryFile,
+  },
+] as const;
+const MACHINES = "machine-directory.json";
 
 const ARCHIVE = "events.sqlite";
 const HISTORY = "usage-history.jsonl";
@@ -83,10 +139,15 @@ const RECOVERED = [`${ARCHIVE}-wal`, `${ARCHIVE}-journal`];
 
 // What the data dir must not hold, in RESTORED's order: every file restore
 // writes, and the archive's siblings, which SQLite would read as the restored
-// archive's own. Restore never replaces a file.
-const HUB_FILES = RESTORED.flatMap((name) =>
-  name === ARCHIVE ? [name, `${name}-wal`, `${name}-shm`, `${name}-journal`] : [name],
-);
+// archive's own, then the v6 directories, which the Hub's boot would convert
+// over nothing or remove beside a restored v7 one. Restore never replaces a
+// file.
+const HUB_FILES = [
+  ...RESTORED.flatMap((name) =>
+    name === ARCHIVE ? [name, `${name}-wal`, `${name}-shm`, `${name}-journal`] : [name],
+  ),
+  ...CONVERTED.map(({ from }) => from),
+];
 
 // The staging dir, and the mark of a restore that has not finished: made
 // under the lock, and removed only once every file is placed and the data dir
@@ -363,6 +424,13 @@ function copyIn(from: string, to: string): void {
   chmodSync(to, 0o600);
 }
 
+// A file restore writes into staging itself, a converted directory: 0600 as
+// a copied one is, and never over a name already there.
+function writeStaged(path: string, text: string): void {
+  writeFileSync(path, text, { flag: "wx", mode: 0o600 });
+  chmodSync(path, 0o600);
+}
+
 function fsyncPath(path: string): void {
   const fd = openSync(path, "r");
   try {
@@ -415,7 +483,7 @@ async function mergeHistory(path: string, clients: readonly ClientHistory[]): Pr
   let added = 0;
   let latestAdded: string | null = null;
   for (const sample of incoming) {
-    if (store.merge([sample]) > 0) {
+    if (store.merge([sample]).changed > 0) {
       added += 1;
       latestAdded = sample.capturedAt;
     }
@@ -519,6 +587,39 @@ async function stageAndPlace(restore: Restore) {
   const unusable = (name: string, reason: string) =>
     new CliError(EXIT.USAGE, `${shown(join(source, name))} cannot be restored: ${reason}`);
 
+  // A v6 backup's directories, staged under their v6 names, then converted
+  // to their v7 files and the staged v6 copies removed. Each must be the v6
+  // file its conversion reads: anything else would leave the Hub's boot to
+  // set it aside and start that directory empty.
+  const notes = new Map<string, string>();
+  const superseded: string[] = [];
+  for (const { from, to, max, convert } of CONVERTED) {
+    if (!isBackupFile(join(source, from), shown)) continue;
+    if (copied.includes(to)) {
+      superseded.push(`${from} (the backup's ${to} replaces it)`);
+      continue;
+    }
+    copyIn(join(source, from), join(staging, from));
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(join(staging, from), "utf8"));
+    } catch {
+      throw unusable(from, "it was not valid JSON");
+    }
+    const converted = convert(raw);
+    if (converted === null)
+      throw unusable(
+        from,
+        `it is not the v6 file of that name, version 1 with at most ${count(max)} entries`,
+      );
+    writeStaged(join(staging, to), converted.text);
+    rmSync(join(staging, from));
+    const n = converted.skipped;
+    const dropped =
+      n === 0 ? "" : `, dropping ${count(n)} unreadable ${n === 1 ? "entry" : "entries"}`;
+    notes.set(to, `converted from ${from}${dropped}`);
+  }
+
   // hub.json as the Hub reads it: anything else would boot it open
   // (ADR-0037). The directories and the Hub roster must parse; a file the
   // Hub's loader still rejects is its own warn-and-preserve at boot.
@@ -546,6 +647,20 @@ async function stageAndPlace(restore: Restore) {
     throw error;
   }
 
+  // The Machine directory's v6 Homes, converted in place as its boot would
+  // (ADR-0139 §6).
+  if (copied.includes(MACHINES)) {
+    const converted = convertMachineDirectoryText(readFileSync(join(staging, MACHINES), "utf8"));
+    if (converted !== null) {
+      rmSync(join(staging, MACHINES));
+      writeStaged(join(staging, MACHINES), converted.text);
+      notes.set(
+        MACHINES,
+        `the Homes of ${counted(converted.migrated, "machine")} converted to Home memberships`,
+      );
+    }
+  }
+
   const history = await mergeHistory(join(staging, HISTORY), clients);
 
   // The report, whole before anything is placed: after the first rename only
@@ -561,10 +676,18 @@ async function stageAndPlace(restore: Restore) {
     ...(recovered.includes(`${ARCHIVE}-wal`) ? ["its WAL folded in"] : []),
     ...(recovered.includes(`${ARCHIVE}-journal`) ? ["its journal recovered"] : []),
   ];
-  const copiedNames = copied.map((name) =>
-    name === ARCHIVE && folded.length > 0 ? `${name} (${folded.join(", ")})` : name,
+  const placed = RESTORED.filter((name) => existsSync(join(staging, name)));
+  const copiedNames = placed.map((name) =>
+    name === ARCHIVE && folded.length > 0
+      ? `${name} (${folded.join(", ")})`
+      : notes.has(name)
+        ? `${name} (${notes.get(name)})`
+        : name,
   );
-  const notCopied = notCopiedLine(source, [...copied, ...recovered], shown);
+  // A v6 directory converted was read; one the v7 file replaced is named on
+  // its own line, with why.
+  const legacy = CONVERTED.map(({ from }) => from);
+  const notCopied = notCopiedLine(source, [...copied, ...recovered, ...legacy], shown);
   const report = [
     `Restored the Hub at ${shown(source)} into ${shown(dataDir)}.`,
     `  events.sqlite: ${counted(archive.events, "event")}, Fleet change cursor ${count(archive.cursor)}, Deletion generation ${count(archive.deletionGeneration)}`,
@@ -573,6 +696,7 @@ async function stageAndPlace(restore: Restore) {
     `  usage history: ${history}`,
     `  hub.json: bind ${config.bind}, port ${config.port}, ${config.passwordHash === null ? "no password" : "password set"}`,
     `  copied: ${copiedNames.join(", ")}`,
+    ...superseded.map((line) => `  not copied: ${line}`),
     ...(notCopied === null ? [] : [notCopied]),
     NEXT_STEPS,
   ].join("\n");
@@ -580,7 +704,6 @@ async function stageAndPlace(restore: Restore) {
   // Durable before it is visible, then visible in RESTORED's order. A rename
   // that fails takes back the ones before it; if that fails too, they stay
   // beside the mark.
-  const placed = RESTORED.filter((name) => existsSync(join(staging, name)));
   for (const name of placed) fsyncPath(join(staging, name));
   restore.placed = true;
   const renamed: string[] = [];
@@ -669,7 +792,9 @@ export async function restoreHub(
   const inputs = [
     rawInputPath(dir),
     source,
-    ...[...RESTORED, ...RECOVERED, "serve.lock"].map((name) => join(source, name)),
+    ...[...RESTORED, ...CONVERTED.map(({ from }) => from), ...RECOVERED, "serve.lock"].map((name) =>
+      join(source, name),
+    ),
     ...samples.map(rawInputPath),
     ...samplePaths,
   ];

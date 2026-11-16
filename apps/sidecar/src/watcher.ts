@@ -1,6 +1,6 @@
 import { type FSWatcher, watch } from "chokidar";
 import type { UsageEvent } from "@maxprice/shared";
-import { parseLines, type AttributionCursor } from "./engine/jsonl";
+import { parseLines, type AttributionCursor, type OnAccountPair } from "./engine/jsonl";
 import type { UsageRecord } from "./engine/types";
 import { identityFromPath, parentSessionPath } from "./identity";
 import { createTailReader, type TailReader } from "./tail-reader";
@@ -19,6 +19,11 @@ export type CreateWatcherOptions = {
     sessionId: string,
     isSubagent: boolean,
   ) => void;
+  // Hears the pair observations (ADR-0137 §1) of each main transcript's tail
+  // read, for bootSidecar() to teach the pair table (account-pairs.ts). A
+  // subagent's file is never read with it: its own Email record is no
+  // evidence (ADR-0137 §2).
+  onAccountPair?: OnAccountPair;
   onError?: (error: unknown) => void;
   // Trailing debounce window per file path. Default 500ms per the Part 3 spec
   // — collapses an editor's burst of writes into a single emit, and absorbs
@@ -174,6 +179,7 @@ export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher
   }
 
   async function flushOne(path: string, emitWhenEmpty: boolean): Promise<void> {
+    const isSubagent = parentSessionPath(path, opts.roots) !== null;
     const { count, lines, latestTimestamp, fromStart } = await tailReader.read(path);
     const { projectSlug, sessionId } = identityFromPath(path, opts.roots);
 
@@ -186,14 +192,13 @@ export async function createWatcher(opts: CreateWatcherOptions): Promise<Watcher
     if (opts.onRecords) {
       // A truncation need not emit unlink. Restart positional attribution
       // whenever the reader restarts, even if this chunk has no complete lines.
-      const parsed = parseLines(lines, fromStart ? undefined : cursorAtEnd.get(path));
-      cursorAtEnd.set(path, parsed.cursor);
-      opts.onRecords(
-        parsed.records,
-        projectSlug,
-        sessionId,
-        parentSessionPath(path, opts.roots) !== null,
+      const parsed = parseLines(
+        lines,
+        fromStart ? undefined : cursorAtEnd.get(path),
+        isSubagent ? undefined : opts.onAccountPair,
       );
+      cursorAtEnd.set(path, parsed.cursor);
+      opts.onRecords(parsed.records, projectSlug, sessionId, isSubagent);
     }
 
     // A parent pre-read that found nothing new is not a change worth a poke;

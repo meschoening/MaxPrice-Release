@@ -46,9 +46,13 @@ If you choose **No** at the Windows prompt, nothing changes and the warning stay
 
 The Hub reads your [usage limits](../concepts/blocks.md#usage-limits) from claude.ai with a session key, for every machine in the fleet. Until it has one, the Popout's claude.ai row reads **No key**.
 
-Either paste one into the console: in the Claude account card, choose **Replace key…**, paste the value of your browser's `sessionKey` cookie for claude.ai ([how to copy it](../../../hub/README.md#the-session-key)), and choose **Save key**. Or skip this step: the first client that joins the Hub with [Auto-heal](../concepts/hubs.md#auto-heal) on sends it its own key.
+Either paste one into the console: in the Claude account card, choose **Replace key…**, paste the value of your browser's `sessionKey` cookie for claude.ai ([how to copy it](../../../hub/README.md#the-session-key)), and choose **Save key**. Or skip this step: the first client that joins the Hub with [Send keys to the Hub](../concepts/hubs.md#send-keys-to-the-hub) on sends it its own key.
 
 The Hub keeps the key in the Windows Credential Manager, and never shows it again: the console shows only when it was set, and by whom.
+
+## Optional: a Gateway
+
+If Claude Code on your machines runs through a Gateway, such as CLIProxyAPI, rather than, or as well as, logging in directly, connect it in the console's [Gateways card](popout-and-console.md#gateways): the Hub drains its records for every client, so each request it served counts under its Account and Organization. A client that already holds the Gateway sends it to the Hub when it joins.
 
 ## Optional: a Hub password
 

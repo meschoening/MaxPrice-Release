@@ -18,7 +18,7 @@ import { colorEnabled, style, type Style } from "./style";
 // truncated or dropped.
 
 // The truncatable name columns' minimum widths (#445).
-export const NAME_MIN = { project: 14, organization: 13 } as const;
+export const NAME_MIN = { project: 14, organization: 13, account: 13 } as const;
 
 export type Column<R> = {
   header: string;
@@ -54,8 +54,9 @@ export type ReportContext = {
   // today.
   tz: string | undefined;
   now: number;
-  // All organizations: the Organization (Organizations) column shows.
-  isAll: boolean;
+  // The Scope spans two or more Organizations: the Organization
+  // (Organizations) column shows (ADR-0140 §3).
+  spansOrganizations: boolean;
   // The roster's Organization labels by uuid.
   labels: ReadonlyMap<string, string>;
   // The Machine directory while the machine axis is on, which shows the

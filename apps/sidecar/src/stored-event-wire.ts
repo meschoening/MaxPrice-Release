@@ -8,9 +8,13 @@ import type { StoredEvent } from "./engine/store";
 // or the archive's), which re-mints machineId, so the projection deliberately
 // drops it.
 //
-// `organizationUuid` is the store's RESOLVED tag — owner evidence only, never a
-// presumption (ADR-0103) — and rides LAST, so an untagged row's JSON is
-// byte-identical to the pre-v5 projection (organization-wire.test.ts pins it).
+// `organizationUuid` and `accountUuid` are the store's RESOLVED tags — evidence
+// only, never a presumption (ADR-0103, ADR-0137 §6) — and ride LAST, the
+// Organization then the Account, each only when present, so an untagged row's
+// JSON is byte-identical to the pre-v5 projection and an Organization-only
+// row's to v6's (organization-wire.test.ts pins it). `accountEmailHash` is
+// never projected: a Pending account's rows carry no Account tag, and the hash
+// never leaves the machine.
 export function storedEventToWire(e: StoredEvent): StoredEventWire {
   return {
     timestamp: e.timestamp,
@@ -27,5 +31,6 @@ export function storedEventToWire(e: StoredEvent): StoredEventWire {
     projectSlug: e.projectSlug,
     sessionId: e.sessionId,
     ...(e.organizationUuid !== undefined ? { organizationUuid: e.organizationUuid } : {}),
+    ...(e.accountUuid !== undefined ? { accountUuid: e.accountUuid } : {}),
   };
 }

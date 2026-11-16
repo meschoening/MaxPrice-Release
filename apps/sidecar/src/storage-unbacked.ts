@@ -49,10 +49,19 @@ export type UnbackedBlock = { reason: UnbackedBlockReason; detail: string };
 // element and as the unit #128's `POST /api/events/forget` body carries.
 export type UnbackedSession = { projectSlug: string; sessionId: string; rows: number };
 
-// One Organization's share of the unbacked rows (#295) — the wire's
-// `forget.organizations` element. A disclosure, never a scope: Forget still
-// removes every unbacked session whatever Organization its rows resolve to.
-export type UnbackedOrganization = { organizationUuid: string; rows: number };
+// One Membership's share of the unbacked rows (#295, per Membership since
+// #631) — the wire's `forget.memberships` element. A disclosure, never a
+// scope: Forget still removes every unbacked session whatever Membership its
+// rows resolve to. `accountKey` null = the row's Account is unknown.
+export type UnbackedMembership = {
+  organizationUuid: string;
+  accountKey: string | null;
+  rows: number;
+};
+
+// What `UnbackedInput.membershipOf` answers for one row: its Organization, and
+// its Account key or null when that is unknown.
+export type ForgetMembership = { organizationUuid: string; accountKey: string | null };
 
 // Structurally the `forget` object of the `GET /api/storage` payload (#126).
 // The Zod schema itself lands with the endpoint (#131); assigning this to it
@@ -76,14 +85,15 @@ export type UnbackedReport = {
   // null = enabled. Non-null = the action renders present but DISABLED with
   // `detail` stated inline (a control that silently vanishes reads as a bug).
   block: UnbackedBlock | null;
-  // The unbacked rows split by Organization (#295), biggest first, ties by
-  // uuid. ABSENT — the key itself, not an empty array — unless an
-  // `organizationOf` was supplied, every unbacked row resolved, and the rows
-  // span two or more Organizations. "Every row resolved" is what makes the
-  // entries sum to `unbackedRows` by construction; "two or more" is what keeps
-  // a single-Organization machine's report byte-identical to the one it got
+  // The unbacked rows split by Membership (#295, #631), biggest first, ties by
+  // Organization uuid then Account key (null first). ABSENT — the key itself,
+  // not an empty array — unless a `membershipOf` was supplied, every unbacked
+  // row resolved to an Organization, and the rows span two or more
+  // Memberships. "Every row resolved" is what makes the entries sum to
+  // `unbackedRows` by construction; "two or more" is what keeps a
+  // single-Membership machine's report byte-identical to the one it got
   // before. Informational only: the confirm's ceiling is still `unbackedRows`.
-  organizations?: UnbackedOrganization[];
+  memberships?: UnbackedMembership[];
 };
 
 export type UnbackedClassification = {
@@ -170,13 +180,14 @@ export type UnbackedInput = {
   // follow, and the verdict is the one the same replica would get without
   // them.
   withheld?: (record: FleetRecord) => boolean;
-  // The Organization an unbacked row counts under, for the per-Organization
-  // disclosure (#295) — bootSidecar() wires `eventOrganization` against the
-  // live store's presumption, so a row answers here exactly as it does in every
-  // report: evidence, then assertion, then presumption. `undefined` = it
-  // resolves to none (no Home to presume under), which suppresses the
-  // breakdown rather than leaving a row out of it. Omitted = no breakdown.
-  organizationOf?: (record: FleetRecord) => string | undefined;
+  // The Membership an unbacked row counts under, for the per-Membership
+  // disclosure (#295, #631) — bootSidecar() wires `forgetMembershipOf` against
+  // the live store's presumption, so a row answers here exactly as it does in
+  // every report: evidence, then assertion, then presumption, for its
+  // Organization and its Account alike. `undefined` = it resolves to no
+  // Organization (no Home to presume under), which suppresses the breakdown
+  // rather than leaving a row out of it. Omitted = no breakdown.
+  membershipOf?: (record: FleetRecord) => ForgetMembership | undefined;
   // Test seams.
   sampleLimit?: number;
   ratioLimit?: number;
@@ -200,9 +211,9 @@ export function classifyUnbacked(input: UnbackedInput): UnbackedClassification {
   // The #295 tally, kept in the same pass over the same unbacked rows, so it
   // cannot count a row the totals above did not. `resolvedAll` drops to false
   // at the first row with no Organization, and with it the whole breakdown.
-  const organizationOf = input.organizationOf;
-  const perOrganization = new Map<string, number>();
-  let resolvedAll = organizationOf !== undefined;
+  const membershipOf = input.membershipOf;
+  const perMembership = new Map<string, UnbackedMembership>();
+  let resolvedAll = membershipOf !== undefined;
 
   for (const record of input.records) {
     if (record.machineId !== input.selfMachineId) continue;
@@ -212,10 +223,17 @@ export function classifyUnbacked(input: UnbackedInput): UnbackedClassification {
     if (input.backed.has(key)) continue;
     unbackedRows += 1;
     unbackedBytes += record.bytes;
-    if (resolvedAll && organizationOf !== undefined) {
-      const organization = organizationOf(record);
-      if (organization === undefined) resolvedAll = false;
-      else perOrganization.set(organization, (perOrganization.get(organization) ?? 0) + 1);
+    if (resolvedAll && membershipOf !== undefined) {
+      const membership = membershipOf(record);
+      if (membership === undefined) resolvedAll = false;
+      else {
+        // A NUL never occurs in a uuid or a `pending:<hash>` key, so the pair
+        // keys one entry; the null Account keys apart from every real one.
+        const key = `${membership.organizationUuid}\u0000${membership.accountKey ?? ""}`;
+        const seen = perMembership.get(key);
+        if (seen === undefined) perMembership.set(key, { ...membership, rows: 1 });
+        else seen.rows += 1;
+      }
     }
     const seen = perSession.get(key);
     if (seen === undefined) {
@@ -241,22 +259,17 @@ export function classifyUnbacked(input: UnbackedInput): UnbackedClassification {
 
   const block = evaluateGuards({ input, selfRows, unbackedRows, ratioLimit });
 
-  // Past one Organization only (#295, the rule on `UnbackedReport`). Ordered
+  // Past one Membership only (#295, the rule on `UnbackedReport`). Ordered
   // as the sample is — biggest first, a stable lexicographic tie-break — and
   // computed whatever `block` says, like every other count here.
-  const organizations =
-    resolvedAll && perOrganization.size >= 2
-      ? [...perOrganization]
-          .map(([organizationUuid, rows]) => ({ organizationUuid, rows }))
-          .sort(
-            (a, b) =>
-              b.rows - a.rows ||
-              (a.organizationUuid < b.organizationUuid
-                ? -1
-                : a.organizationUuid > b.organizationUuid
-                  ? 1
-                  : 0),
-          )
+  const memberships =
+    resolvedAll && perMembership.size >= 2
+      ? [...perMembership.values()].sort(
+          (a, b) =>
+            b.rows - a.rows ||
+            compareText(a.organizationUuid, b.organizationUuid) ||
+            compareText(a.accountKey ?? "", b.accountKey ?? ""),
+        )
       : undefined;
 
   // The counts and the sample are reported even when a guard trips: the schema
@@ -264,7 +277,7 @@ export function classifyUnbacked(input: UnbackedInput): UnbackedClassification {
   // evidence that makes the refusal legible ("these look unbacked because that
   // drive is not mounted"). What a block withholds is the ACTIONABLE list.
   //
-  // `organizations` is spread in LAST and only when present, so a report
+  // `memberships` is spread in LAST and only when present, so a report
   // without it is the pre-#295 object key for key (storage.test.ts pins it).
   return {
     forget: {
@@ -274,10 +287,14 @@ export function classifyUnbacked(input: UnbackedInput): UnbackedClassification {
       sessionCount: sessions.length,
       sampleSessions: sessions.slice(0, sampleLimit),
       block,
-      ...(organizations === undefined ? {} : { organizations }),
+      ...(memberships === undefined ? {} : { memberships }),
     },
     sessions: block === null ? sessions : [],
   };
+}
+
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 // Guards 1-3, in a fixed order, first match winning. The order is by

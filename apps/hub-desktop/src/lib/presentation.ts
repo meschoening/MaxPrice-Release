@@ -1,20 +1,34 @@
 import {
+  GATEWAY_STATE_TONE,
+  GATEWAY_STATE_WORDS,
+  type GatewayStateTone,
+  byCodeUnit,
   clientFacingHost,
   displayOrganizationLabels,
   formatRelativeTime,
   hasNonLoopbackBind,
+  hubAccountLabel,
   hubDaemonLabel,
+  hubKeyClause,
+  hubKeyPending,
+  hubMembershipState,
+  mostUsedWindow,
   noFreshReading,
+  rankMemberships,
   resolveMergeTarget,
   resolveOrganizationLabel,
+  usageConnectionDot,
   usageConnectionShortLabel,
   type FirewallVerdict,
+  type GatewayState,
+  type HubAccount,
   type HubClient,
   type HubDaemonState,
+  type HubKeyRow,
   type HubMachine,
+  type HubMembershipState,
   type HubOrganization,
-  type OrganizationUsageStatus,
-  type UsageConnection,
+  type LabelEntry,
 } from "@maxprice/shared";
 
 // An IPv6 host (the Tailscale ULA, fd7a:…) must be bracketed so a `host:port`
@@ -118,14 +132,17 @@ export function autostartRow(state: AutostartState): { value: string; warn: bool
 // the window is hidden — and the tray app autostarts — so it must carry BOTH
 // facts, not just one.
 //
-// Its key clause is the popout row's short label (@maxprice/shared's
-// usageConnectionShortLabel) lowercased, so the row and the tooltip share one
-// vocabulary and can never drift apart.
-export function trayTooltip(state: HubDaemonState, conn: UsageConnection | undefined): string {
+// Its key clauses are the key rows' (@maxprice/shared's hubKeyClause, #614
+// §11): one per Provider whose row is not good, so the rows and the tooltip
+// share one vocabulary. One key keeps today's clause (`· key expired`);
+// several are named by host (`· claude.ai: 1 key expired`). Windows shows a
+// tray tooltip whole up to 63 characters (tray-icon sets no cbSize, #646);
+// the words stay within it (the test measures the longest).
+export function trayTooltip(state: HubDaemonState, rows: readonly HubKeyRow[] | undefined): string {
   const head = `MaxPrice Hub — ${hubDaemonLabel(state).toLowerCase()}`;
-  if (noFreshReading(state)) return head;
-  if (conn === undefined || conn === "connected") return head;
-  return `${head} · ${usageConnectionShortLabel(conn).toLowerCase()}`;
+  if (noFreshReading(state) || rows === undefined) return head;
+  const clauses = rows.map(hubKeyClause).filter((clause) => clause !== null);
+  return [head, ...clauses].join(" · ");
 }
 
 // Live first, then most-recently-seen. ISO-8601 strings compare lexicographi-
@@ -221,15 +238,24 @@ export function organizationLabels(rows: readonly HubOrganization[]): Map<string
   return displayOrganizationLabels(rows);
 }
 
-// What the Hub's key discovered: the listed rows, in roster order. Nothing
-// while no key is set — a key clear keeps the roster file, so its rows would
-// otherwise outlive the key.
-export function discoveredOrganizations(
+// Whether one held key's last listing names a row (ADR-0139 §9): an
+// Account's key by the row's `listedBy`; the unmoved legacy key, which
+// `listedBy` never names, by its own entry's Memberships, which are its
+// listing's Organizations (and only those: no event tag names a legacy key).
+function listedByKey(row: HubOrganization, key: HubAccount): boolean {
+  if (key.accountUuid === null) return key.memberships.some((m) => m.organizationUuid === row.uuid);
+  return row.listedBy.includes(key.accountUuid);
+}
+
+// What one held key discovered: the rows its listing names, in roster order.
+// Nothing while the key has no answer (`disconnected`), as the single key's
+// card always read it.
+export function keyOrganizations(
   rows: readonly HubOrganization[] | undefined,
-  connection: UsageConnection,
+  key: HubAccount,
 ): HubOrganization[] {
-  if (rows === undefined || connection === "disconnected") return [];
-  return rows.filter((row) => row.listed);
+  if (rows === undefined || key.connection === "disconnected") return [];
+  return rows.filter((row) => listedByKey(row, key));
 }
 
 // The account card's Organization row: none → an em dash, one → its label,
@@ -244,70 +270,186 @@ export function accountOrganizationValue(
   return `${formatCount(discovered.length)} organizations`;
 }
 
-// The Limits answer in words, with the dot tones of the client's Settings list
-// (apps/desktop/src/lib/organization-list-view.ts). Glass `.dot` variants.
-// `windows` covers an idle limit too, and `none` is an Organization that
-// reports no limit at all (#384).
-export function limitsAnswerText(limits: OrganizationUsageStatus | null): {
-  dot: "good" | "warn" | "soft";
-  text: string;
-} {
-  if (limits === null) return { dot: "soft", text: "Not read yet" };
-  switch (limits.limits) {
-    case "windows":
-      return { dot: "good", text: "Reading limits" };
-    case "none":
-      return { dot: "good", text: "No limits" };
-    case "forbidden":
-      return { dot: "soft", text: "Can't read limits" };
-    case "error":
-      return { dot: "warn", text: "Error" };
-  }
+// An Organization's label on the console: the roster's display label (a
+// collision suffix included), else the default an unlabelled Organization
+// resolves to.
+export function organizationLabelOf(uuid: string, labels: Map<string, string>): string {
+  return (
+    labels.get(uuid) ??
+    resolveOrganizationLabel({ uuid, rename: null, organizationType: null, hints: null }).label
+  );
 }
 
-// "Last read 5m ago · last sample 2h ago". The roster's persisted answer
-// carries no times, so either side can be an em dash.
-export function organizationSubline(row: HubOrganization, now: number): string {
-  const read = formatRelativeTime(row.limits?.lastReadAt ?? null, now);
-  const sample = formatRelativeTime(row.limits?.lastSampleAt ?? null, now);
-  return `Last read ${read} · last sample ${sample}`;
+// ── The Accounts card (#614 §1–§7) ───────────────────────────────────────────
+
+// Whether the console keeps today's Claude account card (#614 §7): a Hub
+// that knows no Account yet, or a single Account with at most one
+// Membership. Anything more gets the Accounts card.
+export function todayAccountLook(accounts: readonly HubAccount[] | undefined): boolean {
+  const all = accounts ?? [];
+  return all.length === 0 || (all.length === 1 && all[0]!.memberships.length <= 1);
 }
 
-// The Home line's gate counts what the console knows: every row's uuid, listed
-// or directory-only, joined with every machine's published Home. The Hub's
-// directory holds renames only, so counting it alone would hide every Home.
+// An Account's state on its row: today's short words (Connected, Key expired,
+// Poll failing, No key), and `Not read yet` for a key held but not yet read
+// (`hubKeyPending`), which is no missing key.
+export function accountState(account: HubAccount): { text: string; dot: string | null } {
+  if (hubKeyPending(account)) return { text: "Not read yet", dot: null };
+  return {
+    text: usageConnectionShortLabel(account.connection),
+    dot: usageConnectionDot(account.connection),
+  };
+}
+
+// Whether an Account needs a key (#614 §1, §5): one whose key does not work,
+// or that has none. A key pending its first read does not.
+export function accountNeedsKey(account: HubAccount): boolean {
+  return account.connection !== "connected" && !hubKeyPending(account);
+}
+
+// The card head's count (#614 §1): `5`, or `5 · 2 need a key`.
+export function accountsHead(accounts: readonly HubAccount[]): string {
+  const need = accounts.filter(accountNeedsKey).length;
+  const count = formatCount(accounts.length);
+  if (need === 0) return count;
+  return `${count} · ${formatCount(need)} ${need === 1 ? "needs" : "need"} a key`;
+}
+
+// One Membership line of an Account row: its Organization, label and state.
+export type AccountMembershipLine = {
+  organizationUuid: string;
+  label: string;
+  state: HubMembershipState;
+  // The highest live percent, for the fold's `none above X%`.
+  peak: number | null;
+};
+
+// An Account's Memberships, ranked by the one most used ordering (#610,
+// `rankMemberships`), each with its line's words.
+export function accountMembershipLines(
+  account: HubAccount,
+  labels: Map<string, string>,
+  nowMs: number,
+): AccountMembershipLine[] {
+  const ranked = rankMemberships(
+    account.memberships.map((membership) => ({
+      membership,
+      key: membership.organizationUuid,
+      label: organizationLabelOf(membership.organizationUuid, labels),
+      connection: account.connection,
+      limits: membership.limits,
+      reading: membership.current ?? null,
+    })),
+    nowMs,
+  );
+  return ranked.map((m) => ({
+    organizationUuid: m.key,
+    label: m.label,
+    state: hubMembershipState(account.connection, m.membership, nowMs),
+    peak: mostUsedWindow(m.reading, nowMs)?.utilizationPct ?? null,
+  }));
+}
+
+// The Accounts in the card's order (#614 §2): those needing a key first, then
+// by their most used Membership, then by label.
+export function rankHubAccounts(
+  accounts: readonly HubAccount[],
+  accountLabels: Readonly<Record<string, LabelEntry>> | undefined,
+  nowMs: number,
+): HubAccount[] {
+  const keyed = accounts.map((account) => ({
+    account,
+    need: accountNeedsKey(account),
+    peak: Math.max(
+      Number.NEGATIVE_INFINITY,
+      ...account.memberships.map(
+        (m) => mostUsedWindow(m.current ?? null, nowMs)?.utilizationPct ?? Number.NEGATIVE_INFINITY,
+      ),
+    ),
+    label: hubAccountLabel(account.accountUuid, accountLabels),
+  }));
+  keyed.sort(
+    (a, b) =>
+      Number(b.need) - Number(a.need) ||
+      (b.peak === a.peak ? 0 : b.peak > a.peak ? 1 : -1) ||
+      byCodeUnit(a.label, b.label) ||
+      byCodeUnit(a.account.accountUuid ?? "", b.account.accountUuid ?? ""),
+  );
+  return keyed.map((k) => k.account);
+}
+
+// The fold past the first lines (#614 §3): `4 more, none above 30%`, or
+// `4 more` when none of them holds a live window.
+export function membershipFold(rest: readonly AccountMembershipLine[]): string {
+  const peaks = rest.map((m) => m.peak).filter((p): p is number => p !== null);
+  const head = `${formatCount(rest.length)} more`;
+  return peaks.length === 0 ? head : `${head}, none above ${Math.round(Math.max(...peaks))}%`;
+}
+
+// ── The Machines card's Home lines (#614 §6) ─────────────────────────────────
+
+// What the Home lines need: the Organization labels, the Account labels, and
+// whether the Provider has several Accounts (then the Account is named).
+export type HomeLineContext = {
+  organizations: Map<string, string>;
+  accountLabels: Readonly<Record<string, LabelEntry>> | undefined;
+  severalAccounts: boolean;
+};
+
+// The Home lines are shown once the console knows more than one Organization
+// or more than one Account (#614 §6); with one of each there is nothing to
+// tell apart, and today's card shows no line. Null hides every line.
+export function homeLineContext(
+  rows: readonly HubOrganization[] | undefined,
+  machines: readonly HubMachine[],
+  accounts: readonly HubAccount[] | undefined,
+  accountLabels: Readonly<Record<string, LabelEntry>> | undefined,
+): HomeLineContext | null {
+  const severalAccounts = (accounts ?? []).length > 1;
+  if (knownOrganizationCount(rows, machines) <= 1 && !severalAccounts) return null;
+  return { organizations: organizationLabels(rows ?? []), accountLabels, severalAccounts };
+}
+
+// The Home line count is what the console knows: every row's uuid, listed
+// or directory-only, joined with every machine's published Home membership's
+// Organization (ADR-0139 §6). The Hub's directory holds renames only, so
+// counting it alone would hide every Home.
 export function knownOrganizationCount(
   rows: readonly HubOrganization[] | undefined,
   machines: readonly HubMachine[],
 ): number {
   const known = new Set((rows ?? []).map((row) => row.uuid));
   for (const machine of machines) {
-    const home = machine.homeOrganization ?? null;
+    const home = machine.homeMemberships?.anthropic?.organizationUuid ?? null;
     if (home !== null) known.add(home);
   }
   return known.size;
 }
 
-// A machine's published Home organization, as the Machines card's "Home: …"
-// line. A Home no row holds resolves the way an unlabelled Organization does.
-export function machineHomeLine(machine: HubMachine, labels: Map<string, string>): string | null {
-  const uuid = machine.homeOrganization ?? null;
-  if (uuid === null) return null;
-  const label =
-    labels.get(uuid) ??
-    resolveOrganizationLabel({ uuid, rename: null, organizationType: null, hints: null }).label;
-  return `Home: ${label}`;
+// A machine's Home line per Provider (#614 §6), `Home: Acme Team`, or with
+// several Accounts `Home: Work · Acme Team`; a machine that published none
+// reads `Home: not set`. v7 carries one Provider, so one line.
+export function machineHomeLines(machine: HubMachine, context: HomeLineContext): string[] {
+  const home = machine.homeMemberships?.anthropic ?? null;
+  if (home === null) return ["Home: not set"];
+  const organization = organizationLabelOf(home.organizationUuid, context.organizations);
+  if (!context.severalAccounts || home.accountUuid === null) return [`Home: ${organization}`];
+  return [`Home: ${hubAccountLabel(home.accountUuid, context.accountLabels)} · ${organization}`];
 }
 
-// The Machines card's Home lines, gated once for the whole card: null (no line
-// anywhere) until the console knows more than one Organization, else the
-// labels over every row, so a collision suffix reads as it does on the other cards.
-export function homeLineLabels(
-  rows: readonly HubOrganization[] | undefined,
-  machines: readonly HubMachine[],
-): Map<string, string> | null {
-  if (knownOrganizationCount(rows, machines) <= 1) return null;
-  return organizationLabels(rows ?? []);
+// ── The Gateways card (ADR-0141 §8) ─────────────────────────────────────────
+
+// A Gateway's state as its drainer last found it, in the shared words and
+// glass dot variant (packages/shared's `gateway-words.ts`, #673).
+export function gatewayState(state: GatewayState): { text: string; dot: GatewayStateTone } {
+  return { text: GATEWAY_STATE_WORDS[state], dot: GATEWAY_STATE_TONE[state] };
+}
+
+// The row's subline: the age of the Gateway's newest drained record.
+export function gatewayLastRecord(lastRecordAt: string | null, now: number): string {
+  return lastRecordAt === null
+    ? "No record yet"
+    : `Last record ${formatRelativeTime(lastRecordAt, now)}`;
 }
 
 // ── Archive rows + hygiene (M7, #41) ─────────────────────────────────────────

@@ -1,7 +1,18 @@
 import {
+  accountFilterVisible,
+  type AccountsResponse,
   displayOrganizationLabels,
   formatRelativeTime,
+  gatewayUrlHost,
+  GATEWAY_STATE_TONE,
+  type GatewayStateTone,
+  type HomeMembership,
   hubConnectionLabel,
+  LIMIT_STATE_WORDS,
+  type LocalGatewaysResponse,
+  membershipWindows,
+  organizationLabelMap,
+  trackedScopeMemberships,
   usageConnectionLabel,
   type BootProgress,
   type HubConnection,
@@ -10,15 +21,19 @@ import {
   type PricingStatus,
   type StatusSnapshot,
   type UsageConnection,
+  type UsageKeysResponse,
   type UsageOrganizations,
   type WindowState,
 } from "@maxprice/shared";
 import { terminalText } from "@maxprice/usage-core/terminal-text";
 import { type UpdateCheckRead, updateRow } from "@maxprice/usage-core/update-check";
 import { doubleJoinWarning } from "../double-join";
-import type { SecretsHealth } from "../secrets";
+import { type SecretsHealth, sessionKeyCount, sessionKeySetAts } from "../secrets";
 import type { RejectedField, SettingsHealth } from "../settings";
 import { count, plural } from "./count";
+import { gatewayRows, gatewayStatusDetail, lastRecordText } from "./gateways";
+import { type KeyRow, keyRows, setAtText } from "./keys";
+import { type MembershipRow, rankedMembershipRows } from "./membership-limits";
 import type { Paint, Style } from "./style";
 
 // `maxprice status`'s checklist (#445's Variant B): one row per part of the
@@ -36,23 +51,44 @@ import type { Paint, Style } from "./style";
 // glyph and no label, so its detail starts in the detail column. Nothing is
 // truncated.
 //
-// No row shows any part of the session key or the Hub password, not even its
-// last four characters (ADR-0121 §9): only whether each is set, and when the
-// key was.
+// No row shows any part of a session key, a Gateway's management key or the
+// Hub password, not even its last four characters (ADR-0121 §9): only
+// whether each is set, and when a key was.
 
 export type Mark = "ok" | "warn" | "bad" | "off";
 
 type Row = { mark: Mark | null; label: string; detail: string; remedy?: string };
 
+// A daemon answer `status` reads beside `/api/status`, or why it could not
+// be read: an `{error}` envelope, an answer that does not parse, or no answer
+// within the probe's 3 s. Each such read costs only its own lines.
+export type Unavailable = { unavailable: string };
+export type Read<T> = T | Unavailable;
+
+function readable<T extends object>(read: Read<T> | null): T | null {
+  return read === null || "unavailable" in read ? null : read;
+}
+
 // The daemon's Organization roster; why it could not be read, which shows
 // as one warning in place of the Organization lines; or null for none.
-export type Roster = OrganizationsResponse | { unavailable: string } | null;
+export type Roster = Read<OrganizationsResponse> | null;
 
 export type StatusInput = {
   status: StatusSnapshot;
   // Already as a message shows it, `~` for the home.
   socket: string;
   roster: Roster;
+  // `/api/accounts`, read once the scan is done where two or more Accounts
+  // are tracked or two or more keys stored: the keys' labels, and the
+  // Membership lines while two or more Accounts are tracked. Null when not
+  // read.
+  accounts?: Read<AccountsResponse> | null;
+  // `/api/usage/keys`, read while secrets.json holds two or more session
+  // keys or the unfiled one: each key's connection. Null when not read.
+  keys?: Read<UsageKeysResponse> | null;
+  // `/api/gateways`, read while secrets.json holds a Gateway. Null when not
+  // read.
+  gateways?: Read<LocalGatewaysResponse> | null;
   // The daemon's update-check.json (`readUpdateCheck`): its last check of the
   // channel, why the file cannot be used, or null for none yet.
   update: UpdateCheckRead;
@@ -137,14 +173,17 @@ function localDate(iso: string): string {
   return date.toLocaleDateString("en-CA", { year: "numeric", month: "2-digit", day: "2-digit" });
 }
 
-// ADR-0121 §9: when the session key was set, or that it is not. A file that
-// cannot be used gives no fact, rather than a guessed `not set`: its Secrets
-// row says why.
+// ADR-0121 §9: when the session key was set, or that it is not. Several keys
+// (one per Account, #633) are counted, with when the newest was set. A file
+// that cannot be used gives no fact, rather than a guessed `not set`: its
+// Secrets row says why.
 function keyFact(health: SecretsHealth, now: number): string | null {
   if ("problem" in health) return null;
-  const key = health.secrets.sessionKey;
-  if (key === undefined) return "key not set";
-  return `key set ${localDate(key.setAt)} (${formatRelativeTime(key.setAt, now)})`;
+  const setAts = sessionKeySetAts(health.secrets);
+  const newest = setAts.at(-1);
+  if (newest === undefined) return "key not set";
+  const when = `${localDate(newest)} (${formatRelativeTime(newest, now)})`;
+  return setAts.length === 1 ? `key set ${when}` : `${setAts.length} keys set, newest ${when}`;
 }
 
 function limitsRow(status: StatusSnapshot, health: SecretsHealth, now: number): Row {
@@ -156,6 +195,62 @@ function limitsRow(status: StatusSnapshot, health: SecretsHealth, now: number): 
   const key = keyFact(health, now);
   if (key !== null) parts.push(key);
   return { ...LIMITS[conn], label: "Limits", detail: parts.join(" · ") };
+}
+
+// ADR-0140 §6: the unfiled legacy key, expired.
+export const UNFILED_EXPIRED = "Your saved key has expired; maxprice key set replaces it";
+
+// ADR-0140 §4's header over the key lines while some Account's key is dead.
+export function needReconnecting(dead: number): string {
+  return dead === 1 ? "1 Account needs reconnecting" : `${dead} Accounts need reconnecting`;
+}
+
+// One key's line: its Account's label, the key's connection as the daemon
+// holds it, and when it was set, with the command that reconnects a dead
+// one. A key the daemon does not hold (the file changed since it read it)
+// is not in use until it restarts.
+function keyLine(row: KeyRow, now: number): Row {
+  const set = `key set ${setAtText(row.setAt, now)}`;
+  if (row.account === null && row.connection === "expired") {
+    return { mark: "warn", label: "", detail: UNFILED_EXPIRED };
+  }
+  if (row.connection === null) {
+    return {
+      mark: "warn",
+      label: "",
+      detail: `${row.label}: not in use until the daemon restarts · ${set}`,
+    };
+  }
+  const detail = `${row.label}: ${usageConnectionLabel(row.connection)} · ${set}`;
+  return { ...LIMITS[row.connection], label: "", detail };
+}
+
+// ADR-0140 §4: one line per stored key, under a header while some Account's
+// key is dead. With no key, or one, the Limits line is as it was: one line,
+// the Limits connection, its sample's age and the key's fact; but the one
+// key being the unfiled key, expired, which says so. The key lines need the
+// keys' connections, so with none read the Limits line is as it was.
+function limitsRows(input: StatusInput): Row[] {
+  const { status, secrets: health, now } = input;
+  const single = [limitsRow(status, health, now)];
+  if ("problem" in health) return single;
+  const keys = readable(input.keys ?? null);
+  if (keys === null) return single;
+  const accounts = readable(input.accounts ?? null)?.accounts ?? [];
+  const rows = keyRows({ secrets: health.secrets, keys, accounts, hub: null });
+  if (sessionKeyCount(health.secrets) <= 1) {
+    const only = rows[0];
+    if (only?.account === null && only.connection === "expired") {
+      return [{ mark: "warn", label: "Limits", detail: UNFILED_EXPIRED }];
+    }
+    return single;
+  }
+  const dead = rows.filter((row) => row.account !== null && row.connection === "expired").length;
+  const lines = rows.map((row) => keyLine(row, now));
+  if (dead > 0) {
+    return [{ mark: "warn", label: "Limits", detail: needReconnecting(dead) }, ...lines];
+  }
+  return lines.map((row, i) => (i === 0 ? { ...row, label: "Limits" } : row));
 }
 
 // #445's marks. `connecting` is not yet confirmed, so it warns; the wording
@@ -218,8 +313,8 @@ function pricingRow(pricing: PricingStatus | undefined, now: number): Row {
 
 const WINDOW: Record<WindowState, string> = { active: "active", idle: "idle", absent: "none" };
 
-// The Desktop client's Organization list words (`organization-list-view.ts`),
-// shortened for a line.
+// The words the Desktop client's Organizations list used before Settings ›
+// Accounts replaced it (#639), shortened for a line.
 function limitsPhrase(answer: OrganizationUsageStatus | undefined): string {
   if (answer === undefined) return "no read yet";
   switch (answer.limits) {
@@ -255,13 +350,132 @@ function organizationRows(roster: OrganizationsResponse, answers: UsageOrganizat
   });
 }
 
-function rosterRows(roster: Roster, answers: UsageOrganizations): Row[] {
+// The Home membership and the tracked Organizations as the daemon resolves
+// them: its listing's Home membership, else the roster's Home with no
+// Account, and the roster's tracked Organizations (none excluded with no
+// Home, as the daemon's null set excludes none).
+function daemonScopeState(roster: OrganizationsResponse, accounts: AccountsResponse) {
+  let home: HomeMembership | null =
+    roster.home === null ? null : { organizationUuid: roster.home, accountUuid: null };
+  for (const account of accounts.accounts) {
+    const membership = account.memberships.find((m) => m.home);
+    if (membership !== undefined) {
+      home = { organizationUuid: membership.organizationUuid, accountUuid: account.key };
+    }
+  }
+  const trackedOrganizations =
+    roster.home === null
+      ? null
+      : new Set(roster.organizations.filter((o) => o.tracked).map((o) => o.uuid));
+  return { home, trackedOrganizations };
+}
+
+// A Membership's limits answer in the Organization lines' words: a key not
+// connected or expired first (`LIMIT_STATE_WORDS`, live's Limits list's),
+// then its own last Limits answer, its windows read off its own reading.
+function membershipPhrase(row: MembershipRow, roster: OrganizationsResponse, now: number): string {
+  if (row.state === "not-connected" || row.state === "stale") return LIMIT_STATE_WORDS[row.state];
+  if (row.limits === null) return "no read yet";
+  if (row.limits !== "windows" || row.reading === null) {
+    return limitsPhrase({
+      limits: row.limits,
+      windowStates: null,
+      lastReadAt: null,
+      lastSampleAt: null,
+    });
+  }
+  const windowState = (uuid: string, window: "fiveHour" | "weekly") =>
+    roster.organizations.find((o) => o.uuid === uuid)?.limits?.windowStates?.[window];
+  const windows = membershipWindows(row.reading, row.organizationUuid, windowState, now);
+  const word = (kind: "fiveHour" | "weekly"): string => {
+    const window = windows.find((w) => w.kind === kind);
+    return window === undefined ? WINDOW.absent : window.pct === null ? WINDOW.idle : WINDOW.active;
+  };
+  return `5h ${word("fiveHour")}, wk ${word("weekly")}`;
+}
+
+// ADR-0140 §4: one line per tracked Membership, most used first
+// (`rankMemberships`, live's Limits list's order), none folded, each named
+// as the set names it (`Org · Account` while it spans Accounts) and marked
+// Home.
+function membershipRows(
+  roster: OrganizationsResponse,
+  accounts: AccountsResponse,
+  now: number,
+): Row[] {
+  const memberships = trackedScopeMemberships(
+    accounts.accounts,
+    daemonScopeState(roster, accounts),
+  );
+  const labels = organizationLabelMap(roster.organizations);
+  return rankedMembershipRows(memberships, accounts.accounts, labels, now).map((row) => {
+    const home = row.home ? " (Home)" : "";
+    return {
+      mark: null,
+      label: "",
+      detail: `${row.label}${home}: ${membershipPhrase(row, roster, now)}`,
+    };
+  });
+}
+
+// The Organization lines, or, while two or more Accounts are tracked, the
+// Membership lines (the multi-Membership gate, `accountFilterVisible`). A
+// one-Account install's lines are the Organization lines, as before.
+function rosterRows(input: StatusInput): Row[] {
+  const { roster, now } = input;
   if (roster === null) return [];
   if ("unavailable" in roster) {
     const detail = `the Organization lines are unavailable: ${roster.unavailable}`;
     return [{ mark: "warn", label: "", detail }];
   }
-  return organizationRows(roster, answers);
+  const accounts = input.accounts ?? null;
+  if (accounts !== null && "unavailable" in accounts) {
+    const detail = `the Membership lines are unavailable: ${accounts.unavailable}`;
+    return [{ mark: "warn", label: "", detail }];
+  }
+  if (accounts !== null && accountFilterVisible(accounts.accounts)) {
+    return membershipRows(roster, accounts, now);
+  }
+  return organizationRows(roster, input.status.organizations);
+}
+
+// Each Gateway's mark, by its shared tone (`GATEWAY_STATE_TONE`): draining
+// is fine, statistics off a warning, and a Gateway that cannot be drained bad.
+const GATEWAY_MARKS: Record<GatewayStateTone, Mark> = { good: "ok", warn: "warn", bad: "bad" };
+
+// ADR-0141 §8: one line per Gateway secrets.json holds, its state and the
+// age of its last record, with the remedy where one applies; one warning when
+// the daemon's listing cannot be read. No Gateway, no line.
+function gatewayLines(input: StatusInput): Row[] {
+  const read = input.gateways ?? null;
+  if (read === null || "problem" in input.secrets) return [];
+  let rows: Row[];
+  if ("unavailable" in read) {
+    rows = [
+      { mark: "warn", label: "", detail: `the Gateway lines are unavailable: ${read.unavailable}` },
+    ];
+  } else {
+    rows = gatewayRows(input.secrets.secrets, read).map((g): Row => {
+      const host = gatewayUrlHost(g.url);
+      if (g.state === null) {
+        return {
+          mark: "warn",
+          label: "",
+          detail: `${host} · not in use until the daemon restarts`,
+        };
+      }
+      const { words, remedy } = gatewayStatusDetail(g.state, g.url);
+      const parts = [host, words, `last record ${lastRecordText(g.lastRecordAt, input.now)}`];
+      if (g.drainedBy === "hub") parts.push("drained by the Hub");
+      return {
+        mark: GATEWAY_MARKS[GATEWAY_STATE_TONE[g.state]],
+        label: "",
+        detail: parts.join(" · "),
+        ...(remedy === undefined ? {} : { remedy }),
+      };
+    });
+  }
+  return rows.map((row, i) => (i === 0 ? { ...row, label: "Gateways" } : row));
 }
 
 // ADR-0122 §7. A rejected setting, or a Hub key, has the schema's fallback
@@ -350,10 +564,11 @@ export function renderStatus(input: StatusInput): string {
   const rows: Row[] = [
     daemonRow(status, input.socket),
     engineRow(status),
-    limitsRow(status, input.secrets, now),
+    ...limitsRows(input),
     hubRow(status, input.hub, input.secrets),
     pricingRow(status.pricing, now),
-    ...rosterRows(input.roster, status.organizations),
+    ...rosterRows(input),
+    ...gatewayLines(input),
     updateCheckRow(input.update, status),
     ...settingsRows(input.settings),
     ...secretsRows(input.secretsPath, input.secrets),

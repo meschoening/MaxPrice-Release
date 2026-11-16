@@ -1,5 +1,7 @@
+mod account_credentials;
 mod ambient;
 mod autostart;
+mod gateway_credentials;
 #[cfg(windows)]
 mod job_object;
 #[cfg(any(target_os = "macos", test))]
@@ -345,6 +347,13 @@ fn read_settings_at(path: &Path) -> Result<serde_json::Value, String> {
 // so concurrent writes don't share a temp file; a failed rename best-effort
 // removes the temp so it can't accumulate.
 fn write_settings_at(path: &Path, next: &serde_json::Value) -> Result<(), String> {
+    write_json_atomic(path, next)
+}
+
+// The atomic JSON write itself, shared with the Account credential list
+// (account_credentials.rs, #633) and the Gateway list (gateway_credentials.rs,
+// #651), which sit beside settings.json.
+fn write_json_atomic(path: &Path, next: &serde_json::Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
     }
@@ -374,7 +383,7 @@ fn write_settings(
     write_settings_at(&settings_path(&app)?, &next)?;
     // Kick the ambient readout poller (map #168 M3; T5 decision 3): the poller
     // re-reads settings.json per poll, so this makes a costMode/timezone flip,
-    // or an Organization scope flip (`organizationScope`, ADR-0106 §11),
+    // or a Scope flip (`scope`, ADR-0106 §11, #637),
     // update the tray readout immediately instead of up-to-60s later.
     ambient::kick(&app.state::<ambient::AmbientState>());
     Ok(())
@@ -385,6 +394,12 @@ fn write_settings(
 // Secret Service on Linux, Credential Manager on Windows). The renderer is the
 // only client; it pushes the value to the sidecar over loopback. Never written
 // to settings.json.
+//
+// Since #633 (ADR-0138 §6, §12) this one entry is the legacy key: each
+// Account's key lives in its own entry (account_credentials.rs), and the
+// renderer moves this one into its Account's once the key's Account is known.
+// The renderer still reads and deletes it here, and rewrites it only to drop
+// an acknowledged legacy `orgId` while the move waits.
 const CRED_SERVICE: &str = "maxprice-desktop";
 const CRED_ACCOUNT: &str = "usage-credential";
 
@@ -1281,9 +1296,11 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
     // popout's previous monitor. The macOS adapter owns the coordinate units.
     #[cfg(target_os = "macos")]
     let anchor = macos_popout::capture(rect);
-    let (model_row, update_pending) = {
+    let (model_row, update_pending, limit_rows) = {
         let ambient = app.state::<ambient::AmbientState>();
         let model_window = *ambient.model_window.lock();
+        // The ranked popout's row count (#638), None for today's popout.
+        let limit_rows = *ambient.popout_limit_rows.lock();
         let update_pending = ambient.pending_update.lock().is_some();
         // The row is an opt-in (Settings › Claude account) on top of the
         // wire's presence bit; settings.json is re-read here rather than
@@ -1293,10 +1310,13 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
             .and_then(|p| read_settings_at(&p))
             .map(|v| model_limit_row_enabled(&v))
             .unwrap_or(false);
-        (model_window && enabled, update_pending)
+        (model_window && enabled, update_pending, limit_rows)
     };
-    let logical = popout_logical_size(app.config())
-        .map(|(w, _)| (w, popout::popout_content_height(model_row, update_pending)));
+    let height = match limit_rows {
+        Some(rows) => popout::ranked_popout_content_height(rows, update_pending),
+        None => popout::popout_content_height(model_row, update_pending),
+    };
+    let logical = popout_logical_size(app.config()).map(|(w, _)| (w, height));
     if let Some(logical) = logical {
         #[cfg(target_os = "macos")]
         {
@@ -1799,6 +1819,11 @@ pub fn run() {
             write_settings,
             get_credential,
             set_credential,
+            account_credentials::list_account_credentials,
+            account_credentials::set_account_credential,
+            gateway_credentials::list_gateway_credentials,
+            gateway_credentials::set_gateway_credential,
+            gateway_credentials::delete_gateway_credential,
             get_hub_password,
             set_hub_password,
             log_client_event,

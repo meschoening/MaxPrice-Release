@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { Check, Copy } from "lucide-react";
 import {
   abbreviate,
@@ -7,13 +7,16 @@ import {
   formatAbsoluteTimestamp,
   formatCost,
   formatRelativeTime,
+  scopeKeyPart,
   type CostMode,
   type TimeDisplay,
   foldMachineIdList,
 } from "@maxprice/shared";
 import { useFilters, type Metric } from "@/state/filters";
 import { useSettings, useTimeDisplay } from "@/state/use-settings";
-import { useOrganizationScope } from "@/state/use-organization-scope";
+import { useScope } from "@/state/use-scope";
+import { useAllMembershipsScope } from "@/state/use-all-memberships-scope";
+import { isUnfilteredSession } from "@/lib/finder";
 import { useNowTick } from "@/state/use-now-tick";
 import { useSessionEvents, type SessionEventsData } from "@/state/use-session-events";
 import { useSessionRow } from "@/state/use-session-row";
@@ -21,6 +24,7 @@ import { useMachineAxis, type MachineAxis } from "@/state/use-machine-axis";
 import { MachineChip } from "@/components/machine-chip";
 import { ModelSplitBar } from "@/components/model-split-bar";
 import { UnpricedChip } from "@/components/unpriced-chip";
+import { ZeroCostNote } from "@/components/zero-cost-note";
 import { SessionTimeline } from "@/components/session-timeline";
 import { StripIdentity, StripStat } from "@/components/detail-strip";
 import { cn } from "@/lib/utils";
@@ -41,6 +45,9 @@ const NOW_TICK_MS = 30_000;
 // Page
 // ---------------------------------------------------------------------------
 
+// The empty filter list, shared so an unfiltered page keeps one identity.
+const NO_FILTER: string[] = [];
+
 export function SessionDetailPage(): React.ReactElement {
   const { id } = useParams<{ id: string }>();
   // Cost mode is durable settings (settings.json, ADR-0014); a change re-keys
@@ -49,40 +56,42 @@ export function SessionDetailPage(): React.ReactElement {
   // through here.
   const { data: settings } = useSettings();
   const costMode = settings?.costMode ?? "auto";
-  // The Organization scope (ADR-0106) rides beside `mode`: a flip re-keys and
+  // The Scope (ADR-0106, #637) rides beside `mode`: a flip re-keys and
   // re-streams the session's in-scope events.
-  const { organization } = useOrganizationScope();
+  const { params: railScope } = useScope();
   // The rail's model filter narrows the timeline + totals (ADR-0017): only
   // matching messages stream, and the summary covers exactly those.
-  const models = useFilters((s) => s.models);
+  const railModels = useFilters((s) => s.models);
   // The rail's machine filter narrows the same way (ADR-0041 M6) — the axis
   // supplies alias-expanded machine= params and the em-dash-vs-chips gate.
   const machineAxis = useMachineAxis();
+  // Opened from the ⌘K finder, which ignores the rail's filters: every tracked
+  // Membership and no Model or Machine filter (`finderSessionPath`, #640).
+  const [searchParams] = useSearchParams();
+  const unfiltered = isUnfilteredSession(searchParams);
+  const allScope = useAllMembershipsScope();
+  const scope = unfiltered ? allScope : railScope;
+  const models = unfiltered ? NO_FILTER : railModels;
+  const machineParams = unfiltered ? NO_FILTER : machineAxis.machineParams;
   // Cost vs tokens toggle for the per-model split bar — page-local, not a
   // persisted filter (it only affects this one bar).
   const [splitMetric, setSplitMetric] = useState<Metric>("cost");
 
   const sessionId = id ?? "";
-  const query = useSessionEvents(
-    sessionId,
-    costMode,
-    models,
-    machineAxis.machineParams,
-    organization,
-  );
+  const query = useSessionEvents(sessionId, costMode, models, machineParams, scope);
   const data: SessionEventsData | undefined = query.data;
 
   // Arrival flash (T6): a re-stream (SSE invalidation) fully rebuilds the
   // timeline; rows beyond the PREVIOUS settled count are genuinely new and
   // enter on the arrive rise + accent flash. The first pour of a key has no
   // settled baseline, so nothing flashes; a key change (cost mode / filters /
-  // Organization scope / another session) resets the baseline the same way.
+  // Scope / another session) resets the baseline the same way.
   const streamIdentity = [
     sessionId,
     costMode,
     models.join("\0"),
-    machineAxis.machineParams.join("\0"),
-    organization ?? "",
+    machineParams.join("\0"),
+    JSON.stringify(scopeKeyPart(scope) ?? null),
   ].join("|");
   const settledCount = useRef<number | null>(null);
   const [freshFrom, setFreshFrom] = useState<number | null>(null);
@@ -130,7 +139,7 @@ export function SessionDetailPage(): React.ReactElement {
       ) : data.summary && data.summary.eventCount === 0 ? (
         <EmptyState
           sessionId={sessionId}
-          filtered={models.length > 0 || machineAxis.machineParams.length > 0}
+          filtered={models.length > 0 || machineParams.length > 0}
         />
       ) : (
         <SessionContent
@@ -207,14 +216,7 @@ function SessionContent({
         </div>
       ) : null}
 
-      {allZeroCost ? (
-        <div className="inset">
-          <p>
-            All events read <b>$0.00</b> — this session has no stored cost. Switch the cost mode to{" "}
-            <b style={{ color: "var(--accent)" }}>calculate</b> in the topbar to price tokens.
-          </p>
-        </div>
-      ) : null}
+      {allZeroCost ? <ZeroCostNote /> : null}
 
       <SessionTimeline
         events={events}

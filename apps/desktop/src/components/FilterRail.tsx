@@ -12,13 +12,14 @@ import {
 import { isOptionSelected, selectedOptionCount, toggleOption } from "@/lib/multi-select";
 import { useFilters } from "@/state/filters";
 import { useSettings, useTimeDisplay } from "@/state/use-settings";
-import { useOrganizationScope } from "@/state/use-organization-scope";
+import { useScope } from "@/state/use-scope";
 import { useWeekWindow } from "@/state/use-week";
 import { weekReadout } from "@/lib/week-copy";
 import { useProjects } from "@/state/use-projects";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useProjectAxis } from "@/state/use-project-axis";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { AccountFilter } from "@/components/account-filter";
 import { cn } from "@/lib/utils";
 
 const PRESETS: DateRangePreset[] = ["24h", "week", "30d", "90d", "all"];
@@ -33,8 +34,8 @@ function presetLabel(p: DateRangePreset): string {
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 // The sidebar's filter fields (Glass, ADR-0043): date presets as a seg pill +
-// resolved readout, then Project / Model / Machine select chips whose menus
-// are floating glass leaves. Filter semantics are frozen — the rail drives
+// resolved readout, the Account filter (#637, account-filter.tsx), then
+// Project / Model / Machine select chips whose menus are floating glass leaves. Filter semantics are frozen — the rail drives
 // the same store the old rail drove.
 export function FilterRail() {
   const dateRange = useFilters((s) => s.dateRange);
@@ -52,7 +53,7 @@ export function FilterRail() {
   const { data: settings } = useSettings();
   const tz = settings?.timezone;
   // ADR-0106: the project options come from the scope's rows, like every table.
-  const { organization } = useOrganizationScope();
+  const { params: scope } = useScope();
 
   // ADR-0083: the `week` preset follows the Week setting — an anchored week
   // resolves to an instant `since` and its own readout below.
@@ -64,7 +65,7 @@ export function FilterRail() {
     until,
     mode: settings?.costMode ?? "auto",
     tz,
-    organization,
+    ...scope,
   });
 
   // Options come from the rows the rail's range actually has data for — never
@@ -131,6 +132,11 @@ export function FilterRail() {
         </div>
         <div className="readout num">{readout}</div>
       </div>
+
+      {/* The Provider switch and the Account filter (#637): the Scope, shown
+          once two Accounts are tracked. Its money follows the range above and
+          the filters below, never its own selection. */}
+      <AccountFilter since={since} until={until} />
 
       <div className="field">
         <span className="eyebrow">Project</span>

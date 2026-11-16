@@ -1,4 +1,4 @@
-import type { BlockRow } from "./blocks";
+import type { BlockRow, BlocksResponse } from "./blocks";
 import type { ModelBreakdown } from "./models";
 import type { ProjectRow } from "./projects";
 import type { SessionRow } from "./sessions";
@@ -130,6 +130,25 @@ export function aggregateBlocks(rows: BlockRow[]): BlocksAggregate {
     for (const m of b.models) models.add(m);
   }
   return { count, totalCost, totalTokens, entries, models: Array.from(models) };
+}
+
+// The usage in a Blocks answer whose Account is not known (ADR-0137 §3's and
+// ADR-0108's #635 notes): the Blocks of every Membership with
+// `accountUuid: null` in `memberships`, the head excepted. A report's table
+// and totals already show the head, which can itself be the Unknown
+// Membership (a Home membership whose Account is not known), so counting it
+// here would count it twice. Null when there is none, or it holds no usage:
+// it is shown only beside usage it describes. `memberships` is present only
+// while the Scope spans two or more Memberships, and follows the date range
+// like `blocks`. The Desktop's Blocks page and the Headless client's `blocks`
+// and `live` all read it here, so they agree on it.
+export function unknownAccountUsage(body: BlocksResponse | undefined): BlocksAggregate | null {
+  const rows = (body?.memberships ?? [])
+    .slice(1)
+    .filter((m) => m.accountUuid === null)
+    .flatMap((m) => m.blocks);
+  const sum = aggregateBlocks(rows);
+  return sum.totalCost > 0 || sum.totalTokens > 0 ? sum : null;
 }
 
 // The "typical" block — the MEDIAN `totalTokens` across the completed

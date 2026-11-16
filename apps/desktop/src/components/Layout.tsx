@@ -3,8 +3,11 @@ import { Outlet } from "react-router-dom";
 import { useLiveStream } from "@/lib/live-stream";
 import { useMainWindowVisibility } from "@/lib/window-visibility";
 import { useManualRefreshHotkey } from "@/state/use-manual-refresh-hotkey";
-import { useSeedHomeOrganization } from "@/state/use-organizations";
-import { readCredential, pushCredentialToSidecar, syncCredential } from "@/lib/usage-credential";
+import { useSeedAccounts, useSeedHomeOrganization } from "@/state/use-organizations";
+import { syncCredentials } from "@/lib/credential-ops";
+import { tauriCredentialIo } from "@/lib/usage-credential";
+import { pushGatewaysAtLaunch } from "@/lib/gateway-config";
+import { useLegacyMove } from "@/state/use-usage-keys";
 import { readHubPassword, pushHubConfigToSidecar } from "@/lib/hub-config";
 import { useSettings } from "@/state/use-settings";
 import { insideTauri } from "@/lib/tauri";
@@ -14,6 +17,7 @@ import { Sidebar } from "./Sidebar";
 import { Topbar } from "./Topbar";
 import { UpdateGate } from "./UpdateGate";
 import { ToastHost } from "./toast";
+import { Finder } from "./finder";
 
 export function Layout() {
   useLiveStream();
@@ -25,23 +29,29 @@ export function Layout() {
   useManualRefreshHotkey();
   // ADR-0098: persist the boot login as the Home organization on first launch.
   useSeedHomeOrganization();
+  // #631: persist the sidecar's Account seed and Pending account folds.
+  useSeedAccounts();
+  // #633: move the legacy key into its Account's entry once its Account is known.
+  useLegacyMove();
   const { data: settings } = useSettings();
 
-  // Push the stored credential to the sidecar once on mount so the usage
-  // poller can start immediately without waiting for the Settings page to open
-  // (ADR-0023). `pushCredentialToSidecar` awaits `getSidecarUrl` internally,
-  // so this resolves once the sidecar is ready. A legacy `{ sessionKey, orgId }`
-  // blob goes through `syncCredential`: pushed verbatim so the sidecar stamps
-  // the usage history, then rewritten key-only once acknowledged (ADR-0104).
-  // Failures are swallowed — a down sidecar at boot is non-fatal; the poller
-  // idles until the credential is pushed later from the Settings page, and an
-  // unacknowledged `orgId` stays in the keychain for the next push.
+  // Push the stored keyset to the sidecar once on mount so the usage poller
+  // can start immediately without waiting for the Settings page to open
+  // (ADR-0023; every Account's key and the legacy key since #633, ADR-0138 §6).
+  // The push awaits `getSidecarUrl` internally, so this resolves once the
+  // sidecar is ready. A legacy `orgId`, in whichever entry holds it, is pushed
+  // so the sidecar stamps the usage history, then dropped once acknowledged
+  // (ADR-0104, `syncKeyset`). Failures are swallowed — a down sidecar at boot
+  // is non-fatal; the poller idles until a key is pushed later from the
+  // Settings page, and an unacknowledged `orgId` stays for the next push.
   useEffect(() => {
-    void readCredential()
-      .then((c) => (c === null ? pushCredentialToSidecar(null) : syncCredential(c)))
-      .catch(() => {
-        /* sidecar may not be up yet at boot; poller idles until pushed */
-      });
+    void syncCredentials(tauriCredentialIo).catch(() => {
+      /* sidecar may not be up yet at boot; poller idles until pushed */
+    });
+    // Every connected Gateway, likewise (ADR-0141 §7, #651).
+    void pushGatewaysAtLaunch().catch(() => {
+      /* sidecar may not be up yet at boot; no Gateway drains until pushed */
+    });
   }, []);
 
   // Push the configured hub URL + stored keychain password to the sidecar ONCE
@@ -116,6 +126,9 @@ function AppFrame(): React.ReactElement {
         <>
           <UpdateGate />
           <ToastHost />
+          {/* The ⌘K finder (#640): main window only, so the popout never
+              answers its hotkey; mounted at the reveal, behind no splash. */}
+          <Finder />
         </>
       ) : null}
       <Sidebar />

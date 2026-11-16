@@ -34,6 +34,19 @@ export const SSE_EVENT = {
   // a settings edit started or finished re-walking, or a rename landed. Payload
   // is empty — a poke, never data.
   organizationsChanged: "organizations:changed",
+  // Account roster changed — refetch GET /api/accounts (#631): a settings edit
+  // started or finished applying, or a pair resolved a Pending account
+  // (ADR-0137 §1). Payload is empty — a poke, never data.
+  accountsChanged: "accounts:changed",
+  // The held keyset changed — refetch GET /api/usage/keys (#633): a push
+  // landed, a key's connection moved, or the legacy key's Account resolved
+  // (ADR-0138 §12). Payload is empty — a poke, never data.
+  usageKeysChanged: "usage-keys:changed",
+  // The held Gateways' list changed — refetch GET /api/gateways (ADR-0141
+  // §5, #651): the held set was replaced, a Gateway's state or last record
+  // moved, or who drains it flipped between the Hub and this machine.
+  // Payload is empty — a poke, never data.
+  gatewaysChanged: "gateways:changed",
 } as const;
 
 // `usage:new` — emitted once per 500ms-debounced write window per JSONL file.
@@ -222,6 +235,14 @@ export type BootProgress = z.infer<typeof bootProgressSchema>;
 // `status:changed` frame so the renderer reacts live.
 export const statusSnapshotSchema = z.object({
   watchedPaths: z.array(z.string()),
+  // The `projects` directories `$CLAUDE_CONFIG_DIR` names in the sidecar's
+  // environment, that exist, and that the settings file's `claudePaths` leaves
+  // out (#679, ADR-0014's 2026-11-14 note). A listed `claudePaths` wins over
+  // the variable, so Settings › Claude data paths offers to add these. Empty
+  // with no variable, no settings file, or a file with no `claudePaths` key,
+  // where the variable already decides (ADR-0122 §5). Optional, absent-means-
+  // empty (the localArchiveDegraded channel below).
+  unlistedConfigDirRoots: z.array(z.string()).optional(),
   engineVersion: z.string(),
   hasData: z.boolean(),
   // Pricing provenance (ADR-0053), replacing `pricingFreshAt`.

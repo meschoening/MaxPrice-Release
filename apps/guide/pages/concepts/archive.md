@@ -6,10 +6,10 @@ Claude Code deletes its old session logs, after 30 days unless you change its `c
 
 The Local archive is MaxPrice's copy of this machine's own usage. Every request MaxPrice reads from a session log goes into it, and it is kept after Claude Code deletes that log. Where a log is already gone, the archive is the only copy.
 
-- **It holds usage alone:** when each request ran, its model, its token counts and cost, the directory it ran in, and its session and Organization. It holds none of your prompts or Claude's replies.
+- **It holds usage alone:** when each request ran, its model, its token counts and cost, the directory it ran in, and its session, and its Organization and Account where known. It holds none of your prompts or Claude's replies.
 - **It is always on.** It needs no Hub and has no setting.
 - **It starts when you install MaxPrice.** History from logs Claude Code deleted before then can't be recovered.
-- **It holds only Tracked organizations' usage.** An [Excluded organization](organizations.md#tracked-and-excluded-organizations)'s usage is never written to it.
+- **It holds only usage whose Account and Organization are both tracked.** An [Excluded](organizations.md#tracked-and-excluded-organizations) Account's or Organization's usage is never written to it.
 
 With a [Hub](hubs.md), the Hub keeps an archive of the whole fleet's usage too, and the [Fleet replica](hubs.md#fleet-replica) is this machine's copy of it.
 
@@ -22,7 +22,7 @@ Settings › Storage shows what MaxPrice keeps on this machine. Its first line s
 - **Parse cache:** what MaxPrice has already read from each session log, so a restart reads only what changed;
 - **Usage limit readings:** the limit readings from claude.ai;
 - **Logs**, capped at 5 MB with one older copy kept;
-- **Other app files:** settings, machine and project identity;
+- **Other app files:** settings, machine and project identity, model prices, your Account and Organization labels and session assignments, which login is which Account, and Gateway records;
 - **System webview**: the window's own browser data.
 
 ![Settings › Storage: the disk usage bar and its legend, and Clean up](../../screenshots/archive-storage.light.png "Settings › Storage")
@@ -43,11 +43,11 @@ The Desktop client keeps its settings, its archive, its caches and its logs in o
 | Windows | `%APPDATA%\com.maxprice.desktop`                                          |
 | Linux   | `~/.local/share/com.maxprice.desktop`, or under `$XDG_DATA_HOME` when set |
 
-In it, `settings.json` holds the settings, `local-archive.sqlite` the Local archive, `fleet-events.sqlite` the Fleet replica, and `logs/sidecar.log` the log. The claude.ai [session key](blocks.md#the-claudeai-session-key) and the Hub password are never in that folder: they are in the system's keychain, the macOS Keychain, the Windows Credential Manager or the Secret Service on Linux.
+In it, `settings.json` holds the settings, `local-archive.sqlite` the Local archive, `fleet-events.sqlite` the Fleet replica, and `logs/sidecar.log` the log. The claude.ai [session keys](blocks.md#the-claudeai-session-key), Gateway management keys and the Hub password are never in that folder: they are in the system's keychain, the macOS Keychain, the Windows Credential Manager or the Secret Service on Linux.
 
 ### Hub tray app
 
-The Hub's files are in `%APPDATA%\maxprice-hub`, laid out as a [Headless Hub's data dir](../../../hub/README.md#the-data-dir) is, and its log is `%APPDATA%\com.maxprice.hub\logs\hub.log`. Its session key is in the Windows Credential Manager.
+The Hub's files are in `%APPDATA%\maxprice-hub`, laid out as a [Headless Hub's data dir](../../../hub/README.md#the-data-dir) is, and its log is `%APPDATA%\com.maxprice.hub\logs\hub.log`. Its session keys and Gateway management keys are in the Windows Credential Manager.
 
 ### Headless client and Headless Hub
 

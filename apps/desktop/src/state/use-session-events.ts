@@ -1,8 +1,11 @@
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import {
+  appendScopeParams,
+  scopeKeyPart,
   sessionEventsFrameSchema,
   sessionKey,
   type CostMode,
+  type ScopeQueryParams,
   type SessionEventFrame,
   type SessionEventsFrame,
   type SessionSummaryFrame,
@@ -61,8 +64,9 @@ function emptyData(): SessionEventsData {
 // as the fifth element leaves that prefix untouched). See the `sessionKey` doc
 // comment in `packages/shared/src/query-keys.ts`.
 //
-// The Organization scope (ADR-0106 §2) rides as a sixth element, and only when
-// named: under Home the key stays the five elements above.
+// The Scope (ADR-0106 §2, #637) rides as a sixth element (`scopeKeyPart`), and
+// only when named: under the default Scope the key stays the five elements
+// above.
 type SessionEventsKey = [string, string, CostMode, string[], string[]];
 
 export function sessionEventsQueryKey(
@@ -70,30 +74,31 @@ export function sessionEventsQueryKey(
   mode: CostMode,
   models: string[] = [],
   machines: string[] = [],
-  organization?: string,
-): SessionEventsKey | [...SessionEventsKey, string] {
+  scope: ScopeQueryParams = {},
+): SessionEventsKey | [...SessionEventsKey, ScopeQueryParams] {
   const key: SessionEventsKey = [...sessionKey(id), mode, [...models].sort(), [...machines].sort()];
-  return organization === undefined ? key : [...key, organization];
+  const part = scopeKeyPart(scope);
+  return part === undefined ? key : [...key, part];
 }
 
 // The NDJSON endpoint path. `mode` and the repeated `model` / `machine` params
 // map onto the query the sidecar validates (ADR-0017 / ADR-0041 M6); an unknown
 // id is not an HTTP error (it streams a zero-event `summary`), so there is no
 // id-encoding subtlety here beyond URL-escaping. Absent machines ⇒ the URL is
-// byte-identical to the pre-M6 shape, and an absent `organization` (Home) adds
-// no param.
+// byte-identical to the pre-M6 shape, and the default Scope adds no param
+// (`appendScopeParams`).
 export function buildSessionEventsUrl(
   id: string,
   mode: CostMode,
   models: string[] = [],
   machines: string[] = [],
-  organization?: string,
+  scope: ScopeQueryParams = {},
 ): string {
   const params = new URLSearchParams();
   params.set("mode", mode);
   for (const m of models) params.append("model", m);
   for (const m of machines) params.append("machine", m);
-  if (organization !== undefined) params.set("organization", organization);
+  appendScopeParams(params, scope);
   return `/api/session/${encodeURIComponent(id)}/events?${params.toString()}`;
 }
 
@@ -203,7 +208,7 @@ export function applySessionFrame(
 // LAST — after the `fetchImpl` test seam — and defaulted, so the streaming-core
 // tests' positional `(id, mode, models, signal, fetchImpl)` calls stay unchanged
 // while the hook threads it through to both the key and the URL. The
-// Organization scope (`organization`, ADR-0106) follows it on the same terms.
+// Scope (`scope`, ADR-0106, #637) follows it on the same terms.
 export async function streamSessionEvents(
   id: string,
   mode: CostMode,
@@ -211,10 +216,10 @@ export async function streamSessionEvents(
   signal: AbortSignal | undefined,
   fetchImpl: typeof sidecarFetch = sidecarFetch,
   machines: string[] = [],
-  organization?: string,
+  scope: ScopeQueryParams = {},
 ): Promise<SessionEventsData> {
-  const key = sessionEventsQueryKey(id, mode, models, machines, organization);
-  const res = await fetchImpl(buildSessionEventsUrl(id, mode, models, machines, organization), {
+  const key = sessionEventsQueryKey(id, mode, models, machines, scope);
+  const res = await fetchImpl(buildSessionEventsUrl(id, mode, models, machines, scope), {
     signal,
   });
   if (!res.ok) {
@@ -315,18 +320,18 @@ export async function streamSessionEvents(
 // Drives the session detail page. `id` is the route param; `mode` is the cost
 // mode; `models` is the filter rail's model multi-select (ADR-0017); `machines`
 // is the alias-expanded machine multi-select (ADR-0041 M6); `organization` is
-// the Organization scope (ADR-0106), absent under Home. A change to any of the
+// the Scope (ADR-0106, #637), absent under the default Scope. A change to any of the
 // five produces a new key → an automatic re-stream.
 export function useSessionEvents(
   id: string,
   mode: CostMode,
   models: string[] = [],
   machines: string[] = [],
-  organization?: string,
+  scope: ScopeQueryParams = {},
 ): UseQueryResult<SessionEventsData> {
   return useQuery<SessionEventsData>({
-    queryKey: sessionEventsQueryKey(id, mode, models, machines, organization),
+    queryKey: sessionEventsQueryKey(id, mode, models, machines, scope),
     queryFn: ({ signal }) =>
-      streamSessionEvents(id, mode, models, signal, sidecarFetch, machines, organization),
+      streamSessionEvents(id, mode, models, signal, sidecarFetch, machines, scope),
   });
 }

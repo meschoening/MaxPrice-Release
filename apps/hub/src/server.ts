@@ -4,16 +4,26 @@ import { eventDownloadResponse } from "./event-download";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
-import { FleetRecoveryRequired, FleetUploadConflict, streamSSEPump } from "@maxprice/usage-core";
+import {
+  FleetRecoveryRequired,
+  FleetUploadConflict,
+  LEGACY_KEY,
+  streamSSEPump,
+} from "@maxprice/usage-core";
 import {
   EVENT_PULL_LIMIT_MAX,
+  GATEWAY_RECORDS_SINCE_PARAM,
+  HUB_GATEWAYS_PATH,
+  HUB_GATEWAY_RECORDS_PATH,
+  gatewayConnectRequestSchema,
+  gatewayIdSchema,
+  gatewayRecordsPushSchema,
   HUB_ORGANIZATIONS_PATH,
   HUB_SSE_EVENT,
   HUB_PROTOCOL_VERSION,
-  ORGANIZATION_ASSERTION_DIRECTORY_PATH,
-  ORGANIZATION_DIRECTORY_PATH,
-  ORGANIZATION_LABEL_MAX,
-  checkOrganizationLabel,
+  LABEL_DIRECTORY_PATH,
+  MEMBERSHIP_ASSERTION_DIRECTORY_PATH,
+  accountUuidSchema,
   hubPurgeRequestSchema,
   liveClientCount,
   PROJECT_IDENTITY_PATH,
@@ -22,42 +32,57 @@ import {
   hubMachineMergeRequestSchema,
   hubMachineRenameRequestSchema,
   hubMachineSelfUpdateRequestSchema,
-  hubOrganizationAssertionDirectorySchema,
-  hubOrganizationDirectorySchema,
+  hubLabelDirectorySchema,
+  hubMembershipAssertionDirectorySchema,
   hubPasswordSetRequestSchema,
   hubProjectIdentityPushRequestSchema,
   hubSamplesPushRequestSchema,
   organizationRenameRequestSchema,
-  organizationUuidKeySchema,
+  accountLabelRequestSchema,
   sessionPairKey,
   usageCredentialSchema,
+  CLAUDE_CODE_TOKEN_REFUSAL,
+  HUB_CREDENTIALS_PATH,
+  HUB_LEGACY_CREDENTIAL,
+  isClaudeCodeToken,
+  sessionKeyListingFailure,
   type CredentialAck,
   type ErrorResponse,
+  type GatewayConnectResponse,
+  type GatewayRecordsAck,
+  type GatewayRecordsFeed,
+  type HubCredentialAck,
   type HubClientsResponse,
   type HubEventsForgetResponse,
   type HubEventsPushResponse,
   type HubMachinesResponse,
-  type HubOrganizationAssertionDirectory,
-  type HubOrganizationDirectory,
+  type HubLabelDirectory,
+  type HubMembershipAssertionDirectory,
   type HubOrganizationsResponse,
   type HubProjectIdentityResponse,
   type HubSamplesResponse,
   type HubSamplesPushResponse,
   type HubStatus,
-  type UsageCredential,
   type UsageSample,
+  isAccountUuid,
 } from "@maxprice/shared";
 import type { FleetEventStore, IdentityDirectory } from "@maxprice/usage-core";
 import { createClientRegistry, type ClientRegistry } from "./clients";
-import type { CredentialProvenance } from "./credstore";
 import type { HubFanout } from "./fanout";
 import type { MachineDirectory } from "./machine-directory";
-import type { OrganizationAssertionDirectory } from "./organization-assertion-directory";
-import type { OrganizationDirectory } from "./organization-directory";
+import type { LabelDirectory } from "./label-directory";
+import {
+  applyLabelRename,
+  checkedLabel,
+  LABEL_DIRECTORY_FULL,
+  type LabelTarget,
+} from "./label-rename";
+import type { MembershipAssertionDirectory } from "./membership-assertion-directory";
 import { hubOrganizationRows, type HubRosterEntry } from "./organization-rows";
 import { mountHubPage, type HubPageDeps } from "./page";
 import { socketPeerAddress } from "./peer";
-import type { HubPollSet } from "./poll-set";
+import type { HubKeys } from "./hub-keys";
+import type { HubGateways } from "./gateway-drainer";
 
 // The hub's HTTP surface (ADR-0035). Optional-password gated (ADR-0037) except
 // /healthz — transport encryption + machine identity come from the tailnet
@@ -81,22 +106,25 @@ export type BuildHubAppDeps = {
   // store; returns how many were new. The impl (index.ts) also patches the
   // fanout status so subscribers see the store grow.
   mergeSamples: (incoming: UsageSample[]) => number;
-  usage: {
-    setCredential: (c: UsageCredential | null) => void;
-    pollOnce: () => Promise<void>;
-  };
-  // What the poller reads (#283): the Organizations the key lists. A credential
-  // push re-lists; a clear empties it.
-  pollSet: Pick<HubPollSet, "refresh" | "clear">;
-  // Writes through the credstore: on Linux `<data dir>/secrets.json`, with the
-  // push's provenance (ADR-0126 §2, §4), elsewhere the OS keychain via the
-  // Rust helper. A key always comes with its provenance, the same the status
-  // then reports; a clear (null) with none. Failures surface as a 500 — the
-  // caller (a Settings push) should see them.
-  persistCredential: (
-    c: UsageCredential | null,
-    provenance?: CredentialProvenance,
-  ) => Promise<void>;
+  // The Hub's keys (hub-keys.ts, ADR-0139 §4): POST /api/credentials and
+  // the two DELETEs go through it, which persists first (a failed store write
+  // is a 500 before the poller is armed) and moves the poller, the poll set
+  // and the status's `accounts` with the store. Optional: absent ⇒ the routes
+  // are not mounted (the sidecar's fleet rig, whose Hub polls nothing).
+  keys?: Pick<HubKeys, "add" | "remove" | "removeLegacy">;
+  // The Hub's Gateways and their record feed (gateway-drainer.ts, ADR-0141
+  // §9): POST /api/gateways, DELETE /api/gateways/:id and the two
+  // /api/gateway-records routes go through it. Optional: absent ⇒ the routes
+  // are not mounted, and a client's 404 latch reads this Hub as one with no
+  // Gateway routes (the sidecar's fleet rig, older v7 Hubs).
+  gateways?: Pick<HubGateways, "connect" | "remove" | "feed" | "push">;
+  // Fired after a push the archive accepted with new rows, which may carry an
+  // Account tag the status's `accounts` lists (ADR-0139 §2).
+  onEventsAccepted?: () => void;
+  // Fired after a write that may name an Account the status's `accounts`
+  // lists (ADR-0139 §2): a published Home membership changed, or the Label
+  // directory did.
+  onAccountNamesChanged?: () => void;
   // Connected-client registry (ADR-0036). Optional: buildHubApp constructs its
   // own if omitted, so existing tests/call sites stay green. index.ts passes the
   // production instance.
@@ -149,17 +177,17 @@ export type BuildHubAppDeps = {
   // is broken". Only the machine-purge cascade needs the difference, and only to
   // log it. Absent ⇒ not degraded, i.e. genuinely capability-free.
   identityDegraded?: () => boolean;
-  // Organization directory (#288). Optional like machineDirectory — absent ⇒
+  // Label directory (#288, #635). Optional like machineDirectory — absent ⇒
   // the routes 404 and a client keeps its labels local.
-  organizationDirectory?: OrganizationDirectory;
-  // The Hub roster (organization-roster.ts): each Organization its key last
-  // listed, with its hints and last Limits answer. Read by GET
-  // /api/organizations and the operator rename's uniqueness check. Absent ⇒
-  // an empty roster.
+  labelDirectory?: LabelDirectory;
+  // The Hub roster (organization-roster.ts): each Organization its keys last
+  // listed, with its newest hints and the Account keys that listed it. Read
+  // by GET /api/organizations and the operator rename's uniqueness check.
+  // Absent ⇒ an empty roster.
   organizationRoster?: () => ReadonlyArray<HubRosterEntry>;
-  // Organization assertion directory (#310). Optional like organizationDirectory —
-  // absent ⇒ the routes 404 and a client keeps its assertions local.
-  organizationAssertionDirectory?: OrganizationAssertionDirectory;
+  // Membership assertion directory (#310, #635). Optional like labelDirectory
+  // — absent ⇒ the routes 404 and a client keeps its assertions local.
+  membershipAssertionDirectory?: MembershipAssertionDirectory;
   // Wall-clock for the lastPushAt stamps (M7). Injectable for tests; the
   // stamps are in-memory since-daemon-start, the roster's exact posture.
   nowImpl?: () => string;
@@ -257,11 +285,11 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
   // CSRF Origin guard (Finding #1): a default-open hub (auth.ts returns true
   // when no password is set) binds loopback + tailnet, so a web page the
   // operator merely visits could fire CORS-simple cross-origin POSTs at a
-  // mutating route that needs no custom header (POST /api/credential,
+  // mutating route that needs no custom header (POST /api/credentials,
   // /api/password, /api/samples — none preflight-shielded). Reject any
   // STATE-CHANGING request carrying a browser `Origin` NOT in the operator
   // allowlist. A request with NO Origin passes: every non-browser fleet client
-  // (server-side fetch) and the sidecar auto-heal POST /api/credential
+  // (server-side fetch) and the sidecar auto-heal POST /api/credentials
   // (x-maxprice-machine, no Origin). The operator console's own origin is in
   // `allowedOrigins`. GET/HEAD/OPTIONS are never guarded — OPTIONS is the CORS
   // preflight (already handled above) and reads carry no side effect. Runs
@@ -411,7 +439,8 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     return c.json({ ok: true } satisfies CredentialAck);
   });
 
-  // Backfill: every sample strictly after `since` (capturedAt), ascending.
+  // Backfill: every sample strictly after `since` (capturedAt), ascending;
+  // with no `since`, the whole history (a cursorless sample exchange, ADR-0139 §8).
   // The store keeps its array sorted, so this is a filter, not a sort.
   app.get("/api/samples", (c) => {
     const since = c.req.query("since");
@@ -433,9 +462,11 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     return c.json(body);
   });
 
-  // Push-up merge (ADR-0035 M2): the client's half of the two-way sync. The
-  // store keys a sample by (organizationUuid, capturedAt), a stamped copy
-  // superseding an unstamped one, so replays and overlaps are harmless.
+  // Push-up merge (ADR-0035 M2): the client's half of the two-way sync, and
+  // of its cursorless sample exchange (ADR-0139 §8). The store keys a sample
+  // by (accountUuid, organizationUuid, capturedAt), a stamped copy superseding
+  // a less-stamped one, so replays and overlaps are harmless; a copy that gives
+  // a held sample its Account moves `samplesStampedAt` (createMergeSamples).
   // Deliberately NOT fanned out to live SSE clients: pushed batches are
   // historical (each machine's own fallback samples cover the same wall-clock
   // period its peers covered for themselves), and a large seed push would blow
@@ -489,6 +520,7 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
       if (ack.added > 0) {
         deps.fanout.patchStatus({ events: fleetEventsStatus(fleetEvents) });
         deps.fanout.emitEventsPoke(fleetEvents.durableSeq());
+        deps.onEventsAccepted?.();
       }
       return c.json(ack satisfies HubEventsPushResponse);
     });
@@ -673,15 +705,16 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
       return c.json(body);
     });
 
-    // Self-update (ADR-0041, #261 item 2): a machine updates only ITSELF — its
-    // name and its published Home — and the hub enforces :id = the
-    // connection's x-maxprice-machine (console rename-any is M7's POST
-    // /api/machines/:id/name). Name uniqueness is write-time and
+    // Self-update (ADR-0041, #261 item 2, ADR-0139 §6): a machine updates
+    // only ITSELF — its name and its published Home memberships — and the hub
+    // enforces :id = the connection's x-maxprice-machine (console rename-any
+    // is M7's POST /api/machines/:id/name). Name uniqueness is write-time and
     // case-insensitive → 409 pinned envelope on collision, and a colliding
-    // body applies nothing. The Home is stored verbatim and never interpreted;
-    // an unchanged Home writes nothing and pokes no one, because every client
-    // re-publishes on every connect. Not gated on archive health: this is
-    // directory metadata a machine writes about itself.
+    // body applies nothing. The Home is stored verbatim and read only to list
+    // its Account (ADR-0139 §2); an unchanged Home writes nothing and pokes no
+    // one, because every client re-publishes on every connect. Not gated on
+    // archive health: this is directory metadata a machine writes about
+    // itself.
     app.put("/api/machines/:id", async (c) => {
       const machineId = c.req.header("x-maxprice-machine");
       const id = c.req.param("id");
@@ -696,7 +729,7 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
         const body: ErrorResponse = { error: "invalid self-update payload" };
         return c.json(body, 400);
       }
-      const { name: rawName, homeOrganization } = parsed.data;
+      const { name: rawName, homeMemberships } = parsed.data;
       let changed = false;
       if (rawName !== undefined) {
         // Trim + empty/63-char ceiling via the shared helper (cleanHostname's
@@ -721,8 +754,8 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
         }
         changed = true;
       }
-      if (homeOrganization !== undefined) {
-        const result = machineDirectory.setHome(id, homeOrganization);
+      if (homeMemberships !== undefined) {
+        const result = machineDirectory.setHome(id, homeMemberships);
         if (result === "unknown") {
           // Defensive, as above.
           const body: ErrorResponse = { error: "unknown machine" };
@@ -736,7 +769,10 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
           const body: ErrorResponse = { error: "invalid self-update payload" };
           return c.json(body, 400);
         }
-        if (result === "ok") changed = true;
+        if (result === "ok") {
+          changed = true;
+          deps.onAccountNamesChanged?.();
+        }
       }
       if (changed) deps.fanout.emitMachinesPoke();
       return c.json({ ok: true } satisfies CredentialAck);
@@ -860,168 +896,190 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     const body: HubOrganizationsResponse = {
       organizations: hubOrganizationRows(
         organizationRoster(),
-        deps.organizationDirectory?.labels() ?? {},
-        deps.fanout.getStatus().organizations,
+        deps.labelDirectory?.labels().organizations ?? {},
+        LEGACY_KEY,
       ),
     };
     return c.json(body);
   });
 
-  // Organization directory (#288, ADR-0105 §8): the fleet's union of
-  // Organization labels, newest `editedAt` winning. Only a write that changed
-  // the union pokes hub:organizations, so a push of what is already held
-  // echoes nowhere. An edit that would take the union past
-  // ORGANIZATION_DIRECTORY_MAX is refused whole (409), so every answer fits
-  // the wire's cap. Needs no machine header and no archive: labels are
+  // Label directory (#288, ADR-0105 §8, ADR-0139 §7): the fleet's union of
+  // Organization and Account labels, newest `editedAt` winning. Only a write
+  // that changed the union pokes hub:labels, so a push of what is already held
+  // echoes nowhere. An edit that would take the union of both maps past
+  // LABEL_DIRECTORY_MAX is refused whole (409), so every answer fits the
+  // wire's cap. Needs no machine header and no archive: labels are
   // user-authored presentation, fleet-wide whenever a Hub is configured.
-  const organizationDirectory = deps.organizationDirectory;
-  if (organizationDirectory !== undefined) {
-    const directoryBody = (): HubOrganizationDirectory => ({
-      labels: organizationDirectory.labels(),
-    });
+  const labelDirectory = deps.labelDirectory;
+  if (labelDirectory !== undefined) {
+    const directoryBody = (): HubLabelDirectory => labelDirectory.labels();
     // The store restored the previous union before throwing.
     const writeFailed = (c: Context, error: unknown) => {
-      console.error("[hub] organization directory write failed:", error);
-      const body: ErrorResponse = { error: "organization directory write failed" };
+      console.error("[hub] label directory write failed:", error);
+      const body: ErrorResponse = { error: "label directory write failed" };
       return c.json(body, 500);
     };
-    // The edit would take the union past ORGANIZATION_DIRECTORY_MAX: refused
-    // whole, nothing written, no poke.
+    // The edit would take the union past LABEL_DIRECTORY_MAX: refused whole,
+    // nothing written, no poke.
     const directoryFull = (c: Context) => {
-      const body: ErrorResponse = { error: "organization directory is full" };
+      const body: ErrorResponse = { error: LABEL_DIRECTORY_FULL };
       return c.json(body, 409);
     };
-
-    app.get(ORGANIZATION_DIRECTORY_PATH, (c) => c.json(directoryBody()));
-
-    // A client's push of its whole local map. The answer is the union after
-    // the merge, which the client adopts: push and pull in one round trip.
-    app.post(ORGANIZATION_DIRECTORY_PATH, async (c) => {
-      const parsed = hubOrganizationDirectorySchema.safeParse(await c.req.json().catch(() => null));
+    // A write that changed the union: every client pulls, and the status
+    // lists any Account a new account entry names (ADR-0139 §2).
+    const changed = () => {
+      deps.fanout.emitLabelsPoke();
+      deps.onAccountNamesChanged?.();
+    };
+    // A rename body, parsed by its kind's shared schema (the sidecar's
+    // matching route parses the same one), then trimmed and checked by the
+    // shared label rules (checkedLabel), or the 400 that refuses it.
+    const renameLabel = async (
+      c: Context,
+      what: "organization" | "account",
+    ): Promise<{ label: string | null } | Response> => {
+      const schema =
+        what === "organization" ? organizationRenameRequestSchema : accountLabelRequestSchema;
+      const parsed = schema.safeParse(await c.req.json().catch(() => null));
       if (!parsed.success) {
         const body: ErrorResponse = {
-          error: "invalid organization directory",
+          error: `invalid ${what} rename`,
           issues: parsed.error.issues.map(({ code, path, message }) => ({ code, path, message })),
         };
         return c.json(body, 400);
       }
-      let result: ReturnType<OrganizationDirectory["merge"]>;
+      if (parsed.data.label === null) return { label: null };
+      const checked = checkedLabel(parsed.data.label);
+      if ("error" in checked) {
+        const body: ErrorResponse = { error: checked.error };
+        return c.json(body, checked.status);
+      }
+      return checked;
+    };
+    // The rename itself, by the rules `maxprice-hub label`'s offline edit
+    // shares (label-rename.ts): known, unique, within the cap.
+    const rename = (c: Context, target: LabelTarget, label: string | null) => {
+      let result: ReturnType<typeof applyLabelRename>;
       try {
-        result = organizationDirectory.merge(parsed.data.labels);
+        result = applyLabelRename(labelDirectory, target, label);
+      } catch (error) {
+        return writeFailed(c, error);
+      }
+      if (typeof result !== "string") {
+        const body: ErrorResponse = { error: result.error };
+        return c.json(body, result.status);
+      }
+      if (result === "ok") changed();
+      return c.json(directoryBody());
+    };
+
+    app.get(LABEL_DIRECTORY_PATH, (c) => c.json(directoryBody()));
+
+    // A client's push of its whole local maps. The answer is the union after
+    // the merge, which the client adopts: push and pull in one round trip.
+    app.post(LABEL_DIRECTORY_PATH, async (c) => {
+      const parsed = hubLabelDirectorySchema.safeParse(await c.req.json().catch(() => null));
+      if (!parsed.success) {
+        const body: ErrorResponse = {
+          error: "invalid label directory",
+          issues: parsed.error.issues.map(({ code, path, message }) => ({ code, path, message })),
+        };
+        return c.json(body, 400);
+      }
+      let result: ReturnType<LabelDirectory["merge"]>;
+      try {
+        result = labelDirectory.merge(parsed.data);
       } catch (error) {
         return writeFailed(c, error);
       }
       if (result === "full") return directoryFull(c);
-      if (result === "ok") deps.fanout.emitOrganizationsPoke();
+      if (result === "ok") changed();
       return c.json(directoryBody());
     });
 
-    // The operator's rename (#294's console), with the sidecar's rules and
-    // words (ADR-0105 §4). Uniqueness is checked here, on the machine that
-    // edits, against every OTHER row GET /api/organizations answers — each
-    // roster entry and each live directory label — resolved from its label,
-    // else its roster hints, else its short id. A merge never refuses a label.
-    app.put(`${ORGANIZATION_DIRECTORY_PATH}/:uuid`, async (c) => {
-      const parsed = organizationRenameRequestSchema.safeParse(
-        await c.req.json().catch(() => null),
+    // The operator's Organization rename (#294's console), with the sidecar's
+    // rules and words (ADR-0105 §4). Uniqueness is checked here, on the
+    // machine that edits, against every OTHER row GET /api/organizations
+    // answers — each roster entry and each live directory label — resolved
+    // from its label, else its roster hints, else its short id. A merge never
+    // refuses a label.
+    app.put(`${LABEL_DIRECTORY_PATH}/organizations/:uuid`, async (c) => {
+      const renamed = await renameLabel(c, "organization");
+      if (renamed instanceof Response) return renamed;
+      const uuid = c.req.param("uuid");
+      return rename(
+        c,
+        { kind: "organizations", uuid, roster: organizationRoster() },
+        renamed.label,
       );
-      if (!parsed.success) {
-        const body: ErrorResponse = {
-          error: "invalid organization rename",
-          issues: parsed.error.issues.map(({ code, path, message }) => ({ code, path, message })),
-        };
+    });
+
+    // The operator's Account rename (ADR-0136 §7, ADR-0139 §7). The key is an
+    // account uuid (`accountUuidSchema`): a Pending key or an address is
+    // refused before anything is read, so neither can enter the directory. An
+    // Account is known when the status lists it or the directory holds its
+    // entry, and its label is unique among the other Accounts' labels as the
+    // Hub resolves them (`hubAccountLabel`), case-insensitively.
+    app.put(`${LABEL_DIRECTORY_PATH}/accounts/:uuid`, async (c) => {
+      const uuid = c.req.param("uuid");
+      if (!accountUuidSchema.safeParse(uuid).success) {
+        const body: ErrorResponse = { error: "not an account uuid" };
         return c.json(body, 400);
       }
-      const uuid = c.req.param("uuid");
-      const roster = organizationRoster();
-      const labels = organizationDirectory.labels();
-      // A roster id no directory key could hold is unknown too: stored, it
-      // would fail every client's parse of the union.
-      if (
-        (!roster.some((entry) => entry.id === uuid) && !Object.hasOwn(labels, uuid)) ||
-        !organizationUuidKeySchema.safeParse(uuid).success
-      ) {
-        const body: ErrorResponse = { error: "unknown organization" };
-        return c.json(body, 404);
-      }
-      let label: string | null = null;
-      if (parsed.data.label !== null) {
-        const check = checkOrganizationLabel(parsed.data.label);
-        if (!check.ok) {
-          const body: ErrorResponse = {
-            error:
-              check.reason === "empty"
-                ? "label is empty"
-                : `label is longer than ${ORGANIZATION_LABEL_MAX} characters`,
-          };
-          return c.json(body, 400);
-        }
-        const folded = check.label.toLowerCase();
-        // A label never reads a Limits answer, so no status map.
-        const taken = hubOrganizationRows(roster, labels, {}).some(
-          (row) => row.uuid !== uuid && row.label.toLowerCase() === folded,
-        );
-        if (taken) {
-          const body: ErrorResponse = { error: "another organization already uses that label" };
-          return c.json(body, 409);
-        }
-        label = check.label;
-      }
-      let result: ReturnType<OrganizationDirectory["rename"]>;
-      try {
-        result = organizationDirectory.rename(uuid, label);
-      } catch (error) {
-        return writeFailed(c, error);
-      }
-      if (result === "full") return directoryFull(c);
-      if (result === "ok") deps.fanout.emitOrganizationsPoke();
-      return c.json(directoryBody());
+      const renamed = await renameLabel(c, "account");
+      if (renamed instanceof Response) return renamed;
+      const accounts = deps.fanout
+        .getStatus()
+        .accounts.flatMap((account) => (account.accountUuid === null ? [] : [account.accountUuid]));
+      return rename(c, { kind: "accounts", uuid, accounts }, renamed.label);
     });
   }
 
-  // Organization assertion directory (#310, ADR-0107 §11): the fleet's union of
-  // Organization assertions, newest `editedAt` winning — the Organization
-  // directory's mechanics (above) without its operator edit. Only a write that
-  // changed the union pokes hub:organization-assertions, so a push of what is
-  // already held echoes nowhere; a push that would take the union past
-  // ORGANIZATION_ASSERTION_DIRECTORY_MAX is refused whole (409). Needs no
-  // machine header and no archive, and is gated on neither sharing toggle: any
-  // machine may assert any session, fleet-wide whenever a Hub is configured.
-  const organizationAssertionDirectory = deps.organizationAssertionDirectory;
-  if (organizationAssertionDirectory !== undefined) {
-    const assertionDirectoryBody = (): HubOrganizationAssertionDirectory => ({
-      assertions: organizationAssertionDirectory.assertions(),
+  // Membership assertion directory (#310, ADR-0107 §11, ADR-0139 §7): the
+  // fleet's union of Membership assertions, newest `editedAt` winning, the
+  // entry whole — the Label directory's mechanics (above) without its
+  // operator edit. Only a write that changed the union pokes
+  // hub:membership-assertions, so a push of what is already held echoes
+  // nowhere; a push that would take the union past
+  // MEMBERSHIP_ASSERTION_DIRECTORY_MAX is refused whole (409). Needs no
+  // machine header and no archive, and is gated on neither sharing toggle:
+  // any machine may assert any session, fleet-wide whenever a Hub is
+  // configured.
+  const membershipAssertionDirectory = deps.membershipAssertionDirectory;
+  if (membershipAssertionDirectory !== undefined) {
+    const assertionDirectoryBody = (): HubMembershipAssertionDirectory => ({
+      assertions: membershipAssertionDirectory.assertions(),
     });
 
-    app.get(ORGANIZATION_ASSERTION_DIRECTORY_PATH, (c) => c.json(assertionDirectoryBody()));
+    app.get(MEMBERSHIP_ASSERTION_DIRECTORY_PATH, (c) => c.json(assertionDirectoryBody()));
 
     // A client's push of its whole local map, answered with the union after
     // the merge, which the client adopts: push and pull in one round trip.
-    app.post(ORGANIZATION_ASSERTION_DIRECTORY_PATH, async (c) => {
-      const parsed = hubOrganizationAssertionDirectorySchema.safeParse(
+    app.post(MEMBERSHIP_ASSERTION_DIRECTORY_PATH, async (c) => {
+      const parsed = hubMembershipAssertionDirectorySchema.safeParse(
         await c.req.json().catch(() => null),
       );
       if (!parsed.success) {
         const body: ErrorResponse = {
-          error: "invalid organization assertion directory",
+          error: "invalid membership assertion directory",
           issues: parsed.error.issues.map(({ code, path, message }) => ({ code, path, message })),
         };
         return c.json(body, 400);
       }
-      let result: ReturnType<OrganizationAssertionDirectory["merge"]>;
+      let result: ReturnType<MembershipAssertionDirectory["merge"]>;
       try {
-        result = organizationAssertionDirectory.merge(parsed.data.assertions);
+        result = membershipAssertionDirectory.merge(parsed.data.assertions);
       } catch (error) {
         // The store kept the previous union.
-        console.error("[hub] organization assertion directory write failed:", error);
-        const body: ErrorResponse = { error: "organization assertion directory write failed" };
+        console.error("[hub] membership assertion directory write failed:", error);
+        const body: ErrorResponse = { error: "membership assertion directory write failed" };
         return c.json(body, 500);
       }
       if (result === "full") {
-        const body: ErrorResponse = { error: "organization assertion directory is full" };
+        const body: ErrorResponse = { error: "membership assertion directory is full" };
         return c.json(body, 409);
       }
-      if (result === "ok") deps.fanout.emitOrganizationAssertionsPoke();
+      if (result === "ok") deps.fanout.emitMembershipAssertionsPoke();
       return c.json(assertionDirectoryBody());
     });
   }
@@ -1056,6 +1114,8 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
       deps.fanout.emitEventsPoke(fleetEvents.durableSeq());
       deps.fanout.patchStatus({ events: fleetEventsStatus(fleetEvents) });
       deps.fanout.emitMachinesPoke();
+      // The purged machine's published Home names its Account no longer.
+      deps.onAccountNamesChanged?.();
       return c.json({ ok: true } satisfies CredentialAck);
     });
 
@@ -1068,78 +1128,132 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
     });
   }
 
-  // Key custody (ADR-0035, ADR-0126 §4): persist through the credstore (on
-  // Linux the data dir's secrets.json, elsewhere the OS keychain), then arm
-  // the poller. Every push — the console's, or a client's heal — re-lists
-  // the Organizations the key can see and polls all of them before the ack, for
-  // a fast first sample (#283): nothing in the body decides what the Hub polls.
-  // Write-only: the hub never serves the key back out.
-  app.post("/api/credential", async (c) => {
-    // Parse explicitly so an UNPARSEABLE body (a truncated / proxy-mangled
-    // request) is a 400 — NOT folded into the same `null` the documented clear
-    // contract uses, which would silently delete the stored key and disarm
-    // the poller on a mangled write (F4). A literal `null` still clears; both
-    // shipped callers send the literal body "null".
-    let raw: unknown;
-    try {
-      raw = JSON.parse(await c.req.text());
-    } catch {
-      const body: ErrorResponse = { error: "invalid credential" };
-      return c.json(body, 400);
-    }
-    if (raw === null) {
-      await deps.persistCredential(null);
-      // The poll set first: its clear resets the discovery flag while the
-      // poller still reads the old key, so no frame pairs "no key" with
-      // `error` (#284). The roster file is kept.
-      deps.pollSet.clear();
-      deps.usage.setCredential(null);
-      deps.fanout.patchStatus({ usageCurrent: {}, usageWeeklyResetAt: {} });
-      // A clear resets provenance — there is no longer a key to attribute
-      // (overview §8).
-      deps.fanout.patchStatus({
-        credentialPresent: false,
-        credentialUpdatedAt: null,
-        credentialSource: null,
-      });
-      return c.json({ ok: true } satisfies CredentialAck);
-    }
-    // Strict (ADR-0104): a body carrying `orgId` is a caller still holding the
-    // retired shape, refused rather than narrowed to its key.
-    const parsed = usageCredentialSchema.safeParse(raw);
-    if (!parsed.success) {
-      const body: ErrorResponse = { error: "invalid credential" };
-      return c.json(body, 400);
-    }
-    // Provenance (ADR-0036, overview §8): WHO set/healed the key and WHEN. The
-    // console's own POST carries no machine header ⇒ "local"; a sidecar
-    // auto-heal POST carries its machineId ⇒ that machine is the healer. An
-    // empty header names no machine, as the client registry reads it, and
-    // secrets.json refuses an empty source. Taken ONCE: the store keeps it
-    // beside the key (on Linux, so a restart restores it, ADR-0126 §3) and the
-    // status reports the same. The session key value is never echoed —
-    // write-only stays intact.
-    const provenance: CredentialProvenance = {
-      setAt: new Date().toISOString(),
-      source: c.req.header("x-maxprice-machine") || "local",
-    };
-    // Persist-first is the fail-closed ordering: if the write rejects, the
-    // 500 fires before the poller is armed or the status names a key — never
-    // a poller running on a credential that didn't persist.
-    await deps.persistCredential(parsed.data, provenance);
-    deps.usage.setCredential(parsed.data);
-    deps.fanout.patchStatus({
-      credentialPresent: true,
-      credentialUpdatedAt: provenance.setAt,
-      credentialSource: provenance.source,
+  // Key custody (ADR-0035, ADR-0126 §4, ADR-0139 §4): one key per Account.
+  // The Hub reads the key's `/api/account` to learn its Account (dropping
+  // the email), persists it under that uuid (on Linux the data dir's
+  // secrets.json, elsewhere the OS keychain), then arms the poller. Every
+  // push — the console's, the terminal's, or a client's heal — re-lists the
+  // Organizations the key can see and polls them before the ack, for a fast
+  // first sample (#283): nothing in the body decides what the Hub polls.
+  // Write-only: the hub never serves a key back out. There is no clear-all
+  // route: a key is removed by its Account, or the legacy one by name.
+  const keys = deps.keys;
+  if (keys !== undefined) {
+    app.post(HUB_CREDENTIALS_PATH, async (c) => {
+      // Strict (ADR-0104): the key alone. A body carrying `orgId`, a null
+      // (v6's clear) or anything unparseable is a 400, and nothing changes.
+      const parsed = usageCredentialSchema.safeParse(await c.req.json().catch(() => undefined));
+      if (!parsed.success) {
+        const body: ErrorResponse = { error: "invalid credential" };
+        return c.json(body, 400);
+      }
+      const { sessionKey } = parsed.data;
+      // Claude Code's OAuth token is named, never sent to claude.ai
+      // (ADR-0126 §6).
+      if (isClaudeCodeToken(sessionKey)) {
+        const body: ErrorResponse = { error: CLAUDE_CODE_TOKEN_REFUSAL };
+        return c.json(body, 400);
+      }
+      // Provenance (ADR-0036, overview §8): WHO set/healed the key. The
+      // console's and the terminal's POST carry no machine header ⇒ "local"; a
+      // sidecar auto-heal POST carries its machineId ⇒ that machine is the
+      // healer. An empty header names no machine, as the client registry
+      // reads it, and secrets.json refuses an empty source.
+      const source = c.req.header("x-maxprice-machine") || "local";
+      const result = await keys.add(sessionKey, source);
+      if (!result.ok) {
+        // `/api/account` refused the key, or claude.ai did not answer:
+        // nothing was stored. Every surface that checks a key says the same.
+        const body: ErrorResponse = { error: sessionKeyListingFailure(result.kind) };
+        return c.json(body, result.kind === "expired" ? 400 : 503);
+      }
+      return c.json({ ok: true, accountUuid: result.accountUuid } satisfies HubCredentialAck);
     });
-    // A changed set is polled as the listing installs it; the explicit poll
-    // then covers an unchanged one (a new key for the same Organizations) and
-    // coalesces with the former.
-    await deps.pollSet.refresh(parsed.data.sessionKey);
-    await deps.usage.pollOnce();
-    return c.json({ ok: true } satisfies CredentialAck);
-  });
+
+    // The legacy key (ADR-0139 §3), which has no Account to record a removal
+    // time for: its entry simply goes. Before the uuid route, which would
+    // otherwise read "legacy" as an Account.
+    app.delete(`${HUB_CREDENTIALS_PATH}/${HUB_LEGACY_CREDENTIAL}`, async (c) => {
+      if (!(await keys.removeLegacy())) {
+        const body: ErrorResponse = { error: "no legacy session key" };
+        return c.json(body, 404);
+      }
+      return c.json({ ok: true });
+    });
+
+    // One Account's key (ADR-0139 §4, §5): removed, its removal time
+    // recorded, and its entry kept, `disconnected`.
+    app.delete(`${HUB_CREDENTIALS_PATH}/:accountUuid`, async (c) => {
+      const accountUuid = c.req.param("accountUuid");
+      if (!isAccountUuid(accountUuid)) {
+        const body: ErrorResponse = { error: "invalid account" };
+        return c.json(body, 400);
+      }
+      if (!(await keys.remove(accountUuid))) {
+        const body: ErrorResponse = { error: "no session key for that account" };
+        return c.json(body, 404);
+      }
+      return c.json({ ok: true });
+    });
+  }
+
+  // Gateways (ADR-0141 §7, §9), inside v7 with no bump. Connect is
+  // write-only: the management key goes into the key store and never comes
+  // back in any answer, status or line. A Connect whose check fails answers
+  // 200 with `{ ok: false, failure }` (gatewayConnectResponseSchema): the
+  // request was understood and the Gateway answered it so (unreachable,
+  // unauthorized, error), and nothing was stored. A body that is not a
+  // Connect request is a 400; a store write that fails is the 500 below.
+  // Connecting a Gateway the Hub holds replaces its key. There is no
+  // operator-only gate: like every write here it passes the password gate,
+  // and a Gateway on the Hub is removed only at the Hub (§7) because no client
+  // ever calls DELETE.
+  const gateways = deps.gateways;
+  if (gateways !== undefined) {
+    app.post(HUB_GATEWAYS_PATH, async (c) => {
+      const parsed = gatewayConnectRequestSchema.safeParse(await c.req.json().catch(() => null));
+      if (!parsed.success) {
+        // No issue list: an issue could echo part of the key.
+        const body: ErrorResponse = { error: "invalid Gateway connect request" };
+        return c.json(body, 400);
+      }
+      const body: GatewayConnectResponse = await gateways.connect(parsed.data);
+      return c.json(body);
+    });
+
+    app.delete(`${HUB_GATEWAYS_PATH}/:id`, async (c) => {
+      const id = c.req.param("id");
+      if (!gatewayIdSchema.safeParse(id).success || !(await gateways.remove(id))) {
+        const body: ErrorResponse = { error: "unknown Gateway" };
+        return c.json(body, 404);
+      }
+      return c.json({ ok: true } satisfies CredentialAck);
+    });
+
+    // The 7-day feed, oldest first, a page at a time (gateway-records.ts): no
+    // `since` from the start; a cursor this Hub cannot place (another epoch,
+    // or not a cursor) from the start too, never a 400, so a client whose
+    // Hub was reset or replaced simply replays and dedups.
+    app.get(HUB_GATEWAY_RECORDS_PATH, (c) => {
+      const body: GatewayRecordsFeed = gateways.feed(
+        c.req.query(GATEWAY_RECORDS_SINCE_PARAM) ?? null,
+      );
+      return c.json(body);
+    });
+
+    // A client's push-up of records it drained in fallback (§5). The ack
+    // names every executionId the client may drop; new records poke
+    // hub:gateway-records. A write that fails acks nothing (the 500 below).
+    app.post(HUB_GATEWAY_RECORDS_PATH, async (c) => {
+      const parsed = gatewayRecordsPushSchema.safeParse(await c.req.json().catch(() => null));
+      if (!parsed.success) {
+        const body: ErrorResponse = { error: "invalid Gateway records push" };
+        return c.json(body, 400);
+      }
+      const body: GatewayRecordsAck = gateways.push(parsed.data.records);
+      return c.json(body);
+    });
+  }
 
   // Live stream — bounded write-chain SSE pump (shared with the sidecar). For an
   // identified fleet client the subscription lifetime is its "live" window in

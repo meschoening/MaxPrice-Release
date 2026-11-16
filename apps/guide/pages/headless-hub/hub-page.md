@@ -22,7 +22,7 @@ Whether the Hub can do its job for the fleet.
 
 ### claude.ai
 
-Whether the Hub can read your claude.ai [usage limits](../concepts/blocks.md#usage-limits).
+Whether the Hub can read your claude.ai [usage limits](../concepts/blocks.md#usage-limits). The Hub keeps one session key per claude.ai Account. With one key, the row reads:
 
 | Reads            | What it means                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------------ |
@@ -31,7 +31,16 @@ Whether the Hub can read your claude.ai [usage limits](../concepts/blocks.md#usa
 | **Key expired**  | claude.ai no longer accepts the Hub's session key                                                      |
 | **Poll failing** | The Hub has a key, but it can't read the limits with it, as when it can't reach claude.ai              |
 
-While the Hub has no working key, each client reads the limits itself, with its own key ([Fallback polling](../concepts/hubs.md#fallback-polling)).
+With keys for several Accounts, the row counts them and names none, since the page is public to whoever can reach it:
+
+| Reads                                                    | What it means                                                                              |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| **3 connected**                                          | Every key works                                                                            |
+| **1 key expired**, **1 poll failing**, **1 needs a key** | One Account's key doesn't work, or the Hub has none for an Account the fleet's usage names |
+| **2 need a key**                                         | More than one Account's key doesn't work, or is missing                                    |
+| **No key works**                                         | Every key has expired or is missing, in red                                                |
+
+While none of the Hub's keys works, each client reads the limits itself, with its own keys ([Fallback polling](../concepts/hubs.md#fallback-polling)).
 
 ### Access
 
@@ -49,10 +58,10 @@ The browser tab says how the Hub is without being looked at: its title reads the
 
 ## What it doesn't show
 
-The page shows no usage, costs or limits, no machine names, no clients' addresses, no [Organizations](../concepts/organizations.md), and nothing about the session key but whether it works. To see usage, use a client: the [Desktop client](../desktop-client/overview.md) or the [Headless client](../headless-client/overview.md).
+The page shows no usage, costs or limits, no machine names, no clients' addresses, no [Organizations](../concepts/organizations.md), and nothing about the session keys but how many work: never an Account or its label. To see usage, use a client: the [Desktop client](../desktop-client/overview.md) or the [Headless client](../headless-client/overview.md).
 
 ## For the Hub's operator
 
 The Hub serves the page only to its own machine. A web server on that machine publishes it at the Hub page URL you set, and decides who may see it. [Publish the Hub page](../../../hub/README.md#publish-the-hub-page) has the steps and the snippet, and the page's own section, [The Hub page](../../../hub/README.md#the-hub-page), says what it answers. The data behind the page also carries the addresses the Hub listens on and the counters of its fleet archive, so anyone who can see the page can read those. With no web server, an SSH tunnel to the Hub's machine opens it in your own browser.
 
-`maxprice-hub status` prints the same rows in the Hub's terminal, with the Hub's own details beside them ([reference](../../../hub/README.md#maxprice-hub-status)).
+`maxprice-hub status` prints the same rows in the Hub's terminal, in longer words once the Hub holds several keys (one line per key, with its fix), with the Hub's own details beside them ([reference](../../../hub/README.md#maxprice-hub-status)).

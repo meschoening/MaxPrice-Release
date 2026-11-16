@@ -1,17 +1,22 @@
 import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { hubMachinesQueryKey, hubOrganizationsQueryKey, hubStatusQueryKey } from "@/lib/hub-api";
+import {
+  hubLabelDirectoryQueryKey,
+  hubMachinesQueryKey,
+  hubOrganizationsQueryKey,
+  hubStatusQueryKey,
+} from "@/lib/hub-api";
 import { subscribeHubStream } from "@/lib/hub-stream";
 
 // Opens the hub SSE channel for the window's lifetime; a hub:status / hub:sample
 // frame invalidates the status query (which re-fetches connection, sampleCount,
 // last sample) and, with `directories`, the organizations query. With
-// `directories`, a hub:machines / hub:organizations frame refreshes the Machines
-// / Organizations card. The connected-clients list has its own refetchInterval
+// `directories`, a hub:machines / hub:labels frame refreshes the Machines card,
+// or the Accounts card's Organization and Account labels. The connected-clients list has its own refetchInterval
 // (no client-event frames).
 //
 // `directories: false` is the popout's option (ADR-0050): it renders neither the
-// Machines nor the Organizations card, so there is nothing for their frames to
+// Machines nor the Accounts card, so there is nothing for their frames to
 // refresh. Its subscription exists for the other half — the popout owns the tray
 // tooltip, and this is what flips it fast when the daemon dies instead of
 // waiting out the status query's 30s backstop. A second loopback SSE connection
@@ -31,9 +36,12 @@ export function useHubStream({ directories = true }: { directories?: boolean } =
             // refreshes the Machines card immediately; stats drift is covered
             // by its 5s poll.
             onMachines: () => void qc.invalidateQueries({ queryKey: hubMachinesQueryKey() }),
-            // An Organization label changed (#288): the Organizations card.
-            onOrganizations: () =>
-              void qc.invalidateQueries({ queryKey: hubOrganizationsQueryKey() }),
+            // A label changed (#288, #635): the Accounts card's Organization
+            // and Account labels.
+            onLabels: () => {
+              void qc.invalidateQueries({ queryKey: hubOrganizationsQueryKey() });
+              void qc.invalidateQueries({ queryKey: hubLabelDirectoryQueryKey() });
+            },
           }
         : {}),
       // Losing the channel is itself a status change: the same dead daemon that

@@ -4,9 +4,11 @@
 // resident as parsed rows — the walk's scan-cache records, the Local archive,
 // the fleet replica — carries one copy per row of values that have only a few
 // thousand distinct members across the whole corpus. Measured on a real
-// machine's copy (#361), interning these six fields removed 1.5M strings and
-// ~70 MB of live heap. Strings are immutable values, so nothing can observe the
-// sharing: an interned row is equal to its parse in every field.
+// machine's copy (#361), interning the first six of these fields removed 1.5M
+// strings and ~70 MB of live heap. The two Account fields (ADR-0137) take a
+// handful of values per machine, like `organizationUuid`. Strings are
+// immutable values, so nothing can observe the sharing: an interned row is
+// equal to its parse in every field.
 //
 // ONLY categorical fields belong here. A per-event value (message id, request
 // id, timestamp) would make the table a second copy of the corpus. The table
@@ -30,6 +32,8 @@ export const INTERNED_ROW_FIELDS = [
   "model",
   "cwd",
   "organizationUuid",
+  "accountUuid",
+  "accountEmailHash",
 ] as const;
 
 type InternedRowFields = { [K in (typeof INTERNED_ROW_FIELDS)[number]]?: string | undefined };

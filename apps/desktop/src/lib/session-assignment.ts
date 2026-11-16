@@ -1,16 +1,21 @@
 import {
   deriveProjectName,
+  formatMembershipToken,
+  homeMembershipOf,
+  isAccountUuid,
+  membershipNameText,
   organizationLabel,
-  organizationLabelMap,
   sessionOrganizationLabel,
-  type OrganizationEntry,
+  type AccountEntry,
   type SessionRow,
+  trackedOrganizationSet,
+  type Settings,
 } from "@maxprice/shared";
 
-// The Sessions page's Organization assignment (#312), as pure view logic: how
-// an owner-less session reads, how the review list groups it, what a selection
-// sums to, how a write is undone, and what the chooser offers. No React, so
-// every rule is testable on plain rows.
+// The owner-less review's assignment (#312; Settings › Unattributed usage since
+// #639), as pure view logic: how an owner-less session reads, how the review
+// list groups it, how a write is undone, and what the chooser offers. No
+// React, so every rule is testable on plain rows.
 //
 // Everything reads the ROWS (#312 ruling 2): `organizationResolution` says how
 // a session's owner-less usage is attributed, and `organizationSplit` names a
@@ -25,6 +30,15 @@ export type OwnerlessKind = "presumed" | "assigned";
 // selectable: an assertion on a wholly owned session would apply to nothing.
 export function isOwnerless(row: SessionRow): boolean {
   return row.organizationResolution === "presumed" || row.organizationResolution === "assigned";
+}
+
+// Unattributed (#620 item 4): owner-less usage with no Membership assertion
+// either, which counts under its Presumed membership (ADR-0137 §4). What
+// Settings › Unattributed usage lists, and what the ⌘K finder tags Unknown. An
+// assigned session has been attributed by hand; a partly owned one is listed
+// for its owner-less half.
+export function isUnattributed(row: Pick<SessionRow, "organizationResolution">): boolean {
+  return row.organizationResolution === "presumed";
 }
 
 // Where a session's owner-less usage counts now: the split's owner-less half,
@@ -124,13 +138,13 @@ export interface GroupOwnerlessOptions {
   searchKeys?: (row: SessionRow) => readonly string[];
 }
 
-// The owner-less review list: owner-less sessions grouped by folded project
+// The review list (Settings › Unattributed usage): owner-less sessions grouped by folded project
 // name, groups by cost descending (then name), sessions by last activity
 // descending. A search is the table's (DataTable): trimmed, case-insensitive,
 // a substring of any key. A group whose name matches keeps all its sessions;
 // otherwise only its matching sessions show, and a group with none is dropped.
-// Cost and summary describe the shown sessions only — what "Select all N
-// shown" and the group checkbox act on (Review Focus 5).
+// Cost and summary describe the shown sessions only — what the group
+// checkbox acts on (Review Focus 5).
 export function groupOwnerless(
   rows: readonly SessionRow[],
   { search, projectName, labels, searchKeys }: GroupOwnerlessOptions,
@@ -196,60 +210,13 @@ function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-// --- the selection bar -------------------------------------------------------
-
-export interface SelectionSummary {
-  count: number;
-  cost: number;
-  presumed: number;
-  assigned: number;
-  partlyOwned: number;
-  // Distinct folded project names, first-seen order.
-  projects: string[];
-  // The chooser's checked Organization: the assertion every selected session
-  // holds, only when all of them are assigned to that one uuid. Null for any
-  // presumed session in the selection, differing targets, or no selection —
-  // picking Home for a presumed session is a real write that pins it there,
-  // so a checked Home would misread as a no-op (the prototype's rule).
-  sharedTarget: string | null;
-  anyAssigned: boolean;
-}
-
-export function selectionSummary(
-  selected: readonly SessionRow[],
-  projectName: (row: SessionRow) => string,
-): SelectionSummary {
-  let cost = 0;
-  let presumed = 0;
-  let assigned = 0;
-  let partlyOwned = 0;
-  const projects = new Set<string>();
-  const targets = new Set<string | undefined>();
-  for (const row of selected) {
-    cost += row.totalCost;
-    if (row.organizationResolution === "presumed") presumed += 1;
-    if (row.organizationResolution === "assigned") assigned += 1;
-    if (isPartlyOwned(row)) partlyOwned += 1;
-    projects.add(projectName(row));
-    targets.add(ownerlessTarget(row));
-  }
-  const [only] = targets;
-  return {
-    count: selected.length,
-    cost,
-    presumed,
-    assigned,
-    partlyOwned,
-    projects: [...projects],
-    sharedTarget: assigned === selected.length && targets.size === 1 ? (only ?? null) : null,
-    anyAssigned: assigned > 0,
-  };
-}
-
 // --- Undo --------------------------------------------------------------------
 
 export interface UndoGroup {
   organizationUuid: string | null;
+  // The claim's Account, where the claim restored names one (Unassign's
+  // Undo, #672); never beside a null Organization.
+  accountUuid?: string;
   sessionIds: string[];
 }
 
@@ -278,51 +245,66 @@ export function undoPlan(rows: readonly SessionRow[]): UndoGroup[] {
 
 // --- the chooser -------------------------------------------------------------
 
+// One Membership `Assign to…` offers (#639): an Account's place in an
+// Organization, which the write names whole (ADR-0137 §5).
 export interface ChooserOption {
-  uuid: string;
+  // Its Membership token (`formatMembershipToken`): the option's identity.
+  key: string;
+  organizationUuid: string;
+  // An account uuid: the PUT's `accountUuid`, never a Pending key.
+  accountUuid: string;
+  // "‹Organization› · ‹Account›", the Organization's collision-suffixed label.
   label: string;
+  // Its Organization is tracked. An Excluded one confirms first.
   tracked: boolean;
   isHome: boolean;
 }
 
-// What `Assign to…` offers: Home first, then the other tracked Organizations,
-// then the Excluded ones, each in roster order. Labels are collision-suffixed
-// across the whole roster, as every surface naming an Organization reads them.
-export function chooserOptions(
-  roster: ReadonlyArray<Pick<OrganizationEntry, "uuid" | "label" | "tracked">>,
-  home: string | null,
+// What `Assign to…` offers: the Memberships of every tracked Account that has
+// an account uuid, Home first, then the other tracked ones in Account and
+// listing order, then those in an Excluded Organization. A Pending account
+// has no uuid for the claim to name, and an Excluded Account's Membership
+// would make the usage Dormant (ADR-0137 §5), so neither is offered.
+export function membershipChooserOptions(
+  accounts: readonly Pick<
+    AccountEntry,
+    "accountUuid" | "pending" | "tracked" | "label" | "memberships"
+  >[],
+  settings: Pick<Settings, "homeMemberships" | "trackedOrganizations">,
+  labels: ReadonlyMap<string, string>,
 ): ChooserOption[] {
-  const labels = organizationLabelMap(roster);
-  const options = roster.map(({ uuid, tracked }) => ({
-    uuid,
-    label: organizationLabel(labels, uuid),
-    tracked,
-    isHome: uuid === home,
-  }));
+  const home = homeMembershipOf(settings);
+  const trackedOrganizations = trackedOrganizationSet(settings);
+  const options: ChooserOption[] = [];
+  const seen = new Set<string>();
+  for (const account of accounts) {
+    const accountUuid = account.accountUuid;
+    if (!account.tracked || account.pending || accountUuid === null) continue;
+    for (const { organizationUuid } of account.memberships) {
+      const key = formatMembershipToken(organizationUuid, accountUuid);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      options.push({
+        key,
+        organizationUuid,
+        accountUuid,
+        label: membershipNameText({
+          organization: organizationLabel(labels, organizationUuid),
+          account: account.label,
+        }),
+        tracked: trackedOrganizations === null || trackedOrganizations.has(organizationUuid),
+        isHome:
+          home !== null &&
+          home.organizationUuid === organizationUuid &&
+          home.accountUuid === accountUuid,
+      });
+    }
+  }
   return [
     ...options.filter((o) => o.isHome),
     ...options.filter((o) => !o.isHome && o.tracked),
     ...options.filter((o) => !o.isHome && !o.tracked),
   ];
-}
-
-// --- Settings' counts ----------------------------------------------------------
-
-// The presumed sessions among `rows`. Settings hands it the Home-scoped,
-// all-time sessions query (#312 ruling 4), where a peer's sessions presumed
-// under its own published Home never appear; it counts what it is handed.
-export function presumptionCount(rows: readonly SessionRow[]): number {
-  return rows.reduce((n, row) => (row.organizationResolution === "presumed" ? n + 1 : n), 0);
-}
-
-// The sessions an assertion map (GET /api/organization-assertions) claims for
-// one Organization — Settings' `N sessions assigned here`, and the ids Return
-// them clears.
-export function assignedHereIds(
-  assertions: Readonly<Record<string, string>>,
-  uuid: string,
-): string[] {
-  return Object.keys(assertions).filter((sessionId) => assertions[sessionId] === uuid);
 }
 
 // --- the review list's checkboxes ------------------------------------------------
@@ -356,12 +338,6 @@ export function toggleSessions(
   return next;
 }
 
-// The sessions the review list shows, in list order: what "Select all N shown"
-// counts and makes the selection (Review Focus 5).
-export function shownSessionIds(groups: readonly OwnerlessGroup[]): string[] {
-  return groups.flatMap((group) => group.sessions.map((row) => row.sessionId));
-}
-
 // --- the selection after a write -----------------------------------------------
 
 // The selection, keyed by sessionId, narrowed to sessions still in `rows` and
@@ -377,4 +353,10 @@ export function pruneSelection(
   const kept = new Set<string>();
   for (const id of selectedIds) if (selectable.has(id)) kept.add(id);
   return kept.size === selectedIds.size ? selectedIds : kept;
+}
+
+// The options `Assign to…` can write: an Account whose id the assertion's
+// schema refuses (`isAccountUuid`) would only get a 400, so it is not offered.
+export function assignableOptions(options: readonly ChooserOption[]): ChooserOption[] {
+  return options.filter((option) => isAccountUuid(option.accountUuid));
 }

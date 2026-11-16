@@ -1,5 +1,5 @@
 import { Component, useEffect, type ErrorInfo, type ReactNode } from "react";
-import { hubDaemonState, liveClientCount } from "@maxprice/shared";
+import { hubDaemonState, hubKeyRow, liveClientCount } from "@maxprice/shared";
 import { HubStatusRows } from "@/components/HubStatusRows";
 import { useHubDaemonExited } from "@/state/use-hub-daemon-exited";
 import { useHubStatus } from "@/state/use-hub-status";
@@ -93,7 +93,7 @@ export function Popout(): React.ReactElement {
   // implement. MachinesCard's `role="menu"` is a real menu and stays.
   return (
     <div className="popout-frame" role="group" aria-label="MaxPrice Hub">
-      <HubStatusRows daemon={daemon} status={status} liveClients={count} />
+      <HubStatusRows daemon={daemon} status={status} keys={status?.accounts} liveClients={count} />
       <div className="pdivider" aria-hidden />
       <PopoutActions restart={stopped} />
     </div>
@@ -143,7 +143,7 @@ export function TrayTooltip(): null {
 
   const tooltip = trayTooltip(
     hubDaemonState(isError, status, firewall, exited),
-    status?.usageConnection,
+    status === undefined ? undefined : hubKeyRow(status.accounts),
   );
   useEffect(() => {
     setTrayTooltip(tooltip).catch((err: unknown) => {

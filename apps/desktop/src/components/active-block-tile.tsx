@@ -7,6 +7,7 @@ import {
   type ActiveBlockTileState,
   type BlockRow,
   type TimeDisplay,
+  withAccountNotKnown,
 } from "@maxprice/shared";
 import { ringStrokeDasharray } from "@/lib/ring-stroke";
 import type { NoLimit } from "@/lib/organization-scope-view";
@@ -16,7 +17,7 @@ import { UnpricedChip } from "@/components/unpriced-chip";
 import { useLiveStatus } from "@/state/use-live-status";
 import { useNowTick } from "@/state/use-now-tick";
 import { useTimeDisplay } from "@/state/use-settings";
-import { useOrganizationScope } from "@/state/use-organization-scope";
+import { useScope } from "@/state/use-scope";
 import { useQuotaSurface } from "@/state/use-quota-surface";
 import { useUsageCurrent } from "@/state/use-usage-current";
 import { useBump } from "@/state/use-bump";
@@ -27,6 +28,9 @@ export type ActiveBlockTileProps = {
   // The "typical" block — median tokens across the range's completed blocks
   // (see typicalBlockTokens). Shown in the tile's foot as the reference.
   typicalBlockTokens: number;
+  // The block is the Unknown Membership's, heading in place of an empty Home
+  // membership (#644): the eyebrow says "account not known".
+  accountNotKnown?: boolean;
 };
 
 // The Active Block tile (Glass, ADR-0043): the 100px elapsed ring and the 5-hour
@@ -41,6 +45,7 @@ export type ActiveBlockTileProps = {
 export function ActiveBlockTile({
   block,
   typicalBlockTokens,
+  accountNotKnown = false,
 }: ActiveBlockTileProps): React.ReactElement {
   // 1Hz tick so the ring, meter and meta advance every second, independent of
   // the SSE pipeline (Part 3); the 900ms linear transitions turn the steps
@@ -51,10 +56,11 @@ export function ActiveBlockTile({
   // (ADR-0060). Both arrive together as one TimeDisplay.
   const display = useTimeDisplay();
   // The ring reads the Quota organization's reading (ADR-0106 §8).
-  const { quotaOrganization } = useOrganizationScope();
+  const { quotaOrganization } = useScope();
   const { data: usage } = useUsageCurrent(quotaOrganization);
   // The 5-hour window's note: none for an idle limit (#384).
-  const { tag: quotaTag, fiveHourNote: noLimit } = useQuotaSurface();
+  const { tag: scopeTag, fiveHourNote: noLimit } = useQuotaSurface();
+  const quotaTag = withAccountNotKnown(scopeTag, accountNotKnown);
   const usageConnection = useLiveStatus((s) => s.usageConnection);
   const tileState = activeBlockTileState(
     block,
@@ -103,8 +109,8 @@ type QuotaSurfaceProps = {
   noLimit: NoLimit | null;
 };
 
-// The eyebrow names whose block this is only under All organizations; scoped to
-// one Organization, the scope chip already names it.
+// The eyebrow names whose block this is only while the Scope spans
+// Organizations; scoped to one Organization, there is no other it could be.
 function ActiveBlockEyebrow({ quotaTag }: Pick<QuotaSurfaceProps, "quotaTag">): React.ReactElement {
   return (
     <span className="eyebrow">

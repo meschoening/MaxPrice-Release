@@ -1,37 +1,42 @@
-import type { ListOrgsResult, UsagePoller } from "@maxprice/usage-core";
+import type { ListOrgsResult, PollerKey, UsagePoller } from "@maxprice/usage-core";
 import type { OrganizationRoster } from "./organization-roster";
 
-// What the Hub polls (#283, #284, ADR-0104): every Organization its key lists.
-// The Hub has no Home and no tracked set, so the poll set is the listing's and
-// the poller observes each one's Limits answer (a forbidden Organization is
-// kept and re-probed hourly by the poller). The last successful listing is
-// persisted (organization-roster.json): boot installs it at once and lists in
-// the background, so a Hub whose discovery fails at boot still polls. A
-// credential arrival — boot, console POST, a client's heal — lists again, and
-// so does one timer: each minute while nothing is polled, hourly otherwise
-// (#264 item 8's re-probe cadence). A listing that refuses the key expires the
-// credential exactly as a 401 on a read would. A listing that names nothing is
-// treated exactly as a transient failure: it changes no roster row, installs
-// nothing, and the persisted set keeps being polled. Either raises
-// `discoveryFailed`, which the Hub's status reads as `error` while nothing
-// answers (#267 item 2). The flag belongs to the key that failed: a new key
-// starts with it lowered, pending its own first answer, while the retry timer
-// and a same-key refresh keep it raised.
-// A generation fences every await: a refresh, clear or stop that supersedes an
-// in-flight listing makes its late answer a no-op — no roster write, no set.
+// What the Hub polls (#283, #284, ADR-0104, ADR-0139 §4): every Organization
+// any of its keys lists. The Hub has no Home and no tracked set, so the poll
+// set is the union of the listings, each key reads the Organizations its own
+// listing names (`poller.setListing`), and the poller observes each
+// Membership's Limits answer (a forbidden one is kept and re-probed hourly).
+// Each key's last successful listing is persisted (organization-roster.json):
+// boot installs them at once and lists in the background, so a Hub whose
+// discovery fails at boot still polls.
 //
-// INVARIANT: `expireCredential()` names no key — it expires whatever the poller
-// holds when the refusal lands. That is correct only because every Hub
-// `poller.setCredential` is paired synchronously (no await between) with
-// `boot`, `refresh` or `clear` — the boot seed and a keying POST
-// /api/credential call it after the key, a clearing one before — whose
-// generation bump fences the listing that belonged to the previous key. A new
-// credential path must keep that pair.
+// Each key lists on its own clock: when it arrives (boot, a console POST, a
+// client's heal, a replaced key), then each minute while its own listing
+// names nothing, hourly otherwise (#264 item 8's re-probe cadence). A listing
+// that refuses the key expires that key alone (`poller.expireKey(account)`),
+// exactly as a 401 on its read would, and schedules nothing more for it. A
+// listing that names nothing is treated exactly as a transient failure: it
+// changes no roster row, installs nothing, and the persisted listing keeps
+// being polled. Either raises that key's `discoveryFailed`, which the Hub's
+// status reads as `error` while that key has no answer (hub-accounts.ts). The
+// flag belongs to the key that failed: a new or replaced key starts with it
+// lowered, pending its own first answer.
+//
+// A generation per key fences every await: a replacement, a removal, a move
+// or stop that supersedes a key's in-flight listing makes its late answer a
+// no-op — no roster write, no set, no expiry.
+//
+// INVARIANT: every Hub `poller.setKeys` is followed synchronously (no await
+// between) by `setKeys` here, since the poller's push drops the listing of a
+// key it does not keep and re-arms the ones it does; this reinstalls every
+// held key's listing and the union over them.
 export type HubPollSetOptions = {
   list: (sessionKey: string) => Promise<ListOrgsResult>;
-  poller: Pick<UsagePoller, "setOrganizations" | "expireCredential">;
-  roster: Pick<OrganizationRoster, "ids" | "replace">;
-  onDiscoveryFailed?: (failed: boolean) => void;
+  poller: Pick<UsagePoller, "setOrganizations" | "setListing" | "expireKey">;
+  roster: Pick<OrganizationRoster, "ids" | "listing" | "replace" | "forget" | "move">;
+  // A key's discovery flag changed: the status reads it.
+  onDiscoveryChange?: () => void;
+  now?: () => number;
   retryMs?: number;
   rediscoverMs?: number;
   setTimeoutImpl?: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -39,104 +44,150 @@ export type HubPollSetOptions = {
 };
 
 export type HubPollSet = {
-  boot: (sessionKey: string) => Promise<void>;
-  refresh: (sessionKey: string) => Promise<void>;
-  clear: () => void;
+  // The held keyset, as the poller was just given it. A key new to the set,
+  // or whose session key changed, lists now; a key that left loses its
+  // timer, its in-flight listing and its roster listing. Every held key's
+  // persisted listing and the union over them are installed synchronously.
+  // `relist` names held keys that list again even though unchanged: every
+  // push re-lists what its key can see (#283), the same key healed back
+  // included. Resolves once the new and relisted keys' listings have landed.
+  setKeys: (keys: readonly PollerKey[], relist?: readonly string[]) => Promise<void>;
+  // ADR-0138 §12's move, after `poller.rekey(from, to)`: the key's clock,
+  // flag and roster listing follow it.
+  rekey: (from: string, to: string) => void;
   stop: () => void;
-  discoveryFailed: () => boolean;
+  discoveryFailed: (account: string) => boolean;
+};
+
+type KeyClock = {
+  // The Account key it lists for; a move changes it in place, so a listing
+  // in flight lands under the new one.
+  account: string;
+  sessionKey: string;
+  generation: number;
+  failed: boolean;
+  next: ReturnType<typeof setTimeout> | null;
 };
 
 export function createHubPollSet(opts: HubPollSetOptions): HubPollSet {
   const retryMs = opts.retryMs ?? 60_000;
   const rediscoverMs = opts.rediscoverMs ?? 60 * 60_000;
+  const now = opts.now ?? Date.now;
   const setTimer = opts.setTimeoutImpl ?? ((cb, ms) => setTimeout(cb, ms));
   const clearTimer = opts.clearTimeoutImpl ?? ((handle) => clearTimeout(handle));
-  let generation = 0;
+  const clocks = new Map<string, KeyClock>();
   let stopped = false;
-  let next: ReturnType<typeof setTimeout> | null = null;
-  let installed: readonly string[] = [];
-  let failed = false;
-  // The key whose discovery `failed` describes.
-  let keyed: string | null = null;
 
-  function cancelNext(): void {
-    if (next !== null) clearTimer(next);
-    next = null;
+  function cancel(clock: KeyClock): void {
+    if (clock.next !== null) clearTimer(clock.next);
+    clock.next = null;
   }
-  function setFailed(value: boolean): void {
-    if (failed === value) return;
-    failed = value;
-    opts.onDiscoveryFailed?.(value);
+  function setFailed(clock: KeyClock, value: boolean): void {
+    if (clock.failed === value) return;
+    clock.failed = value;
+    opts.onDiscoveryChange?.();
   }
-  function install(ids: readonly string[]): void {
-    installed = ids;
-    opts.poller.setOrganizations(ids, null);
-  }
-
-  async function refresh(sessionKey: string): Promise<void> {
-    if (stopped) return;
-    // A new key has not been asked yet: it starts pending, not failed. The
-    // timer and a same-key refresh keep the flag — that key's discovery did
-    // fail.
-    if (sessionKey !== keyed) {
-      keyed = sessionKey;
-      setFailed(false);
+  // Every held key's persisted listing to the poller, then the union.
+  function install(): void {
+    const union = new Set<string>();
+    for (const account of [...clocks.keys()].sort()) {
+      const ids = opts.roster.listing(account);
+      opts.poller.setListing(account, ids);
+      for (const id of ids ?? []) union.add(id);
     }
-    const mine = ++generation;
-    cancelNext();
+    opts.poller.setOrganizations([...union].sort(), null);
+  }
+
+  async function refresh(clock: KeyClock): Promise<void> {
+    if (stopped || clocks.get(clock.account) !== clock) return;
+    const mine = ++clock.generation;
+    cancel(clock);
     let result: ListOrgsResult;
     try {
-      result = await opts.list(sessionKey);
+      result = await opts.list(clock.sessionKey);
     } catch {
       result = { ok: false, kind: "error" };
     }
-    if (mine !== generation || stopped) return;
+    const account = clock.account;
+    if (stopped || clocks.get(account) !== clock || clock.generation !== mine) return;
     if (result.ok && result.orgs.length > 0) {
       try {
-        opts.roster.replace(result.orgs);
+        opts.roster.replace(account, result.orgs, new Date(now()).toISOString());
       } catch (err) {
         console.warn("[hub] organization roster write failed:", err);
       }
-      setFailed(false);
-      install(result.orgs.map((o) => o.id));
+      setFailed(clock, false);
+      install();
     } else if (!result.ok && result.kind === "expired") {
-      setFailed(false);
-      opts.poller.expireCredential();
+      setFailed(clock, false);
+      opts.poller.expireKey(account);
       return;
     } else {
       // A transient failure, or a listing that named nothing.
-      setFailed(true);
+      setFailed(clock, true);
     }
-    next = setTimer(
+    const listed = opts.roster.listing(account) ?? [];
+    clock.next = setTimer(
       () => {
-        next = null;
-        void refresh(sessionKey);
+        clock.next = null;
+        void refresh(clock);
       },
-      installed.length === 0 ? retryMs : rediscoverMs,
+      listed.length === 0 ? retryMs : rediscoverMs,
     );
   }
 
   return {
-    boot: (sessionKey) => {
+    setKeys: (keys, relist = []) => {
       if (stopped) return Promise.resolve();
-      install(opts.roster.ids());
-      return refresh(sessionKey);
+      const given = new Map(keys.map((k) => [k.account, k.sessionKey]));
+      for (const [account, clock] of [...clocks]) {
+        if (given.get(account) === clock.sessionKey) continue;
+        cancel(clock);
+        clock.generation += 1;
+        clocks.delete(account);
+        if (!given.has(account)) {
+          try {
+            opts.roster.forget(account);
+          } catch (err) {
+            console.warn("[hub] organization roster write failed:", err);
+          }
+        }
+        if (clock.failed) opts.onDiscoveryChange?.();
+      }
+      const fresh: KeyClock[] = [];
+      for (const [account, sessionKey] of given) {
+        const held = clocks.get(account);
+        if (held !== undefined) {
+          if (relist.includes(account)) fresh.push(held);
+          continue;
+        }
+        const clock: KeyClock = { account, sessionKey, generation: 0, failed: false, next: null };
+        clocks.set(account, clock);
+        fresh.push(clock);
+      }
+      install();
+      return Promise.all(fresh.map(refresh)).then(() => {});
     },
-    refresh,
-    clear: () => {
-      generation += 1;
-      cancelNext();
-      keyed = null;
-      // The flag first: the empty install publishes, and a still-raised flag
-      // would read that frame as `error`.
-      setFailed(false);
-      install([]);
+    rekey: (from, to) => {
+      const clock = clocks.get(from);
+      if (clock === undefined || clocks.has(to)) return;
+      clocks.delete(from);
+      clock.account = to;
+      clocks.set(to, clock);
+      try {
+        opts.roster.move(from, to);
+      } catch (err) {
+        console.warn("[hub] organization roster write failed:", err);
+      }
+      install();
     },
     stop: () => {
       stopped = true;
-      generation += 1;
-      cancelNext();
+      for (const clock of clocks.values()) {
+        cancel(clock);
+        clock.generation += 1;
+      }
     },
-    discoveryFailed: () => failed,
+    discoveryFailed: (account) => clocks.get(account)?.failed ?? false,
   };
 }

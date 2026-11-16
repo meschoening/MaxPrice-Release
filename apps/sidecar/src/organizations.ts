@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import {
-  checkOrganizationLabel,
+  checkLabel,
+  labelTaken,
   organizationRosterHintsSchema,
   organizationUuidKeySchema,
   orgLimitsAnswerSchema,
@@ -15,7 +16,9 @@ import {
   type OrgLimitsAnswer,
   type UsageOrganizations,
 } from "@maxprice/shared";
-import type { OrganizationLabels } from "./organization-labels";
+import { emailHash } from "@maxprice/shared";
+import type { AccountPair } from "./engine/jsonl";
+import { labelUnionFull, type LabelStore, type LabelUnionLock } from "./organization-labels";
 
 // The Organizations this machine knows about (GLOSSARY.md, ADR-0098): read from
 // Claude Code's login files and from a listing — Connect's discovery (#283),
@@ -23,11 +26,13 @@ import type { OrganizationLabels } from "./organization-labels";
 // listing (#366) — remembered in a small registry so a plan word survives
 // logging out, and listed as the Settings roster (#287). The Home
 // organization select is one of its readers. UUIDs, `organizationType`,
-// first-seen times, and the listings' Limits answers and roster hints only —
-// `oauthAccount.emailAddress` and `organizationName` (which embeds the email)
-// are never read past the parse, the listing's `name` is never parsed at all,
-// and none is written anywhere. The user's renames live in
-// ./organization-labels.ts.
+// first-seen times, and the listings' Limits answers and roster hints only.
+// `oauthAccount.emailAddress` leaves the parse only as its hash (`emailHash`,
+// ADR-0137 §1), the pair table's key, except through `readLoginEmails`, which
+// hands the clear address to its caller for display and keeps nothing.
+// `organizationName` (which embeds the email) is never read past the parse,
+// the listing's `name` is never parsed at all, and no address is written
+// anywhere. The user's renames live in ./organization-labels.ts.
 
 // Claude Code keeps the login in `.claude.json`: `$CLAUDE_CONFIG_DIR/.claude.json`
 // when the config dir is relocated, else `~/.claude.json` — a SIBLING of
@@ -47,6 +52,8 @@ const loginFileSchema = z
       .object({
         organizationUuid: z.string().min(1),
         organizationType: z.string().nullable().optional(),
+        accountUuid: z.string().min(1).nullable().optional(),
+        emailAddress: z.string().nullable().optional(),
       })
       .passthrough()
       .nullable()
@@ -54,28 +61,34 @@ const loginFileSchema = z
   })
   .passthrough();
 
-export type CurrentLogin = { organizationUuid: string; organizationType: string | null };
+// The Account a login file names (ADR-0137 §1): its `accountUuid`, and its
+// `emailAddress` as the hash only, null when the file names none. The clear
+// address is never kept here.
+export type LoginAccount = { accountUuid: string; emailHash: string | null };
 
-// The Organizations the CLI is logged into RIGHT NOW. Each watched root's
-// config dir keeps its own login, so two roots can name two Organizations at
-// once (labels decision 2): every candidate is read, and each Organization is
-// listed once, in candidate order — the first root in `claudePaths` order
-// first, the home login last. A later file naming the same Organization only
-// fills a plan word the earlier one lacked. An unreadable or malformed file is
-// skipped; empty when none names one. The caller decides when this may be
-// consulted — the home seed uses only the first, as a boot tie-break/fallback,
-// and never tracks it live (GLOSSARY.md).
-export async function readCurrentLogins(
+export type CurrentLogin = {
+  organizationUuid: string;
+  organizationType: string | null;
+  // Every Account a login file naming this Organization names, in candidate
+  // order, each once by uuid (a later file fills only a missing hash). Empty
+  // when no file names an `accountUuid`.
+  accounts: LoginAccount[];
+};
+
+type LoginFileAccount = NonNullable<z.infer<typeof loginFileSchema>["oauthAccount"]>;
+
+// Every watched root's login file, then the home login, each parsed once and
+// in that order; unreadable, malformed and logged-out files are skipped.
+async function readLoginFiles(
   roots: readonly string[],
-  readFileImpl: (path: string) => Promise<string> = (p) => readFile(p, "utf8"),
-  homeDirectory: string = homedir(),
-): Promise<CurrentLogin[]> {
+  readFileImpl: (path: string) => Promise<string>,
+  homeDirectory: string,
+): Promise<LoginFileAccount[]> {
   const candidates = new Set([
     ...roots.flatMap(loginFileCandidates),
     join(homeDirectory, ".claude.json"),
   ]);
-  // Keyed by uuid; `Map.set` on a known key keeps its first-seen position.
-  const logins = new Map<string, CurrentLogin>();
+  const accounts: LoginFileAccount[] = [];
   for (const candidate of candidates) {
     let text: string;
     try {
@@ -92,14 +105,87 @@ export async function readCurrentLogins(
     const parsed = loginFileSchema.safeParse(json);
     const account = parsed.success ? parsed.data.oauthAccount : null;
     if (account === null || account === undefined) continue;
+    accounts.push(account);
+  }
+  return accounts;
+}
+
+// The Organizations the CLI is logged into RIGHT NOW. Each watched root's
+// config dir keeps its own login, so two roots can name two Organizations at
+// once (labels decision 2): every candidate is read, and each Organization is
+// listed once, in candidate order — the first root in `claudePaths` order
+// first, the home login last. A later file naming the same Organization only
+// fills a plan word the earlier one lacked, and adds its Account. An
+// unreadable or malformed file is skipped; empty when none names one. The
+// caller decides when this may be consulted — the home seed uses only the
+// first, as a boot tie-break/fallback, and never tracks it live (GLOSSARY.md).
+// Each login's Accounts are a pair source (`loginPairs`, ADR-0137 §1).
+export async function readCurrentLogins(
+  roots: readonly string[],
+  readFileImpl: (path: string) => Promise<string> = (p) => readFile(p, "utf8"),
+  homeDirectory: string = homedir(),
+): Promise<CurrentLogin[]> {
+  // Keyed by uuid; `Map.set` on a known key keeps its first-seen position.
+  const logins = new Map<string, CurrentLogin>();
+  for (const account of await readLoginFiles(roots, readFileImpl, homeDirectory)) {
     const organizationUuid = account.organizationUuid;
     const organizationType = account.organizationType ?? null;
     const prev = logins.get(organizationUuid);
-    if (prev === undefined || (prev.organizationType === null && organizationType !== null)) {
-      logins.set(organizationUuid, { organizationUuid, organizationType });
+    const login: CurrentLogin =
+      prev === undefined
+        ? { organizationUuid, organizationType, accounts: [] }
+        : prev.organizationType === null && organizationType !== null
+          ? { ...prev, organizationType }
+          : prev;
+    const accountUuid = account.accountUuid ?? null;
+    if (accountUuid !== null) {
+      // Hashed here, so the clear address never reaches a returned structure.
+      const address = account.emailAddress?.trim() ?? "";
+      const hash = address === "" ? null : emailHash(address);
+      const index = login.accounts.findIndex((a) => a.accountUuid === accountUuid);
+      if (index === -1) {
+        login.accounts = [...login.accounts, { accountUuid, emailHash: hash }];
+      } else if (login.accounts[index]!.emailHash === null && hash !== null) {
+        login.accounts = login.accounts.map((a, i) =>
+          i === index ? { accountUuid, emailHash: hash } : a,
+        );
+      }
     }
+    logins.set(organizationUuid, login);
   }
   return [...logins.values()];
+}
+
+// The pairs the current logins teach the pair table (ADR-0137 §1): each
+// Account a login file names with both an `accountUuid` and an address.
+export function loginPairs(logins: readonly CurrentLogin[]): AccountPair[] {
+  return logins.flatMap((login) =>
+    login.accounts.flatMap((account) =>
+      account.emailHash === null
+        ? []
+        : [{ emailHash: account.emailHash, accountUuid: account.accountUuid }],
+    ),
+  );
+}
+
+// Each current login's address in clear, by account uuid, read live from the
+// same files as `readCurrentLogins` — for `/api/accounts` to show an Account
+// under its email "as read here" (ADR-0136 §7, #631 T5). The caller shows it
+// and keeps nothing: it is never stored, logged or sent. The first file naming
+// an Account with an address wins.
+export async function readLoginEmails(
+  roots: readonly string[],
+  readFileImpl: (path: string) => Promise<string> = (p) => readFile(p, "utf8"),
+  homeDirectory: string = homedir(),
+): Promise<Map<string, string>> {
+  const emails = new Map<string, string>();
+  for (const account of await readLoginFiles(roots, readFileImpl, homeDirectory)) {
+    const accountUuid = account.accountUuid ?? null;
+    const address = account.emailAddress?.trim() ?? "";
+    if (accountUuid === null || address === "" || emails.has(accountUuid)) continue;
+    emails.set(accountUuid, address);
+  }
+  return emails;
 }
 
 // Whether Claude Code will attach Remote Control to every interactive session
@@ -193,16 +279,23 @@ export type OrganizationRegistry = {
   // downgraded to null (logging out of an org must not erase its label).
   remember: (uuid: string, organizationType: string | null) => Promise<void>;
   // Record a listing: Connect's discovery (#283), the Hub's roster (#366) and
-  // a Hub-less client's own listing (#366) all record through here, and each
-  // call is its lister's COMPLETE listing. For each Organization it names, the
-  // roster hints and a non-null Limits answer replace the previous ones, a
-  // null answer leaves a recorded one in place, the plan word is kept, and an
-  // `unlisted` mark is cleared. Every other entry some listing once named (it
-  // has hints) is marked `unlisted` (#360 item 3) and otherwise left as it
-  // was; one known only from a login, usage or a legacy push is never marked,
-  // and nothing ever leaves the registry. An empty listing changes nothing.
-  // One write, and only when something moved — answered true exactly then.
-  recordDiscovery: (orgs: readonly LearnedOrg[]) => Promise<boolean>;
+  // a Hub-less client's own listing (#366) all record through here. For each
+  // Organization it names, the roster hints and a non-null Limits answer
+  // replace the previous ones, a null answer leaves a recorded one in place,
+  // the plan word is kept, and an `unlisted` mark is cleared. A `complete`
+  // listing (the default) names everything this machine's keys list: every
+  // other entry some listing once named (it has hints) is marked `unlisted`
+  // (#360 item 3) and otherwise left as it was. A partial one (one key's
+  // Connect, or a key listing before every held key has listed) marks
+  // nothing, since with several Accounts' keys one key's list says nothing
+  // about another's (#646). One known only from a login, usage or a legacy
+  // push is never marked, and nothing ever leaves the registry. An empty
+  // listing changes nothing. One write, and only when something moved —
+  // answered true exactly then.
+  recordDiscovery: (
+    orgs: readonly LearnedOrg[],
+    opts?: { readonly complete?: boolean },
+  ) => Promise<boolean>;
   // Add every Organization the registry does not know yet, with no plan word
   // (#287: one known only from usage still gets a first-seen time). A known
   // one is left as it was. One write, and only when something was added.
@@ -261,7 +354,10 @@ export function createOrganizationRegistry(opts: {
     await persist();
   }
 
-  async function recordDiscovery(orgs: readonly LearnedOrg[]): Promise<boolean> {
+  async function recordDiscovery(
+    orgs: readonly LearnedOrg[],
+    opts: { readonly complete?: boolean } = {},
+  ): Promise<boolean> {
     // An empty listing says nothing about what the key lists.
     if (orgs.length === 0) return false;
     let changed = false;
@@ -285,9 +381,9 @@ export function createOrganizationRegistry(opts: {
       known.set(org.id, next);
       changed = true;
     }
-    // The listing is complete: an entry some listing named that this one
-    // omits has left the key's list. Marked, never removed (#360 item 3).
-    for (const [uuid, entry] of known) {
+    // A complete listing: an entry some listing named that this one omits has
+    // left every key's list. Marked, never removed (#360 item 3).
+    for (const [uuid, entry] of opts.complete === false ? [] : known) {
       if (listed.has(uuid) || entry.hints === undefined || entry.unlisted === true) continue;
       known.set(uuid, { ...entry, unlisted: true });
       changed = true;
@@ -340,7 +436,8 @@ export function createOrganizationRegistry(opts: {
 // orders its own rows.
 export function listOrganizations(input: {
   home: string | null;
-  currentLogins: readonly CurrentLogin[];
+  // The roster reads no Account: a login's Organization and plan word only.
+  currentLogins: readonly Pick<CurrentLogin, "organizationUuid" | "organizationType">[];
   remoteControlAtStartup: boolean;
   seen: { machine: ReadonlySet<string>; fleet: ReadonlySet<string> };
   // The resolved tracked set; null excludes nothing, so every row is tracked.
@@ -350,7 +447,7 @@ export function listOrganizations(input: {
   pollerOrganizations: UsageOrganizations;
   reingesting: ReadonlySet<string>;
   registry: ReadonlyMap<string, Readonly<RegistryEntry>>;
-  labels: Pick<OrganizationLabels, "get">;
+  labels: Pick<LabelStore, "get">;
 }): OrganizationsResponse {
   const logins = new Map(input.currentLogins.map((login) => [login.organizationUuid, login]));
   const uuids = new Set<string>(logins.keys());
@@ -426,20 +523,26 @@ export type OrganizationRenameResult =
   | { kind: "ok"; body: OrganizationsResponse }
   | { kind: "unknown" }
   | { kind: "invalid"; reason: "empty" | "too-long" }
-  | { kind: "duplicate" };
+  | { kind: "duplicate" }
+  | { kind: "full" };
 
 // The rename rules (#287). `label: null` clears the rename back to the
 // resolved default. Otherwise the label is trimmed, 1 to 40 code points
-// (`checkOrganizationLabel`), and unique case-insensitively against every
+// (`checkLabel`), and unique case-insensitively against every
 // OTHER Organization's resolved label, defaults included — renaming one to
-// the label it already shows is allowed. Only an Organization in the roster
-// can be renamed, and only one whose uuid the Organization directory can key
+// the label it already shows is allowed (`labelTaken`, the Account rename's
+// rule too). Only an Organization in the roster
+// can be renamed, and only one whose uuid the Label directory can key
 // (`organizationUuidKeySchema`), as the Hub's PUT requires: every push sends
 // the whole map, so one unkeyable entry would have the Hub refuse them all
-// (#288). A rename that changes the stored label emits the wholesale
+// (#288). A new label that would grow this machine's Organization and Account
+// labels past the Label directory's cap on their union is refused as `full`
+// (#635, ADR-0139 §7), for the same reason, checked and written under the
+// union lock the Account rename shares. A rename that changes the stored
+// label emits the wholesale
 // invalidation a Home change emits (labels decision 10), and the roster's own
 // `organizations:changed` poke beside it, then `labelsWritten` —
-// bootSidecar()'s push to the Hub's Organization directory (#288); one that
+// bootSidecar()'s push to the Hub's Label directory (#288); one that
 // changes nothing writes nothing and emits nothing, and still answers the
 // roster.
 //
@@ -450,7 +553,11 @@ export type OrganizationRenameResult =
 // `labelsReady`).
 export function createOrganizationRename(deps: {
   list: () => Promise<OrganizationsResponse>;
-  labels: Pick<OrganizationLabels, "set">;
+  labels: Pick<LabelStore, "set" | "entries">;
+  accountLabels: Pick<LabelStore, "entries">;
+  // The lock the cap check and the write share with the Account rename and
+  // the fleet's adoption (`createLabelUnionLock`).
+  unionLock: LabelUnionLock;
   invalidateReports: () => void;
   rosterChanged: () => void;
   labelsWritten: () => void;
@@ -465,15 +572,19 @@ export function createOrganizationRename(deps: {
     }
     let label: string | null = null;
     if (raw !== null) {
-      const check = checkOrganizationLabel(raw);
+      const check = checkLabel(raw);
       if (!check.ok) return { kind: "invalid", reason: check.reason };
-      const folded = check.label.toLowerCase();
-      if (roster.organizations.some((o) => o.uuid !== uuid && o.label.toLowerCase() === folded)) {
-        return { kind: "duplicate" };
-      }
+      const rows = roster.organizations.map((o) => [o.uuid, o.label] as const);
+      if (labelTaken(rows, uuid, check.label)) return { kind: "duplicate" };
       label = check.label;
     }
-    if (!(await deps.labels.set(uuid, label))) return { kind: "ok", body: roster };
+    const wrote = await deps.unionLock(async () => {
+      const adds = label !== null && !deps.labels.entries().has(uuid);
+      if (labelUnionFull(deps.labels, deps.accountLabels, adds)) return null;
+      return deps.labels.set(uuid, label);
+    });
+    if (wrote === null) return { kind: "full" };
+    if (!wrote) return { kind: "ok", body: roster };
     deps.invalidateReports();
     deps.rosterChanged();
     deps.labelsWritten();

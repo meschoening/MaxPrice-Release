@@ -82,25 +82,46 @@ export function createReingestState(): ReingestState {
   };
 }
 
-// What ONE admission change did. A settings edit moves the two Organization
-// inputs (and the dormant set with the tracked one); since #311 an assertion
-// install can move the dormant set alone (`dormantChange`, below). Its producer
-// computes all six synchronously, as the change arrives: `previousTracked` is
-// the set the change replaces and `nextTracked` the one it installs, and the
-// dormant sides likewise, so a queued change's `previous` is its predecessor's
-// `next` however long the queue is.
+// What ONE admission change did. A settings edit moves the Home membership and
+// both tracked lists (and the dormant set with the tracked ones); since #311
+// an assertion install can move the dormant set alone (`dormantChange`,
+// below), and since #631 the pair table can move rows between Accounts
+// (`reresolved`). Its producer computes every side synchronously, as the
+// change arrives: `previousTracked` is the set the change replaces and
+// `nextTracked` the one it installs, and the Account and dormant sides
+// likewise, so a queued change's `previous` is its predecessor's `next`
+// however long the queue is.
 export type OrganizationSettingsChange = {
-  // The Home just installed — the new presumption's `selfHome`.
+  // The Home membership just installed — the new presumption's `selfHome`:
+  // its Organization, and its Account (`null` while unknown, ADR-0136 §8).
   home: string | null;
-  // Whether this edit moved Home at all. The presumption is a function of Home
-  // and the Machine directory's published Homes (#281), and this edit moves
-  // only the Home half — so an edit that left Home where it was must not mint
-  // a new identity: that would clear every report-cache entry for nothing.
+  homeAccount: string | null;
+  // Whether this edit moved the Home membership at all, its Organization or
+  // its Account. The presumption is a function of Home and the Machine
+  // directory's published Homes (#281), and this edit moves only the Home
+  // half — so an edit that left Home where it was must not mint a new
+  // identity: that would clear every report-cache entry for nothing. A
+  // Home-Account-only change reinstalls the presumption like any Home change:
+  // it re-answers the Account of owner-less rows (ADR-0137 §4).
   homeChanged: boolean;
   // The resolved tracked sets either side of this edit (`null` = nothing
   // excluded), compared by value.
   previousTracked: ReadonlySet<string> | null;
   nextTracked: ReadonlySet<string> | null;
+  // #631 (ADR-0136 §3): the resolved tracked Account sets either side, the
+  // admission's second level, compared the same way (`null` = no Account
+  // excluded).
+  previousTrackedAccounts: ReadonlySet<string> | null;
+  nextTrackedAccounts: ReadonlySet<string> | null;
+  // #631 (ADR-0137 §1): what a pair-table change did to rows the engine holds.
+  // A pair re-resolves an Email record's hash to another Account, so rows can
+  // move between Accounts with neither set moving, which only a rebuild from
+  // the scan cache applies. "none": no such move (every settings edit and
+  // assertion install). "additive": rows moved and none of them leaves the
+  // tracked Account set (with a null set, every move). "restrictive": some
+  // moved row leaves it. Its producer judges it against the queued pair table,
+  // as the sets are judged against the queued sets.
+  reresolved: "none" | "additive" | "restrictive";
   // #311 (ADR-0107 §12): the dormant sets either side of this change
   // (`dormantSessions`, engine/presumption.ts), compared by value. The engine's
   // admission is the PAIR (tracked, dormant): an assertion install that moved
@@ -112,14 +133,15 @@ export type OrganizationSettingsChange = {
 export type OrganizationSettingsDriverDeps = {
   // Synchronous arrival fence: an excluded in-flight read cannot append while a walk queues.
   setPollingOrganizations: (ids: ReadonlySet<string> | null, home: string | null) => void;
-  // Install a Home into bootSidecar()'s one presumption cell (`withSelfHome`),
+  // Install a Home membership into bootSidecar()'s one presumption cell
+  // (`withSelfHome`),
   // keeping the published Homes the Machine directory supplied (#281). The
   // driver owns WHEN a Home change takes effect — in queue order — but not the
   // peer half, which the fleet replaces on its own schedule. Every store reads
   // that one cell through the `getPresumption` thunk it was built with, so a
   // single write reaches the live engine, the retained report view, and both
   // caches.
-  installHome: (home: string | null) => void;
+  installHome: (home: string | null, homeAccount: string | null) => void;
   // Release at arrival, ahead of any queued walk.
   releaseRetainedView: () => void;
   rebuild: (o: { keepRetainedView: boolean }) => Promise<void>;
@@ -145,25 +167,52 @@ export type OrganizationSettingsDriverDeps = {
   // beside `trackedNow`, so a change overtaken by a later edit OR a later
   // assertion install skips its repair.
   dormantNow: () => ReadonlySet<string>;
+  // The tracked Account set RIGHT NOW — bootSidecar()'s `trackedAccountsNow`
+  // (#631). Read beside the other two, so a change overtaken by a later
+  // Account edit or pair change skips its repair too.
+  trackedAccountsNow: () => ReadonlySet<string> | null;
 };
 
-// The verdict over the whole admission pair (#311). "same" when neither set
-// moved. "additive" when the tracked set is same-or-additive AND no session
-// became dormant (`nextDormant ⊆ previousDormant`): every row the old admission
-// kept is still kept, so the retained view may stay. "restrictive" otherwise.
-// A dormant-only shrink is additive with nothing to mark re-ingesting.
+// The verdict over the whole admission (#311, #631): both tracked levels, the
+// dormant set and the rows a pair re-resolved. "same" when nothing moved.
+// "additive" when each tracked level is same-or-additive, no session became
+// dormant (`nextDormant ⊆ previousDormant`) and no re-resolved row left the
+// tracked Account set: every row the old admission kept is still kept, so the
+// retained view may stay. "restrictive" otherwise: narrowing EITHER level
+// (ADR-0136 §3's two conjunctive levels) is a scoped repair. Only a newly
+// tracked Organization is marked re-ingesting (`added`), since the roster
+// marks Organizations; a widened Account set, a dormant-only shrink and an
+// additive re-resolve are additive with nothing to mark.
 export function classifyAdmissionChange(
   change: Pick<
     OrganizationSettingsChange,
-    "previousTracked" | "nextTracked" | "previousDormant" | "nextDormant"
+    | "previousTracked"
+    | "nextTracked"
+    | "previousTrackedAccounts"
+    | "nextTrackedAccounts"
+    | "previousDormant"
+    | "nextDormant"
+    | "reresolved"
   >,
 ): TrackedChange {
   const tracked = classifyTrackedChange(change.previousTracked, change.nextTracked);
   if (tracked.kind === "restrictive") return tracked;
+  const accounts = classifyTrackedChange(
+    change.previousTrackedAccounts,
+    change.nextTrackedAccounts,
+  );
+  if (accounts.kind === "restrictive" || change.reresolved === "restrictive") {
+    return { kind: "restrictive" };
+  }
   for (const sessionId of change.nextDormant) {
     if (!change.previousDormant.has(sessionId)) return { kind: "restrictive" };
   }
-  if (tracked.kind === "same" && change.nextDormant.size !== change.previousDormant.size) {
+  if (
+    tracked.kind === "same" &&
+    (accounts.kind === "additive" ||
+      change.reresolved === "additive" ||
+      change.nextDormant.size !== change.previousDormant.size)
+  ) {
     return { kind: "additive", added: [] };
   }
   return tracked;
@@ -176,18 +225,71 @@ export function classifyAdmissionChange(
 // new.
 export function dormantChange(opts: {
   home: string | null;
+  homeAccount: string | null;
   tracked: ReadonlySet<string> | null;
+  trackedAccounts: ReadonlySet<string> | null;
   previousDormant: ReadonlySet<string>;
   nextDormant: ReadonlySet<string>;
 }): OrganizationSettingsChange | null {
   if (trackedSetsEqual(opts.previousDormant, opts.nextDormant)) return null;
   return {
     home: opts.home,
+    homeAccount: opts.homeAccount,
     homeChanged: false,
     previousTracked: opts.tracked,
     nextTracked: opts.tracked,
+    previousTrackedAccounts: opts.trackedAccounts,
+    nextTrackedAccounts: opts.trackedAccounts,
     previousDormant: opts.previousDormant,
     nextDormant: opts.nextDormant,
+    reresolved: "none",
+  };
+}
+
+// bootSidecar()'s producer of a PAIR change (#631, ADR-0137 §1): the pair
+// table moved, so rows the engine holds may resolve to another Account, and a
+// Pending account's fold may have moved the tracked Account set (and with it
+// the dormant set). `moves` are the rows' Account keys before and after, one
+// per moved email hash the engine holds evidence of; the `previous` sides are
+// what the last queued change installed and the `next` sides what holds under
+// the new table. null when nothing moved and no set did: a pair for an
+// address no row names rebuilds nothing.
+export function pairChange(opts: {
+  home: string | null;
+  homeAccount: string | null;
+  tracked: ReadonlySet<string> | null;
+  previousTrackedAccounts: ReadonlySet<string> | null;
+  nextTrackedAccounts: ReadonlySet<string> | null;
+  previousDormant: ReadonlySet<string>;
+  nextDormant: ReadonlySet<string>;
+  moves: readonly { from: string; to: string }[];
+}): OrganizationSettingsChange | null {
+  const moved = opts.moves.filter((move) => move.from !== move.to);
+  if (
+    moved.length === 0 &&
+    trackedSetsEqual(opts.previousTrackedAccounts, opts.nextTrackedAccounts) &&
+    trackedSetsEqual(opts.previousDormant, opts.nextDormant)
+  ) {
+    return null;
+  }
+  const previous = opts.previousTrackedAccounts;
+  const next = opts.nextTrackedAccounts;
+  // A move leaves the admission when the row was admitted under the old set
+  // and is not under the new one. A null set admits every Account.
+  const leaves = moved.some(
+    ({ from, to }) => (previous === null || previous.has(from)) && next !== null && !next.has(to),
+  );
+  return {
+    home: opts.home,
+    homeAccount: opts.homeAccount,
+    homeChanged: false,
+    previousTracked: opts.tracked,
+    nextTracked: opts.tracked,
+    previousTrackedAccounts: previous,
+    nextTrackedAccounts: next,
+    previousDormant: opts.previousDormant,
+    nextDormant: opts.nextDormant,
+    reresolved: moved.length === 0 ? "none" : leaves ? "restrictive" : "additive",
   };
 }
 
@@ -245,9 +347,19 @@ export type OrganizationSettingsDriver = {
  * verdict. The repair after its rebuild is also what runs the lossless forget
  * of the dormant sessions on the Hub.
  *
+ * Since #631 the admission has a second tracked level, the Accounts (ADR-0136
+ * §3), and a third input, the pair table (ADR-0137 §1), and the same three
+ * verdicts judge them: narrowing either level is a scoped repair, widening
+ * either an additive re-walk, and a pair change that moves rows between
+ * Accounts (`pairChange`) is restrictive when some moved row leaves the
+ * tracked Account set and additive otherwise. The repair's marker is keyed by
+ * both levels, and the skip below checks all three live cells.
+ *
  * A Home change installs its Home into the presumption on EVERY verdict, ahead
  * of the work: a rebuild that kept the preceding Home would go on presuming
  * this machine's owner-less rows under an organization it no longer calls home.
+ * The Home is the Home membership: a change of its Account alone is a Home
+ * change too, and installs with the "same" verdict's work only.
  *
  * The roster hears of an edit through `rosterChanged` (#287, ADR-0105). A
  * changing verdict fires it twice: once as the change starts applying — after
@@ -327,7 +439,7 @@ async function applyChange(
   // rather than true only of the statements that happen to be awaited.
   let end: (() => void) | undefined;
   try {
-    if (opts.homeChanged) deps.installHome(opts.home);
+    if (opts.homeChanged) deps.installHome(opts.home, opts.homeAccount);
     const change = classifyAdmissionChange(opts);
     if (change.kind === "same") {
       if (opts.homeChanged) {
@@ -356,6 +468,7 @@ async function applyChange(
     // behind this walk moved what the store should refuse.
     if (
       !trackedSetsEqual(deps.trackedNow(), opts.nextTracked) ||
+      !trackedSetsEqual(deps.trackedAccountsNow(), opts.nextTrackedAccounts) ||
       !trackedSetsEqual(deps.dormantNow(), opts.nextDormant)
     ) {
       await deps.resetRepair();

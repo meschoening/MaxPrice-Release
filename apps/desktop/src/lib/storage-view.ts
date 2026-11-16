@@ -1,4 +1,12 @@
-import type { HubMachine, StorageReport, StorageSegment, StorageSegmentId } from "@maxprice/shared";
+import {
+  ACCOUNT_NOT_KNOWN,
+  accountLabel,
+  organizationLabel,
+  type HubMachine,
+  type StorageReport,
+  type StorageSegment,
+  type StorageSegmentId,
+} from "@maxprice/shared";
 
 // Settings › Storage — the renderer's pure half (map #124, ticket #133).
 //
@@ -125,6 +133,33 @@ export function selfMachineLabel(selfId: string, machines: HubMachine[]): string
   return machines.find((m) => m.machineId === selfId)?.name ?? `machine-${selfId.slice(0, 8)}`;
 }
 
+// The labels of Forget's per-Membership breakdown (#295, per Membership since
+// #631), one per entry and in its order. An entry reads as its Organization,
+// as it always has; only an Organization the breakdown lists under two or more
+// Accounts adds the Account, ` · ` and its label from `/api/accounts` (the
+// email as read here, else `Account <first 8>`, which `accountLabel` also
+// supplies for a key the roster has not listed), or `Account not known` for
+// rows whose Account is not known (a Home membership with no Account).
+export function forgetMembershipLabels(
+  memberships: NonNullable<NonNullable<StorageReport["forget"]>["memberships"]>,
+  organizationLabels: ReadonlyMap<string, string>,
+  accountLabels: ReadonlyMap<string, string>,
+): string[] {
+  const perOrganization = new Map<string, number>();
+  for (const m of memberships) {
+    perOrganization.set(m.organizationUuid, (perOrganization.get(m.organizationUuid) ?? 0) + 1);
+  }
+  return memberships.map((m) => {
+    const organization = organizationLabel(organizationLabels, m.organizationUuid);
+    if ((perOrganization.get(m.organizationUuid) ?? 0) < 2) return organization;
+    const account =
+      m.accountKey === null
+        ? STORAGE_COPY.forget.accountNotKnown
+        : (accountLabels.get(m.accountKey) ?? accountLabel(m.accountKey, null));
+    return `${organization} · ${account}`;
+  });
+}
+
 // Guard 4 — the LAST gate before ADR-0063's irreversible, fleet-wide delete.
 // Extracted from `ForgetConfirm` for exactly the `table-tree.ts` reason: this
 // repo has no component-test rig, so a rule living inside a dialog is a rule
@@ -238,7 +273,10 @@ export const STORAGE_COPY = {
       note: "One reading a minute. Old readings are what place your 5-hour block boundaries, so they're kept.",
     },
     logs: { label: "Logs", note: "Capped at 5 MB, with one older copy kept." },
-    other: { label: "Other app files", note: "Settings, machine and project identity." },
+    other: {
+      label: "Other app files",
+      note: "Settings, machine and project identity, model prices, your Account and Organization labels and session assignments, which login is which Account, and Gateway records.",
+    },
   } satisfies Record<StorageSegmentId, { label: string; note: string }>,
 
   clean: {
@@ -297,8 +335,11 @@ export const STORAGE_COPY = {
       return rest > 0 ? `…and ${rest.toLocaleString()} more sessions` : null;
     },
     // A row count in the confirm's two lists — each sampled session, and each
-    // Organization's share when the rows span more than one (#295).
+    // Membership's share when the rows span more than one (#295, #631).
     rows: (rows: number): string => `${rows.toLocaleString()} rows`,
+    // The Account half of a breakdown entry whose rows' Account is not known
+    // (`forgetMembershipLabels`): the shared words (`ACCOUNT_NOT_KNOWN`).
+    accountNotKnown: ACCOUNT_NOT_KNOWN,
     confirmCta: "Forget history",
     confirmCancel: "Cancel",
   },

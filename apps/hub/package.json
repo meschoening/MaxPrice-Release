@@ -1,6 +1,6 @@
 {
   "name": "@maxprice/hub",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "private": true,
   "type": "module",
   "exports": {
@@ -8,10 +8,16 @@
     "./auth": "./src/auth.ts",
     "./fanout": "./src/fanout.ts",
     "./machine-directory": "./src/machine-directory.ts",
-    "./organization-directory": "./src/organization-directory.ts",
-    "./organization-assertion-directory": "./src/organization-assertion-directory.ts",
+    "./label-directory": "./src/label-directory.ts",
+    "./membership-assertion-directory": "./src/membership-assertion-directory.ts",
     "./organization-roster": "./src/organization-roster.ts",
-    "./poll-set": "./src/poll-set.ts"
+    "./poll-set": "./src/poll-set.ts",
+    "./key-wiring": "./src/index.ts",
+    "./key-store": "./src/key-store.ts",
+    "./sample-stamps": "./src/sample-stamps.ts",
+    "./gateway-drainer": "./src/gateway-drainer.ts",
+    "./gateway-records": "./src/gateway-records.ts",
+    "./gateway-registry": "./src/gateway-registry.ts"
   },
   "imports": {
     "#page-manifest": {

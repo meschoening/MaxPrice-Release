@@ -71,8 +71,39 @@ import type { FleetForgetResult } from "./fleet";
 // rows this tree excludes, and the evidence half strikes such a pair from the
 // lists, under any marker, persisting the strike before any forget
 // (`archivedExcludedPairs`, #368 review).
+//
+// Since #631 the classification is the PAIR of tracked sets (ADR-0136 §3):
+// the Organizations and the Accounts. Excluding an Account repairs this
+// machine's history for it exactly as excluding an Organization does, because
+// the store lists the pairs either level excluded (`foreignSessions`) and holds
+// their keys (`isExcludedDedupKey`). The marker (version 4) is keyed by both:
+// `tracked`, as before, and `trackedAccounts`, the sorted tracked Account set,
+// `null` while no Account is excluded (an absent `trackedAccounts` in
+// settings, or no Home). A v3 marker is MIGRATED, as v2's was (#368): v3 knew
+// no Account and excluded none, so whatever Account set is resolved when it is
+// first read is taken as the one its done lists were made under. The run that
+// reads it compares Organizations alone, keeps the lists when they match, and
+// persists the v4 body at once. An upgrade therefore re-runs no forget: its
+// first boot resolves the Accounts known at upgrade (ADR-0136 §8), every one
+// tracked, so no pair is newly excluded, and when the host persists that set
+// it is the same set, the same key. A v2 marker migrates through v3 the same
+// way.
 
 const markerSchema = z.object({
+  version: z.literal(4),
+  tracked: z.array(z.string()),
+  trackedAccounts: z.array(z.string()).nullable(),
+  hubTarget: z.string().nullable(),
+  hubEpoch: z.string().nullable(),
+  archiveDone: z.array(z.string()),
+  hubDone: z.array(z.string()),
+  dormant: z.string(),
+  dormantHubDone: z.array(z.string()),
+});
+type Marker = z.infer<typeof markerSchema>;
+
+// v0.9.2's marker (version 3, #276/#311/#515), keyed by the Organizations alone.
+const markerV3Schema = z.object({
   version: z.literal(3),
   tracked: z.array(z.string()),
   hubTarget: z.string().nullable(),
@@ -82,7 +113,6 @@ const markerSchema = z.object({
   dormant: z.string().default(""),
   dormantHubDone: z.array(z.string()).default([]),
 });
-type Marker = z.infer<typeof markerSchema>;
 
 // v0.7.1's marker (`git show 994afaf:apps/sidecar/src/organization-repair.ts`).
 // Its `home` was never null on disk (v0.7.1 returned before writing without
@@ -95,33 +125,52 @@ const markerV2Schema = z.object({
   hubDone: z.array(z.string()),
 });
 
-// The on-disk document as a v3 marker, or null when it is neither version.
-// `migrated` is true for a v2 body: the file must be rewritten even when the
-// comparison keeps everything.
-function parseMarker(raw: unknown): { data: Marker; migrated: boolean } | null {
-  const v3 = markerSchema.safeParse(raw);
-  if (v3.success) return { data: v3.data, migrated: false };
+// The on-disk document as a v4 marker, or null when it is none of the three
+// versions. `migrated` is true for a v2 or v3 body: the file must be
+// rewritten even when the comparison keeps everything. An older body takes
+// `trackedAccounts`, the Account set resolved at the run that reads it, as its
+// own key (see the header): it excluded no Account, so its done lists hold
+// under whichever set this machine now resolves.
+function parseMarker(
+  raw: unknown,
+  trackedAccounts: string[] | null,
+): { data: Marker; migrated: boolean } | null {
+  const v4 = markerSchema.safeParse(raw);
+  if (v4.success) return { data: v4.data, migrated: false };
+  const v3 = markerV3Schema.safeParse(raw);
+  if (v3.success) {
+    return { data: { ...v3.data, version: 4, trackedAccounts }, migrated: true };
+  }
   const v2 = markerV2Schema.safeParse(raw);
   if (!v2.success) return null;
   const { home, hubTarget, archiveDone, hubDone } = v2.data;
-  return {
-    data: markerSchema.parse({
-      version: 3,
-      tracked: home === null ? [] : [home],
-      hubTarget,
-      archiveDone,
-      hubDone,
-    }),
-    migrated: true,
-  };
+  const v3Body = markerV3Schema.parse({
+    version: 3,
+    tracked: home === null ? [] : [home],
+    hubTarget,
+    archiveDone,
+    hubDone,
+  });
+  return { data: { ...v3Body, version: 4, trackedAccounts }, migrated: true };
 }
 
 const DEFAULT_RETRY_MS = 300_000;
 
 const trackedKey = (set: ReadonlySet<string>): string[] => [...set].sort();
 
+// The Account half of the key: sorted, or null for no Account excluded. A
+// non-null set may be empty (a Home membership whose Account is unknown and an
+// empty list), so null and [] are different keys.
+const trackedAccountsKey = (set: ReadonlySet<string> | null): string[] | null =>
+  set === null ? null : trackedKey(set);
+
 function sameKey(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((value, i) => value === b[i]);
+}
+
+function sameAccountsKey(a: readonly string[] | null, b: readonly string[] | null): boolean {
+  if (a === null || b === null) return a === b;
+  return sameKey(a, b);
 }
 
 // #311: the dormant half's key. Sorted, JSON-encoded (a session id is any string),
@@ -144,6 +193,9 @@ function transient(result: Extract<FleetForgetResult, { ok: false }>): boolean {
 export type OrganizationRepairDeps = {
   markerPath: string;
   trackedOrganizations: () => ReadonlySet<string> | null;
+  // #631: the tracked Account set (ADR-0136 §3), the key's other half; `null`
+  // excludes no Account.
+  trackedAccounts: () => ReadonlySet<string> | null;
   foreignSessions: () => ForgetSessionRef[];
   hubTarget: () => string | null;
   // The connected Hub's events epoch at that target, or null when it is not
@@ -235,13 +287,15 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
 
   function freshMarker(
     tracked: string[],
+    trackedAccounts: string[] | null,
     dormant: string,
     hubTarget: string | null,
     hubEpoch: string | null,
   ): Marker {
     return {
-      version: 3,
+      version: 4,
       tracked,
+      trackedAccounts,
       hubTarget,
       hubEpoch,
       archiveDone: [],
@@ -252,21 +306,28 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
   }
 
   // `persistNow` is true when a REAL, readable marker exists for a different
-  // tracked set or dormant set (a rekey) — never for an absent or corrupt
-  // file, which carries no prior classification to wipe — or when the file is
-  // a v0.7.1 marker, which is rewritten as v3 whatever the comparison keeps
-  // (#368).
+  // tracked set, tracked Account set or dormant set (a rekey) — never for an
+  // absent or corrupt file, which carries no prior classification to wipe — or
+  // when the file is a v0.7.1 or v0.9.2 marker, which is rewritten as v4
+  // whatever the comparison keeps (#368, #631).
   async function loadMarker(
     tracked: string[],
+    trackedAccounts: string[] | null,
     dormant: string,
     hubTarget: string | null,
     hubEpoch: string | null,
   ): Promise<{ marker: Marker; persistNow: boolean }> {
     try {
-      const parsed = parseMarker(JSON.parse(await readFile(deps.markerPath, "utf8")));
+      const parsed = parseMarker(
+        JSON.parse(await readFile(deps.markerPath, "utf8")),
+        trackedAccounts,
+      );
       if (parsed !== null) {
         const { data, migrated } = parsed;
-        if (sameKey(data.tracked, tracked)) {
+        if (
+          sameKey(data.tracked, tracked) &&
+          sameAccountsKey(data.trackedAccounts, trackedAccounts)
+        ) {
           // #515: an unknown epoch at the marker's own URL judges nothing, so
           // the marker keeps its epoch and lists; the Hub halves skip this run.
           const epochUnknown = hubTarget !== null && hubEpoch === null;
@@ -289,14 +350,17 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
           };
         }
         return {
-          marker: freshMarker(tracked, dormant, hubTarget, hubEpoch),
+          marker: freshMarker(tracked, trackedAccounts, dormant, hubTarget, hubEpoch),
           persistNow: true,
         };
       }
     } catch {
       // Absent or unreadable: nothing has been repaired under this tracked set.
     }
-    return { marker: freshMarker(tracked, dormant, hubTarget, hubEpoch), persistNow: false };
+    return {
+      marker: freshMarker(tracked, trackedAccounts, dormant, hubTarget, hubEpoch),
+      persistNow: false,
+    };
   }
 
   async function saveMarker(marker: Marker): Promise<void> {
@@ -335,6 +399,7 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
     // on disk as `tracked: []` — a resolved non-null set always contains
     // Home, so the empty array can never collide with a real one.
     const trackedKeyArr = tracked === null ? [] : trackedKey(tracked);
+    const accountsKeyArr = trackedAccountsKey(deps.trackedAccounts());
     const dormant = dormantDigest(deps.dormantSessions());
     const hubTarget = deps.hubTarget()?.replace(/\/+$/, "") ?? null;
     const hubEpoch = hubTarget === null ? null : deps.hubEpoch(hubTarget);
@@ -342,13 +407,16 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
     const hubKnown = hubTarget !== null && hubEpoch !== null;
     const { marker, persistNow } =
       generation === diskGeneration
-        ? await loadMarker(trackedKeyArr, dormant, hubTarget, hubEpoch)
+        ? await loadMarker(trackedKeyArr, accountsKeyArr, dormant, hubTarget, hubEpoch)
         : // A reset has been called whose wipe has not landed yet (or failed):
           // the file still carries the done lists it discarded. Start from an
           // empty marker instead of reading them — the wipe, when it lands,
           // only ever wipes, so nothing this run writes is trusted more than
           // it should be.
-          { marker: freshMarker(trackedKeyArr, dormant, hubTarget, hubEpoch), persistNow: false };
+          {
+            marker: freshMarker(trackedKeyArr, accountsKeyArr, dormant, hubTarget, hubEpoch),
+            persistNow: false,
+          };
     if (persistNow) {
       // A real marker exists for a different tracked set or dormant set: its
       // done lists (or, for the dormant set, its dormant list) don't apply to
@@ -356,13 +424,13 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
       // return early, so a set that is excluded, re-tracked, and excluded
       // again (or cleared to null and restored, or asserted, cleared and
       // asserted again) can never meet a done list the prior exclusion wrote
-      // under the same key. A migrated v0.7.1 marker (#368) is persisted here
-      // too, as the v3 body its comparison produced.
+      // under the same key. A migrated v0.7.1 or v0.9.2 marker (#368, #631) is
+      // persisted here too, as the v4 body its comparison produced.
       await persist(marker, generation);
     }
-    if (tracked === null) {
-      // Nothing is excluded, so nothing is dormant either: no forget, no
-      // rebuild — just the rekey above, if any.
+    if (tracked === null && accountsKeyArr === null) {
+      // Nothing is excluded on either level, so nothing is dormant either: no
+      // forget, no rebuild — just the rekey above, if any.
       disarmRetry();
       return;
     }
@@ -370,8 +438,9 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
     const hubDone = new Set(marker.hubDone);
     const dormantHubDone = new Set(marker.dormantHubDone);
     const snapshot = (): Marker => ({
-      version: 3,
+      version: 4,
       tracked: trackedKeyArr,
+      trackedAccounts: accountsKeyArr,
       hubTarget,
       hubEpoch: marker.hubEpoch,
       archiveDone: [...archiveDone],
@@ -558,6 +627,7 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
         await saveMarker(
           freshMarker(
             tracked === null ? [] : trackedKey(tracked),
+            trackedAccountsKey(deps.trackedAccounts()),
             dormantDigest(deps.dormantSessions()),
             hubTarget,
             hubTarget === null ? null : deps.hubEpoch(hubTarget),

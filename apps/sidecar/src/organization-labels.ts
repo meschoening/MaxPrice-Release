@@ -1,15 +1,23 @@
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { z } from "zod";
+import type { ZodType } from "zod";
 import {
-  checkOrganizationLabel,
+  LABEL_DIRECTORY_MAX,
+  accountUuidSchema,
+  checkLabel,
+  labelEntrySchema,
   mergeNewestWins,
-  organizationLabelEntrySchema,
   organizationUuidKeySchema,
-  type OrganizationLabelEntry,
+  type LabelEntry,
 } from "@maxprice/shared";
+import type { FleetLabels } from "./fleet";
 
 // organization-labels.json — the user's renames (GLOSSARY.md, Organization
 // label; #287): `{ version: 1, labels: { [uuid]: { label, editedAt } } }`.
+// account-labels.json beside it (#635, ADR-0136 §7) is the same store for the
+// Account labels, keyed by account uuid (`accountUuidSchema`, so a
+// Pending key or an address is dropped at load and never pushed); everything
+// said here of the one is said of the other.
 // Durable and user-authored, unlike the disposable `organizations.json` beside
 // it (./organizations.ts): deleting that one costs plan words and Connect's
 // seed until a later login or Connect relearns them, and first-seen times,
@@ -18,7 +26,7 @@ import {
 // that can be re-derived.
 // Each entry carries its own `editedAt` (ISO), and a cleared label stays as a
 // tombstone (`label: null`) rather than being deleted, so the Hub's
-// Organization directory (#288, ADR-0105 §8) can merge copies
+// Label directory (#288, ADR-0105 §8, ADR-0139 §7) can merge copies
 // newest-`editedAt`-wins and an older copy of a rename can never resurrect a
 // label the user cleared. The fleet pushes this file's entries to that
 // directory and adopts its union back through `merge`, so the file also holds
@@ -36,14 +44,14 @@ const labelsFileSchema = z.object({
   labels: z.record(z.unknown()),
 });
 
-export type OrganizationLabels = {
+export type LabelStore = {
   load: () => Promise<void>;
   // The user's label, or null when never set, cleared, or not one the rename
   // rules would accept — so the resolved default applies.
   get: (uuid: string) => string | null;
   // Every entry, tombstones included, by uuid, each as stored. The live map:
   // callers only read it.
-  entries: () => ReadonlyMap<string, Readonly<OrganizationLabelEntry>>;
+  entries: () => ReadonlyMap<string, Readonly<LabelEntry>>;
   // label: an already-validated, trimmed label, or null to clear. Resolves true
   // when it wrote. A request that changes nothing — the label the entry already
   // holds, or a clear of a uuid with no label (no entry, or already a
@@ -61,16 +69,104 @@ export type OrganizationLabels = {
   // change a reader can see — an `editedAt` that moved alone is not. A write
   // that fails rejects and restores every changed entry. Queued with `set`.
   merge: (
-    incoming: Record<string, OrganizationLabelEntry>,
+    incoming: Record<string, LabelEntry>,
   ) => Promise<{ wrote: boolean; labelChanged: boolean }>;
 };
 
-export function createOrganizationLabels(opts: {
+// Whether one more label entry, of either kind, would grow this machine's two
+// label maps past the Label directory's cap on their union (ADR-0139 §7,
+// §10): `adds` when the rename keys an entry its store does not hold yet. The
+// push sends both maps whole while they fit, so a rename the Hub's union
+// could never take is refused here, before it is written, rather than having the Hub refuse every
+// later push. The check and the write it guards run inside one
+// `LabelUnionLock` turn, or two renames of different kinds could both pass at
+// one entry below the cap. Adopting the Hub's union is not capped: the Hub
+// holds its own union to the cap, and adoption cannot refuse another
+// machine's labels. It takes the lock so that a rename's check never reads
+// the union in the middle of an adoption. What this machine adds and has not
+// pushed yet is outside the Hub's union, so a rename here and one on another
+// machine landing at the cap together can still leave this machine over it
+// after adoption; the cap is local, and only the Hub sees the fleet. Such a
+// machine keeps every label, refuses each new one here, and pushes only what
+// the Hub can take (fleet.ts's `labelPushBody`): the rest stay unsynced.
+export function labelUnionFull(
+  organizations: Pick<LabelStore, "entries">,
+  accounts: Pick<LabelStore, "entries">,
+  adds: boolean,
+): boolean {
+  return adds && organizations.entries().size + accounts.entries().size >= LABEL_DIRECTORY_MAX;
+}
+
+// One turn at a time across both label stores, for every step that reads the
+// union of the two maps and then grows it (#635, ADR-0139 §7): the
+// Organization rename's and the Account rename's cap check and write, and
+// the fleet's adoption of the Hub's union into both maps. Each store keeps
+// its own queue for its own writes; this lock is outside them and never taken
+// inside a store's queue, so the two cannot wait on each other. bootSidecar()
+// makes one and hands it to both renames and to `createFleetLabels`. A task
+// that rejects rejects its own caller and never stalls the next.
+export type LabelUnionLock = <T>(task: () => Promise<T>) => Promise<T>;
+
+export function createLabelUnionLock(): LabelUnionLock {
+  let chain: Promise<unknown> = Promise.resolve();
+  return (task) => {
+    const run = chain.then(task);
+    chain = run.catch(() => {});
+    return run;
+  };
+}
+
+// The two stores as the fleet's Label directory sync sees them (#288, #635):
+// both maps pushed whole, and the Hub's union adopted into each store, the
+// Organization map first, then the Account map, with which kind's labels a
+// reader can now see changed. bootSidecar() and the test rigs wire this one
+// adapter.
+export function createFleetLabels(opts: {
+  ready: Promise<void>;
+  organizations: Pick<LabelStore, "entries" | "merge">;
+  accounts: Pick<LabelStore, "entries" | "merge">;
+  unionLock: LabelUnionLock;
+}): FleetLabels {
+  return {
+    ready: opts.ready,
+    entries: () => ({
+      organizations: opts.organizations.entries(),
+      accounts: opts.accounts.entries(),
+    }),
+    merge: (incoming) =>
+      opts.unionLock(async () => {
+        const organizations = await opts.organizations.merge(incoming.organizations);
+        const accounts = await opts.accounts.merge(incoming.accounts);
+        return {
+          organizationsChanged: organizations.labelChanged,
+          accountsChanged: accounts.labelChanged,
+        };
+      }),
+  };
+}
+
+export function createOrganizationLabels(opts: { path: string; now?: () => number }): LabelStore {
+  return createLabelStore({
+    ...opts,
+    name: "organization-labels.json",
+    key: organizationUuidKeySchema,
+  });
+}
+
+export function createAccountLabels(opts: { path: string; now?: () => number }): LabelStore {
+  return createLabelStore({ ...opts, name: "account-labels.json", key: accountUuidSchema });
+}
+
+function createLabelStore(opts: {
   path: string;
+  // The file's name, for its warnings.
+  name: string;
+  // What may key an entry: the Label directory's key for this kind.
+  key: ZodType<string>;
   now?: () => number;
-}): OrganizationLabels {
+}): LabelStore {
   const now = opts.now ?? Date.now;
-  const known = new Map<string, OrganizationLabelEntry>();
+  const known = new Map<string, LabelEntry>();
 
   // Absent: start empty, silently. Unreadable JSON or an envelope that is not
   // `{ version: 1, labels: {…} }`: keep the bytes as `.bak` and start empty.
@@ -85,9 +181,7 @@ export function createOrganizationLabels(opts: {
     } catch (err) {
       // ENOENT — first launch. Any other fault starts empty too, but says so.
       if (!(err instanceof Error && "code" in err && err.code === "ENOENT")) {
-        console.warn(
-          `[sidecar] organization-labels.json could not be read; starting empty: ${err}`,
-        );
+        console.warn(`[sidecar] ${opts.name} could not be read; starting empty: ${err}`);
       }
       return;
     }
@@ -104,15 +198,15 @@ export function createOrganizationLabels(opts: {
       } catch {
         // best-effort — never fail the load on the backup copy
       }
-      console.warn("[sidecar] organization-labels.json unreadable; starting empty (kept .bak)");
+      console.warn(`[sidecar] ${opts.name} unreadable; starting empty (kept .bak)`);
       return;
     }
     // A bad entry is a bounded loss of one label; it leaves the disk at the
     // next write.
     let skipped = 0;
     for (const [uuid, candidate] of Object.entries(file.labels)) {
-      const parsed = organizationLabelEntrySchema.safeParse(candidate);
-      if (parsed.success && organizationUuidKeySchema.safeParse(uuid).success) {
+      const parsed = labelEntrySchema.safeParse(candidate);
+      if (parsed.success && opts.key.safeParse(uuid).success) {
         known.set(uuid, parsed.data);
       } else {
         skipped += 1;
@@ -120,7 +214,7 @@ export function createOrganizationLabels(opts: {
     }
     if (skipped > 0) {
       console.warn(
-        `[sidecar] organization-labels.json: skipped ${skipped} unreadable ${skipped === 1 ? "entry" : "entries"}`,
+        `[sidecar] ${opts.name}: skipped ${skipped} unreadable ${skipped === 1 ? "entry" : "entries"}`,
       );
     }
   }
@@ -175,7 +269,7 @@ export function createOrganizationLabels(opts: {
   }
 
   async function applyMerge(
-    incoming: Record<string, OrganizationLabelEntry>,
+    incoming: Record<string, LabelEntry>,
   ): Promise<{ wrote: boolean; labelChanged: boolean }> {
     const { merged, changed } = mergeNewestWins(known, Object.entries(incoming));
     if (changed.length === 0) return { wrote: false, labelChanged: false };
@@ -209,7 +303,7 @@ export function createOrganizationLabels(opts: {
   function get(uuid: string): string | null {
     const label = known.get(uuid)?.label ?? null;
     if (label === null) return null;
-    const check = checkOrganizationLabel(label);
+    const check = checkLabel(label);
     return check.ok && check.label === label ? label : null;
   }
 

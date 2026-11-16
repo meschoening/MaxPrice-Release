@@ -1,19 +1,23 @@
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
-  storedUsageCredentialSchema,
-  type StoredUsageCredential,
-  type UsageCredential,
-} from "@maxprice/shared";
-import { createFileCredstore, secretsPath } from "./secrets";
+  createHelperGatewayKeyStore,
+  createHelperKeyStore,
+  createMemoryGatewayKeyStore,
+  createMemoryKeyStore,
+  type HubGatewayKeyStore,
+  type HubKeyStore,
+  type KeychainEntries,
+} from "./key-store";
+import { createFileGatewayKeyStore, createFileKeyStore, secretsPath } from "./secrets";
 
-// Where the Hub keeps its claude.ai session key (ADR-0035, ADR-0126 §1), chosen
-// by the platform in `openCredstore`: on Linux, `<data dir>/secrets.json`
-// (secrets.ts), and nowhere else; elsewhere the OS keychain through the Rust
-// keyring helper (credstore/src/main.rs), else memory. The rest of this module
-// is the helper's TS face: the secret crosses process boundaries via
-// stdin/stdout only, and the helper inherits this process's env, so
-// MAXPRICE_CREDSTORE_ACCOUNT (tests) flows through.
+// Where the Hub keeps its claude.ai session keys (ADR-0035, ADR-0126 §1,
+// ADR-0138 §6), chosen by the platform in `openKeyStore`: on Linux,
+// `<data dir>/secrets.json` (secrets.ts), and nowhere else; elsewhere the OS
+// keychain through the Rust keyring helper (credstore/src/main.rs), one entry
+// per Account (key-store.ts), else memory. The rest of this module is the
+// helper's TS face: the secret crosses process boundaries via stdin/stdout
+// only, and the entry's account name is the helper's one argument.
 
 const exeExt = process.platform === "win32" ? ".exe" : "";
 
@@ -38,21 +42,6 @@ export function resolveCredstorePath(
   }
   return null;
 }
-
-// When the key was set and by whom: `credentialUpdatedAt` and
-// `credentialSource` on HubStatus (ADR-0036), "local" for the console's push or
-// a healing client's machine id. POST /api/credential takes it once per push.
-export type CredentialProvenance = { setAt: string; source: string };
-
-// `get` reads what the store holds — a pre-#283 keychain entry still carries
-// the `orgId` the boot stamp needs (ADR-0104), and the file store's entry its
-// provenance, which the boot restores to the status (ADR-0126 §3); `set` only
-// ever writes the key, with its provenance where the store keeps one. The
-// keychain and memory stores keep none: theirs is lost at a restart.
-export type Credstore = {
-  get: () => Promise<(StoredUsageCredential & { provenance?: CredentialProvenance }) | null>;
-  set: (cred: UsageCredential | null, provenance?: CredentialProvenance) => Promise<void>;
-};
 
 // Injectable helper-IPC seam. The default spawns the Rust binary; tests pass a
 // fake to exercise the exit-code mapping + JSON parse without a real keychain.
@@ -117,55 +106,36 @@ export function spawnRunner(
   };
 }
 
-export function createCredstore(
+// The helper's three verbs, each over the one keychain entry its argument
+// names (`usage-credential`, `usage-credential/<uuid>` or
+// `gateway-credential/<id>`). Exit 3 on `get` is
+// no entry; any other non-zero exit throws, naming the verb and the code.
+export function createKeychainEntries(
   helperPath: string,
   run: CredstoreRunner = spawnRunner(helperPath),
-): Credstore {
+): KeychainEntries {
   return {
-    async get() {
-      const { code, stdout } = await run(["get"]);
+    async get(account) {
+      const { code, stdout } = await run(["get", account]);
       if (code === 3) return null; // NoEntry
       if (code !== 0) throw new Error(`credstore get failed (exit ${code})`);
-      try {
-        const parsed = storedUsageCredentialSchema.safeParse(JSON.parse(stdout));
-        return parsed.success ? parsed.data : null;
-      } catch {
-        return null; // corrupt keychain value — treat as not configured
-      }
+      return stdout;
     },
-    async set(cred) {
-      if (cred === null) {
-        const { code } = await run(["delete"]);
-        if (code !== 0) throw new Error(`credstore delete failed (exit ${code})`);
-        return;
-      }
-      const value: UsageCredential = { sessionKey: cred.sessionKey };
-      const { code } = await run(["set"], JSON.stringify(value));
+    async set(account, secret) {
+      const { code } = await run(["set", account], secret);
       if (code !== 0) throw new Error(`credstore set failed (exit ${code})`);
     },
-  };
-}
-
-// Fallback, off Linux, when no helper binary is found (a dev box without
-// cargo): the hub still runs, the credential is memory-only — exactly
-// ADR-0035's rejected-as-end-state but acceptable-as-degraded mode (a client
-// re-push re-arms it). A Linux Hub never falls back to it (ADR-0126 §1).
-// `initial` seeds it (tests: a pre-#283 entry for the boot migration).
-export function createMemoryCredstore(initial: StoredUsageCredential | null = null): Credstore {
-  let held: StoredUsageCredential | null = initial;
-  return {
-    get: () => Promise.resolve(held),
-    set: (cred) => {
-      held = cred === null ? null : { sessionKey: cred.sessionKey };
-      return Promise.resolve();
+    async delete(account) {
+      const { code } = await run(["delete", account]);
+      if (code !== 0) throw new Error(`credstore delete failed (exit ${code})`);
     },
   };
 }
 
 const MEMORY_ONLY =
-  "[hub] no credstore helper found — credential will be memory-only (set MAXPRICE_CREDSTORE_PATH or build credstore/)";
+  "[hub] no credstore helper found — keys will be memory-only (set MAXPRICE_CREDSTORE_PATH or build credstore/)";
 
-export type OpenCredstoreOptions = {
+export type OpenKeyStoreOptions = {
   platform?: NodeJS.Platform;
   env?: Record<string, string | undefined>;
   // The file store's status line (stdout).
@@ -173,21 +143,49 @@ export type OpenCredstoreOptions = {
   // The file store's tighten and skip lines, and the memory-only warning
   // (stderr).
   warn: (line: string) => void;
+  // The helper's runner, for a test.
+  run?: CredstoreRunner;
 };
 
-// serve's store for the key (ADR-0126 §1). The platform decides, not
+// serve's store for the keys (ADR-0126 §1). The platform decides, not
 // headlessness: on Linux every Hub, an embedded one run from source included,
-// keeps its key in `<data dir>/secrets.json`, and never resolves the helper,
+// keeps its keys in `<data dir>/secrets.json`, and never resolves the helper,
 // MAXPRICE_CREDSTORE_PATH included, nor falls back to memory, since the
 // helper's keyring there loses the key at a reboot or refuses every write
-// (#450). Elsewhere, as before: the helper, else memory with a warning.
-export function openCredstore(
+// (#450). Elsewhere, as before: the helper, its uuid list beside hub.json,
+// else memory with a warning (ADR-0035's degraded mode: a client re-push
+// re-arms it).
+export function openKeyStore(
   dataDir: string,
-  { platform = process.platform, env = process.env, log, warn }: OpenCredstoreOptions,
-): Credstore {
-  if (platform === "linux") return createFileCredstore(secretsPath(dataDir), { log, warn });
+  { platform = process.platform, env = process.env, log, warn, run }: OpenKeyStoreOptions,
+): HubKeyStore {
+  if (platform === "linux") return createFileKeyStore(secretsPath(dataDir), { log, warn });
   const helper = resolveCredstorePath(env);
-  if (helper !== null) return createCredstore(helper);
+  if (helper !== null) {
+    return createHelperKeyStore({
+      keychain: createKeychainEntries(helper, run),
+      dataDir,
+      warn,
+    });
+  }
   warn(MEMORY_ONLY);
-  return createMemoryCredstore();
+  return createMemoryKeyStore();
+}
+
+// serve's store for the Gateways' management keys (ADR-0141 §7), by the same
+// platform rule as `openKeyStore`: `secrets.json`'s `gateways` on Linux, the
+// keychain helper elsewhere, else memory. It says nothing of its own: the
+// memory-only warning is `openKeyStore`'s, made once for both.
+export function openGatewayKeyStore(
+  dataDir: string,
+  {
+    platform = process.platform,
+    env = process.env,
+    run,
+  }: Pick<OpenKeyStoreOptions, "platform" | "env" | "run"> = {},
+): HubGatewayKeyStore {
+  if (platform === "linux") return createFileGatewayKeyStore(secretsPath(dataDir));
+  const helper = resolveCredstorePath(env);
+  if (helper !== null) return createHelperGatewayKeyStore(createKeychainEntries(helper, run));
+  return createMemoryGatewayKeyStore();
 }

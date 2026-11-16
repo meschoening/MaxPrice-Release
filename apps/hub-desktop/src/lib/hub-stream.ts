@@ -14,8 +14,8 @@ const realDelay: HubStreamDelay = (ms) => new Promise((r) => setTimeout(r, ms));
 export type HubStreamHandlers = {
   onStatus: () => void;
   onMachines?: () => void;
-  // The Organization directory's empty changed-signal (#288): a label changed.
-  onOrganizations?: () => void;
+  // The Label directory's empty changed-signal (#288, #635): a label changed.
+  onLabels?: () => void;
   // Fired once per LOST connection, just before the reconnect backoff — both
   // when the read threw (the daemon died, the connect was refused, a non-2xx)
   // and when the daemon ended the stream cleanly. Deliberately NOT fired by the
@@ -62,7 +62,7 @@ export function subscribeHubStream(
                 handlers.onStatus();
               }
               if (f.event === HUB_SSE_EVENT.machines) handlers.onMachines?.();
-              if (f.event === HUB_SSE_EVENT.organizations) handlers.onOrganizations?.();
+              if (f.event === HUB_SSE_EVENT.labels) handlers.onLabels?.();
             }
           }
         } finally {

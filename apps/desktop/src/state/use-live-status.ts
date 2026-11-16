@@ -16,6 +16,9 @@ export type LiveStatusState = {
   // reads connection state from anywhere else.
   connectionState: ConnectionState;
   watchedPaths: string[];
+  // `$CLAUDE_CONFIG_DIR`'s projects directories that `claudePaths` leaves out
+  // (#679): Settings › Claude data paths offers to add each.
+  unlistedConfigDirRoots: string[];
   // Pricing provenance + last-attempt outcome (ADR-0053). `null` means the
   // renderer has no answer yet — either no `status:changed` frame has arrived,
   // or the frame carried no `pricing` at all (a stale sidecar binary, the case
@@ -107,6 +110,7 @@ export type LiveStatusState = {
 export const useLiveStatus = create<LiveStatusState>((set) => ({
   connectionState: "reconnecting",
   watchedPaths: [],
+  unlistedConfigDirRoots: [],
   pricing: null,
   lastEventAt: null,
   engineVersion: null,
@@ -131,6 +135,7 @@ export const useLiveStatus = create<LiveStatusState>((set) => ({
   applyStatusSnapshot: (snapshot) =>
     set((s) => ({
       watchedPaths: snapshot.watchedPaths,
+      unlistedConfigDirRoots: snapshot.unlistedConfigDirRoots ?? [],
       // `?? null` for the same reason `hubEventsDegraded` has a fallback: the
       // field is optional on the wire, and absent must land as an explicit
       // "unknown" rather than `undefined` leaking into the store.

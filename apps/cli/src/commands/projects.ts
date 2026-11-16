@@ -4,6 +4,7 @@ import {
   normalize,
   projectsResponseSchema,
 } from "@maxprice/shared";
+import { accountProbes, rowAccounts } from "../account-column";
 import { connect } from "../daemon-client";
 import { EXIT } from "../exit";
 import type { Io, Parsed } from "../main";
@@ -20,6 +21,13 @@ import { readSettings } from "../settings";
 // the Identity directory's index as `--project` does, and reads the Machine
 // directory while the machine axis is on, for the Machines column. `--json`
 // reads neither unless `--project` or `--machine` needs it.
+//
+// The Accounts column (ADR-0140 §3) shows while the Scope's Memberships span
+// two or more Accounts. Rows carry no Account, so the table then asks the
+// route once more per Account in the Scope, and once for the usage whose
+// Account is not known when the Scope holds it, each narrowed by the
+// `membership` param (`account-column.ts`): a project lists the Accounts
+// whose answer holds one of its directories. `--json` asks none of them.
 
 export const PROJECTS_HELP_REF = "maxprice projects --help";
 
@@ -45,9 +53,25 @@ export async function projects(parsed: Parsed, io: Io, env: Env = process.env): 
   }
   const { identity } = request;
   if (identity === null) throw new Error("the projects report read no Identity directory index");
+  const probes = accountProbes(request);
+  const accounts =
+    probes === null
+      ? null
+      : await rowAccounts(
+          daemon,
+          "/api/projects",
+          projectsResponseSchema,
+          request.input,
+          probes,
+          (answer) => answer.projects.map((p) => p.slug),
+        );
   io.stdout.write(
     renderProjects(
-      { ...reportContext(request, Date.now()), groups: foldProjectRows(data.projects, identity) },
+      {
+        ...reportContext(request, Date.now()),
+        groups: foldProjectRows(data.projects, identity),
+        accounts,
+      },
       terminalOutput(io.stdout, env),
     ),
   );

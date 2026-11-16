@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { normalizeHubUrl } from "@maxprice/shared";
+import { isValidHubPassword, normalizeHubUrl } from "@maxprice/shared";
 import { getSidecarUrl } from "@/lib/sidecar";
 import { usageAuthHeaders } from "@/lib/usage-credential";
 import { insideTauri } from "@/lib/tauri";
@@ -14,6 +14,20 @@ export async function readHubPassword(): Promise<string | null> {
 
 export async function writeHubPassword(password: string | null): Promise<void> {
   await invoke("set_hub_password", { value: password });
+}
+
+// Read the stored keychain password (Tauri-only; null outside Tauri or when
+// unset) and reject a value poisoned by an earlier bad paste — one that can't
+// form a valid Authorization header fails every push opaquely as a generic
+// "unreachable" (F18). Throws a user-facing Error on a corrupted value; the
+// Usage hub section's Save and "Send keys to the Hub" (hub-auto-heal.ts)
+// catch it into their error line and skip the push, prompting a re-entry.
+export async function readStoredHubPassword(): Promise<string | null> {
+  const stored = insideTauri() ? await readHubPassword() : null;
+  if (stored !== null && stored !== "" && !isValidHubPassword(stored)) {
+    throw new Error("The stored hub password looks corrupted — re-enter it.");
+  }
+  return stored;
 }
 
 // Pure derivation of the url/password fields sent to the sidecar. An empty url

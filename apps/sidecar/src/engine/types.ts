@@ -108,10 +108,14 @@ export const assistantRecordSchema = z
 // usage event, and it is NOT a member of `jsonlRecordSchema` — the scan reads
 // it ahead of the pre-filter (jsonl.ts) and it never reaches the union. Older
 // records omit the owner fields; those are no evidence, not a reset.
+// `ownerAccountUuid` names the owning Account beside the Organization, present
+// only when known (ADR-0137): it is read only from a record that names an
+// Organization, and such a record without it names no Account.
 export const ownerRecordSchema = z
   .object({
     type: z.literal("bridge-session"),
     ownerOrganizationUuid: z.string().min(1).optional(),
+    ownerAccountUuid: z.string().min(1).optional(),
   })
   .passthrough();
 export type OwnerRecord = z.infer<typeof ownerRecordSchema>;
@@ -133,6 +137,29 @@ export const loginRecordSchema = z
   })
   .passthrough();
 export type LoginRecord = z.infer<typeof loginRecordSchema>;
+
+// The Email record (ADR-0137 §2): the `session_context` attachment Claude Code
+// writes at a session's first query, under the same claude.ai-login gate as the
+// Login record, whose `context.userEmail` is a sentence embedding the login's
+// email address. A re-announce adds `changed: true` and a `reason`; only
+// `reason: "account_change"` (the in-process login routine's) moves the
+// Account. Attribution evidence like the Login record: never a usage event, read
+// ahead of the pre-filter (jsonl.ts). A sentence naming no address is no
+// evidence.
+export const emailRecordSchema = z
+  .object({
+    type: z.literal("attachment"),
+    attachment: z
+      .object({
+        type: z.literal("session_context"),
+        context: z.object({ userEmail: z.string() }).passthrough(),
+        changed: z.boolean().optional(),
+        reason: z.string().optional(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+export type EmailRecord = z.infer<typeof emailRecordSchema>;
 
 // Every non-assistant record kind. The engine reads none of their innards, so
 // each is modelled as `{ type: <literal> }` open — enough to discriminate, no
@@ -200,6 +227,7 @@ export type JsonlRecord = z.infer<typeof jsonlRecordSchema>;
 //   - `costUSD`         — top-level `costUSD`, when present (never `null`)
 //   - `cwd`             — top-level `cwd`, the session's working directory
 //   - `organizationUuid` — the Login or Owner record in effect above it (jsonl.ts)
+//   - `accountUuid` / `accountEmailHash` — the Account cursor's evidence (jsonl.ts)
 export type UsageRecord = {
   timestamp: string;
   messageId: string;
@@ -226,7 +254,46 @@ export type UsageRecord = {
   // transcript's rows are tagged the same way, and the store ignores that tag:
   // every subagent row inherits its parent session's owner (ADR-0109 §5).
   organizationUuid: string | undefined;
+  // The Account (GLOSSARY.md, ADR-0137 §2) this line's evidence names, on the
+  // same clock as `organizationUuid`, AS READ: never resolved, so at most one
+  // of the two is set. From the file's first Login record on it is the Email
+  // cursor's, `accountEmailHash` (emailHash's SHA-256 hex of the address,
+  // never the address itself); in a file with no Login record it is the most
+  // recent Owner record's `ownerAccountUuid`, `accountUuid`. Both `undefined`
+  // when that source names none. The hash is resolved to a uuid through the
+  // pair table at ingest, never here, so a pair learned later re-resolves a
+  // cached row with no re-parse (ADR-0137 §6). A subagent's rows are tagged
+  // the same way, and that tag is no evidence (ADR-0137 §2).
+  accountUuid: string | undefined;
+  accountEmailHash: string | undefined;
 };
+
+// A record's or a row's Account evidence, as read: `UsageRecord`'s two fields,
+// at most one of them set. The parser's cursor answers it (jsonl.ts's
+// `attributedAccount`) and the store's owner points carry it (store.ts).
+export type AccountEvidence = Pick<UsageRecord, "accountUuid" | "accountEmailHash">;
+
+// The evidence of a line or a row that carries none, shared because it is
+// never mutated.
+export const NO_ACCOUNT_EVIDENCE: AccountEvidence = {
+  accountUuid: undefined,
+  accountEmailHash: undefined,
+};
+
+// Whether a line or a row carries transcript evidence of its own: an
+// Organization, or an Account by uuid or email hash. A matched Gateway record
+// is evidence only for a line where this is false (ADR-0141 §2), so the
+// store's Gateway lookup, its `hasTranscriptEvidence` and the sessions
+// report's evidence fold share this one test.
+export function hasOwnEvidence(
+  e: Pick<UsageRecord, "organizationUuid" | "accountUuid" | "accountEmailHash">,
+): boolean {
+  return (
+    e.organizationUuid !== undefined ||
+    e.accountUuid !== undefined ||
+    e.accountEmailHash !== undefined
+  );
+}
 
 // The on-disk parse cache's whole-cache version (ADR-0048). The cache stores
 // `UsageRecord[]` per source file and loads them WITHOUT re-validation, so any
@@ -240,8 +307,10 @@ export type UsageRecord = {
 // reviewed together.
 // History: 1 — the original shape; 2 — ADR-0098 added `organizationUuid`;
 // 3 — ADR-0109: a Login record outranks the Owner record, so a cached
-// record's `organizationUuid` may be stale.
-export const SCAN_CACHE_VERSION = 3;
+// record's `organizationUuid` may be stale; 4 — ADR-0137 §6 added
+// `accountUuid` and `accountEmailHash` (the cache stores an Email record's
+// evidence as the email hash, never a uuid a pair resolves it to).
+export const SCAN_CACHE_VERSION = 4;
 
 // ---------------------------------------------------------------------------
 // parseLine result

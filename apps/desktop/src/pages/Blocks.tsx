@@ -3,21 +3,26 @@ import type { BlockKind, BlockRow, BlocksAggregate, TimeDisplay } from "@maxpric
 import { useFilters } from "@/state/filters";
 import { useWeekWindow } from "@/state/use-week";
 import { useSettings, useTimeDisplay } from "@/state/use-settings";
-import { useOrganizationScope } from "@/state/use-organization-scope";
+import { useScope } from "@/state/use-scope";
 import { useBlocks } from "@/state/use-blocks";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useCorpusEmpty } from "@/state/use-corpus-empty";
 import { useEscapeToDeselect } from "@/state/use-escape-deselect";
 import { useNowTick } from "@/state/use-now-tick";
+import { useBlocksTabs } from "@/state/use-blocks-tabs";
 import { EmptyState } from "@/components/EmptyState";
 import { DataTable, type Column } from "@/components/data-table";
 import { StripPage } from "@/components/strip-page";
 import { DetailStrip, StripIdentity, StripSection, StripStat } from "@/components/detail-strip";
 import { ModelBadges } from "@/components/model-badges";
+import { UnknownAccountStat } from "@/components/unknown-account-stat";
+import { MembershipStrip, MembershipTabs } from "@/components/membership-blocks";
 import {
   abbreviate,
+  ACCOUNT_NOT_KNOWN,
   activeBlockOf,
   aggregateBlocks,
+  blocksHeadAccountNotKnown,
   blockKind,
   blockRemainingLabel,
   blockStartMs,
@@ -25,9 +30,11 @@ import {
   formatRange,
   formatRelativeTime,
   formatWallDayMonth,
+  homeMembershipOf,
   RANGE_LABEL,
   resolveDateRange,
   typicalBlockTokens,
+  unknownAccountUsage,
 } from "@maxprice/shared";
 import { WINDOW_SOURCE } from "@/components/window-source";
 import { useArrangement } from "@/state/use-arrangement";
@@ -77,18 +84,32 @@ export function BlocksPage(): React.ReactElement {
   const tz = settings?.timezone;
   // ADR-0106/ADR-0108: the Organization scope rides beside `mode` and `tz`; the
   // sidecar forms Blocks for its Quota organization.
-  const { organization } = useOrganizationScope();
+  const { params: scope } = useScope();
   const display = useTimeDisplay();
   const week = useWeekWindow();
   const { since, until } = resolveDateRange(dateRange, tz, week);
   const now = useNowTick(60_000);
 
+  // A tab per Membership while two or more tracked Accounts are (#619 A,
+  // #638); `single` on a one-Account install, which keeps today's page.
+  const [tabToken, setTabToken] = useState<string | null>(null);
+  const tabsView = useBlocksTabs({ since, until, selectedToken: tabToken, nowMs: now });
+  const membershipTab =
+    tabsView.kind === "tabs"
+      ? tabsView.selected
+      : tabsView.kind === "one"
+        ? tabsView.tab
+        : undefined;
+
+  // The shown Membership's Blocks alone (its `membership` token names the
+  // Scope), the range, model and machine filters kept; else the Scope's head
+  // Membership's, as before.
   const query = useBlocks({
     since,
     until,
     mode: settings?.costMode ?? "auto",
     tz,
-    organization,
+    ...(membershipTab === undefined ? scope : { memberships: [membershipTab.token] }),
     models,
     machines: machineAxis.machineParams,
   });
@@ -109,9 +130,21 @@ export function BlocksPage(): React.ReactElement {
   };
   const deselect = useCallback(() => setSelectedId(undefined), []);
   useEscapeToDeselect(deselect);
+  const pickTab = (token: string): void => {
+    setTabToken(token);
+    setSelectedId(undefined);
+  };
 
   // Filter totals for the strip's no-selection state (ADR-0016).
   const aggregate = useMemo(() => aggregateBlocks(blocks), [blocks]);
+  // Usage whose Account is not known, outside the head's Blocks (#635).
+  const unknown = useMemo(() => unknownAccountUsage(query.data), [query.data]);
+  // The head Blocks are the Unknown Membership's, heading in place of an
+  // empty Home membership (#644): the strip says "account not known".
+  const headAccountNotKnown = blocksHeadAccountNotKnown(
+    query.data,
+    settings === undefined ? null : homeMembershipOf(settings),
+  );
 
   // First-launch empty state — the engine holds no usage data at all. Captured
   // before the columns memo / early return below so the hook order is stable.
@@ -227,31 +260,50 @@ export function BlocksPage(): React.ReactElement {
     );
   }
 
+  const strip = selected ? (
+    <BlockDetailStrip block={selected} typical={typical} display={display} />
+  ) : query.isPending ? (
+    // The blocks query hasn't resolved yet — a quiet shell rather than a
+    // false "0 blocks · $0.00" aggregate.
+    <DetailStrip selected={false}>
+      <span className="text-sm text-soft">Loading…</span>
+    </DetailStrip>
+  ) : query.isError && blocks.length === 0 ? (
+    // A failed query with nothing cached: the zero aggregate would
+    // assert a false "0 blocks · $0.00" — say what happened instead
+    // (the table body carries the danger inset).
+    <DetailStrip selected={false}>
+      <span className="text-sm text-soft">Couldn&apos;t load blocks.</span>
+    </DetailStrip>
+  ) : membershipTab !== undefined ? (
+    <MembershipStrip
+      tab={membershipTab}
+      aggregate={aggregate}
+      rangeLabel={RANGE_LABEL[dateRange]}
+      activeBlock={activeBlock}
+      nowMs={now}
+    />
+  ) : (
+    <BlocksAggregateStrip
+      aggregate={aggregate}
+      rangeLabel={RANGE_LABEL[dateRange]}
+      activeBlock={activeBlock}
+      unknown={unknown}
+      headAccountNotKnown={headAccountNotKnown}
+    />
+  );
+
   return (
     <StripPage
       onBackgroundClick={deselect}
       strip={
-        selected ? (
-          <BlockDetailStrip block={selected} typical={typical} display={display} />
-        ) : query.isPending ? (
-          // The blocks query hasn't resolved yet — a quiet shell rather than a
-          // false "0 blocks · $0.00" aggregate.
-          <DetailStrip selected={false}>
-            <span className="text-sm text-soft">Loading…</span>
-          </DetailStrip>
-        ) : query.isError && blocks.length === 0 ? (
-          // A failed query with nothing cached: the zero aggregate would
-          // assert a false "0 blocks · $0.00" — say what happened instead
-          // (the table body carries the danger inset).
-          <DetailStrip selected={false}>
-            <span className="text-sm text-soft">Couldn&apos;t load blocks.</span>
-          </DetailStrip>
+        tabsView.kind === "tabs" ? (
+          <div className="flex flex-col gap-[12px]">
+            <MembershipTabs view={tabsView} onPick={pickTab} />
+            {strip}
+          </div>
         ) : (
-          <BlocksAggregateStrip
-            aggregate={aggregate}
-            rangeLabel={RANGE_LABEL[dateRange]}
-            activeBlock={activeBlock}
-          />
+          strip
         )
       }
       table={
@@ -357,16 +409,21 @@ function BlocksAggregateStrip({
   aggregate,
   rangeLabel,
   activeBlock,
+  unknown,
+  headAccountNotKnown,
 }: {
   aggregate: BlocksAggregate;
   rangeLabel: string;
   activeBlock: BlockRow | undefined;
+  unknown: BlocksAggregate | null;
+  headAccountNotKnown: boolean;
 }): React.ReactElement {
   return (
     <DetailStrip selected={false}>
       <StripIdentity title="All blocks">
         <span className="sub num">
           {aggregate.count} blocks · {rangeLabel}
+          {headAccountNotKnown ? ` · ${ACCOUNT_NOT_KNOWN.toLowerCase()}` : null}
         </span>
       </StripIdentity>
 
@@ -376,6 +433,7 @@ function BlocksAggregateStrip({
       <StripStat label="active burn">
         {activeBlock?.burnRate ? `${abbreviate(activeBlock.burnRate.tokensPerMinute)}/min` : "—"}
       </StripStat>
+      <UnknownAccountStat usage={unknown} />
 
       <StripSection label="Models">
         {aggregate.models.length > 0 ? (

@@ -18,6 +18,7 @@ import {
   type PathCapture,
 } from "./project-path";
 import type { StoredEvent } from "./store";
+import { hasOwnEvidence } from "./types";
 
 // Part 4.5 — E6: the sessions aggregator.
 //
@@ -153,6 +154,12 @@ export type SessionBucket = ModelRollup & {
   // reports the worktree, matching the slug it is filed under; see
   // `./project-path`.
   cwd: PathCapture;
+  // The Gateway signature's two facts (ADR-0141 §4): whether any folded event
+  // carries a `requestId`, and whether any carries transcript Attribution
+  // evidence (a tag its transcript gave it, never a matched Gateway record's,
+  // `viaGateway`). The row carries `gatewaySignature` when neither.
+  anyRequestId: boolean;
+  anyTranscriptEvidence: boolean;
 };
 
 // One half of a session's split: the raw ISO timestamp of the latest event of
@@ -171,6 +178,8 @@ function emptyBucket(projectSlug: string): SessionBucket {
     latestOwnerless: undefined,
     latestOwned: undefined,
     cwd: emptyPathCapture(),
+    anyRequestId: false,
+    anyTranscriptEvidence: false,
   };
 }
 
@@ -203,6 +212,10 @@ function foldEvent(
   // Events fold in timestamp order, so the fallback is still the first
   // non-empty `cwd`; a `cwd` that encodes to the session's project slug wins.
   capturePath(bucket.cwd, event.projectSlug, event.cwd);
+  if (event.requestId !== undefined) bucket.anyRequestId = true;
+  if (event.viaGateway !== true && hasOwnEvidence(event)) {
+    bucket.anyTranscriptEvidence = true;
+  }
   // #309: EVERY event raises the summary, not only the latest — the same
   // bound presumption `organizationUuid` resolves through below, so the two
   // fields of one row can never have been answered under different rules.
@@ -286,6 +299,12 @@ function flushRow(sessionId: string, bucket: SessionBucket): SessionRow {
             owned: bucket.latestOwned.org,
           },
         }
+      : {}),
+    // ADR-0141 §4: present only for a session that looks Gateway-served (no
+    // line with a `requestId`, none with transcript evidence); omitted
+    // otherwise, so no other session's row changes.
+    ...(!bucket.anyRequestId && !bucket.anyTranscriptEvidence
+      ? { gatewaySignature: true as const }
       : {}),
   };
 }

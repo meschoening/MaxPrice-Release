@@ -1,19 +1,23 @@
 import { HubStatusCard } from "@/components/HubStatusCard";
+import { AccountsCard } from "@/components/AccountsCard";
 import { ClaudeAccountCard } from "@/components/ClaudeAccountCard";
 import { AccessCard } from "@/components/AccessCard";
 import { ClientsRosterCard } from "@/components/ClientsRosterCard";
 import { MachinesCard } from "@/components/MachinesCard";
-import { OrganizationsCard } from "@/components/OrganizationsCard";
+import { GatewaysCard } from "@/components/GatewaysCard";
 import { UpdatesCard } from "@/components/UpdatesCard";
 import { ToastHost } from "@/components/toast";
 import { useHubMachines } from "@/state/use-hub-machines";
+import { useHubStatus } from "@/state/use-hub-status";
 import { useHubStream } from "@/state/use-hub-stream";
 import { NowTickProvider } from "@/state/use-now-tick";
 import { themeChipLabel, useTheme } from "@/lib/theme";
+import { todayAccountLook } from "@/lib/presentation";
 
 export function App(): React.ReactElement {
   useHubStream();
   const machines = useHubMachines();
+  const { data: status } = useHubStatus();
 
   // The tray tooltip is NOT driven from here anymore (ADR-0050, amending
   // ADR-0049): the popout webview owns it — it is the semantic tray surface,
@@ -47,8 +51,10 @@ export function App(): React.ReactElement {
       </header>
       <main className="cards">
         <HubStatusCard />
-        <ClaudeAccountCard />
-        <OrganizationsCard />
+        {/* Today's Claude account card until the Hub knows more than one
+            Account or Membership; then the Accounts card (#614 §1, §7). */}
+        {todayAccountLook(status?.accounts) ? <ClaudeAccountCard /> : <AccountsCard />}
+        <GatewaysCard />
         <AccessCard />
         {machines.data === null ? <ClientsRosterCard /> : <MachinesCard />}
         <UpdatesCard />

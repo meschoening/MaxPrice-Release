@@ -21,7 +21,8 @@ import { type Column, NAME_MIN, type Output, renderTable } from "./table";
 //   │ Team         │ bbbbbbbb │ Tracked  │               │ the fleet    │ yes        │
 //   └──────────────┴──────────┴──────────┴───────────────┴──────────────┴────────────┘
 //
-// The rows are the Desktop client's Organizations list's: Home first, then
+// The rows are the order the Desktop client's Organizations list had before
+// Settings › Accounts replaced it (#639): Home first, then
 // the roster's order, each under its collision-suffixed label. Home is the
 // roster's, the daemon's own: the persisted setting, else its seed.
 
@@ -34,7 +35,7 @@ export const EMPTY_ROSTER =
 // id, the exclude confirmation's title shape (`excludeTitle`). The bare
 // label, since the id follows: a collision suffix would name the id twice.
 // Inert, since a label is the user's.
-export function organizationName(entry: Pick<OrganizationEntry, "uuid" | "label">): string {
+export function organizationText(entry: Pick<OrganizationEntry, "uuid" | "label">): string {
   return `${terminalText(entry.label)} (${shortId(entry.uuid)})`;
 }
 

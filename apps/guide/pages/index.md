@@ -6,13 +6,13 @@ MaxPrice shows what your Claude Code use would cost at API prices, and how close
 
 ## What MaxPrice does
 
-- **It reads Claude Code's own logs.** Claude Code writes a log for every session under `~/.claude/projects` or `~/.config/claude/projects` (or `$CLAUDE_CONFIG_DIR/projects` when that is set). MaxPrice only reads these files and never changes them. What it keeps from them is usage alone: when each request ran, its model, its token counts and cost, and the directory it ran in. It keeps none of your prompts or Claude's replies.
+- **It reads Claude Code's own logs.** Claude Code writes a log for every session under `~/.claude/projects` or `~/.config/claude/projects` (or `$CLAUDE_CONFIG_DIR/projects` when that is set). The Desktop client reads the folders listed in [Settings › Claude data paths](desktop-client/settings.md#claude-data-paths), which start as those two. MaxPrice only reads these files and never changes them. What it keeps from them is usage alone: when each request ran, its model, its token counts and cost, and the directory it ran in. It keeps none of your prompts or Claude's replies.
 - **It prices each request at Anthropic's API rates**, from LiteLLM's public model prices. On a subscription plan that is not a bill: it measures how much you use, in dollars. See [Cost modes and pricing](concepts/cost-modes.md).
 - **It shows your real usage limits** once you give it your claude.ai session key: the 5-hour and weekly limits your plan sets. See [Blocks and usage limits](concepts/blocks.md).
 - **It keeps your history** after Claude Code deletes its old logs. See [The archive and where data lives](concepts/archive.md).
 - **It can combine several machines** through a Hub, so one view shows the usage of every machine you run Claude Code on. See [Hubs and the fleet](concepts/hubs.md).
 
-Your usage stays on your machine unless you join it to a Hub. Apart from a Hub, MaxPrice connects to three places: claude.ai, for your usage limits, and only once you give it a session key; LiteLLM's model prices on GitHub; and MaxPrice's update channel.
+Your usage stays on your machine unless you join it to a Hub. Apart from a Hub and any [Gateway](desktop-client/settings.md#gateways) you connect, MaxPrice connects to three places: claude.ai, for your usage limits, and only once you give it a session key; LiteLLM's model prices on GitHub; and MaxPrice's update channel.
 
 ## Which do I need?
 
@@ -41,7 +41,7 @@ Every product is on the [releases page](https://github.com/meschoening/MaxPrice-
 
 These pages explain the ideas every product shares. Other pages link here the first time they use one of these terms.
 
-- [Organizations](concepts/organizations.md): which claude.ai Organization your usage belongs to, and which ones MaxPrice counts.
+- [Accounts and Organizations](concepts/organizations.md): which claude.ai login and Organization your usage belongs to, and which ones MaxPrice counts.
 - [Blocks and usage limits](concepts/blocks.md): the 5-hour windows your plan limits, and the claude.ai session key that reads them.
 - [Cost modes and pricing](concepts/cost-modes.md): how MaxPrice puts a dollar figure on each request.
 - [Projects](concepts/projects.md): how directories, worktrees and checkouts on other machines become one project.

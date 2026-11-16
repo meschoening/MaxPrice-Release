@@ -8,6 +8,7 @@ import { currentWindowLabel } from "./lib/tauri";
 import { isMacOS } from "./lib/platform";
 import { queryClient } from "./lib/query";
 import "./styles/globals.css";
+import "./styles/topbar-scope-chip.css";
 
 // ONE bundle, branched on the webview window's label (the hub's ADR-0050
 // pattern; map #168 / M2): the app mounts the router, the tray popout mounts

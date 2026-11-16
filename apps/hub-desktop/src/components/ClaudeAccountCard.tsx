@@ -2,51 +2,88 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   formatRelativeTime,
-  hubKeyLabel,
+  hubKeyHeld,
+  hubKeyProvenance,
   usageConnectionDot,
   usageConnectionLabel,
+  type HubAccount,
   type HubOrganization,
-  type UsageConnection,
 } from "@maxprice/shared";
 import { useHubOrganizations } from "@/state/use-hub-organizations";
 import { useHubStatus } from "@/state/use-hub-status";
 import { useNowTick } from "@/state/use-now-tick";
-import { hubFetch, hubStatusQueryKey } from "@/lib/hub-api";
+import { clearCredential, hubStatusQueryKey, saveCredential } from "@/lib/hub-api";
 import { dotVariant } from "@/lib/dot-variant";
 import { showToast } from "@/lib/toast";
-import {
-  accountOrganizationValue,
-  discoveredOrganizations,
-  organizationLabels,
-} from "@/lib/presentation";
+import { accountOrganizationValue, keyOrganizations, organizationLabels } from "@/lib/presentation";
 
+// The Claude account card (ADR-0036, ADR-0139 §4) at today's look: kept for a
+// Hub that knows no Account yet and for a single Account with at most one
+// Membership (#614 §7, `todayAccountLook`); anything more gets the Accounts
+// card. Save posts the key alone to /api/credentials, where the Hub learns its
+// Account; Clear removes the key by its own route.
 export function ClaudeAccountCard(): React.ReactElement {
   const { data: status } = useHubStatus();
   const { data: organizations } = useHubOrganizations();
-  const qc = useQueryClient();
   const now = useNowTick();
+  return (
+    <ClaudeAccountCardContent
+      account={status?.accounts[0]}
+      rows={organizations?.organizations}
+      lastSampleAt={status?.usageLastSampleAt ?? null}
+      now={now}
+    />
+  );
+}
+
+// Props only, so the tests render it without a Hub. An Account the fleet
+// names only by an event tag holds no key, so the card reads as no key.
+export function ClaudeAccountCardContent({
+  account,
+  rows,
+  lastSampleAt,
+  now,
+}: {
+  // The Hub's one Account, undefined while it knows none.
+  account: HubAccount | undefined;
+  rows: readonly HubOrganization[] | undefined;
+  lastSampleAt: string | null;
+  now: number;
+}): React.ReactElement {
+  const entry = account !== undefined && hubKeyHeld(account) ? account : undefined;
+  return <AccountCard entry={entry} rows={rows} lastSampleAt={lastSampleAt} now={now} />;
+}
+
+function AccountCard({
+  entry,
+  rows,
+  lastSampleAt,
+  now,
+}: {
+  // The held key this card shows; undefined: no key at all.
+  entry: HubAccount | undefined;
+  rows: readonly HubOrganization[] | undefined;
+  lastSampleAt: string | null;
+  now: number;
+}): React.ReactElement {
+  const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [sessionKey, setSessionKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const conn = status?.usageConnection ?? "disconnected";
-  const present = status?.credentialPresent ?? false;
+  const conn = entry?.connection ?? "disconnected";
+  const heading = "Claude account";
 
-  async function postCredential(body: unknown): Promise<void> {
+  async function act(request: () => Promise<unknown>, done: string): Promise<void> {
     setBusy(true);
     setError(null);
     try {
-      const res = await hubFetch("/api/credential", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error(`credential ${res.status}: ${await res.text()}`);
+      await request();
       setSessionKey("");
       setEditing(false);
       await qc.invalidateQueries({ queryKey: hubStatusQueryKey() });
-      showToast(body === null ? "Key cleared" : "Key saved");
+      showToast(done);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -55,9 +92,9 @@ export function ClaudeAccountCard(): React.ReactElement {
   }
 
   return (
-    <section className="panel card" aria-label="Claude account">
+    <section className="panel card" aria-label={heading}>
       <div className="card-head">
-        <span className="eyebrow">Claude account</span>
+        <span className="eyebrow">{heading}</span>
         <span className="status">
           <span aria-hidden className={`dot ${dotVariant(usageConnectionDot(conn))}`} />
           {usageConnectionLabel(conn)}
@@ -66,12 +103,12 @@ export function ClaudeAccountCard(): React.ReactElement {
       <div className="krows">
         <div className="krow">
           <span>Last sample</span>
-          <b>{formatRelativeTime(status?.usageLastSampleAt ?? null, now)}</b>
+          <b>{formatRelativeTime(lastSampleAt, now)}</b>
         </div>
-        <AccountOrganizationRow rows={organizations?.organizations} connection={conn} />
+        <AccountOrganizationRow rows={rows} entry={entry} />
         <div className="krow">
           <span>Key</span>
-          <b>{hubKeyLabel(status, now)}</b>
+          <b>{hubKeyProvenance(entry, now)}</b>
         </div>
       </div>
 
@@ -90,9 +127,10 @@ export function ClaudeAccountCard(): React.ReactElement {
               type="button"
               className="chip active"
               disabled={busy || sessionKey.trim() === ""}
-              // The key alone (ADR-0104): the Hub lists and polls every
-              // Organization it can read.
-              onClick={() => void postCredential({ sessionKey: sessionKey.trim() })}
+              // The key alone (ADR-0139 §4): the Hub reads its Account from
+              // claude.ai, stores it there, and lists and polls every
+              // Organization that Account can read.
+              onClick={() => void act(() => saveCredential(sessionKey.trim()), "Key saved")}
             >
               {busy ? "Saving…" : "Save key"}
             </button>
@@ -118,8 +156,11 @@ export function ClaudeAccountCard(): React.ReactElement {
           <button
             type="button"
             className="chip ghost-btn"
-            disabled={busy || !present}
-            onClick={() => void postCredential(null)}
+            disabled={busy || entry === undefined}
+            onClick={() => {
+              if (entry !== undefined)
+                void act(() => clearCredential(entry.accountUuid), "Key cleared");
+            }}
           >
             Clear
           </button>
@@ -135,22 +176,22 @@ export function ClaudeAccountCard(): React.ReactElement {
   );
 }
 
-// The Organization row (#294): what the key discovered, by label. The labels
-// span every row the roster answers, so a collision suffix here reads as it
-// does on the Organizations card and the Machines card's Home lines.
+// The Organization row (#294): what this card's key discovered, by label. The
+// labels span every row the roster answers, so a collision suffix here reads
+// as it does on the Accounts card and the Machines card's Home lines.
 export function AccountOrganizationRow({
   rows,
-  connection,
+  entry,
 }: {
   rows: readonly HubOrganization[] | undefined;
-  connection: UsageConnection;
+  entry: HubAccount | undefined;
 }): React.ReactElement {
   return (
     <div className="krow">
       <span>Organization</span>
       <b>
         {accountOrganizationValue(
-          discoveredOrganizations(rows, connection),
+          entry === undefined ? [] : keyOrganizations(rows, entry),
           organizationLabels(rows ?? []),
         )}
       </b>

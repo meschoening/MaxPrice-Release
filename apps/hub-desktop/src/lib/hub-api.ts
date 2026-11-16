@@ -1,16 +1,28 @@
 import {
+  HUB_CREDENTIALS_PATH,
+  HUB_GATEWAYS_PATH,
   HUB_ORGANIZATIONS_PATH,
   HUB_PROTOCOL_VERSION,
-  ORGANIZATION_DIRECTORY_PATH,
+  LABEL_DIRECTORY_PATH,
   hubCompactResponseSchema,
+  hubCredentialAckSchema,
+  gatewayConnectResponseSchema,
+  hubCredentialPath,
   hubClientsResponseSchema,
+  hubGatewayPath,
+  hubLabelDirectorySchema,
   hubMachinesResponseSchema,
   hubOrganizationsResponseSchema,
   hubStatusSchema,
   type HubClientsResponse,
+  type GatewayConnectRequest,
+  type GatewayConnectResponse,
+  type HubCredentialAck,
+  type HubLabelDirectory,
   type HubMachinesResponse,
   type HubOrganizationsResponse,
   type HubStatus,
+  labelDirectoryEntryPath,
 } from "@maxprice/shared";
 import { getOperatorToken, getHubUrl } from "./tauri";
 
@@ -20,7 +32,7 @@ import { getOperatorToken, getHubUrl } from "./tauri";
 //
 // It attaches NO `x-maxprice-machine` / `x-maxprice-hostname` header — the
 // console is not a fleet sidecar; a header-less credential POST is what makes
-// Phase 1 record `credentialSource = "local"` (the acceptance check).
+// the Hub record the key's `source` as "local" (the acceptance check).
 export async function hubFetch(path: string, init?: RequestInit): Promise<Response> {
   const [base, token] = await Promise.all([getHubUrl(), getOperatorToken()]);
   const url = path.startsWith("http") ? path : `${base.replace(/\/$/, "")}${path}`;
@@ -72,7 +84,8 @@ export async function fetchHubMachines(signal?: AbortSignal): Promise<HubMachine
 }
 
 // --- /api/organizations: ADR-0004 four-piece (#294). The Hub's roster joined
-// with the Organization directory's labels and the live Limits answers. No 404
+// with the Label directory's Organization labels (its Limits answers are the
+// status's Memberships, ADR-0139 §9). No 404
 // degrade: the console ships in its daemon's artifact, so the route is there.
 export function hubOrganizationsQueryKey(): readonly ["hub-organizations"] {
   return ["hub-organizations"] as const;
@@ -86,6 +99,22 @@ export async function fetchHubOrganizations(
   const res = await hubFetch(buildHubOrganizationsUrl(), { signal });
   if (!res.ok) throw new Error(`${HUB_ORGANIZATIONS_PATH} ${res.status}: ${await res.text()}`);
   return hubOrganizationsResponseSchema.parse(await res.json());
+}
+
+// --- /api/label-directory: ADR-0004 four-piece (#635). The fleet's Label
+// directory, read for its Account labels: the console resolves an Account's
+// title through it (`hubAccountLabel`), as HubStatus carries no label
+// (ADR-0139 §9). No 404 degrade, as above.
+export function hubLabelDirectoryQueryKey(): readonly ["hub-label-directory"] {
+  return ["hub-label-directory"] as const;
+}
+export function buildHubLabelDirectoryUrl(): string {
+  return LABEL_DIRECTORY_PATH;
+}
+export async function fetchHubLabelDirectory(signal?: AbortSignal): Promise<HubLabelDirectory> {
+  const res = await hubFetch(buildHubLabelDirectoryUrl(), { signal });
+  if (!res.ok) throw new Error(`${LABEL_DIRECTORY_PATH} ${res.status}: ${await res.text()}`);
+  return hubLabelDirectorySchema.parse(await res.json());
 }
 
 // --- operator mutations (M7). A non-2xx throws the pinned envelope's `error`
@@ -124,14 +153,56 @@ export async function purgeMachine(machineId: string): Promise<void> {
   });
   localStorage.removeItem(key);
 }
-// The operator's rename through the Organization directory (#294); a null label
-// clears it back to the resolved default. The Hub's refusals carry its words.
+// The operator's rename through the Label directory (#294, #635); a null
+// label clears it back to the resolved default. The Hub's refusals carry its
+// words.
 export function renameOrganization(uuid: string, label: string | null): Promise<void> {
-  return mutate(`${ORGANIZATION_DIRECTORY_PATH}/${encodeURIComponent(uuid)}`, {
+  return mutate(labelDirectoryEntryPath("organizations", uuid), {
     ...jsonPost({ label }),
     method: "PUT",
   });
 }
+// The operator's Account rename (ADR-0136 §7, ADR-0139 §7, #614 §2): the
+// Label directory's account entry; a null label clears it back to
+// `Account <first 8>`.
+export function renameAccount(accountUuid: string, label: string | null): Promise<void> {
+  return mutate(labelDirectoryEntryPath("accounts", accountUuid), {
+    ...jsonPost({ label }),
+    method: "PUT",
+  });
+}
+// --- the Hub's keys (ADR-0139 §4). Save posts the key alone; the Hub learns
+// its Account from claude.ai and answers it. Clear removes one entry: an
+// Account's key by its uuid, or the unmoved legacy key (null). A refusal
+// throws the Hub's status and body, the card's inline error.
+async function credentialRequest(path: string, init: RequestInit): Promise<Response> {
+  const res = await hubFetch(path, init);
+  if (!res.ok) throw new Error(`credential ${res.status}: ${await res.text()}`);
+  return res;
+}
+export async function saveCredential(sessionKey: string): Promise<HubCredentialAck> {
+  const res = await credentialRequest(HUB_CREDENTIALS_PATH, jsonPost({ sessionKey }));
+  return hubCredentialAckSchema.parse(await res.json());
+}
+export async function clearCredential(accountUuid: string | null): Promise<void> {
+  await credentialRequest(hubCredentialPath(accountUuid), { method: "DELETE" });
+}
+
+// --- the Hub's Gateways (ADR-0141 §7, §8). Connect posts the URL and the
+// management key; the Hub checks the Gateway and answers either the Gateway
+// with Connect's warnings or why the check failed, both a 200. Remove is the
+// Hub's alone: a client never removes a Gateway there.
+export async function connectGateway(
+  request: GatewayConnectRequest,
+): Promise<GatewayConnectResponse> {
+  const res = await hubFetch(HUB_GATEWAYS_PATH, jsonPost(request));
+  if (!res.ok) throw new Error(`${HUB_GATEWAYS_PATH} ${res.status}: ${await res.text()}`);
+  return gatewayConnectResponseSchema.parse(await res.json());
+}
+export function removeGateway(id: string): Promise<void> {
+  return mutate(hubGatewayPath(id), { method: "DELETE" });
+}
+
 export async function compactStore(): Promise<{ freedBytes: number }> {
   const response = await hubFetch("/api/store/compact", { method: "POST" });
   if (!response.ok) throw new Error(`Compaction failed (${response.status})`);

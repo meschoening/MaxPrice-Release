@@ -1,16 +1,7 @@
-import {
-  readFileSync,
-  writeFileSync,
-  openSync,
-  fsyncSync,
-  closeSync,
-  renameSync,
-  mkdirSync,
-  rmSync,
-} from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { forgetSessionRefSchema, hubEventsForgetResponseSchema } from "@maxprice/shared";
+import { writeDurably } from "./durable-file";
 
 const intentSchema = z.object({
   hub: z.string(),
@@ -61,24 +52,11 @@ export function createForgetIntent(path: string) {
   }
   function write(next: FleetForgetIntent | null): void {
     if (error !== null) throw new Error(`Cannot read pending fleet deletion: ${String(error)}`);
-    mkdirSync(dirname(path), { recursive: true });
     // Persist a null marker through the same durable replace as ordinary state;
     // unlink alone would not establish durability of the completed intent.
-    const temporary = `${path}.tmp`;
-    try {
-      writeFileSync(temporary, JSON.stringify(next));
-      const fd = openSync(temporary, "r+");
-      try {
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(temporary, path);
-      value = structuredClone(next);
-      revision++;
-    } finally {
-      rmSync(temporary, { force: true });
-    }
+    writeDurably(path, JSON.stringify(next));
+    value = structuredClone(next);
+    revision++;
   }
   return {
     pending: () => value !== null,

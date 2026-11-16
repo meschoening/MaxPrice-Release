@@ -8,25 +8,28 @@ import { useLiveStatus, type ConnectionState } from "@/state/use-live-status";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useSessionRow } from "@/state/use-session-row";
 import { blocksSubtitleSuffix } from "@/lib/organization-scope-view";
+import { sessionBackTarget } from "@/lib/session-back";
 import { useQuotaSurface } from "@/state/use-quota-surface";
+import { useScopeMemberships } from "@/state/use-scope-memberships";
 import { RefreshPill } from "@/components/refresh-pill";
 import { TopbarScopeChip } from "@/components/topbar-scope-chip";
+import { FinderTrigger } from "@/components/finder";
 import { cn } from "@/lib/utils";
 
 const TITLES: Record<string, string> = {
   "/live": "Live",
-  "/sessions": "Sessions",
   "/projects": "Projects",
   "/blocks": "Blocks",
   "/settings": "Settings",
 };
 
 // The floating pill topbar (Glass, ADR-0043): page title + streaming badge +
-// subtitle on the left; the Organization scope chip (only while two or more
-// Organizations are tracked — ADR-0106), refresh chip (with the connection-dot
-// slot) and the theme chip on the right. The old topbar's separate
-// reconnecting indicator is absorbed by the badge and the refresh chip's dot
-// (the mock's connection-dot slot).
+// subtitle on the left; the Find chip (the ⌘K finder, #640), the Organization
+// scope chip (ADR-0106; only on an install whose Account filter is hidden and
+// that tracks two or more Organizations, #637), the refresh chip (with the
+// connection-dot slot) and the theme chip on the right. The old topbar's separate reconnecting
+// indicator is absorbed by the badge and the refresh chip's dot (the mock's
+// connection-dot slot).
 //
 // The mock's other three right-hand chips are gone, each duplicating a
 // surface that already owns it: the gear (the sidebar's /settings nav item —
@@ -42,8 +45,7 @@ export function Topbar() {
   const isSettings = location.pathname === "/settings";
   const title = TITLES[location.pathname] ?? "MaxPrice";
   // The session-detail route's chrome (M5, T6): a circular glass back chip at
-  // the pill's left edge, the session as the topbar h1. The bare in-page
-  // "← Back to sessions" link is absorbed here.
+  // the pill's left edge, the session as the topbar h1.
   const detailSessionId = matchPath("/sessions/:id", location.pathname)?.params.id;
 
   // The Live page's subtitle (resolved range + the ADR-0041 fleet/seed line)
@@ -67,8 +69,11 @@ export function Topbar() {
       ? "Durable app configuration, stored in settings.json."
       : RANGE_LABEL[dateRange];
   // Every block on the Blocks page is the Quota organization's (ADR-0108), so
-  // under All its subtitle says whose.
+  // while the Scope spans Organizations its subtitle says whose.
   const { tag: quotaTag } = useQuotaSurface();
+  // Where the Blocks page names its Membership in a tab or its strip (#638),
+  // the suffix goes.
+  const { memberships: scopeMemberships } = useScopeMemberships();
 
   return (
     <header className={cn("topbar panel shrink-0", detailSessionId && "has-back")}>
@@ -82,12 +87,13 @@ export function Topbar() {
               {isLive ? <StreamingBadge /> : null}
             </div>
             <p className="subtitle truncate">
-              {subtitle + blocksSubtitleSuffix(location.pathname, quotaTag)}
+              {subtitle + blocksSubtitleSuffix(location.pathname, quotaTag, scopeMemberships)}
             </p>
           </div>
         )}
       </div>
       <div className="tb-right">
+        <FinderTrigger />
         <TopbarScopeChip />
         <RefreshPill />
         <ThemeChip />
@@ -98,9 +104,9 @@ export function Topbar() {
 
 // The /sessions/:id heading: back chip + "Session <id8>" + a context
 // subtitle. The subtitle's project path / machine / date come from the
-// session's `/api/sessions` row (`useSessionRow` — the list's own cache); a
-// deep link outside the rail's range misses the row and falls back to the
-// full uuid. Machine only renders under the ADR-0041 M6 gate.
+// session's `/api/sessions` row (`useSessionRow`); a deep link outside the
+// rail's range misses the row and falls back to the full uuid. Machine only
+// renders under the ADR-0041 M6 gate.
 function SessionHeading({ id }: { id: string }) {
   const navigate = useNavigate();
   const { data: settings } = useSettings();
@@ -121,19 +127,23 @@ function SessionHeading({ id }: { id: string }) {
         .join(" · ")
     : id;
 
-  // `replace` so the select → /sessions/:id → Back round trip consumes one
-  // history slot — pairs with the { replace: true } on the Sessions-list
-  // row-click param writes. Without it the browser back button from the
-  // returned list would re-enter /sessions/:id.
-  const onBack = () => navigate(`/sessions?selected=${encodeURIComponent(id)}`, { replace: true });
+  // Back in history when the page was reached in-app, else Projects
+  // (`sessionBackTarget`, #640). The fallback replaces the entry, so the
+  // browser's back never returns to the session page it left.
+  const location = useLocation();
+  const onBack = () => {
+    const target = sessionBackTarget(location.key);
+    if (target.kind === "history") navigate(-1);
+    else navigate(target.path, { replace: true });
+  };
 
   return (
     <>
       <button
         type="button"
         onClick={onBack}
-        aria-label="Back to sessions"
-        title="Back to sessions"
+        aria-label="Back"
+        title="Back"
         className="chip icon-chip back-chip"
       >
         <ArrowLeft aria-hidden />

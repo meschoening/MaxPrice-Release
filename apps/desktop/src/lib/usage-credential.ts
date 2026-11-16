@@ -2,9 +2,16 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   discoverOrgsResponseSchema,
   storedUsageCredentialSchema,
+  type AccountCredential,
   type DiscoveredOrg,
   type StoredUsageCredential,
+  type UsageKeyset,
 } from "@maxprice/shared";
+import {
+  parseAccountCredentials,
+  type CredentialIo,
+  type HeldAccountKey,
+} from "@/lib/credential-ops";
 import { getSidecarUrl } from "@/lib/sidecar";
 import { insideTauri } from "@/lib/tauri";
 
@@ -25,13 +32,19 @@ export async function usageAuthHeaders(): Promise<Record<string, string>> {
   }
 }
 
-// Bridges the OS keychain (Tauri get/set_credential commands, ADR-0023) and the
-// sidecar's in-memory credential. The renderer is the only keychain client; on
-// launch and on every change it reads the credential and pushes it to the
-// sidecar over loopback so the poller can run.
+// Bridges the OS keychain and the sidecar's in-memory keyset (ADR-0023, and
+// since #633 ADR-0138 §6, §12). The renderer is the only keychain client: each
+// Account's key in its own entry (`list_account_credentials` /
+// `set_account_credential`, account_credentials.rs), and the one legacy entry
+// (`get_credential` / `set_credential`) until its key moves into its
+// Account's. On launch and on every change it reads what the keychain holds
+// and pushes the whole keyset to the sidecar over loopback so the poller can
+// run. These are its Tauri bindings (`tauriCredentialIo`); the operations
+// over them, each read-modify-write one at a time, are credential-ops.ts's.
 
-// A key-only blob, or a legacy pre-#283 blob that parses with its `orgId`
-// intact — the evidence the sidecar's one-time history stamp needs (ADR-0104).
+// The legacy entry: a key-only blob, or a pre-#283 blob that parses with its
+// `orgId` intact — the evidence the sidecar's one-time history stamp needs
+// (ADR-0104).
 export async function readCredential(): Promise<StoredUsageCredential | null> {
   const raw = await invoke<string | null>("get_credential");
   if (raw === null) return null;
@@ -47,43 +60,47 @@ export async function writeCredential(cred: StoredUsageCredential | null): Promi
   await invoke("set_credential", { value: cred === null ? null : JSON.stringify(cred) });
 }
 
-// Push the stored blob to the sidecar, verbatim, so its poller can run. Throws
-// on a non-2xx so the Settings "Connect" flow can surface failure; the
-// launch-time caller should .catch() it (a down sidecar at boot is non-fatal).
-export async function pushCredentialToSidecar(cred: StoredUsageCredential | null): Promise<void> {
+// Every Account's entry (`parseAccountCredentials` skips one that does not
+// parse).
+export async function readAccountCredentials(): Promise<HeldAccountKey[]> {
+  const raw = await invoke<Array<{ accountUuid: string; value: string }>>(
+    "list_account_credentials",
+  );
+  return parseAccountCredentials(raw);
+}
+
+export async function writeAccountCredential(
+  accountUuid: string,
+  entry: AccountCredential | null,
+): Promise<void> {
+  await invoke("set_account_credential", {
+    accountUuid,
+    value: entry === null ? null : JSON.stringify(entry),
+  });
+}
+
+// Push the keyset to the sidecar so its poller can run; null clears it.
+// Throws on a non-2xx so Connect can surface failure; the launch-time caller
+// .catch()es it (a down sidecar at boot is non-fatal).
+export async function pushKeysetToSidecar(keyset: UsageKeyset | null): Promise<void> {
   const base = await getSidecarUrl();
   const res = await fetch(`${base}/api/usage/credential`, {
     method: "POST",
     headers: { "content-type": "application/json", ...(await usageAuthHeaders()) },
-    body: cred === null ? "null" : JSON.stringify(cred),
+    body: JSON.stringify(keyset),
   });
   if (!res.ok) throw new Error(`credential push ${res.status}`);
 }
 
-// Hand a stored credential to the sidecar. A legacy blob's `orgId` leaves the
-// keychain only after the sidecar acknowledges the push that carried it — the ack
-// means the usage history it names is stamped (#279, ADR-0104). A failed push, or
-// a crash between the ack and the rewrite, leaves the blob as it was: the next
-// push stamps again, and a stamp with nothing unstamped does no I/O.
-export async function syncCredential(
-  stored: StoredUsageCredential,
-  io: {
-    push: (cred: StoredUsageCredential) => Promise<void>;
-    write: (cred: StoredUsageCredential) => Promise<void>;
-  } = { push: pushCredentialToSidecar, write: writeCredential },
-): Promise<void> {
-  await io.push(stored);
-  if (stored.orgId !== undefined) await io.write({ sessionKey: stored.sessionKey });
-}
-
-// Connect replaces the key and keeps any legacy `orgId` not yet acknowledged, so
-// a reconnect after a failed stamp still stamps with what the old poller read.
-export function credentialForConnect(
-  sessionKey: string,
-  existing: StoredUsageCredential | null,
-): StoredUsageCredential {
-  return existing?.orgId === undefined ? { sessionKey } : { sessionKey, orgId: existing.orgId };
-}
+// The Tauri keychain and this sidecar, the io every renderer caller passes.
+export const tauriCredentialIo: CredentialIo = {
+  listAccounts: readAccountCredentials,
+  setAccount: writeAccountCredential,
+  readLegacy: readCredential,
+  writeLegacy: writeCredential,
+  push: pushKeysetToSidecar,
+  now: () => new Date(),
+};
 
 // Discover the orgs reachable with `sessionKey`, each carrying its roster hints
 // and what its usage endpoint answered (`limits`, #270). The Settings "Connect"
@@ -94,6 +111,8 @@ export function credentialForConnect(
 export async function discoverOrgsViaSidecar(sessionKey: string): Promise<{
   orgs: DiscoveredOrg[];
   error: string | null;
+  // The key's Account (ADR-0138 §2); null when its `/api/account` read failed.
+  account: string | null;
 }> {
   const base = await getSidecarUrl();
   const res = await fetch(`${base}/api/usage/discover-orgs`, {
@@ -101,10 +120,15 @@ export async function discoverOrgsViaSidecar(sessionKey: string): Promise<{
     headers: { "content-type": "application/json", ...(await usageAuthHeaders()) },
     body: JSON.stringify({ sessionKey }),
   });
-  if (!res.ok) return { orgs: [], error: "error" };
+  if (!res.ok) return { orgs: [], error: "error", account: null };
   const parsed = discoverOrgsResponseSchema.safeParse(await res.json());
-  if (!parsed.success) return { orgs: [], error: "error" };
-  // Map the wire `failureKind` channel onto this function's `error` key so the
-  // sole consumer (settings/usage-connection-section.tsx) stays untouched.
-  return { orgs: parsed.data.orgs, error: parsed.data.failureKind };
+  if (!parsed.success) return { orgs: [], error: "error", account: null };
+  // Map the wire `failureKind` channel onto this function's `error` key, as
+  // the sole consumer (Settings › Accounts' Connect, lib/connect-flow.ts)
+  // reads it.
+  return {
+    orgs: parsed.data.orgs,
+    error: parsed.data.failureKind,
+    account: parsed.data.account?.accountUuid ?? null,
+  };
 }

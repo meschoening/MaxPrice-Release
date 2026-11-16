@@ -62,7 +62,12 @@ export function HubPageLayout({
       </header>
       <main className="hub-page-main">
         <div className="panel hub-page-card">
-          <HubStatusRows daemon={daemon} status={view} liveClients={view?.liveClients ?? null} />
+          <HubStatusRows
+            daemon={daemon}
+            status={view}
+            keys={view?.keys}
+            liveClients={view?.liveClients ?? null}
+          />
         </div>
         <p className="hub-page-foot">
           {`Read-only · refreshes every 5 s${view === undefined ? "" : ` · v${view.version}`}`}

@@ -1,34 +1,50 @@
 import {
   ALL_ORGANIZATIONS,
+  homeOrganizationOf,
+  isMultiOrganization,
   organizationLabel,
   organizationLabelMap,
-  resolveOrganizationScope,
   type OrganizationEntry,
   type OrganizationLimits,
+  type ScopeSetting,
   type Settings,
   type WindowState,
 } from "@maxprice/shared";
 
-// The Organization scope chip's view (ADR-0106), built from settings and the
-// roster. Pure, so the chip's markup is testable without the query hooks.
+// The quota surfaces' view (ADR-0106 §10): what the Active block and This week
+// tiles, the Live chart's block span and the Blocks page's subtitle say about
+// the Organization whose limits they read, and the topbar's Organization scope
+// chip. Pure, so their markup is testable without the query hooks.
+//
+// The Scope's head Organization (`useScope().quotaOrganization`) is what the
+// quota surfaces read under every Scope; while the Scope spans more than one
+// Organization (`spansOrganizations`) they name it (`tag`).
+
+// --- The Organization scope chip (ADR-0106, kept by #637) --------------------
+//
+// The chip shows only on an install whose Account filter is hidden (fewer than
+// two tracked Accounts, `accountFilterVisible`) and that tracks two or more
+// Organizations: there it is the one Scope control, as it was in v0.9.x. With
+// the Account filter showing, the filter holds the Scope and the chip never
+// renders (#613 §3).
 //
 // Presence follows the TRACKED set in settings — Home plus
 // `trackedOrganizations` — never the roster of seen Organizations: a machine
 // that tracks only Home has nothing to scope between, and All over a
-// one-member set is Home (#262 item 11), so it shows no chip at all. The test
-// is the shared resolution rule itself: the chip exists exactly when All
-// resolves to All. The roster only names what settings already lists; one
-// that lags settings still yields an option, under the `Organization <first 8>`
-// fallback.
+// one-member set is Home (#262 item 11), so it shows no chip at all. The roster
+// only names what settings already lists; one that lags settings still yields
+// an option, under the `Organization <first 8>` fallback.
+//
+// It reads and writes the persisted `scope` on the Organization axis alone
+// (`chipScope`): Home as `null`, All as `{ organization: ["all"] }`, another
+// Organization as `{ organization: [uuid] }`, exactly what a released file's
+// `organizationScope` reads as, so a v0.9.x choice is shown and kept.
 //
 // "No limits" marks a Limits answer of `none` or `forbidden`: the last read
-// found no supported limit at all (including idle model-scoped caps), or
-// could not read any. A
-// transient `error`, or an Organization that has never been read, still has
-// limits to read, so it carries no marker. An idle Organization, subscription
-// or Enterprise, answers `windows` (#384), so it wears none; the quota
-// surfaces go further and judge each window by its Window state
-// (`quotaSurface`).
+// found no supported limit at all (including idle model-scoped caps), or could
+// not read any. A transient `error`, or an Organization never read, still has
+// limits to read, so it carries no marker. An idle Organization answers
+// `windows` (#384), so it wears none.
 
 // The answers with no limit to read, the chip's marker.
 export function isNoLimitsAnswer(
@@ -44,31 +60,52 @@ export interface ScopeOption {
   noLimits: boolean;
 }
 
-export interface ScopeView {
+export interface ScopeChipView {
   // Home first, then the tracked rest in roster order, then any the roster
   // lacks in settings order.
   options: ScopeOption[];
-  // The resolved scope: null (Home), a uuid, or "all".
+  // The selected option: null (Home), a uuid, or "all".
   selected: string | null;
   isAll: boolean;
   // The scoped Organization's label; Home's under Home; "All organizations"
   // under All.
   chipLabel: string;
-  // Home's label: the Quota organization under All, the one scope whose chip
+  // Home's label: the head Organization under All, the one scope whose chip
   // names it.
   quotaLabel: string;
+  // A persisted Scope the chip cannot show is being read as Home
+  // (`ScopeView.hiddenSelection`): the chip shows Home and says so.
+  hiddenSelection: boolean;
 }
 
-// `settings.organizationScope` is already resolved (`parseSettings`), so it is
-// taken as given. null: no Home, or fewer than two tracked Organizations.
-export function buildScopeView(
-  settings: Pick<Settings, "homeOrganization" | "trackedOrganizations" | "organizationScope">,
+// The option an Organization-axis Scope selects: Home for none, a stale
+// uuid, `home` or a list the chip cannot show (which the sidecar resolves
+// the same way, or which `scopeView` does not read); All for `all`; else the
+// tracked uuid it names.
+export function chipSelection(
+  scope: ScopeSetting | null,
+  members: ReadonlySet<string>,
+  home: string,
+): string | null {
+  const tokens = scope?.organization;
+  if (tokens === undefined || tokens.length !== 1) return null;
+  const [token] = tokens;
+  if (token === ALL_ORGANIZATIONS) return ALL_ORGANIZATIONS;
+  return token !== undefined && token !== home && members.has(token) ? token : null;
+}
+
+// `selection` is the Scope the window reads (`ScopeView.selection`), and
+// `hiddenSelection` its flag. null: no Home, or fewer than two tracked
+// Organizations.
+export function buildScopeChipView(
+  settings: Pick<Settings, "homeMemberships" | "trackedOrganizations">,
   roster: ReadonlyArray<Pick<OrganizationEntry, "uuid" | "label" | "limits">>,
-): ScopeView | null {
-  const home = settings.homeOrganization;
+  selection: ScopeSetting | null,
+  hiddenSelection = false,
+): ScopeChipView | null {
+  const home = homeOrganizationOf(settings);
   const tracked = settings.trackedOrganizations;
-  if (home === null) return null;
-  if (resolveOrganizationScope(ALL_ORGANIZATIONS, home, tracked) !== ALL_ORGANIZATIONS) return null;
+  if (home === null || !isMultiOrganization(home, tracked)) return null;
 
   // The members again, for ordering only: Home, then the tracked list with
   // empty entries and repeats dropped, in settings order.
@@ -88,7 +125,7 @@ export function buildScopeView(
       noLimits: isNoLimitsAnswer(byUuid.get(uuid)?.limits?.answer),
     }),
   );
-  const selected = settings.organizationScope;
+  const selected = chipSelection(selection, members, home);
   const isAll = selected === ALL_ORGANIZATIONS;
   const homeLabel = organizationLabel(labels, home);
   return {
@@ -101,8 +138,33 @@ export function buildScopeView(
         ? homeLabel
         : organizationLabel(labels, selected),
     quotaLabel: homeLabel,
+    hiddenSelection,
   };
 }
+
+// The option's own selected value, which is also the value it reads as
+// selected under: Home as `null`, the only form Home takes; any other
+// Organization as its uuid; the All option as ALL_ORGANIZATIONS.
+export function optionScope(
+  option: Pick<ScopeOption, "uuid" | "isHome"> | typeof ALL_ORGANIZATIONS,
+): string | null {
+  if (option === ALL_ORGANIZATIONS) return ALL_ORGANIZATIONS;
+  return option.isHome ? null : option.uuid;
+}
+
+// The persisted `scope` an option writes: the Organization axis alone, what a
+// released file's `organizationScope` parses to (`parseSettings`).
+export function chipScope(selected: string | null): ScopeSetting | null {
+  return selected === null ? null : { organization: [selected] };
+}
+
+// The note a hidden selection shows (`ScopeView.hiddenSelection`): the saved
+// Scope names Accounts or Memberships, which no control on a one-Account
+// install can show, so the window reads the default Scope until a second
+// Account is tracked. The file keeps it.
+export const HIDDEN_SELECTION_NOTE =
+  "A saved Account selection is not applied while only one Account is tracked. Showing the Home membership.";
+export const HIDDEN_SELECTION_SHORT = "Saved selection not applied";
 
 // What the quota surfaces say about the Quota organization, whose reading they
 // show under every scope. A tile shows no meter for its window, and says why,
@@ -110,8 +172,9 @@ export function buildScopeView(
 // or its limits can't be read (`forbidden`).
 export type NoLimit = { reason: "absent" | "forbidden"; label: string };
 export interface QuotaSurface {
-  // The Quota organization's label under All organizations, else null:
-  // scoped to one Organization the chip already names it.
+  // The Quota organization's label while the Scope spans more than one
+  // Organization, else null: scoped to one Organization, there is no other
+  // it could be.
   tag: string | null;
   // The Active block tile's note and the This Week tile's, each set only
   // when that tile's window has no limit to show (`quotaSurface`).
@@ -145,7 +208,7 @@ export function rosterWindowState(
   return roster?.find((entry) => entry.uuid === uuid)?.limits?.windowStates?.[window];
 }
 
-// The tag follows the scope; each tile's note follows the Quota organization's
+// The tag follows the Scope; each tile's note follows the Quota organization's
 // roster facts for its own window:
 //   - `forbidden` is unreadable on both: nothing about its limits can be read.
 //   - otherwise a window whose Window state is `absent` has no such limit: an
@@ -157,6 +220,7 @@ export function rosterWindowState(
 // The rule holds under every scope, so a single tracked Organization gains the
 // note too. No Quota organization (no Home) names nothing.
 export function quotaSurface(input: {
+  // The Scope spans more than one Organization (`ScopeView.spansOrganizations`).
   isAll: boolean;
   quotaOrganization: string | undefined;
   labels: ReadonlyMap<string, string>;
@@ -181,23 +245,24 @@ export function quotaSurface(input: {
 }
 
 // The Live chart's note beside its controls on the block span: the 5-hour
-// block it frames is the Quota organization's, so under All it says whose.
+// block it frames is the Quota organization's, so while the Scope spans
+// Organizations it says whose.
 export function blockSpanNote(span: string, tag: string | null): string | null {
   return span === "block" && tag !== null ? `${tag}'s block` : null;
 }
 
 // The Blocks page's topbar subtitle suffix: every block there is the Quota
-// organization's, so under All the subtitle says whose.
-export function blocksSubtitleSuffix(pathname: string, tag: string | null): string {
-  return pathname === "/blocks" && tag !== null ? ` · ${tag}'s blocks` : "";
-}
-
-// The scope a menu option writes, which is also the resolved scope it reads as
-// selected under: Home as `null`, the only form Home takes; any other
-// Organization as its uuid; the All option as ALL_ORGANIZATIONS.
-export function optionScope(
-  option: Pick<ScopeOption, "uuid" | "isHome"> | typeof ALL_ORGANIZATIONS,
-): string | null {
-  if (option === ALL_ORGANIZATIONS) return ALL_ORGANIZATIONS;
-  return option.isHome ? null : option.uuid;
+// organization's, so while the Scope spans Organizations the subtitle says
+// whose. None while the page names its Membership in a tab or its strip
+// instead (#619 A, #638): whenever the Scope's Memberships
+// (`useScopeMemberships`, non-empty only with two or more tracked Accounts)
+// hold any, exactly when `blocksTabsView` is not `single`. A one-Account
+// install, whose list is always empty, keeps the suffix.
+export function blocksSubtitleSuffix(
+  pathname: string,
+  tag: string | null,
+  scopeMemberships: readonly unknown[] = [],
+): string {
+  if (pathname !== "/blocks" || tag === null || scopeMemberships.length > 0) return "";
+  return ` · ${tag}'s blocks`;
 }

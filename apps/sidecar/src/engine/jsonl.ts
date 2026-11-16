@@ -1,8 +1,12 @@
 import { internRowStrings } from "@maxprice/shared";
+import { emailHash } from "@maxprice/shared";
 import {
+  emailRecordSchema,
   jsonlRecordSchema,
   loginRecordSchema,
+  NO_ACCOUNT_EVIDENCE,
   ownerRecordSchema,
+  type AccountEvidence,
   type AssistantRecord,
   type ParseLineResult,
   type UsageRecord,
@@ -74,10 +78,13 @@ const SYNTHETIC_MODEL = "<synthetic>";
 //   - `isApiErrorMessage: true`     — an API-error row
 //   - `message.model === "<synthetic>"` — a synthetic message
 // These are the golden oracle's loader skip rules; exact parity is verified
-// later by the aggregator golden tests (E5–E8).
+// later by the aggregator golden tests (E5–E8). `organizationUuid` and
+// `account` are the attribution cursors' answers for the line
+// (`attributedOrganization`, `attributedAccount`).
 export function toUsageRecord(
   record: AssistantRecord,
   organizationUuid: string | undefined,
+  account: AccountEvidence = NO_ACCOUNT_EVIDENCE,
 ): UsageRecord | null {
   if (record.isApiErrorMessage === true) return null;
   if (record.message.model === SYNTHETIC_MODEL) return null;
@@ -110,6 +117,8 @@ export function toUsageRecord(
     costUSD: record.costUSD,
     cwd: record.cwd,
     organizationUuid,
+    accountUuid: account.accountUuid,
+    accountEmailHash: account.accountEmailHash,
   });
 }
 
@@ -142,7 +151,7 @@ export function preFilterSkips(line: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Attribution records (ADR-0098, ADR-0109)
+// Attribution records (ADR-0098, ADR-0109, ADR-0137)
 // ---------------------------------------------------------------------------
 
 // Each regex requires its literal, so a plain substring test ahead of it is a
@@ -152,6 +161,37 @@ const OWNER_LITERAL = "bridge-session";
 const OWNER_MARKER = /"type"\s*:\s*"bridge-session"/;
 const LOGIN_LITERAL = "credential_org";
 const LOGIN_MARKER = /"type"\s*:\s*"credential_org"/;
+const EMAIL_LITERAL = "session_context";
+const EMAIL_MARKER = /"type"\s*:\s*"session_context"/;
+// The address inside an Email record's sentence. The local part is RFC 5322
+// atext and dots, so an address holding `'`, `%` or `!` is read whole and
+// hashes as its login file's address does (organizations.ts). The domain is
+// dot-separated labels, so the sentence's own full stop after the address is
+// not part of it. `"`, `<`, `(` and `[` are not atext, so no such bracket is
+// read; the atext that also quotes is handled by `QUOTE_CLOSERS`.
+const EMAIL_ADDRESS = /[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@[\w-]+(?:\.[\w-]+)+/;
+// Atext characters that can also open a quote around the address. One counts
+// as a quote, not as the address, only when its closer follows the domain.
+const QUOTE_CLOSERS: Readonly<Record<string, string>> = {
+  "'": "'",
+  "`": "`",
+  "{": "}",
+  "|": "|",
+};
+
+// The address an Email record's sentence names, or `undefined` for none.
+function addressIn(sentence: string): string | undefined {
+  const match = EMAIL_ADDRESS.exec(sentence);
+  if (match === null) return undefined;
+  const address = match[0];
+  const closer = QUOTE_CLOSERS[address[0] ?? ""];
+  return closer !== undefined && sentence[match.index + address.length] === closer
+    ? address.slice(1)
+    : address;
+}
+// The one re-announce reason that moves the Account: only Claude Code's
+// in-process login and logout routine raises it (ADR-0137 §2).
+const ACCOUNT_CHANGE = "account_change";
 // The command name a user's in-session `/login` writes. JSON.stringify escapes
 // none of these characters, so a raw substring test is a sound pre-check.
 const SLASH_LOGIN_MARKER = "<command-name>/login</command-name>";
@@ -161,30 +201,62 @@ const SLASH_LOGIN_MARKER = "<command-name>/login</command-name>";
 // code review does — has prose before it, and must not arm the gate.
 const COMMAND_LINE = /^\s*<command-(?:name|message)>/;
 
-// The attribution in effect while a file is read. `owner` is the Owner cursor
-// (ADR-0098): the organization the most recent Owner record named. `login` is
-// the Login cursor (ADR-0109): set by the file's first Login record and moved
-// by a later one only when a `/login` command line came since the previous
-// Login record (`loginSinceRecord`) — a change with none records a login made
-// elsewhere, which does not move billing. Once `login` is set it is the file's
-// only evidence; `owner` keeps updating so a tail read never has to look back.
+// The attribution in effect while a file is read: two cursors on one clock,
+// the Organization's and the Account's.
+//
+// The Organization cursor. `owner` is the Owner cursor (ADR-0098): the
+// organization the most recent Owner record named. `login` is the Login cursor
+// (ADR-0109): set by the file's first Login record and moved by a later one
+// only when a `/login` command line came since the previous Login record
+// (`loginSinceRecord`) — a change with none records a login made elsewhere,
+// which does not move billing. Once `login` is set it is the file's only
+// evidence; `owner` keeps updating so a tail read never has to look back.
+//
+// The Account cursor (ADR-0137 §2). `ownerAccount` is the `ownerAccountUuid`
+// of the Owner record `owner` came from (`undefined` when that record names no
+// Account). `email` is the Email cursor: the hash of the file's first Email
+// record, moved by a later one only when it is an `account_change`
+// re-announce, which only the process that logged in writes, so it needs no
+// `/login` gate. It is read from the top of the file but counts only from the
+// first Login record on; before that, and in a file with none, the Account is
+// `ownerAccount`. Rule A carries over: once `login` is set, Owner records name
+// no Account. `ownerSinceEmail` says the Owner record in effect was read while
+// the current Email cursor already was, which is what makes the two a pair
+// observation (`observedPair`).
+//
 // One per file for the whole-file reader; the watcher keeps one per path.
 export type AttributionCursor = {
   owner: string | undefined;
+  ownerAccount: string | undefined;
   login: string | undefined;
   loginSinceRecord: boolean;
+  email: string | undefined;
+  ownerSinceEmail: boolean;
 };
 
 export function freshCursor(): AttributionCursor {
-  return { owner: undefined, login: undefined, loginSinceRecord: false };
+  return {
+    owner: undefined,
+    ownerAccount: undefined,
+    login: undefined,
+    loginSinceRecord: false,
+    email: undefined,
+    ownerSinceEmail: false,
+  };
 }
 
-// Parse one line as an Owner record. Returns the organization it names, or
-// `undefined` when the line is not an owner record, is malformed, or is the
-// old owner-less shape — none of which change the owner in effect. Checked
-// BEFORE `preFilterSkips`, which would otherwise discard the line: it ends in
-// `}` and carries no assistant marker.
-export function parseOwnerLine(line: string): string | undefined {
+// What an Owner record names: its Organization, and its Account when known.
+export type OwnerEvidence = { organizationUuid: string; accountUuid: string | undefined };
+
+// Parse one line as an Owner record. Returns what it names, or `undefined`
+// when the line is not an owner record, is malformed, or names no
+// Organization (the old owner-less shape) — none of which change the owner in
+// effect. A record naming an Organization moves both of the Owner cursor's
+// fields at once, so one naming no Account leaves none in effect (ADR-0137
+// §3's "an Owner record without `ownerAccountUuid`"). Checked BEFORE
+// `preFilterSkips`, which would otherwise discard the line: it ends in `}` and
+// carries no assistant marker.
+export function parseOwnerLine(line: string): OwnerEvidence | undefined {
   if (!line.includes(OWNER_LITERAL) || !OWNER_MARKER.test(line)) return undefined;
   let json: unknown;
   try {
@@ -193,7 +265,11 @@ export function parseOwnerLine(line: string): string | undefined {
     return undefined;
   }
   const parsed = ownerRecordSchema.safeParse(json);
-  return parsed.success ? parsed.data.ownerOrganizationUuid : undefined;
+  if (!parsed.success || parsed.data.ownerOrganizationUuid === undefined) return undefined;
+  return {
+    organizationUuid: parsed.data.ownerOrganizationUuid,
+    accountUuid: parsed.data.ownerAccountUuid,
+  };
 }
 
 // Parse one line as a Login record. Returns the organization it names, or
@@ -210,6 +286,34 @@ export function parseLoginLine(line: string): string | undefined {
   }
   const parsed = loginRecordSchema.safeParse(json);
   return parsed.success ? parsed.data.attachment.organizationUuid : undefined;
+}
+
+// What an Email record says: its address's hash (never the address), and
+// whether it is the `account_change` re-announce (`changed: true` with that
+// reason) that moves the Email cursor.
+export type EmailEvidence = { emailHash: string; accountChange: boolean };
+
+// Parse one line as an Email record (ADR-0137 §2). Returns its evidence, or
+// `undefined` when the line is not one, is malformed, or its sentence names no
+// address — none of which change any cursor state. Checked BEFORE
+// `preFilterSkips`, like the Login record.
+export function parseEmailLine(line: string): EmailEvidence | undefined {
+  if (!line.includes(EMAIL_LITERAL) || !EMAIL_MARKER.test(line)) return undefined;
+  let json: unknown;
+  try {
+    json = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  const parsed = emailRecordSchema.safeParse(json);
+  if (!parsed.success) return undefined;
+  const { attachment } = parsed.data;
+  const address = addressIn(attachment.context.userEmail);
+  if (address === undefined) return undefined;
+  return {
+    emailHash: emailHash(address),
+    accountChange: attachment.changed === true && attachment.reason === ACCOUNT_CHANGE,
+  };
 }
 
 // Whether a line is a `/login` command line, in either shape Claude Code logs a
@@ -244,19 +348,31 @@ export function isSlashLoginLine(line: string): boolean {
   return typeof text === "string" && COMMAND_LINE.test(text) && text.includes(SLASH_LOGIN_MARKER);
 }
 
-// Advance the cursor over one line. Returns true when the line is an Owner or
-// Login record, which is never a usage event. Every Login record, counted or
-// ignored, closes the `/login` gate it was judged against.
+// Advance the cursor over one line. Returns true when the line is an Owner,
+// Login or Email record, which is never a usage event. Every Login record,
+// counted or ignored, closes the `/login` gate it was judged against. An Email
+// record never touches that gate, and a `/login` line never touches the Email
+// cursor.
 export function readAttribution(cursor: AttributionCursor, line: string): boolean {
   const owner = parseOwnerLine(line);
   if (owner !== undefined) {
-    cursor.owner = owner;
+    cursor.owner = owner.organizationUuid;
+    cursor.ownerAccount = owner.accountUuid;
+    cursor.ownerSinceEmail = cursor.email !== undefined;
     return true;
   }
   const login = parseLoginLine(line);
   if (login !== undefined) {
     if (cursor.login === undefined || cursor.loginSinceRecord) cursor.login = login;
     cursor.loginSinceRecord = false;
+    return true;
+  }
+  const email = parseEmailLine(line);
+  if (email !== undefined) {
+    if (cursor.email === undefined || email.accountChange) {
+      cursor.email = email.emailHash;
+      cursor.ownerSinceEmail = false;
+    }
     return true;
   }
   if (isSlashLoginLine(line)) cursor.loginSinceRecord = true;
@@ -266,6 +382,47 @@ export function readAttribution(cursor: AttributionCursor, line: string): boolea
 // The Organization a usage line read now is attributed to (Rule A, ADR-0109).
 export function attributedOrganization(cursor: AttributionCursor): string | undefined {
   return cursor.login ?? cursor.owner;
+}
+
+// The Account a usage line read now is attributed to (ADR-0137 §2): from the
+// first Login record on, the Email cursor's only (Rule A); else the Owner
+// record's.
+export function attributedAccount(cursor: AttributionCursor): AccountEvidence {
+  return cursor.login !== undefined
+    ? { accountUuid: undefined, accountEmailHash: cursor.email }
+    : { accountUuid: cursor.ownerAccount, accountEmailHash: undefined };
+}
+
+// An email hash and the account uuid it belongs to (ADR-0137 §1's third pair
+// source): a usage line read while an Email record and an Owner record naming
+// an Account are both in effect, the Owner record read under that Email record.
+// An Owner record above the Email record in effect is no pair: it may be an
+// inherited copy outranked by Rule A (the corpus's case 7, which would pair
+// Blair's email with Dana). A subagent's copied records make pairs like any
+// file's; whether to learn them is the caller's call, and the scan and the
+// watcher never pass `onPair` for one (ADR-0137 §2: its own Email record is no
+// evidence).
+export type AccountPair = { emailHash: string; accountUuid: string };
+export type OnAccountPair = (pair: AccountPair) => void;
+
+function observedPair(cursor: AttributionCursor): AccountPair | undefined {
+  if (!cursor.ownerSinceEmail || cursor.email === undefined) return undefined;
+  if (cursor.ownerAccount === undefined) return undefined;
+  return { emailHash: cursor.email, accountUuid: cursor.ownerAccount };
+}
+
+// Reports a usage line's pair observation to `onPair`, once per distinct pair
+// in a row: every usage line under one pair would otherwise repeat it.
+function pairReporter(onPair: OnAccountPair | undefined) {
+  let last: AccountPair | undefined;
+  return (cursor: AttributionCursor): void => {
+    if (onPair === undefined) return;
+    const pair = observedPair(cursor);
+    if (pair === undefined) return;
+    if (last?.emailHash === pair.emailHash && last.accountUuid === pair.accountUuid) return;
+    last = pair;
+    onPair(pair);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +451,13 @@ export function attributedOrganization(cursor: AttributionCursor): string | unde
 // `console` to its log surface, and E4 (the only caller) wants a scan to be
 // resilient, not interactive. A caller that needs structured failures can use
 // `parseLine` directly.
-export async function collectUsageRecords(path: string): Promise<UsageRecord[]> {
+//
+// `onPair` hears each pair observation (`AccountPair`) the file's usage lines
+// are read under; it never changes a record.
+export async function collectUsageRecords(
+  path: string,
+  onPair?: OnAccountPair,
+): Promise<UsageRecord[]> {
   const text = await Bun.file(path).text();
   const lines = text.split("\n");
   // A `\n`-terminated file splits into a trailing "" that is not a line; a
@@ -302,9 +465,12 @@ export async function collectUsageRecords(path: string): Promise<UsageRecord[]> 
   const lineCount = lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
   const records: UsageRecord[] = [];
   const cursor = freshCursor();
+  const reportPair = pairReporter(onPair);
   for (let i = 0; i < lineCount; i++) {
     const record = handleLine(path, stripCarriageReturn(lines[i] as string), i + 1, cursor);
-    if (record !== null) records.push(record);
+    if (record === null) continue;
+    records.push(record);
+    reportPair(cursor);
   }
   return records;
 }
@@ -355,7 +521,8 @@ function handleLine(
   cursor: AttributionCursor,
 ): UsageRecord | null {
   // An attribution record moves the cursor and is never a usage event
-  // (ADR-0098, ADR-0109). A `/login` line arms the gate and falls through.
+  // (ADR-0098, ADR-0109, ADR-0137). A `/login` line arms the gate and falls
+  // through.
   if (readAttribution(cursor, line)) return null;
   // The pre-filter: a line that provably cannot be an assistant record skips
   // JSON.parse + Zod (and, per the predicate's contract, warrants no warning).
@@ -372,7 +539,7 @@ function handleLine(
   // `assistantRecordSchema`; `type === "assistant"` narrows `JsonlRecord` to
   // `AssistantRecord` for free, with no second parse.
   if (result.record.type !== "assistant") return null;
-  return toUsageRecord(result.record, attributedOrganization(cursor));
+  return toUsageRecord(result.record, attributedOrganization(cursor), attributedAccount(cursor));
 }
 
 // Parse an in-memory batch of JSONL lines into `UsageRecord`s, applying the
@@ -390,15 +557,27 @@ export type ParsedLines = { records: UsageRecord[]; cursor: AttributionCursor };
 // (the watcher's per-path memory); the returned `cursor` is what the next
 // read must start from. A copy is advanced, never `initial` itself. A first
 // read starts at byte 0 (tail-reader), so it sees the file's own records.
-export function parseLines(lines: string[], initial: AttributionCursor | undefined): ParsedLines {
+// `onPair` is `collectUsageRecords`'s.
+export function parseLines(
+  lines: string[],
+  initial: AttributionCursor | undefined,
+  onPair?: OnAccountPair,
+): ParsedLines {
   const cursor: AttributionCursor = initial === undefined ? freshCursor() : { ...initial };
   const records: UsageRecord[] = [];
+  const reportPair = pairReporter(onPair);
   for (const line of lines) {
     if (readAttribution(cursor, line)) continue;
     const result = parseLine(line);
     if (!result.ok || result.record.type !== "assistant") continue;
-    const record = toUsageRecord(result.record, attributedOrganization(cursor));
-    if (record !== null) records.push(record);
+    const record = toUsageRecord(
+      result.record,
+      attributedOrganization(cursor),
+      attributedAccount(cursor),
+    );
+    if (record === null) continue;
+    records.push(record);
+    reportPair(cursor);
   }
   return { records, cursor };
 }

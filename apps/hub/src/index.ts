@@ -3,7 +3,6 @@ import { join } from "node:path";
 import {
   HUB_PROTOCOL_VERSION,
   type HubStatus,
-  type UsageCredential,
   type UsageSample,
   type UsageReading,
 } from "@maxprice/shared";
@@ -14,12 +13,17 @@ import {
   createSampleStore,
   createUsagePoller,
   discoverOrg,
+  fetchAccount,
   installParentWatchdog,
   installStdinWatchdog,
+  LEGACY_KEY,
   libcGetppid,
+  type CreateUsagePollerOptions,
+  type FetchAccountResult,
   type FleetEventStore,
   type IdentityDirectory,
   type SampleStore,
+  type UsagePoller,
 } from "@maxprice/usage-core";
 import type { Env } from "@maxprice/usage-core/home-path";
 import { EXIT_INTERRUPTED } from "@maxprice/usage-core/secret-input";
@@ -31,15 +35,36 @@ import { prepareDataDir } from "./data-dir";
 import { RESTORE_STAGING, restoreHub, unfinishedRestore } from "./restore";
 import { hubStatus } from "./status";
 import { createMachineDirectory } from "./machine-directory";
-import { createOrganizationAssertionDirectory } from "./organization-assertion-directory";
-import { createOrganizationDirectory } from "./organization-directory";
+import {
+  createLabelDirectory,
+  LABEL_DIRECTORY_FILE,
+  LEGACY_ORGANIZATION_DIRECTORY_FILE,
+} from "./label-directory";
+import {
+  createMembershipAssertionDirectory,
+  LEGACY_ORGANIZATION_ASSERTION_DIRECTORY_FILE,
+  MEMBERSHIP_ASSERTION_DIRECTORY_FILE,
+} from "./membership-assertion-directory";
 import { createHubAuth, mintOperatorSecret } from "./auth";
 import { FirstBindError, hostAndPort, startBindReconciler, type BindReconciler } from "./rebind";
 import { createClientRegistry } from "./clients";
 import { createHubFanout, type HubFanout } from "./fanout";
-import { createHubPollSet, type HubPollSet } from "./poll-set";
+import { createHubPollSet, type HubPollSet, type HubPollSetOptions } from "./poll-set";
+import { fleetAccountNames } from "./hub-accounts";
+import { createHubKeys, type HubKeys } from "./hub-keys";
+import {
+  createHubSampleStamps,
+  readSampleStampedAt,
+  SAMPLE_STAMPS_FILE,
+  type HubSampleStamps,
+} from "./sample-stamps";
+import type { HubKeyStore } from "./key-store";
 import { findPortHolder, type PortHolder } from "./port-holder";
-import { createOrganizationRoster, type OrganizationRoster } from "./organization-roster";
+import {
+  createOrganizationRoster,
+  ORGANIZATION_ROSTER_FILE,
+  type OrganizationRoster,
+} from "./organization-roster";
 import { PAGE_MANIFEST } from "#page-manifest";
 import { cliPage, cliPageClear, cliPageSet, cliPageSnippet } from "./page-publish";
 import type { HubPageDeps } from "./page";
@@ -50,15 +75,18 @@ import { hubService } from "./service";
 import { runSetup, type SetupDeps } from "./setup";
 import { createSetupTerminal } from "./setup-terminal";
 import { hubUpdate } from "./update";
-import { createHubUsageStatus } from "./usage-status";
 import { PRODUCT } from "./update-channel";
 import { VERSION } from "./version";
-import { openCredstore, type Credstore } from "./credstore";
+import { openGatewayKeyStore, openKeyStore } from "./credstore";
+import { createGatewayDrainer, type HubGateways } from "./gateway-drainer";
+import { createGatewayRecordsStore, GATEWAY_RECORDS_FILE } from "./gateway-records";
+import { createGatewayRegistry, GATEWAY_REGISTRY_FILE } from "./gateway-registry";
 import { operatorTokenPath, removeOperatorToken, writeOperatorToken } from "./secrets";
 import { reachHub, type ReachOptions, type RunningHub } from "./operator-client";
+import { keyList, keyRemove, keySet } from "./key-commands";
+import { gatewayConnect, gatewayList, gatewayRemove } from "./gateway-commands";
+import { labelVerb } from "./label-commands";
 import {
-  keyClear,
-  keySet,
   liveCompact,
   liveMergeMachine,
   livePasswordClear,
@@ -72,11 +100,13 @@ import {
 // maxprice-hub (ADR-0035): the standalone always-on usage poller. Its command
 // line is cli.ts's (ADR-0127 §2): no command, or `serve`, runs the daemon;
 // `status` (ADR-0127 §8, status.ts) describes the running daemon on Linux;
-// `password set|clear` (ADR-0037, ADR-0128 §6), `key set|clear` (ADR-0126 §6,
-// §7) and the operator verbs `rename`, `merge`, `purge-machine` and `compact`
-// (ADR-0041) act on the Hub at the data dir: on Linux through the running
-// daemon's own routes while one holds the data dir, else on its files
-// (ADR-0127 §7; operator.ts); `restore` (ADR-0130, restore.ts) fills an empty
+// `password set|clear` (ADR-0037, ADR-0128 §6), `key set|list|remove`
+// (ADR-0126 §6, ADR-0140 §6, §8; key-commands.ts), `gateway
+// connect|list|remove` (ADR-0141 §7, §8; gateway-commands.ts), `label
+// account|org` (ADR-0140 §9; label-commands.ts) and the operator verbs `rename`, `merge`,
+// `purge-machine` and `compact` (ADR-0041) act on the Hub at the data dir: on
+// Linux through the running daemon's own routes while one holds the data
+// dir, else on its files (ADR-0127 §7; operator.ts); `restore` (ADR-0130, restore.ts) fills an empty
 // data dir from a backup; `service install|uninstall|status|logs` (ADR-0127
 // §5–6, service.ts) runs serve as a systemd user unit on Linux; `update`
 // (ADR-0129 §4–§5, update.ts) installs the newest release over this binary on
@@ -96,21 +126,26 @@ import {
 
 // Push-up merge wiring (ADR-0035 M2): set-union the incoming samples into the
 // hub's store and, when any were new, patch the fanout status so SSE
-// subscribers see the store grow. Exported as a factory so the integration
-// test exercises this exact closure rather than a hand-copied double.
+// subscribers see the store grow. A merge in which an Account-stamped copy
+// replaced a held Account-less sample moves `samplesStampedAt` (ADR-0139 §8,
+// sample-stamps.ts); one of new or identical samples does not. Exported as a
+// factory so the integration test exercises this exact closure rather than a
+// hand-copied double.
 export function createMergeSamples(
   store: SampleStore,
   fanout: HubFanout,
+  stamps: HubSampleStamps,
 ): (incoming: UsageSample[]) => number {
   return (incoming) => {
-    const added = store.merge(incoming);
-    if (added > 0) {
+    const { changed, stamped } = store.merge(incoming);
+    if (changed > 0) {
       fanout.patchStatus({
         sampleCount: store.all().length,
         usageLastSampleAt: store.latest()?.capturedAt ?? null,
       });
     }
-    return added;
+    if (stamped > 0) stamps.stamped();
+    return changed;
   };
 }
 
@@ -119,22 +154,78 @@ export function createMergeSamples(
 // so serve()'s status-patch wiring lives in one testable place. The poller
 // hands over the sample it appended to history, so the stream carries exactly
 // what the store kept, an Enterprise organization's five-hour-only line
-// included (#384).
+// included (#384). Each Membership's live reading reaches the status through
+// its `accounts` (hub-keys.ts, from the poller's Memberships), not here.
 export function createEmitUsageSample(
   store: Pick<SampleStore, "all">,
-  fanout: Pick<HubFanout, "emitSample" | "patchStatus" | "getStatus">,
+  fanout: Pick<HubFanout, "emitSample" | "patchStatus">,
 ): (organization: string, sample: UsageReading | null, historical: UsageSample | null) => void {
-  return (organization, sample, historical) => {
+  return (_organization, _sample, historical) => {
     if (historical !== null) fanout.emitSample(historical);
-    fanout.patchStatus({
-      sampleCount: store.all().length,
-      usageWeeklyResetAt: {
-        ...fanout.getStatus().usageWeeklyResetAt,
-        ...(sample?.weekly ? { [organization]: sample.weekly.resetAt } : {}),
-      },
-      usageCurrent: { ...fanout.getStatus().usageCurrent, [organization]: sample },
-    });
+    fanout.patchStatus({ sampleCount: store.all().length });
   };
+}
+
+// The Hub's usage side as serve() wires it (ADR-0139 §4): the roster of each
+// key's listing (#284), the poller with its status hook, the poll set listing
+// every key, and the keys (hub-keys.ts) that move all three with the store.
+// Exported, as createMergeSamples is, so the integration tests drive this
+// exact wiring over a fake claude.ai.
+export function createHubKeyWiring(opts: {
+  rosterPath: string;
+  store: HubKeyStore;
+  sampleStore: SampleStore;
+  sampleStamps: HubSampleStamps;
+  fanout: HubFanout;
+  baseUrl?: string;
+  tags?: () => ReadonlyMap<string, ReadonlySet<string>>;
+  named?: () => ReadonlyMap<string, ReadonlySet<string>>;
+  // A test's seams: `/api/account`, the listing and the usage read, each at
+  // `baseUrl` by default.
+  fetchAccount?: (sessionKey: string) => Promise<FetchAccountResult>;
+  list?: HubPollSetOptions["list"];
+  fetchUsageImpl?: CreateUsagePollerOptions["fetchUsageImpl"];
+}): { poller: UsagePoller; pollSet: HubPollSet; roster: OrganizationRoster; keys: HubKeys } {
+  const { sampleStore, fanout, baseUrl } = opts;
+  const roster = createOrganizationRoster({ path: opts.rosterPath, legacyAccount: LEGACY_KEY });
+  // The poller's publishes reach the status through the keys' `accounts`
+  // (bound below: the keys need the poller and the poll set first).
+  let keys: HubKeys | null = null;
+  // PollerHub adapter: poller broadcasts → fanout; sampleCount rides along.
+  const poller = createUsagePoller({
+    store: sampleStore,
+    liveHub: {
+      emitUsageSample: createEmitUsageSample(sampleStore, fanout),
+      patchStatus: (status) => {
+        fanout.patchStatus({ usageLastSampleAt: status.usageLastSampleAt });
+        keys?.pollerPublished();
+      },
+    },
+    baseUrl,
+    fetchUsageImpl: opts.fetchUsageImpl,
+  });
+  // The Organizations the poller reads: whatever each key lists (#283),
+  // booted from the roster (#284).
+  const pollSet = createHubPollSet({
+    list: opts.list ?? ((sessionKey) => discoverOrg({ sessionKey, baseUrl })),
+    poller,
+    roster,
+    onDiscoveryChange: () => keys?.publish(),
+  });
+  const created = createHubKeys({
+    store: opts.store,
+    poller,
+    pollSet,
+    roster,
+    sampleStore,
+    samplesStamped: opts.sampleStamps.stamped,
+    fanout,
+    fetchAccount: opts.fetchAccount ?? ((sessionKey) => fetchAccount({ sessionKey, baseUrl })),
+    tags: opts.tags,
+    named: opts.named,
+  });
+  keys = created;
+  return { poller, pollSet, roster, keys: created };
 }
 
 // Bind reconciler → status adapter (ADR-0074). The reconciler reports a changed
@@ -154,24 +245,17 @@ export function createBindStatusPatcher(
 }
 
 // Boot-readiness sequence (F1): load the on-disk history, load the fleet-event
-// archive, seed the persisted credential, and start the poller — everything
-// every /api/* route gates on. Exported as a factory for the same reason
+// archive, seed the persisted keys, and start the poller — everything every
+// /api/* route gates on. Exported as a factory for the same reason
 // createMergeSamples is: the test drives THIS closure rather than a hand-copied
 // double.
 //
-// The seed restores what the status says about the key with it: present, and,
-// where the store keeps them (secrets.json, on Linux), when it was set and by
-// whom (ADR-0126 §3), so a restart no longer resets them to null. A keychain
-// entry keeps neither, so they stay null.
-//
-// Boot is also where the Hub stamps its usage history (#279): a credstore entry
-// written before #283 still carries the orgId this Hub polled with, the
-// Organization of every unstamped (legacy) line. The same orgId enters the
-// Hub's roster (#284), so this boot polls it even if the listing fails. Only a
-// successful stamp AND roster write let the entry lose that evidence — it is
-// then rewritten `{ sessionKey }`, so a failure of either retries on the next
-// boot (ADR-0104). Boot only — POST /api/credential never stamps: its body is
-// the key alone, and a heal is no evidence of this Hub's history.
+// The key seed is hub-keys.ts's `boot`: it reads the store, restores what the
+// status says about each key with it (when it was set and by whom, where the
+// store keeps them: secrets.json on Linux and every Account's keychain entry,
+// ADR-0126 §3, ADR-0138 §6), stamps a pre-#283 legacy entry's history
+// (ADR-0104), arms the poller and the poll set, and starts ADR-0138 §12's
+// move of the legacy key in the background.
 //
 // FOUR INDEPENDENT STEPS, each with its OWN try (F20). They used to be nested
 // inside one outer try, which made an early failure skip every later step: a
@@ -186,15 +270,14 @@ export function createBindStatusPatcher(
 // (`ready` in buildHubApp) awaits this promise and a rejection would 500 every
 // /api/* request for the daemon's lifetime.
 export type ReadySequenceDeps = {
-  sampleStore: Pick<SampleStore, "loadHistory" | "all" | "latest" | "stampUnstamped">;
+  sampleStore: Pick<SampleStore, "loadHistory" | "all" | "latest">;
   fleetEvents: FleetEventStore;
-  credstore: Pick<Credstore, "get" | "set">;
-  poller: {
-    setCredential: (c: UsageCredential | null) => void;
-    start: () => void;
-  };
-  roster: Pick<OrganizationRoster, "remember">;
-  pollSet: Pick<HubPollSet, "boot">;
+  keys: Pick<HubKeys, "boot" | "publish">;
+  // The Hub's Gateways (gateway-drainer.ts, ADR-0141 §5), started after the
+  // keys, whose `/api/account` emails resolve each record's Account. Absent
+  // in a rig that holds none.
+  gateways?: Pick<HubGateways, "start">;
+  poller: { start: () => void };
   fanout: Pick<HubFanout, "patchStatus">;
   // Fired when the archive load throws. serve() flips its `eventsUsable` flag,
   // which makes the event + archive-mutation routes 503 (F3) — the on-disk log
@@ -203,7 +286,7 @@ export type ReadySequenceDeps = {
 };
 
 export async function runReadySequence(deps: ReadySequenceDeps): Promise<void> {
-  const { sampleStore, fleetEvents, credstore, poller, roster, pollSet, fanout } = deps;
+  const { sampleStore, fleetEvents, keys, poller, fanout } = deps;
   try {
     // Resolves the store's own `ready` too (F6) — harmless overlap.
     await sampleStore.loadHistory();
@@ -230,61 +313,25 @@ export async function runReadySequence(deps: ReadySequenceDeps): Promise<void> {
     //   - onEventsUnusable ⇒ the SERVER 503s /api/events and the archive
     //     mutations, so an ill-behaved client, a curl, or an operator hitting
     //     Compact cannot write RAM's survivors over the log we failed to read.
-    // It must never cost the hub its M1 duty: the credential seed and the
+    // It must never cost the hub its M1 duty: the key seed and the
     // usage-limit poller below still run.
     deps.onEventsUnusable();
     console.warn("[hub] fleet-event archive load failed:", err);
   }
   try {
-    const stored = await credstore.get();
-    if (stored !== null) {
-      const cred: UsageCredential = { sessionKey: stored.sessionKey };
-      if (stored.orgId !== undefined) {
-        // A pre-#283 entry: its orgId is what this Hub polled with. It stamps
-        // the legacy lines (#279) and enters the roster (#284) BEFORE the seed,
-        // so boot polls it even if the listing fails — whatever the stamp's
-        // outcome; only when both landed may the entry lose that evidence.
-        // Each in its own try — none may cost the seed, the listing or
-        // poller.start() (F20). A failed roster write throws after memory holds
-        // the id, so this boot still polls it; only the rewrite waits for a
-        // later boot.
-        let stamped = false;
-        try {
-          await sampleStore.stampUnstamped(stored.orgId);
-          stamped = true;
-        } catch (err) {
-          console.warn("[hub] usage-history stamp failed:", err);
-        }
-        let remembered = false;
-        try {
-          roster.remember(stored.orgId);
-          remembered = true;
-        } catch (err) {
-          console.warn("[hub] organization roster write failed:", err);
-        }
-        if (stamped && remembered) {
-          try {
-            await credstore.set(cred);
-          } catch (err) {
-            console.warn("[hub] credstore rewrite failed:", err);
-          }
-        }
-      }
-      poller.setCredential(cred);
-      fanout.patchStatus({
-        credentialPresent: true,
-        credentialUpdatedAt: stored.provenance?.setAt ?? null,
-        credentialSource: stored.provenance?.source ?? null,
-      });
-      // Boot polls the persisted roster at once and lists in the background
-      // (#284): each minute while the listing fails and nothing is polled,
-      // hourly otherwise. A listing that refuses the key expires it and
-      // schedules nothing. Not awaited: neither `ready` nor poller.start()
-      // waits on the network.
-      void pollSet.boot(cred.sessionKey);
-    }
+    // Lists in the background (#284): neither `ready` nor poller.start()
+    // waits on the network. The status's tag-named Accounts read the archive
+    // just loaded.
+    await keys.boot();
   } catch (err) {
     console.warn("[hub] credstore read failed:", err);
+    keys.publish();
+  }
+  // Its own try, as every step: a Gateway fault never costs the poller.
+  try {
+    await deps.gateways?.start();
+  } catch (err) {
+    console.warn("[hub] Gateway start failed:", err);
   }
   // UNCONDITIONAL — the hub's M1 duty outranks every step above. Its own try
   // only preserves the never-rejects contract.
@@ -532,6 +579,7 @@ async function serve(): Promise<number> {
   // createSampleStore returns OwnedSampleStore (SampleStore + flush); type as
   // the return type directly so shutdown can call flush().
   const sampleStore = createSampleStore({ path: join(dataDir, "usage-history.jsonl") });
+  const sampleStampsPath = join(dataDir, SAMPLE_STAMPS_FILE);
 
   // Fleet event archive + machine directory (ADR-0041, M4). The directory
   // loads synchronously (small file); the event store's load runs inside
@@ -543,17 +591,21 @@ async function serve(): Promise<number> {
   const machineDirectory = createMachineDirectory({
     path: join(dataDir, "machine-directory.json"),
   });
-  // Organization directory (#288): the fleet union of Organization labels.
-  // Loads synchronously beside the machine directory, a small file too.
-  const organizationDirectory = createOrganizationDirectory({
-    path: join(dataDir, "organization-directory.json"),
+  // Label directory (#288, #635): the fleet union of Organization and
+  // Account labels. Loads synchronously beside the machine directory, a small
+  // file too, converting a v6 Organization directory once (ADR-0139 §7).
+  const labelDirectory = createLabelDirectory({
+    path: join(dataDir, LABEL_DIRECTORY_FILE),
+    legacyPath: join(dataDir, LEGACY_ORGANIZATION_DIRECTORY_FILE),
   });
-  // Organization assertion directory (#310): the fleet union of Organization
-  // assertions. Loads synchronously beside the Organization directory — one
-  // read, at its 20,000-session cap ~2.7 MB with UUID session ids and ~5.1 MB
-  // with every key at its schema limit.
-  const organizationAssertionDirectory = createOrganizationAssertionDirectory({
-    path: join(dataDir, "organization-assertion-directory.json"),
+  // Membership assertion directory (#310, #635): the fleet union of
+  // Membership assertions. Loads synchronously beside the Label directory —
+  // one read, at its 20,000-session cap ~2.7 MB with UUID session ids and
+  // ~5.1 MB with every key at its schema limit — converting a v6 Organization
+  // assertion directory once (ADR-0139 §7).
+  const membershipAssertionDirectory = createMembershipAssertionDirectory({
+    path: join(dataDir, MEMBERSHIP_ASSERTION_DIRECTORY_FILE),
+    legacyPath: join(dataDir, LEGACY_ORGANIZATION_ASSERTION_DIRECTORY_FILE),
   });
 
   // Identity directory (ADR-0062): the fleet union of "which repo is this
@@ -568,13 +620,14 @@ async function serve(): Promise<number> {
   const initialStatus: HubStatus = {
     service: "maxprice-hub",
     protocolVersion: HUB_PROTOCOL_VERSION,
-    usageConnection: "disconnected",
+    // Every Account the Hub knows (ADR-0139 §1): the boot's key seed fills
+    // it (hub-keys.ts) before any route answers.
+    accounts: [],
+    // ADR-0139 §8: when the Hub's history last gained an Account stamp on a
+    // sample it already held, as persisted (sample-stamps.ts); null until then.
+    samplesStampedAt: readSampleStampedAt(sampleStampsPath),
     usageLastSampleAt: null,
-    usageWeeklyResetAt: {},
-    usageCurrent: {},
-    organizations: {},
     sampleCount: 0,
-    credentialPresent: false,
     // Seeded EMPTY on purpose (ADR-0074). The bind reconciler's first pass runs
     // synchronously below and patches both of these before any socket can
     // accept a request, so nothing ever observes the empty seed. Resolving the
@@ -592,49 +645,52 @@ async function serve(): Promise<number> {
     // ADR-0037: reflect the persisted gate at boot; POST /api/password patches
     // it live so the console's Access card re-renders on set/clear.
     passwordProtected: config.passwordHash !== null,
-    // Provenance/display start empty (ADR-0036). POST /api/credential fills
-    // credentialUpdatedAt/credentialSource, and on Linux the boot's credential
-    // seed restores them from secrets.json (ADR-0126 §3). `startedAt` is
-    // stamped ONCE here — this is daemon runtime, not pure tested logic, so a
-    // direct new Date() is fine — and the console renders real uptime from it.
-    credentialUpdatedAt: null,
-    credentialSource: null,
+    // `startedAt` is stamped ONCE here — this is daemon runtime, not pure
+    // tested logic, so a direct new Date() is fine — and the console renders
+    // real uptime from it.
     startedAt: new Date().toISOString(),
   };
   const fanout = createHubFanout({ initialStatus });
+  const sampleStamps = createHubSampleStamps({ path: sampleStampsPath, fanout });
 
-  // The Hub's discovered roster (#284): what its key last listed.
-  const roster = createOrganizationRoster({ path: join(dataDir, "organization-roster.json") });
-  // The key-level usageConnection (#267 item 2); each poller publish records
-  // its Limits answers in the roster.
-  const usageStatus = createHubUsageStatus(fanout, { roster });
-
-  // PollerHub adapter: poller broadcasts → fanout; sampleCount rides along.
-  const poller = createUsagePoller({
-    store: sampleStore,
-    liveHub: {
-      emitUsageSample: createEmitUsageSample(sampleStore, fanout),
-      patchStatus: usageStatus.patchStatus,
-    },
-    // Fake-claude seam (ADR-0035); unset in production → real claude.ai.
-    baseUrl: process.env.MAXPRICE_CLAUDE_BASE_URL,
-  });
-  // The Organizations the poller reads: whatever the key lists (#283), booted
-  // from the roster (#284).
-  const pollSet = createHubPollSet({
-    list: (sessionKey) =>
-      discoverOrg({ sessionKey, baseUrl: process.env.MAXPRICE_CLAUDE_BASE_URL }),
-    poller,
-    roster,
-    onDiscoveryFailed: usageStatus.setDiscoveryFailed,
-  });
-
-  // The key's store, by platform (ADR-0126 §1): on Linux
-  // `<data dir>/secrets.json`, read once by the boot's credential seed;
-  // elsewhere the keychain helper, else memory.
-  const credstore = openCredstore(dataDir, {
+  // The key store, by platform (ADR-0126 §1, ADR-0138 §6): on Linux
+  // `<data dir>/secrets.json`, read once by the boot's key seed; elsewhere
+  // the keychain helper, its uuid list beside hub.json, else memory.
+  const keyStore = openKeyStore(dataDir, {
     log: (line) => console.log(line),
     warn: (line) => console.warn(line),
+  });
+  const {
+    poller,
+    pollSet,
+    roster: hubRoster,
+    keys: hubKeys,
+  } = createHubKeyWiring({
+    rosterPath: join(dataDir, ORGANIZATION_ROSTER_FILE),
+    store: keyStore,
+    sampleStore,
+    sampleStamps,
+    fanout,
+    // Fake-claude seam (ADR-0035); unset in production → real claude.ai.
+    baseUrl: process.env.MAXPRICE_CLAUDE_BASE_URL,
+    tags: () => fleetEvents.accountTags(),
+    // ADR-0139 §2: the Accounts the published Homes and the Label directory
+    // name, listed for display beside the tagged ones.
+    named: () => fleetAccountNames(machineDirectory.list(), labelDirectory.labels().accounts),
+  });
+
+  // The Hub's Gateways (ADR-0141 §5, §7, §9): the URL list in gateways.json,
+  // each management key in the key store beside the session keys (on Linux
+  // secrets.json's `gateways`, elsewhere `gateway-credential/<id>` in the
+  // keychain), the 7-day record feed in gateway-records.json. Neither file is
+  // written until a Gateway is connected or a record arrives. Drained from
+  // `ready` on, after the keys' boot; stopped by the teardown.
+  const hubGateways = createGatewayDrainer({
+    registry: createGatewayRegistry({ path: join(dataDir, GATEWAY_REGISTRY_FILE) }),
+    keyStore: openGatewayKeyStore(dataDir),
+    records: createGatewayRecordsStore({ path: join(dataDir, GATEWAY_RECORDS_FILE) }),
+    fanout,
+    resolver: hubKeys,
   });
 
   const registry = createClientRegistry();
@@ -680,10 +736,9 @@ async function serve(): Promise<number> {
         runReadySequence({
           sampleStore,
           fleetEvents,
-          credstore,
+          keys: hubKeys,
+          gateways: hubGateways,
           poller,
-          roster,
-          pollSet,
           fanout,
           onEventsUnusable: () => {
             eventsUsable = false;
@@ -708,13 +763,11 @@ async function serve(): Promise<number> {
     },
     fanout,
     samples: () => sampleStore.all(),
-    mergeSamples: createMergeSamples(sampleStore, fanout),
-    usage: {
-      setCredential: poller.setCredential,
-      pollOnce: poller.pollOnce,
-    },
-    pollSet,
-    persistCredential: (cred, provenance) => credstore.set(cred, provenance),
+    mergeSamples: createMergeSamples(sampleStore, fanout, sampleStamps),
+    keys: hubKeys,
+    gateways: hubGateways,
+    onEventsAccepted: () => hubKeys.publish(),
+    onAccountNamesChanged: () => hubKeys.publish(),
     registry,
     fleetEvents,
     // Request-time archive health (F3): false once the load above threw, which
@@ -727,10 +780,10 @@ async function serve(): Promise<number> {
     // must be able to tell a capability-free hub from a broken one so it can say
     // out loud that the identity half of the purge did not happen.
     identityDegraded: () => !identityStore.usable(),
-    organizationDirectory,
-    organizationAssertionDirectory,
+    labelDirectory,
+    membershipAssertionDirectory,
     // The console's roster route and the operator rename read it as it stands.
-    organizationRoster: () => roster.list(),
+    organizationRoster: () => hubRoster.organizations(),
     allowedOrigins,
     ready,
     page,
@@ -809,6 +862,9 @@ async function serve(): Promise<number> {
         // First, so no late listing or retry installs a set behind the stop.
         pollSet.stop();
         await poller.stop();
+        // No drain in flight once this resolves: a drained batch is stored
+        // before the feed's last write.
+        await hubGateways.stop();
         await sampleStore.flush();
         await fleetEvents.close();
         fanout.close();
@@ -924,8 +980,9 @@ export type OperatorVerbOptions = {
   env?: Env;
   platform?: NodeJS.Platform;
   // rename, merge, purge-machine and compact, which open the fleet event
-  // archive: off Linux they first probe for a running daemon, and any failure
-  // of their offline edit exits 2. The password verbs keep no check there,
+  // archive, and label, which edits the Label directory a running daemon
+  // holds in memory: off Linux they first probe for a running daemon, and
+  // any failure of their offline edit exits 2. The password verbs keep no check there,
   // and fail with their own codes.
   opensArchive?: boolean;
   // reachHub's, for a test: a short bound on the reach and each request, a
@@ -1204,8 +1261,19 @@ if (import.meta.main) {
     status: (json, io) => hubStatus(json, io),
     passwordSet: () => runPasswordSet(),
     passwordClear: () => runOperatorVerb(PASSWORD_CLEAR),
-    keySet: (io) => keySet(io),
-    keyClear: (io) => keyClear(io),
+    keySet: (label, io) => keySet(io, { label }),
+    keyList: (json, io) => keyList(json, io),
+    keyRemove: (account, io) => keyRemove(account, io),
+    gatewayConnect: (url, io) => gatewayConnect(url, io),
+    gatewayList: (json, io) => gatewayList(json, io),
+    gatewayRemove: (url, io) => gatewayRemove(url, io),
+    // Off Linux it takes the archive verbs' /healthz check: a running
+    // daemon holds the Label directory in memory, and would write over it.
+    label: (kind, name, label) =>
+      runOperatorVerb(
+        labelVerb(kind === "org" ? "organizations" : "accounts", name, label),
+        archive,
+      ),
     rename: (machineId, newName) =>
       runOperatorVerb(
         {

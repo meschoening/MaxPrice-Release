@@ -2,12 +2,12 @@ import { COST_MODE_OPTIONS, type CostMode } from "@maxprice/shared";
 import { cn } from "@/lib/utils";
 
 // CostModeControl — the glass seg pill writing `settings.costMode` (ADR-0014)
-// with the active mode's hint on a dim line below (T7). The topbar chip writes
-// the same field; both controls are two views of one durable setting.
+// with the active mode's hint on a dim line below (T7). It is the Desktop
+// client's only writer of the field: the topbar's cost-mode chip was retired.
 //
 // The mode table — labels + per-mode hints — is the shared `COST_MODE_OPTIONS`
-// from `@maxprice/shared`, the single source the topbar chip also imports, so
-// the two surfaces never disagree on what a mode means.
+// from `@maxprice/shared`, so the hint and the sidecar's mode names never
+// disagree on what a mode means.
 
 export function CostModeControl({
   value,

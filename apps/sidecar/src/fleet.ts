@@ -19,23 +19,28 @@ import {
   EVENT_FORGET_SESSIONS_MAX,
   HUB_ORGANIZATIONS_PATH,
   IDENTITY_PUSH_BATCH_MAX,
-  ORGANIZATION_ASSERTION_DIRECTORY_PATH,
-  ORGANIZATION_DIRECTORY_PATH,
+  LABEL_DIRECTORY_MAX,
+  LABEL_DIRECTORY_PATH,
+  MEMBERSHIP_ASSERTION_DIRECTORY_PATH,
   PROJECT_IDENTITY_PATH,
   buildAutomaticProjectIdentity,
+  isAccountUuid,
   hubEventsForgetResponseSchema,
   hubStatusSchema,
   hubMachinesResponseSchema,
-  hubOrganizationAssertionDirectorySchema,
-  hubOrganizationDirectorySchema,
+  hubLabelDirectorySchema,
+  hubMembershipAssertionDirectorySchema,
   hubOrganizationsResponseSchema,
   hubProjectIdentityResponseSchema,
   projectMergeAssertionKey,
   resolveProjectMergeAssertions,
   type ForgetSessionRef,
+  type HomeMembership,
+  type HubLabelDirectory,
   type HubMachine,
-  type OrganizationAssertionEntry,
-  type OrganizationLabelEntry,
+  type HubMachineSelfUpdateRequest,
+  type LabelEntry,
+  type MembershipAssertionEntry,
   type ProjectIdentityRow,
   type ProjectMergeAssertion,
   type ProjectMergeMutationRequest,
@@ -50,13 +55,12 @@ import {
   createEligibleContributionView,
 } from "./eligible-contribution-view";
 import { createMachineDirectoryCache } from "./machine-directory-cache";
-import { publishedHomes, samePublishedHomes } from "./engine/presumption";
+import { publishedHomeOrganizations, samePublishedHomeOrganizations } from "./engine/presumption";
 import { scanGate } from "./scan-gate";
 import { storedEventToWire } from "./stored-event-wire";
 import type { EventStore, LocalAppend, StoredEvent } from "./engine/store";
 import type { LiveHub } from "./live-hub";
 import type { OrganizationAssertions } from "./organization-assertions";
-import type { OrganizationLabels } from "./organization-labels";
 import type { LearnedOrg } from "./organizations";
 
 // ADR-0041 (M5) — the sidecar's fleet-event WIRING module. This is the ONE place
@@ -76,9 +80,10 @@ import type { LearnedOrg } from "./organizations";
 // ADR-0062 adds the Identity directory's sync to the same home: push rides
 // the shareEvents gate, pull rides the replica gate + the directory sweep,
 // and a pre-identity hub's 404 latches per-connection. See the identity
-// section below. #288 adds the Organization directory's (ADR-0105 §8), which
-// rides neither gate — see its section. #310 adds the Organization assertion
-// directory's (ADR-0107 §11), which rides neither gate either — see its section.
+// section below. #288 adds the Label directory's (ADR-0105 §8, the Organization
+// directory until #635 widened it to Account labels), which rides neither gate
+// — see its section. #310 adds the Membership assertion directory's (ADR-0107
+// §11, ADR-0139 §7), which rides neither gate either — see its section.
 // #366 adds the Organization roster pull, gated on neither as well.
 
 // { cursor, target } | null — the seed-progress shape on the status snapshot.
@@ -91,23 +96,77 @@ type Conn = { url: string; headers: Record<string, string> };
 // A serialized refresh's trigger, plus the force-reset a connection edge needs.
 type RefreshTrigger = { (): void; reset: () => void };
 
-// The label store as the Organization directory sync sees it (#288): what to
-// push, and where to adopt the union. `ready` is bootSidecar()'s `labelsReady`
-// — nothing is pushed or adopted before the store has loaded, because the load
-// would overwrite an entry adopted ahead of it.
-type FleetOrganizationLabels = {
+// The label stores as the Label directory sync sees them (#288, #635): the
+// Organization labels and the Account labels, what to push and where to
+// adopt the union. `ready` is bootSidecar()'s `labelsReady` — nothing is
+// pushed or adopted before both stores have loaded, because a load would
+// overwrite an entry adopted ahead of it. `merge` adopts each map into its
+// store, and says which kind's labels a reader can now see changed.
+export type FleetLabels = {
   ready: Promise<void>;
-  entries: () => ReadonlyMap<string, Readonly<OrganizationLabelEntry>>;
-  merge: OrganizationLabels["merge"];
+  entries: () => {
+    organizations: ReadonlyMap<string, Readonly<LabelEntry>>;
+    accounts: ReadonlyMap<string, Readonly<LabelEntry>>;
+  };
+  merge: (
+    incoming: HubLabelDirectory,
+  ) => Promise<{ organizationsChanged: boolean; accountsChanged: boolean }>;
 };
 
-// The assertion store as the Organization assertion directory sync sees it
-// (#310) — the label store's shape above, for the same reason: `ready` is
-// bootSidecar()'s `assertionsReady`, and nothing is pushed or adopted before
-// it.
-type FleetOrganizationAssertions = {
+// The keys of a Label directory union the Hub answered, map by map.
+type LabelDirectoryKeys = Record<keyof HubLabelDirectory, ReadonlySet<string>>;
+
+// What a label push sends (#635, ADR-0139 §7). Both maps whole while their
+// entries fit under LABEL_DIRECTORY_MAX together. Past it — a machine that
+// adopted another machine's labels on top of its own unsynced ones holds more
+// than the Hub can — every entry whose key the Hub's last answered union
+// (`held`) holds, which never grows that union, and then this machine's
+// newest labels the Hub lacks, while the union stays within the cap. A
+// cleared label the Hub lacks takes no slot: it has nothing there to clear,
+// and should the key reach the Hub later, it is held and goes in the next
+// push. The labels left out stay in the store, unsynced, until a slot frees;
+// `unsynced` counts them.
+function labelPushBody(
+  local: ReturnType<FleetLabels["entries"]>,
+  held: LabelDirectoryKeys,
+): { body: HubLabelDirectory; unsynced: number } {
+  if (local.organizations.size + local.accounts.size <= LABEL_DIRECTORY_MAX) {
+    return {
+      body: {
+        organizations: Object.fromEntries(local.organizations),
+        accounts: Object.fromEntries(local.accounts),
+      },
+      unsynced: 0,
+    };
+  }
+  const body: HubLabelDirectory = { organizations: {}, accounts: {} };
+  const missing: Array<{ kind: keyof HubLabelDirectory; key: string; entry: LabelEntry }> = [];
+  for (const kind of ["organizations", "accounts"] as const) {
+    for (const [key, entry] of local[kind]) {
+      if (held[kind].has(key)) body[kind][key] = entry;
+      else if (entry.label !== null) missing.push({ kind, key, entry });
+    }
+  }
+  // Newest edit first; the key breaks a tie, so the choice is stable.
+  missing.sort((a, b) =>
+    a.entry.editedAt === b.entry.editedAt
+      ? a.key.localeCompare(b.key)
+      : a.entry.editedAt < b.entry.editedAt
+        ? 1
+        : -1,
+  );
+  const slots = Math.max(0, LABEL_DIRECTORY_MAX - held.organizations.size - held.accounts.size);
+  for (const { kind, key, entry } of missing.slice(0, slots)) body[kind][key] = entry;
+  return { body, unsynced: Math.max(0, missing.length - slots) };
+}
+
+// The assertion store as the Membership assertion directory sync sees it
+// (#310, #635) — the label stores' shape above, for the same reason: `ready`
+// is bootSidecar()'s `assertionsReady`, and nothing is pushed or adopted
+// before it.
+type FleetMembershipAssertions = {
   ready: Promise<void>;
-  entries: () => ReadonlyMap<string, Readonly<OrganizationAssertionEntry>>;
+  entries: () => ReadonlyMap<string, Readonly<MembershipAssertionEntry>>;
   merge: OrganizationAssertions["merge"];
 };
 
@@ -160,20 +219,21 @@ export type FleetSyncDeps = {
   // their admitted rows stay archived. Never the pair-wide forget above: absent,
   // as in a rig that wires no archive, the repair's local half does nothing.
   forgetExcludedFromLocalArchive?: (sessions: readonly ForgetSessionRef[]) => Promise<void>;
-  // bootSidecar()'s half of the presumption cell (`withPublishedHomes`, #281):
-  // the machineId -> published Home map the Machine directory implies. The
-  // fleet owns the directory, so it builds the map and decides when it CHANGED;
-  // the report cache sees the swap by identity (ADR-0057's rebind trigger), and
-  // the fleet's own `pokeNow` is the wholesale invalidation that follows it.
-  installPublishedHomes?: (homes: ReadonlyMap<string, string>) => void;
-  // The user's renames, synced with the Hub's Organization directory (#288).
-  // Absent — a rig that wires no label store — and the fleet neither pushes
-  // nor pulls them.
-  organizationLabels?: FleetOrganizationLabels;
-  // The user's Organization assertions, synced with the Hub's Organization
-  // assertion directory (#310). Absent — a rig that wires no assertion store —
-  // and the fleet neither pushes nor pulls them.
-  organizationAssertions?: FleetOrganizationAssertions;
+  // bootSidecar()'s half of the presumption cell (`withMachineDirectory`,
+  // #281): the machineId -> published Home Organization map the Machine
+  // directory implies. The fleet owns the directory, so it builds the map and
+  // decides when it CHANGED; the report cache sees the swap by identity
+  // (ADR-0057's rebind trigger), and the fleet's own `pokeNow` is the
+  // wholesale invalidation that follows it.
+  installMachineDirectory?: (homeOrganizations: ReadonlyMap<string, string>) => void;
+  // The user's Organization and Account labels, synced with the Hub's Label
+  // directory (#288, #635). Absent — a rig that wires no label store — and
+  // the fleet neither pushes nor pulls them.
+  labels?: FleetLabels;
+  // The user's Membership assertions, synced with the Hub's Membership
+  // assertion directory (#310, #635). Absent — a rig that wires no assertion
+  // store — and the fleet neither pushes nor pulls them.
+  organizationAssertions?: FleetMembershipAssertions;
   // bootSidecar()'s assertion writer (#310): called after an adoption that
   // changed some session's resolved Organization, BEFORE the fleet's own
   // wholesale invalidation, so every renderer's refetch already sees the new
@@ -188,6 +248,7 @@ export type FleetSyncDeps = {
   emitMachinesChanged: () => void; // liveHub broadcast of SSE_EVENT.machinesChanged
   emitIdentityChanged: () => void; // liveHub broadcast of SSE_EVENT.identityChanged (ADR-0062)
   emitOrganizationsChanged?: () => void; // liveHub broadcast of SSE_EVENT.organizationsChanged (#288)
+  emitAccountsChanged?: () => void; // liveHub broadcast of SSE_EVENT.accountsChanged (#635: an adopted Account label)
   initial: { shareEvents: boolean; fleetReplica: boolean; hubConfigured: boolean };
   fetchImpl?: typeof fetch;
   debounceMs?: number; // default 500 — the trailing poke/status debounce
@@ -291,16 +352,21 @@ export type FleetSync = {
   // IS the whole effect. Exposed here rather than rebuilt at the call site so
   // there stays exactly one definition of the wholesale invalidation.
   invalidateReports: () => void;
-  // The Home this process runs under (#281), published to the Hub's Machine
-  // directory so every peer presumes this machine's owner-less rows under it.
-  // Publishing starts only once this has been called; an unchanged value is a
-  // no-op, and a value set while disconnected is published on the next connect.
-  setHome: (home: string | null) => void;
-  // A local rename wrote (#288): push the label map to the Hub's Organization
-  // directory. A no-op while disconnected — the next connect pushes anyway.
-  organizationLabelsChanged: () => void;
+  // The Home membership this process runs under (#281, #635), published to the
+  // Hub's Machine directory as `homeMemberships.anthropic`, Account included
+  // (ADR-0139 §6). Every peer presumes this machine's owner-less rows under
+  // its Organization alone; the Account is for display, never presumed
+  // (ADR-0137 §4's 2026-11-09 note). Publishing starts only once this has been
+  // called; a value equal to the last one on both fields is a no-op, so a
+  // change of the Account alone publishes; a value set while disconnected is
+  // published on the next connect.
+  setHome: (home: HomeMembership | null) => void;
+  // A local rename wrote, of an Organization or an Account (#288, #635): push
+  // both label maps to the Hub's Label directory. A no-op while disconnected
+  // — the next connect pushes anyway.
+  labelsChanged: () => void;
   // A local assertion edit wrote (#310): push the assertion map to the Hub's
-  // Organization assertion directory. A no-op while disconnected — the next
+  // Membership assertion directory. A no-op while disconnected — the next
   // connect pushes anyway.
   organizationAssertionsChanged: () => void;
   // The live replica store, or null when detached (replica off / hub
@@ -312,6 +378,37 @@ export type FleetSync = {
   mayArchiveFleet: (row: StoredEvent) => boolean;
   stop: () => Promise<void>;
 };
+
+// Two Home memberships, equal on both fields (null: no Home). The publish's
+// no-op test and the heal's comparison: an Account learned alone is a change
+// to publish (ADR-0139 §6's republish with its Account).
+function sameHome(
+  a: Pick<HomeMembership, "organizationUuid" | "accountUuid"> | null,
+  b: HomeMembership | null,
+): boolean {
+  if (a === null || b === null) return a === b;
+  return a.organizationUuid === b.organizationUuid && a.accountUuid === b.accountUuid;
+}
+
+// The Home membership as the Machine directory can hold it (ADR-0139 §6): an
+// Account is published only as an account uuid (`isAccountUuid`, the
+// directory's rule). A settings file's Account that is not one, which no
+// writer here produces (a Pending key is never the Home membership's Account,
+// account-tracking.ts), publishes as unknown rather than having the Hub refuse
+// the whole Home, and the heal compares the Hub's entry against this form, so
+// it never fights the Hub over a value the Hub cannot store.
+function publishableHome(home: HomeMembership | null): HomeMembership | null {
+  if (home === null) return null;
+  const accountUuid =
+    home.accountUuid !== null && isAccountUuid(home.accountUuid) ? home.accountUuid : null;
+  return { organizationUuid: home.organizationUuid, accountUuid };
+}
+
+// The self PUT body that publishes `home`: the whole map, its one Provider's
+// Home membership, or null for a machine with no Home.
+function homePublishBody(home: HomeMembership | null): HubMachineSelfUpdateRequest {
+  return { homeMemberships: home === null ? null : { anthropic: home } };
+}
 
 function seedEqual(a: HubSeed, b: HubSeed): boolean {
   if (a === null || b === null) return a === b;
@@ -353,24 +450,24 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   const cache = createMachineDirectoryCache({ path: deps.directoryCachePath });
   cache.load();
 
-  // The published Homes last handed to bootSidecar() (#281). Starts as the
-  // empty map, which is exactly what bootSidecar()'s initial presumption
-  // carries.
-  let installedHomes: ReadonlyMap<string, string> = publishedHomes([], deps.machineId);
-  // Hand bootSidecar() the presumption map a directory list implies — only when
-  // it CHANGED. Every GET carries fresh `live`/`lastSeenAt` join fields, so an
-  // unconditional install would mint a new presumption identity, and clear
-  // every report cache in the fleet, on every 5-minute sweep.
-  function adoptPublishedHomes(machines: readonly HubMachine[], poke: boolean): void {
-    const next = publishedHomes(machines, deps.machineId);
-    if (samePublishedHomes(installedHomes, next)) return;
-    installedHomes = next;
-    deps.installPublishedHomes?.(next);
+  // The published Home Organizations last handed to bootSidecar() (#281). They
+  // start as an empty directory's, no map, which is exactly what
+  // bootSidecar()'s seeded presumption carries.
+  let installedHomes: ReadonlyMap<string, string> = publishedHomeOrganizations([], deps.machineId);
+  // Hand bootSidecar() the presumption half a directory list implies — only
+  // when it CHANGED. Every GET carries fresh `live`/`lastSeenAt` join fields,
+  // so an unconditional install would mint a new presumption identity, and
+  // clear every report cache in the fleet, on every 5-minute sweep.
+  function adoptMachineDirectory(machines: readonly HubMachine[], poke: boolean): void {
+    const homes = publishedHomeOrganizations(machines, deps.machineId);
+    if (samePublishedHomeOrganizations(installedHomes, homes)) return;
+    installedHomes = homes;
+    deps.installMachineDirectory?.(homes);
     if (poke) pokeNow();
   }
   // Boot: the persisted directory presumes peers offline, before any connect.
   // No poke — there is no renderer yet to tell.
-  adoptPublishedHomes(cache.list(), false);
+  adoptMachineDirectory(cache.list(), false);
 
   // The Identity directory (ADR-0062 §3): own probed rows + the mirrored fleet
   // union. Unlike the disposable cache above this is AUTHORITATIVE — a dead
@@ -1181,7 +1278,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // latch — and differs only in URL, schema, and terminal action. The
   // serializer has a third user that is no pull at all: the Home publish
   // (#281), a PUT that wants the same one-in-flight, last-value-wins shape and
-  // takes no part in the fetch ladder. The Organization directory (#288) is
+  // takes no part in the fetch ladder. The Label directory (#288, #635) is
   // one of each: a pull that climbs the ladder, and a push (a POST) that
   // doesn't.
 
@@ -1248,7 +1345,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // The fetch ladder: GET → ok → json → schema, warning ONCE at whichever rung
   // fails and never handing the caller a partial result. `notFound` is reported
   // apart from `failed` because the three callers disagree about what a 404
-  // MEANS: to identity and to the Organization directory's pull (#288) it is a
+  // MEANS: to identity and to the Label directory's pull (#288) it is a
   // Hub that predates the route (a per-connection capability latch), to the
   // machine directory it is just another rejection.
   async function fetchAndParse<T>(
@@ -1307,8 +1404,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     // rows out of the fleet union until reconnect — ADR-0055's defect class
     // on the push half, the same reason the event sweep pushes AND pulls. An
     // unchanged re-push is a no-op merge hub-side (newest-probedAt-wins). The
-    // Organization directory's push rides it for the same reason (#288), and so
-    // does the Organization assertion directory's (#310); since each answer is
+    // Label directory's push rides it for the same reason (#288), and so
+    // does the Membership assertion directory's (#310); since each answer is
     // its union, it is each directory's pull floor too. So does the
     // Organization roster pull (#366): no poke announces a roster change, so
     // the sweep is how a later listing reaches this client.
@@ -1316,8 +1413,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       refreshDirectory();
       refreshIdentity();
       void pushIdentity();
-      pushOrganizationLabels();
-      pushOrganizationAssertions();
+      pushLabels();
+      pushMembershipAssertions();
       pullOrganizationRoster();
       if (forgetIntent.read() !== null) void whenBootResolves(bootIngestion, () => forget([]));
     }, directorySweepMs);
@@ -1338,12 +1435,12 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     if (out.kind !== "ok") {
       // The directory has no capability latch, so a 404 is just another
       // rejection here — say so, exactly as the pre-extraction `!res.ok` arm
-      // did (identity and the Organization directory latch on a 404 instead).
+      // did (identity and the Label directory latch on a 404 instead).
       if (out.kind === "notFound") console.warn("[sidecar] fleet directory refresh rejected (404)");
       return;
     }
     cache.update(out.data.machines);
-    adoptPublishedHomes(out.data.machines, true);
+    adoptMachineDirectory(out.data.machines, true);
     deps.emitMachinesChanged();
     // Re-publish when the directory's self entry disagrees with the Home this
     // process runs under — DAMPED. It heals only a publish this connection has
@@ -1361,10 +1458,11 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     // and this install says so once per connection.
     if (home !== undefined) {
       const self = out.data.machines.find((m) => m.machineId === deps.machineId);
-      const listed = self?.homeOrganization ?? null;
-      if (listed !== home) {
-        if (landedHome !== home || listed === null) publishHome();
-        else if (!warnedHomeConflict) {
+      const listed = self?.homeMemberships?.anthropic ?? null;
+      if (!sameHome(listed, home)) {
+        if (landedHome === undefined || !sameHome(landedHome, home) || listed === null) {
+          publishHome();
+        } else if (!warnedHomeConflict) {
           warnedHomeConflict = true;
           console.warn(
             "[sidecar] fleet home publish stood down: the Hub lists a different Home for this machine than the one this connection published — another install is likely publishing under the same machine id (e.g. a copied app-data directory); leaving the last writer's Home in place",
@@ -1382,11 +1480,11 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // the directory entry exists on any authenticated contact, and rows shared
   // before sharing was switched off still need their producer's Home.
   //
-  // The Home this process runs under, as bootSidecar() last handed it.
-  // `undefined` until the first `setHome` — a first launch's Home is not known
-  // until the seed walk settles, and publishing a placeholder would only make
-  // every peer drop its caches twice.
-  let home: string | null | undefined;
+  // The Home membership this process runs under, as bootSidecar() last handed
+  // it. `undefined` until the first `setHome` — a first launch's Home is not
+  // known until the seed walk settles, and publishing a placeholder would only
+  // make every peer drop its caches twice.
+  let home: HomeMembership | null | undefined;
   // The Home this CONNECTION last saw the Hub accept: the value SENT in a PUT
   // answered 2xx — not the live `home` at completion, so a `setHome` landing
   // mid-flight still counts as not landed. The heal's damper (above) reads it,
@@ -1394,7 +1492,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // are reset on every connection edge (`resetRefreshSerializers`), so a
   // reconnect — the one after a Hub restart included — publishes and heals
   // afresh.
-  let landedHome: string | null | undefined;
+  let landedHome: HomeMembership | null | undefined;
   let warnedHomeConflict = false;
   // The SAME serializer as the pulls: one PUT in flight, and a burst of
   // `setHome` calls coalesces into one follow-up that publishes the last value.
@@ -1409,7 +1507,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       const res = await fetchImpl(`${c.url}/api/machines/${encodeURIComponent(deps.machineId)}`, {
         method: "PUT",
         headers: { ...c.headers, "content-type": "application/json" },
-        body: JSON.stringify({ homeOrganization: value }),
+        body: JSON.stringify(homePublishBody(value)),
         signal: deadline.signal,
       });
       // A superseded connection's answer says nothing about the live one.
@@ -1569,142 +1667,182 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     }
   }
 
-  // ── Organization directory sync (#288, ADR-0105 §8) ──
-  // The user's renames go fleet-wide through the Hub's Organization directory.
-  // The push POSTs this machine's whole label map, and the Hub answers with
-  // the union after merging it — push and pull in one round trip — which is
-  // adopted newest-`editedAt`-wins. It runs on connect, on a local rename that
-  // wrote, and on the directory sweep; a hub:organizations poke pulls with a
-  // GET. Like the published Home, and unlike the identity rows, it is gated on
-  // neither `shareEvents` nor the replica: a label is user-authored
-  // presentation, fleet-wide whenever a Hub is configured. A Hub that predates
-  // the directory 404s, which latches `organizationDirectoryUnsupported` for
-  // THIS connection (the identity precedent); any other push failure warns
-  // once per connection, and the sweep retries. `onConnected` clears both. A
-  // pull, poke-driven and so rare, warns at whichever ladder rung it fails.
-  let organizationDirectoryUnsupported = false;
-  let warnedOrganizationDirectory = false;
-  function warnOrganizationDirectory(detail: string): void {
-    if (warnedOrganizationDirectory) return;
-    warnedOrganizationDirectory = true;
-    console.warn(`[sidecar] organization directory sync failed: ${detail}`);
+  // ── Label directory sync (#288, ADR-0105 §8; #635, ADR-0139 §7) ──
+  // The user's renames, of Organizations and of Accounts, go fleet-wide
+  // through the Hub's Label directory. The push POSTs this machine's whole
+  // label maps, `{ organizations, accounts }` (or, past the cap, what the Hub
+  // can take: `labelPushBody`), and the Hub answers with the
+  // union after merging them — push and pull in one round trip — which is
+  // adopted newest-`editedAt`-wins, map by map. It runs on connect, on a local
+  // rename that wrote, and on the directory sweep; a hub:labels poke pulls
+  // with a GET. Like the published Home, and unlike the identity rows, it is
+  // gated on neither `shareEvents` nor the replica: a label is user-authored
+  // presentation, fleet-wide whenever a Hub is configured. A 404 latches
+  // `labelDirectoryUnsupported` for THIS connection (the identity precedent);
+  // any other push failure warns once per connection, and the sweep retries.
+  // `onConnected` clears both. A pull, poke-driven and so rare, warns at
+  // whichever ladder rung it fails.
+  let labelDirectoryUnsupported = false;
+  let warnedLabelDirectory = false;
+  function warnLabelDirectory(detail: string): void {
+    if (warnedLabelDirectory) return;
+    warnedLabelDirectory = true;
+    console.warn(`[sidecar] label directory sync failed: ${detail}`);
   }
 
-  // Adopt a union. The pair a local rename fires — the wholesale invalidation
-  // and organizations:changed — fires only when some Organization's label
-  // changed: an `editedAt` that moved alone is written to disk and shown to
-  // no one. A merge that rejects (a disk fault) restored the store as it was,
-  // so there is nothing to announce.
-  async function adoptOrganizationLabels(
-    labels: FleetOrganizationLabels,
-    union: Record<string, OrganizationLabelEntry>,
-  ): Promise<void> {
-    let merged: { wrote: boolean; labelChanged: boolean };
+  // Adopt a union. What a local rename fires follows only a label a reader can
+  // see changed: an Organization's, the wholesale invalidation and
+  // organizations:changed; an Account's, the wholesale invalidation and
+  // accounts:changed. An `editedAt` that moved alone is written to disk and
+  // shown to no one. A merge that rejects (a disk fault) restored its store as
+  // it was, so there is nothing to announce.
+  async function adoptLabels(labels: FleetLabels, union: HubLabelDirectory): Promise<void> {
+    let merged: { organizationsChanged: boolean; accountsChanged: boolean };
     try {
       merged = await labels.merge(union);
     } catch (err) {
-      console.warn(`[sidecar] organization directory adopt failed: ${String(err)}`);
+      console.warn(`[sidecar] label directory adopt failed: ${String(err)}`);
       return;
     }
-    if (!merged.labelChanged) return;
+    if (!merged.organizationsChanged && !merged.accountsChanged) return;
     pokeNow();
-    deps.emitOrganizationsChanged?.();
+    if (merged.organizationsChanged) deps.emitOrganizationsChanged?.();
+    if (merged.accountsChanged) deps.emitAccountsChanged?.();
   }
 
   // The SAME serializer as the pulls: one push in flight, and a burst of
-  // triggers coalesces into one follow-up that sends the map as it is then.
-  const pushOrganizationLabels = createSerializedRefresh(
-    "organization directory push",
-    pushOrganizationLabelsOnce,
-  );
+  // triggers coalesces into one follow-up that sends the maps as they are then.
+  const pushLabels = createSerializedRefresh("label directory push", pushLabelsOnce);
 
-  async function pushOrganizationLabelsOnce(c: Conn, myGen: number): Promise<void> {
-    const labels = deps.organizationLabels;
-    if (labels === undefined || organizationDirectoryUnsupported) return;
+  // Every key this connection's Hub has answered in its union. The Hub never
+  // forgets a key (a cleared label stays as a tombstone), so each answer only
+  // adds to it; `onConnected` empties it for the next Hub. A push past the cap
+  // sends what it holds (`labelPushBody`).
+  let hubLabelKeys = { organizations: new Set<string>(), accounts: new Set<string>() };
+  function noteHubLabelKeys(union: HubLabelDirectory): void {
+    for (const kind of ["organizations", "accounts"] as const) {
+      for (const key of Object.keys(union[kind])) hubLabelKeys[kind].add(key);
+    }
+  }
+  // Said once per connection: how many labels a landed push left out.
+  let warnedLabelsUnsynced = false;
+
+  // A 409 means the push would take the Hub's union past the cap: this
+  // machine holds labels the Hub lacks, and the Hub is full. It learns the
+  // union with a GET, adopts it, and pushes once more, now bounded by what the
+  // Hub holds; the sweep retries anything later.
+  async function pushLabelsOnce(c: Conn, myGen: number): Promise<void> {
+    const labels = deps.labels;
+    if (labels === undefined || labelDirectoryUnsupported) return;
     await labels.ready;
     if (connGen !== myGen) return;
-    let union: Record<string, OrganizationLabelEntry>;
+    const first = await postLabels(c, myGen, labels);
+    if (first !== "full") return;
+    const out = await fetchAndParse(
+      `${c.url}${LABEL_DIRECTORY_PATH}`,
+      c.headers,
+      hubLabelDirectorySchema,
+      "label directory",
+    );
+    if (connGen !== myGen || out.kind !== "ok") return;
+    noteHubLabelKeys(out.data);
+    await adoptLabels(labels, out.data);
+    if (connGen !== myGen) return;
+    if ((await postLabels(c, myGen, labels)) === "full") warnLabelDirectory("409");
+  }
+
+  async function postLabels(c: Conn, myGen: number, labels: FleetLabels): Promise<"done" | "full"> {
+    const { body, unsynced } = labelPushBody(labels.entries(), hubLabelKeys);
+    let union: HubLabelDirectory;
     const deadline = requestDeadline();
     try {
-      const res = await fetchImpl(`${c.url}${ORGANIZATION_DIRECTORY_PATH}`, {
+      const res = await fetchImpl(`${c.url}${LABEL_DIRECTORY_PATH}`, {
         method: "POST",
         headers: { ...c.headers, "content-type": "application/json" },
-        body: JSON.stringify({ labels: Object.fromEntries(labels.entries()) }),
+        body: JSON.stringify(body),
         signal: deadline.signal,
       });
       // Everything below belongs to the connection that ASKED (F16): a
       // superseded Hub's 404 must not latch the fresh connection, nor its
       // union be adopted.
-      if (connGen !== myGen) return;
+      if (connGen !== myGen) return "done";
       if (res.status === 404) {
-        organizationDirectoryUnsupported = true; // pre-#288 Hub: silent, per-connection
-        return;
+        labelDirectoryUnsupported = true; // a Hub without the route: silent, per-connection
+        return "done";
       }
+      if (res.status === 409) return "full";
       if (!res.ok) {
-        warnOrganizationDirectory(String(res.status));
-        return;
+        warnLabelDirectory(String(res.status));
+        return "done";
       }
-      const parsed = hubOrganizationDirectorySchema.safeParse(await res.json());
-      if (connGen !== myGen) return;
+      const parsed = hubLabelDirectorySchema.safeParse(await res.json());
+      if (connGen !== myGen) return "done";
       if (!parsed.success) {
-        warnOrganizationDirectory("malformed answer");
-        return;
+        warnLabelDirectory("malformed answer");
+        return "done";
       }
-      union = parsed.data.labels;
+      union = parsed.data;
     } catch (err) {
-      if (connGen !== myGen) return;
-      warnOrganizationDirectory(String(err));
-      return;
+      if (connGen !== myGen) return "done";
+      warnLabelDirectory(String(err));
+      return "done";
     } finally {
       deadline.clear();
     }
-    await adoptOrganizationLabels(labels, union);
+    noteHubLabelKeys(union);
+    if (unsynced > 0 && !warnedLabelsUnsynced) {
+      warnedLabelsUnsynced = true;
+      console.warn(
+        `[sidecar] label directory is full: ${unsynced} local ${unsynced === 1 ? "label is" : "labels are"} not synced`,
+      );
+    }
+    await adoptLabels(labels, union);
+    return "done";
   }
 
-  const refreshOrganizationLabels = createSerializedRefresh(
-    "organization directory refresh",
-    refreshOrganizationLabelsOnce,
-  );
+  const refreshLabels = createSerializedRefresh("label directory refresh", refreshLabelsOnce);
 
-  async function refreshOrganizationLabelsOnce(c: Conn, myGen: number): Promise<void> {
-    const labels = deps.organizationLabels;
-    if (labels === undefined || organizationDirectoryUnsupported) return;
+  async function refreshLabelsOnce(c: Conn, myGen: number): Promise<void> {
+    const labels = deps.labels;
+    if (labels === undefined || labelDirectoryUnsupported) return;
     await labels.ready;
     if (connGen !== myGen) return;
     const out = await fetchAndParse(
-      `${c.url}${ORGANIZATION_DIRECTORY_PATH}`,
+      `${c.url}${LABEL_DIRECTORY_PATH}`,
       c.headers,
-      hubOrganizationDirectorySchema,
-      "organization directory",
+      hubLabelDirectorySchema,
+      "label directory",
     );
     // As the push: a superseded connection's answer neither latches nor lands.
     if (connGen !== myGen) return;
     if (out.kind === "notFound") {
-      organizationDirectoryUnsupported = true; // pre-#288 Hub: silent, per-connection
+      labelDirectoryUnsupported = true; // a Hub without the route: silent, per-connection
       return;
     }
     if (out.kind === "failed") return;
-    await adoptOrganizationLabels(labels, out.data.labels);
+    noteHubLabelKeys(out.data);
+    await adoptLabels(labels, out.data);
   }
 
-  // ── Organization assertion directory sync (#310, ADR-0107 §11) ──
-  // The Organization directory's sync above, copied for the user's
-  // Organization assertions: the push POSTs this machine's whole assertion map
-  // and adopts the union the Hub answers, on connect, on a local edit that
-  // wrote, and on the directory sweep; a hub:organization-assertions poke pulls
-  // with a GET. Gated on neither `shareEvents` nor the replica: any machine may
-  // assert any session, and archive-only history has no living producer to
-  // carry a claim (#306 item 6). A 404 latches
-  // `organizationAssertionDirectoryUnsupported` for THIS connection, apart from
+  // ── Membership assertion directory sync (#310, ADR-0107 §11; #635, ADR-0139 §7) ──
+  // The Label directory's sync above, copied for the user's Membership
+  // assertions: the push POSTs this machine's whole assertion map, each entry
+  // whole, its Account included (ADR-0137 §5), and adopts the union the Hub
+  // answers, entry by entry and whole, Account and all, on connect, on a local
+  // edit that wrote, and on the directory sweep; a hub:membership-assertions
+  // poke pulls with a GET. Gated on neither `shareEvents` nor the replica: any
+  // machine may assert any session, and archive-only history has no living
+  // producer to carry a claim (#306 item 6). A 404 latches
+  // `membershipAssertionDirectoryUnsupported` for THIS connection, apart from
   // the label directory's latch — a Hub may serve one and not the other; any
   // other push failure warns once per connection, and the sweep retries.
   // `onConnected` clears both.
-  let organizationAssertionDirectoryUnsupported = false;
-  let warnedOrganizationAssertionDirectory = false;
-  function warnOrganizationAssertionDirectory(detail: string): void {
-    if (warnedOrganizationAssertionDirectory) return;
-    warnedOrganizationAssertionDirectory = true;
-    console.warn(`[sidecar] organization assertion directory sync failed: ${detail}`);
+  let membershipAssertionDirectoryUnsupported = false;
+  let warnedMembershipAssertionDirectory = false;
+  function warnMembershipAssertionDirectory(detail: string): void {
+    if (warnedMembershipAssertionDirectory) return;
+    warnedMembershipAssertionDirectory = true;
+    console.warn(`[sidecar] membership assertion directory sync failed: ${detail}`);
   }
 
   // Adopt a union. Only a change to some session's resolved Organization is
@@ -1714,15 +1852,15 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // written to disk and shown to no one. A merge that rejects restored the
   // store, so there is nothing to announce. No roster poke: a claim moves no
   // Organization's row in Settings.
-  async function adoptOrganizationAssertions(
-    store: FleetOrganizationAssertions,
-    union: Record<string, OrganizationAssertionEntry>,
+  async function adoptMembershipAssertions(
+    store: FleetMembershipAssertions,
+    union: Record<string, MembershipAssertionEntry>,
   ): Promise<void> {
     let merged: { wrote: boolean; assertionChanged: boolean };
     try {
       merged = await store.merge(union);
     } catch (err) {
-      console.warn(`[sidecar] organization assertion directory adopt failed: ${String(err)}`);
+      console.warn(`[sidecar] membership assertion directory adopt failed: ${String(err)}`);
       return;
     }
     if (!merged.assertionChanged) return;
@@ -1730,20 +1868,20 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     pokeNow();
   }
 
-  const pushOrganizationAssertions = createSerializedRefresh(
-    "organization assertion directory push",
-    pushOrganizationAssertionsOnce,
+  const pushMembershipAssertions = createSerializedRefresh(
+    "membership assertion directory push",
+    pushMembershipAssertionsOnce,
   );
 
-  async function pushOrganizationAssertionsOnce(c: Conn, myGen: number): Promise<void> {
+  async function pushMembershipAssertionsOnce(c: Conn, myGen: number): Promise<void> {
     const store = deps.organizationAssertions;
-    if (store === undefined || organizationAssertionDirectoryUnsupported) return;
+    if (store === undefined || membershipAssertionDirectoryUnsupported) return;
     await store.ready;
     if (connGen !== myGen) return;
-    let union: Record<string, OrganizationAssertionEntry>;
+    let union: Record<string, MembershipAssertionEntry>;
     const deadline = requestDeadline();
     try {
-      const res = await fetchImpl(`${c.url}${ORGANIZATION_ASSERTION_DIRECTORY_PATH}`, {
+      const res = await fetchImpl(`${c.url}${MEMBERSHIP_ASSERTION_DIRECTORY_PATH}`, {
         method: "POST",
         headers: { ...c.headers, "content-type": "application/json" },
         body: JSON.stringify({ assertions: Object.fromEntries(store.entries()) }),
@@ -1753,54 +1891,54 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       // Hub's 404 must not latch the fresh connection, nor its union land.
       if (connGen !== myGen) return;
       if (res.status === 404) {
-        organizationAssertionDirectoryUnsupported = true; // pre-#310 Hub: silent, per-connection
+        membershipAssertionDirectoryUnsupported = true; // a Hub without the route: silent, per-connection
         return;
       }
       if (!res.ok) {
-        warnOrganizationAssertionDirectory(String(res.status));
+        warnMembershipAssertionDirectory(String(res.status));
         return;
       }
-      const parsed = hubOrganizationAssertionDirectorySchema.safeParse(await res.json());
+      const parsed = hubMembershipAssertionDirectorySchema.safeParse(await res.json());
       if (connGen !== myGen) return;
       if (!parsed.success) {
-        warnOrganizationAssertionDirectory("malformed answer");
+        warnMembershipAssertionDirectory("malformed answer");
         return;
       }
       union = parsed.data.assertions;
     } catch (err) {
       if (connGen !== myGen) return;
-      warnOrganizationAssertionDirectory(String(err));
+      warnMembershipAssertionDirectory(String(err));
       return;
     } finally {
       deadline.clear();
     }
-    await adoptOrganizationAssertions(store, union);
+    await adoptMembershipAssertions(store, union);
   }
 
-  const refreshOrganizationAssertions = createSerializedRefresh(
-    "organization assertion directory refresh",
-    refreshOrganizationAssertionsOnce,
+  const refreshMembershipAssertions = createSerializedRefresh(
+    "membership assertion directory refresh",
+    refreshMembershipAssertionsOnce,
   );
 
-  async function refreshOrganizationAssertionsOnce(c: Conn, myGen: number): Promise<void> {
+  async function refreshMembershipAssertionsOnce(c: Conn, myGen: number): Promise<void> {
     const store = deps.organizationAssertions;
-    if (store === undefined || organizationAssertionDirectoryUnsupported) return;
+    if (store === undefined || membershipAssertionDirectoryUnsupported) return;
     await store.ready;
     if (connGen !== myGen) return;
     const out = await fetchAndParse(
-      `${c.url}${ORGANIZATION_ASSERTION_DIRECTORY_PATH}`,
+      `${c.url}${MEMBERSHIP_ASSERTION_DIRECTORY_PATH}`,
       c.headers,
-      hubOrganizationAssertionDirectorySchema,
-      "organization assertion directory",
+      hubMembershipAssertionDirectorySchema,
+      "membership assertion directory",
     );
     // As the push: a superseded connection's answer neither latches nor lands.
     if (connGen !== myGen) return;
     if (out.kind === "notFound") {
-      organizationAssertionDirectoryUnsupported = true; // pre-#310 Hub: silent, per-connection
+      membershipAssertionDirectoryUnsupported = true; // a Hub without the route: silent, per-connection
       return;
     }
     if (out.kind === "failed") return;
-    await adoptOrganizationAssertions(store, out.data.assertions);
+    await adoptMembershipAssertions(store, out.data.assertions);
   }
 
   // ── Organization roster pull (#366, #360's resolution) ──
@@ -1845,9 +1983,13 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       return;
     }
     const learned: LearnedOrg[] = [];
+    // A row some Hub key's listing names (ADR-0139 §9). Its Limits answer is
+    // not on the row any more (it is the status's Memberships'): learned as
+    // null, "not read yet", which leaves an answer the registry recorded in
+    // place.
     for (const row of out.data.organizations) {
-      if (!row.listed || row.hints === undefined) continue;
-      learned.push({ id: row.uuid, hints: row.hints, limits: row.limits?.limits ?? null });
+      if (row.listedBy.length === 0 || row.hints === undefined) continue;
+      learned.push({ id: row.uuid, hints: row.hints, limits: null });
     }
     if (learned.length === 0) return;
     let changed: boolean;
@@ -1932,17 +2074,17 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // the identical wedge; since the extraction they share the remedy too, and
   // the Home publish (#281), which rides the same serializer, shares it again —
   // along with its per-connection memory: what this connection landed, and
-  // whether its damper has warned. The Organization directory's push and pull
-  // (#288) share it too, and so do the Organization assertion directory's
+  // whether its damper has warned. The Label directory's push and pull
+  // (#288) share it too, and so do the Membership assertion directory's
   // (#310) and the Organization roster pull (#366).
   function resetRefreshSerializers(): void {
     refreshDirectory.reset();
     refreshIdentity.reset();
     publishHome.reset();
-    pushOrganizationLabels.reset();
-    refreshOrganizationLabels.reset();
-    pushOrganizationAssertions.reset();
-    refreshOrganizationAssertions.reset();
+    pushLabels.reset();
+    refreshLabels.reset();
+    pushMembershipAssertions.reset();
+    refreshMembershipAssertions.reset();
     pullOrganizationRoster.reset();
     landedHome = undefined;
     warnedHomeConflict = false;
@@ -1969,17 +2111,19 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       identityUnsupported = false;
       void pushIdentity();
       refreshIdentity();
-      // The Organization directory (#288): the same fresh probe, and a fresh
-      // warning, for a new connection. Then push the label map; its answer is
-      // the union, so there is no separate pull.
-      organizationDirectoryUnsupported = false;
-      warnedOrganizationDirectory = false;
-      pushOrganizationLabels();
-      // The Organization assertion directory (#310): the same fresh probe and
-      // fresh warning, then the push, whose answer is the union.
-      organizationAssertionDirectoryUnsupported = false;
-      warnedOrganizationAssertionDirectory = false;
-      pushOrganizationAssertions();
+      // The Label directory (#288, #635): the same fresh probe, and a fresh
+      // warning, for a new connection. Then push both label maps; its answer
+      // is the union, so there is no separate pull.
+      labelDirectoryUnsupported = false;
+      warnedLabelDirectory = false;
+      hubLabelKeys = { organizations: new Set(), accounts: new Set() };
+      warnedLabelsUnsynced = false;
+      pushLabels();
+      // The Membership assertion directory (#310, #635): the same fresh probe
+      // and fresh warning, then the push, whose answer is the union.
+      membershipAssertionDirectoryUnsupported = false;
+      warnedMembershipAssertionDirectory = false;
+      pushMembershipAssertions();
       // The Organization roster (#366): learn every Organization the Hub's key lists.
       pullOrganizationRoster();
       // event-sync mirrors its capability verdict through onDegraded — the
@@ -2019,8 +2163,8 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       eventSync.onStatusEvents(events);
     },
     onMachinesPoke: () => refreshDirectory(),
-    onOrganizationsPoke: () => refreshOrganizationLabels(),
-    onOrganizationAssertionsPoke: () => refreshOrganizationAssertions(),
+    onLabelsPoke: () => refreshLabels(),
+    onMembershipAssertionsPoke: () => refreshMembershipAssertions(),
   };
 
   return {
@@ -2112,14 +2256,15 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
         : null,
     rebuildEngine: requestRebuild,
     invalidateReports: pokeNow,
-    setHome: (next) => {
-      if (next === home) return;
+    setHome: (requested) => {
+      const next = publishableHome(requested);
+      if (home !== undefined && sameHome(next, home)) return;
       home = next;
       // No-ops while disconnected; `onConnected` publishes the value later.
       publishHome();
     },
-    organizationLabelsChanged: () => pushOrganizationLabels(),
-    organizationAssertionsChanged: () => pushOrganizationAssertions(),
+    labelsChanged: () => pushLabels(),
+    organizationAssertionsChanged: () => pushMembershipAssertions(),
     getReplica: () => replica,
     mayArchiveFleet: (row) => {
       if (
@@ -2132,15 +2277,16 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
         return false;
       if (!eventSync.isCaughtUp()) return false;
       // An identity test — "this row IS the replica's copy" — so it must match
-      // in tag too (ADR-0103): a row fuller or emptier by Organization evidence
-      // alone is a different copy. The replica's copy is its record of it
-      // (ADR-0111 §2).
+      // in both tags too (ADR-0103, ADR-0137 §6): a row fuller or emptier by
+      // Organization or Account evidence alone is a different copy. The
+      // replica's copy is its record of it (ADR-0111 §2).
       const held = replica.get(row.messageId, row.requestId);
       return (
         held !== undefined &&
         held.machineId === row.machineId &&
         held.total === fleetTokenTotal(row) &&
-        held.organizationUuid === row.organizationUuid
+        held.organizationUuid === row.organizationUuid &&
+        held.accountUuid === row.accountUuid
       );
     },
     stop: async () => {

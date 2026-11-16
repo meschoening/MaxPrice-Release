@@ -145,6 +145,21 @@ pub fn popout_content_height(model_row: bool, update_pending: bool) -> f64 {
         }
 }
 
+/// The ranked popout's height (#638; #610's head + ranked rows): while the
+/// readout carries `popoutLimitRows` (two or more Memberships in the Scope's
+/// multi-Membership set) the renderer draws that many limit rows in place of
+/// the base's two (5-hour, Weekly), each a model row's 31px, and no
+/// `<Model> limit` row; the update row adds as ever. Two rows is the base.
+pub fn ranked_popout_content_height(limit_rows: u32, update_pending: bool) -> f64 {
+    POPOUT_HEIGHT
+        + f64::from(limit_rows.saturating_sub(2)) * POPOUT_MODEL_ROW_HEIGHT
+        + if update_pending {
+            POPOUT_UPDATE_ROW_HEIGHT
+        } else {
+            0.0
+        }
+}
+
 /// The popout's physical inner size on the monitor it is about to open on:
 /// its CONFIGURED logical size (tauri.conf.json — the size the CSS layout was
 /// drawn against) times that monitor's live scale factor.
@@ -562,6 +577,20 @@ mod tests {
         assert_eq!(
             popout_content_height(true, true),
             POPOUT_HEIGHT + POPOUT_MODEL_ROW_HEIGHT + POPOUT_UPDATE_ROW_HEIGHT
+        );
+    }
+
+    #[test]
+    fn ranked_height_adds_a_row_per_limit_row_past_two() {
+        assert_eq!(ranked_popout_content_height(2, false), POPOUT_HEIGHT);
+        assert_eq!(
+            ranked_popout_content_height(3, false),
+            POPOUT_HEIGHT + POPOUT_MODEL_ROW_HEIGHT
+        );
+        // Four rows and the `+N more` row: 5 × 31 in place of the base's 2.
+        assert_eq!(
+            ranked_popout_content_height(5, true),
+            POPOUT_HEIGHT + 3.0 * POPOUT_MODEL_ROW_HEIGHT + POPOUT_UPDATE_ROW_HEIGHT
         );
     }
 

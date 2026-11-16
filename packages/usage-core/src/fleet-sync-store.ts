@@ -67,8 +67,9 @@ type DeleteReceipt = {
 /**
  * What a replica keeps resident for one key in place of its row (ADR-0111 §1).
  * Every per-row read answers from it: the push pass's stamp predicate,
- * `mayArchiveFleet` and Storage's unbacked classification. `total` and
- * `organizationUuid` are the row's fullness parts (ADR-0103); `bytes` is its
+ * `mayArchiveFleet` and Storage's unbacked classification. `total`,
+ * `organizationUuid` and `accountUuid` are the row's fullness parts (ADR-0103,
+ * ADR-0137 §6); `bytes` is its
  * canonical line's byte cost (`fleetRowBytes`), which Storage sums for the
  * unbacked bytes. The strings are the row's interned ones (ADR-0110 §3).
  */
@@ -76,6 +77,7 @@ export type FleetRecord = {
   readonly seq: number;
   readonly total: number;
   readonly organizationUuid: string | undefined;
+  readonly accountUuid: string | undefined;
   readonly machineId: string;
   readonly projectSlug: string;
   readonly sessionId: string;
@@ -88,6 +90,7 @@ export function fleetRecord(row: FleetEvent, bytes = fleetRowBytes(row)): FleetR
     seq: row.seq,
     total: fleetDedupTokenTotal(row),
     organizationUuid: row.organizationUuid,
+    accountUuid: row.accountUuid,
     machineId: row.machineId,
     projectSlug: row.projectSlug,
     sessionId: row.sessionId,
@@ -99,8 +102,9 @@ export function fleetRecord(row: FleetEvent, bytes = fleetRowBytes(row)): FleetR
  * What the Local archive keeps resident for one key in place of its row
  * (ADR-0111 §1). The archive's per-row reads answer from it alone: the stamp
  * predicate, `excludedPairs`, the forgets' choice of keys and Storage's
- * earliest-at, which reads `timestamp` and skips withheld rows. `total` and
- * `organizationUuid` are the row's fullness parts (ADR-0103). The categorical
+ * earliest-at, which reads `timestamp` and skips withheld rows. `total`,
+ * `organizationUuid` and `accountUuid` are the row's fullness parts (ADR-0103,
+ * ADR-0137 §6). The categorical
  * strings are the row's interned ones (ADR-0110 §3); the timestamp is a
  * per-event value and is not interned.
  */
@@ -108,6 +112,7 @@ export type ArchiveRecord = {
   readonly seq: number;
   readonly total: number;
   readonly organizationUuid: string | undefined;
+  readonly accountUuid: string | undefined;
   readonly machineId: string;
   readonly projectSlug: string;
   readonly sessionId: string;
@@ -120,6 +125,7 @@ export function archiveRecord(row: FleetEvent): ArchiveRecord {
     seq: row.seq,
     total: fleetDedupTokenTotal(row),
     organizationUuid: row.organizationUuid,
+    accountUuid: row.accountUuid,
     machineId: row.machineId,
     projectSlug: row.projectSlug,
     sessionId: row.sessionId,
@@ -523,6 +529,32 @@ function hubStore(opts: FleetStoreOptions) {
   );
   const { database, get, number, set, transaction } = core;
   const snapshots = new Map<string, Snapshot>();
+  // ADR-0139 §2: the distinct Account tags of the rows this Hub accepted, each
+  // with the Organization tags it rode beside (an Account tagged with no
+  // Organization holds an empty set). Built from the stored rows at its first
+  // read after a load (`close` drops it, and a load on an open store is a
+  // no-op, so a built set is always this open's), and extended at each
+  // committed accept. Add-only between loads, like the
+  // engine's derived sets: a removed row's tag stays listed until the next
+  // load. The Hub status reads it to list the Accounts the fleet names.
+  let accountTagSet: Map<string, Set<string>> | null = null;
+  function recordAccountTag(tags: Map<string, Set<string>>, row: FleetEvent): void {
+    if (row.accountUuid === undefined) return;
+    let organizations = tags.get(row.accountUuid);
+    if (organizations === undefined) {
+      organizations = new Set();
+      tags.set(row.accountUuid, organizations);
+    }
+    if (row.organizationUuid !== undefined) organizations.add(row.organizationUuid);
+  }
+  function accountTags(): ReadonlyMap<string, ReadonlySet<string>> {
+    if (accountTagSet === null) {
+      const tags = new Map<string, Set<string>>();
+      for (const row of core.committed().values()) recordAccountTag(tags, row);
+      accountTagSet = tags;
+    }
+    return accountTagSet;
+  }
   const now = () => opts.nowImpl?.() ?? new Date().toISOString();
   const clock = () => Date.parse(now());
   const retentionMs = opts.retentionMs ?? 90 * 86400_000;
@@ -573,7 +605,8 @@ function hubStore(opts: FleetStoreOptions) {
     machineId: string,
     fence?: { epoch: string; deletionGeneration: number },
   ) {
-    return transaction(() => {
+    const accepted: FleetEvent[] = [];
+    const result = transaction(() => {
       if (
         fence !== undefined &&
         (fence.epoch !== get("epoch") || fence.deletionGeneration !== number("generation"))
@@ -585,8 +618,8 @@ function hubStore(opts: FleetStoreOptions) {
       for (const input of rows) {
         const previous = event(input.messageId, input.requestId);
         let row = previous;
-        // The one merge rule (ADR-0103): a larger total, or an equal total
-        // gaining a tag or a smaller one (#374). A loser is stamped with the
+        // The one merge rule (ADR-0103, ADR-0137 §6): a larger total, or an
+        // equal total gaining a tag or a better one (#374). A loser is stamped with the
         // incumbent's seq below.
         if (previous === undefined || fleetCopySupersedes(input, previous)) {
           const seq = number("eventSeq") + 1;
@@ -598,6 +631,7 @@ function hubStore(opts: FleetStoreOptions) {
         stamps.push({ messageId: input.messageId, requestId: input.requestId, seq: row!.seq });
       }
       appendChange(upserts, []);
+      accepted.push(...upserts);
       return {
         epoch: get("epoch"),
         deletionGeneration: number("generation"),
@@ -605,6 +639,9 @@ function hubStore(opts: FleetStoreOptions) {
         stamps,
       };
     });
+    // Only a committed accept names an Account (a failed batch throws above).
+    if (accountTagSet !== null) for (const row of accepted) recordAccountTag(accountTagSet, row);
+    return result;
   }
   async function remove(
     operationId: string,
@@ -730,6 +767,7 @@ function hubStore(opts: FleetStoreOptions) {
     changes,
     snapshotPage,
     all,
+    accountTags,
     get: event,
     getByKey: core.residentByKey,
     changeBytes: () =>
@@ -755,6 +793,7 @@ function hubStore(opts: FleetStoreOptions) {
     close: async () => {
       core.close();
       snapshots.clear();
+      accountTagSet = null;
     },
   };
 }
@@ -933,8 +972,10 @@ function archiveStore(opts: FleetStoreOptions) {
           !fleetFullnessPartsExceed(
             fleetDedupTokenTotal(input),
             input.organizationUuid,
+            input.accountUuid,
             held.total,
             held.organizationUuid,
+            held.accountUuid,
           )
         )
           continue;

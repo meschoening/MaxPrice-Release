@@ -23,11 +23,13 @@ export const EXIT = {
   // holding a restore that did not finish, a Hub running on the data dir of
   // a command that edits its files, a running Hub a command could not reach,
   // or that did not answer a request, within 10 s, that refused its operator
-  // token, its probe, `status`'s page view, a password or a key, that sent
-  // an answer it cannot read, that stopped while it waited, or that it lost,
+  // token, its probe, `status`'s page view, a password, a key, a Gateway or
+  // a removal, that sent an answer it cannot read, that stopped while it
+  // waited, or that it lost, a key `key set` stored whose label was refused,
   // a serve.lock record no Hub writes, two password entries that differ, a
   // key claude.ai refused or could not check or a Claude Code OAuth token
-  // given as one, a service step that failed, or restore's backup running,
+  // given as one, a Gateway that failed `gateway connect`'s check (ADR-0141
+  // §7), a service step that failed, or restore's backup running,
   // written while it is copied, or unreadable; for `page` and its commands,
   // a hub.json they cannot use, or a Hub page URL at which the page is not
   // published; for `setup`, a Hub its ending waited 10 s for in vain; for
@@ -36,8 +38,12 @@ export const EXIT = {
   // version within 30 s.
   FAILURE: 1,
   // A usage error, a secret given as an argument or not at all, `key`,
-  // `status`, `restore`, `service` or `update` off Linux, no Hub at the data
-  // dir, an invalid password, a machine a command cannot act on, a backup
+  // `gateway`, `status`, `restore`, `service` or `update` off Linux, no Hub
+  // at the data dir, an invalid password or management key, a machine a
+  // command cannot act on, an Account or an Organization a name does not
+  // match alone (ADR-0140 §2), an Account that holds no key, a label `label`
+  // cannot write, a Gateway URL that is none or names no Gateway the Hub
+  // holds (ADR-0141 §8), a backup
   // restore cannot use, or a data dir that already holds a Hub's files; an
   // invalid Hub page URL, or none set; `setup` off Linux, as root, off a
   // terminal, or with a data dir the unit does not or would not serve.
@@ -98,8 +104,19 @@ export type HubHandlers = {
   // The password and the key are read by the handler, never from argv.
   passwordSet: () => Promise<number>;
   passwordClear: () => Promise<number>;
-  keySet: (io: Io) => Promise<number>;
-  keyClear: (io: Io) => Promise<number>;
+  // `--label`'s value, or undefined.
+  keySet: (label: string | undefined, io: Io) => Promise<number>;
+  keyList: (json: boolean, io: Io) => Promise<number>;
+  // The Account as named, or null for `--unfiled`.
+  keyRemove: (account: string | null, io: Io) => Promise<number>;
+  // The new label, or null for `--unset`.
+  label: (kind: "account" | "org", name: string, label: string | null) => Promise<number>;
+  // The URL as typed; the management key is read by the handler, never
+  // from argv.
+  gatewayConnect: (url: string, io: Io) => Promise<number>;
+  gatewayList: (json: boolean, io: Io) => Promise<number>;
+  // The URL, or the Id `gateway list` shows, as typed.
+  gatewayRemove: (url: string, io: Io) => Promise<number>;
   rename: (machineId: string, newName: string) => Promise<number>;
   merge: (sourceId: string, targetId: string) => Promise<number>;
   purgeMachine: (machineId: string) => Promise<number>;
@@ -210,8 +227,15 @@ Describe the Hub running on the data dir as the hub tray app's Popout
 describes its own: the Hub row (Online, Local only, Event sync down or Not
 responding), the claude.ai row, the Access row and the connected clients;
 then the session key (set or not, when and by whom, never any part of it),
-the Hub's version, Update, the data dir, and the pid and port serve.lock
-records. A row that has a fix names its command. Linux only.
+the Gateways, the Hub's version, Update, the data dir, and the pid and port
+serve.lock records. A row that has a fix names its command. Linux only.
+
+With several Accounts, the claude.ai row counts them, as in '2 of 3
+connected · 1 expired', every Account the Hub knows counted, one it holds
+no key for as no key, and each Account gets a Key row of its own: its label,
+then its key's provenance while it works, else Key expired, Poll failing or
+No key on this Hub. Each Gateway the Hub drains gets a Gateway row: its
+host, its state and the age of its last record.
 
 Update is serve's last check of the update channel, read from
 update-check.json in the data dir: a newer version (naming maxprice-hub
@@ -234,7 +258,7 @@ instead.
 
 Options:
   --json  Print one object instead: the Hub page's view of the Hub, the Hub
-          row's state, the key, the data dir, the pid, the port and whether
+          row's state, the keys, the data dir, the pid, the port and whether
           the pid runs in maxprice-hub.service; for a Hub that recorded its
           port but did not answer, the state "not-responding" with the last
           four alone. It has no Update and reads no update-check.json
@@ -295,33 +319,57 @@ ${SKEW_EXIT_4}
   130  set: Ctrl-C at a prompt; nothing is written
 `;
 
-const KEY_HELP = `Usage: maxprice-hub key set
-       maxprice-hub key clear
+const KEY_HELP = `Usage: maxprice-hub key set [--label <label>]
+       maxprice-hub key list [--json]
+       maxprice-hub key remove <account>
+       maxprice-hub key remove --unfiled
 
-Store or remove the claude.ai session key the Hub polls the Usage limits
-with. The Hub keeps it in secrets.json in the data dir, readable by this
-user alone (0600). Linux only: elsewhere the Hub keeps it in the keychain,
-and the console sets it.
+Store, list or remove the claude.ai session keys the Hub polls the Usage
+limits with. The Hub holds one key per claude.ai Account, in secrets.json in
+the data dir, readable by this user alone (0600). Linux only: elsewhere the
+Hub keeps its keys in the keychain, and the console sets them.
 
 Verbs:
-  set    Read the key, check it with claude.ai, then hand it to the running
-         Hub, or store it for the Hub's next start. On a terminal it asks
-         for the key and shows nothing as it is typed or pasted; otherwise
-         it reads all of stdin, as in 'maxprice-hub key set < key.txt'. The
-         key is never an argument: argv lands in shell history and ps. It
-         stores nothing until claude.ai lists the key's Organizations, and
-         reaches the Hub only once it has.
-  clear  Remove the stored key, and the running Hub's copy. It checks
-         nothing.
+  set     Read the key, check it with claude.ai, then hand it to the running
+          Hub, or store it for the Hub's next start. On a terminal it asks
+          for the key and shows nothing as it is typed or pasted; otherwise
+          it reads all of stdin, as in 'maxprice-hub key set < key.txt'. The
+          key is never an argument: argv lands in shell history and ps. It
+          stores nothing until claude.ai lists the key's Organizations, and
+          reaches the Hub only once it has. The key is stored under the
+          Account claude.ai names for it, replacing that Account's earlier
+          key. Then it labels that Account: with --label, that label; on a
+          terminal, the one typed at 'Label for Account <first 8> (Enter to
+          skip):', where Enter skips and a label too long or in use asks
+          again; off a terminal, none.
+  list    Each Account the Hub knows: its label, the first 8 characters of
+          its uuid, its key's connection, when the key was set and by whom
+          (local, or the machine whose client pushed it), or No key and when
+          it was removed. A key not yet moved under its Account reads
+          Unfiled key. With no Hub running it reads the data dir's files and
+          says no connection is known. Never any part of a key.
+  remove  Remove one Account's key, recording its removal time, so a
+          client's auto-heal pushes back only a key set after it; or, with
+          --unfiled, the unfiled key.
+
+An <account> is its label, exactly, its uuid, or the first 8 characters of
+its uuid; one that matches no Account the Hub knows, or several, exits 2.
+
+Options:
+  --label <label>  set: the Account's label, 1 to 40 characters once
+                   trimmed, checked before the key is read
+  --json           list: print {"running":…,"keys":[…]} instead
+  --unfiled        remove: the unfiled key, which has no Account to name
 
 The data dir's serve.lock says whether a Hub runs there. While one does,
-the command sends the key, or the clear, to that Hub's own route, as the
-console does, with the data dir's operator-token: the Hub stores the key
-and polls with it at once, or stops polling at once. The Hub must answer
-within 10 s. With the lock free, the command holds it and writes or removes
-secrets.json itself, which the Hub reads when it starts. It refuses a data
-dir with no hub.json: only serve or setup makes one, or restore copies one
-from a backup.
+the command goes through that Hub's own routes, as the console does, with
+the data dir's operator-token: the Hub stores the key and polls with it at
+once, or stops polling a removed one at once. The Hub must answer within
+10 s. With the lock free, the command holds it and reads or edits
+secrets.json and label-directory.json itself, which the Hub reads when it
+starts; no prompt is answered holding it. It refuses a data dir with no
+hub.json: only serve or setup makes one, or restore copies one from a
+backup.
 
 The key is the sessionKey cookie of a browser signed in to claude.ai, a value
 starting sk-ant-sid01-. To copy it from a browser on another machine: sign in
@@ -332,21 +380,133 @@ refuses; maxprice-hub never reads ~/.claude/.credentials.json.
 
 ${DATA_DIR}
 
-Ctrl-C at the prompt stops with exit 130, having stored nothing.
+Ctrl-C at the key prompt stops with exit 130, having stored nothing; at the
+label prompt, with exit 130, keeping the key.
 
 Exit codes:
   1  The key is a Claude Code OAuth token, claude.ai refused it or could not
      be reached, the running Hub did not answer within 10 s (see
      maxprice-hub service logs), serve.lock held a pid alone all that time
      (a serve still starting, or another command at work), the Hub refused
-     the operator token, its status probe or the change, sent an answer this
-     maxprice-hub cannot read, stopped while it waited, or was lost, flock
-     failed on serve.lock, or secrets.json cannot be written or removed
-  2  A bad command or option, an argument after set or clear, not Linux, no
-     Hub at the data dir, or no key given
+     the operator token, its status probe, its label directory or the
+     change, sent an answer this maxprice-hub cannot read, stopped while it
+     waited, or was lost, flock failed on serve.lock, secrets.json cannot be
+     written, or set stored the key and the label was refused or not
+     written
+  2  A bad command or option, an argument after set or list, not Linux, no
+     Hub at the data dir, no key given, an empty or too long --label, an
+     <account> that matches no Account or several, or that holds no key,
+     no unfiled key to remove, or remove given both or neither of
+     <account> and --unfiled
   4  The running Hub speaks another Hub protocol: restart it to finish the
      update
-  130  set: Ctrl-C at the prompt; nothing is stored
+  130  set: Ctrl-C at the key prompt, storing nothing, or at the label
+       prompt, keeping the key
+`;
+
+const LABEL_HELP = `Usage: maxprice-hub label account <account> <label>
+       maxprice-hub label account <account> --unset
+       maxprice-hub label org <org> <label>
+       maxprice-hub label org <org> --unset
+
+Label an Account or an Organization in the Hub's Label directory, as the
+console's Rename does, or with --unset remove its label: an Account then
+reads Account <first 8 of its uuid>, an Organization its plan or
+Organization <first 8 of its id>. Every client adopts the label. The label
+is trimmed, 1 to 40 characters, and in use by no other Account, or no other
+Organization, whatever its case.
+
+An <account> or an <org> is its label, exactly, its uuid, or the first 8
+characters of its uuid; one that matches nothing the Hub knows, or several,
+exits 2. With no Hub running, the Accounts it knows are those secrets.json
+holds a key or a removal time for and those the Label directory names, and
+the Organizations those the roster lists and the Label directory names.
+
+Options:
+  --unset  Remove the label instead of setting one
+
+${OPERATOR}
+
+Exit codes:
+${OPERATOR_EXIT_1}
+  2  A bad command, option or argument, both or neither of <label> and
+     --unset, no Hub at the data dir, or the label failed: an empty or too
+     long label, a name that matches nothing or several things, a label
+     another Account or Organization already uses, a Label directory that
+     is full, or one that could not be written
+${SKEW_EXIT_4}
+`;
+
+const GATEWAY_HELP = `Usage: maxprice-hub gateway connect <url>
+       maxprice-hub gateway list [--json]
+       maxprice-hub gateway remove <url>
+
+Connect, list or remove the Gateways the Hub drains: services that serve
+Claude Code's requests on credentials they hold themselves, whose records
+name the Membership each request was billed to. CLIProxyAPI is the one
+MaxPrice reads. Each is keyed by its URL, its management address, http://
+or https://. The Hub keeps each
+management key in secrets.json in the data dir, readable by this user alone
+(0600), and each URL in gateways.json beside it. Linux only: elsewhere the
+Hub keeps the keys in the keychain, and the console connects them.
+
+Verbs:
+  connect  Read the management key, check it with the Gateway (one read of
+           its credential list), then hand the Gateway to the running Hub,
+           or store it for the Hub's next start. On a terminal it asks for
+           the key and shows nothing as it is typed or pasted; otherwise it
+           reads all of stdin, as in
+           'maxprice-hub gateway connect <url> < key.txt'. The key is never
+           an argument: argv lands in shell history and ps. It stores
+           nothing the Gateway does not accept. Connecting a Gateway the Hub
+           holds replaces its key. A Gateway that connects prints two
+           warnings every time, since neither call shows them: set the
+           Gateway's usage queue retention to 3600 seconds or more, and let
+           MaxPrice be the queue's only consumer, since anything else that
+           drains it takes records MaxPrice then never sees.
+  list     Each Gateway the Hub holds: its host, its Id, its state
+           (Draining, Statistics off, Unreachable, Key refused or Error) and
+           the age of its last record. With no Hub running it reads
+           gateways.json and says no state is known. Never any part of a
+           key.
+  remove   Stop draining one Gateway, and forget its key and URL. A <url>
+           is the URL it was connected with, or its Id as list shows it. A
+           client that connected the Gateway itself keeps its own copy, and
+           drains it while the Hub does not.
+
+Options:
+  --json  list: print {"running":…,"gateways":[…]} instead
+
+The data dir's serve.lock says whether a Hub runs there. While one does,
+the command goes through that Hub's own routes, as the console does, with
+the data dir's operator-token: the Hub checks the Gateway again and drains
+it at once, or stops draining a removed one at once. The Hub must answer
+within 10 s. With the lock free, the command holds it and reads or edits
+gateways.json and secrets.json itself, which the Hub reads when it starts;
+no prompt or check is answered holding it. It refuses a data dir with no
+hub.json: only serve or setup makes one, or restore copies one from a
+backup.
+
+${DATA_DIR}
+
+Ctrl-C at the management key prompt stops with exit 130, having stored
+nothing.
+
+Exit codes:
+  1  The Gateway did not answer, refused the management key or answered as
+     no CLIProxyAPI does, the running Hub did not answer within 10 s (see
+     maxprice-hub service logs), serve.lock held a pid alone all that time
+     (a serve still starting, or another command at work), the Hub refused
+     the operator token, its status probe or the change, found the Gateway
+     failing its own check, sent an answer this maxprice-hub cannot read,
+     stopped while it waited, or was lost, flock failed on serve.lock, or
+     secrets.json or gateways.json cannot be written
+  2  A bad command or option, a missing <url> or an extra argument, not
+     Linux, no Hub at the data dir, a <url> that is not a Gateway's URL or
+     Id, or that names no Gateway the Hub holds, or no management key given
+     or an invalid one
+${SKEW_EXIT_4}
+  130  connect: Ctrl-C at the management key prompt; nothing is stored
 `;
 
 const RENAME_HELP = `Usage: maxprice-hub rename <machineId> <newName>
@@ -422,7 +582,8 @@ Restore a stopped Hub's data dir, or a backup of one, at <dir> into the
 data dir, before the data dir's first serve: a fleet moves to another Hub
 this way, or a Hub comes back from a backup. It copies hub.json and
 events.sqlite, which <dir> must hold, and usage-history.jsonl, the Machine,
-Identity, Organization and Organization assertion directories and the Hub
+Identity, Label and Membership assertion directories (or a v6 backup's
+Organization and Organization assertion directories, converted) and the Hub
 roster when it holds them. It never copies secrets.json,
 operator-token, serve.lock or update-check.json, nor any other file: give
 the restored Hub its session key with key set or setup. It only reads <dir>,
@@ -625,7 +786,7 @@ Exit codes:
 const SETUP_HELP = `Usage: maxprice-hub setup
 
 Walk the Hub's setup on a terminal, in four steps: the claude.ai session
-key, the Hub password, the Hub page URL and maxprice-hub.service. Each step
+keys, the Hub password, the Hub page URL and maxprice-hub.service. Each step
 runs its command's own code, key set, password set or clear, page set or
 clear, and service install, and has that command's effect; setup adds only
 the questions around them. Linux only: the hub tray app sets itself up.
@@ -647,6 +808,13 @@ commits on its own. Enter skips or keeps the first three steps. At step 4's
 step says why and asks again. Ctrl-C at a prompt, or Ctrl-D on an empty
 visible one, stops setup with exit 130, keeping every step it completed.
 Run again, the first three steps show what is set and keep it on Enter.
+
+Step 1 lists the keys the Hub holds, one line each as key list shows them,
+then takes session keys one at a time, one per claude.ai Account: after
+each key it stores, it asks that Account's label as key set does (Enter
+skips), then for another key, and Enter ends the step. Each key is stored
+as it is accepted, and Ctrl-C keeps every key stored before it. Step 1
+removes no key: key remove does.
 An installed unit is installed again without a question, which restarts
 the Hub only when the unit's file changed.
 
@@ -741,18 +909,36 @@ export const VERBS: Record<string, Verb> = {
     },
   },
   key: {
-    summary: "Set or clear the session key: maxprice-hub key set|clear",
+    summary: "Store, list or remove session keys: key set|list|remove",
     help: KEY_HELP,
-    options: {},
+    options: {
+      label: { type: "string" },
+      json: { type: "boolean" },
+      unfiled: { type: "boolean" },
+    },
     positionals: true,
     secretSafeParseErrors: true,
     // ADR-0126 §6: no message here quotes what was typed, a key pasted
     // where the command goes or after it included.
-    run: async ([command, ...rest], handlers, _values, io) => {
+    run: async ([command, ...rest], handlers, values, io) => {
+      const label = values.label as string | undefined;
+      const json = values.json === true;
+      const unfiled = values.unfiled === true;
+      // Each option belongs to one command.
+      const owns = (owner: string) => {
+        for (const [option, given, of] of [
+          ["label", label !== undefined, "set"],
+          ["json", json, "list"],
+          ["unfiled", unfiled, "remove"],
+        ] as const) {
+          if (given && of !== owner) throw usage("key", `--${option} goes with key ${of} only`);
+        }
+      };
       switch (command) {
         case undefined:
-          throw usage("key", "key needs a command: set or clear");
+          throw usage("key", "key needs a command: set, list or remove");
         case "set":
+          owns("set");
           if (rest.length > 0) {
             throw usage(
               "key",
@@ -760,12 +946,78 @@ export const VERBS: Record<string, Verb> = {
                 "paste it at the prompt or pipe it on stdin",
             );
           }
-          return await handlers.keySet(io);
-        case "clear":
-          if (rest.length > 0) throw usage("key", "key clear takes no arguments");
-          return await handlers.keyClear(io);
+          return await handlers.keySet(label, io);
+        case "list":
+          owns("list");
+          if (rest.length > 0) throw usage("key", "key list takes no arguments");
+          return await handlers.keyList(json, io);
+        case "remove":
+          owns("remove");
+          if (rest.length + (unfiled ? 1 : 0) !== 1) {
+            throw usage("key", "key remove takes one <account>, or --unfiled");
+          }
+          return await handlers.keyRemove(unfiled ? null : rest[0]!, io);
         default:
-          throw usage("key", "unknown key command; the commands are set and clear");
+          throw usage("key", "unknown key command; the commands are set, list and remove");
+      }
+    },
+  },
+  label: {
+    summary: "Label an Account or an Organization: label account|org",
+    help: LABEL_HELP,
+    options: { unset: { type: "boolean" } },
+    positionals: true,
+    run: async ([kind, name, label, ...extra], handlers, values) => {
+      if (kind !== "account" && kind !== "org") {
+        throw usage(
+          "label",
+          kind === undefined
+            ? "label needs a kind: account or org"
+            : "unknown label kind; the kinds are account and org",
+        );
+      }
+      const unset = values.unset === true;
+      if (name === undefined || extra.length > 0 || (label === undefined) !== unset) {
+        throw usage("label", `label ${kind} takes <${kind}> and a <label>, or <${kind}> --unset`);
+      }
+      return await handlers.label(kind, name, label ?? null);
+    },
+  },
+  gateway: {
+    summary: "Connect, list or remove Gateways: gateway connect|list|remove",
+    help: GATEWAY_HELP,
+    options: { json: { type: "boolean" } },
+    positionals: true,
+    secretSafeParseErrors: true,
+    // ADR-0141 §8: no message here quotes what was typed, a management key
+    // pasted after the URL, or where it goes, included.
+    run: async ([command, ...rest], handlers, values, io) => {
+      const json = values.json === true;
+      if (json && command !== "list") throw usage("gateway", "--json goes with gateway list only");
+      switch (command) {
+        case undefined:
+          throw usage("gateway", "gateway needs a command: connect, list or remove");
+        case "connect":
+          if (rest.length === 0) throw usage("gateway", "gateway connect takes one <url>");
+          if (rest.length > 1) {
+            throw usage(
+              "gateway",
+              "the management key is never an argument: argv lands in shell history and ps; " +
+                "paste it at the prompt or pipe it on stdin",
+            );
+          }
+          return await handlers.gatewayConnect(rest[0]!, io);
+        case "list":
+          if (rest.length > 0) throw usage("gateway", "gateway list takes no arguments");
+          return await handlers.gatewayList(json, io);
+        case "remove":
+          if (rest.length !== 1) throw usage("gateway", "gateway remove takes one <url>");
+          return await handlers.gatewayRemove(rest[0]!, io);
+        default:
+          throw usage(
+            "gateway",
+            "unknown gateway command; the commands are connect, list and remove",
+          );
       }
     },
   },
@@ -899,12 +1151,12 @@ The commands other than serve, setup, status, service, update, restore and
 page act on the Hub at the data dir. On Linux, while a Hub runs there, they
 go through its own routes with the data dir's operator-token, and it
 applies each change at once, with no restart; with none running, they edit
-the data dir's files. Elsewhere they edit the files, and key is Linux only.
-setup walks key set, password set, page set and service install on a
-terminal, on Linux, making the data dir first as serve does. status
-describes the Hub running there, the same way, on Linux. restore fills an
-empty data dir from a stopped Hub's backup, and service runs serve as a
-systemd user unit, both on Linux. update replaces this binary with the
+the data dir's files. Elsewhere they edit the files, and key and gateway
+are Linux only. setup walks key set, password set, page set and service
+install on a terminal, on Linux, making the data dir first as serve does.
+status describes the Hub running there, the same way, on Linux. restore
+fills an empty data dir from a stopped Hub's backup, and service runs serve
+as a systemd user unit, both on Linux. update replaces this binary with the
 newest release, on Linux, and restarts the unit that runs it. page set and
 page clear edit hub.json beside a running Hub too, which reads the Hub page
 URL only for its boot log.
@@ -916,11 +1168,14 @@ Exit codes:
      of a command that edits its files, a running Hub a command could not
      reach within 10 s, or that did not answer a request within 10 s (a
      change may then have been applied), that refused its operator token,
-     its probe, its page view, a password or a key, that sent an answer it
-     cannot read, that stopped while it waited or that it lost, a
-     serve.lock record no Hub writes, two password entries that differ, a
+     its probe, its page view, a password, a key, a Gateway or a removal,
+     that sent an answer it cannot read, that stopped while it waited or
+     that it lost, a key set stored whose label was refused or not written,
+     a serve.lock record no Hub writes, two password entries that differ, a
      key claude.ai refused or could not check or a Claude Code OAuth token
-     given as one, a service step that failed, or restore's backup
+     given as one, a Gateway that did not answer, refused its management
+     key or answered as no CLIProxyAPI does, secrets.json or gateways.json
+     that cannot be written, a service step that failed, or restore's backup
      running, written while it is copied, or unreadable; for page, a
      hub.json it cannot use, or a Hub page URL at which the page is not
      published; for setup, a Hub its ending waited 10 s for in vain; for
@@ -928,8 +1183,11 @@ Exit codes:
      restart that failed, or a restarted Hub that did not report the new
      version within 30 s
   2  Usage error, a secret given as an argument or not at all, no Hub at
-     the data dir, an invalid password, key set or clear, status, restore,
-     service or update, off Linux, a machine a command cannot act on, a
+     the data dir, an invalid password or management key, key, gateway,
+     status, restore, service or update, off Linux, a machine a command
+     cannot act on, an Account or an Organization a name does not match
+     alone, an Account that holds no key, a label a command cannot write, a
+     Gateway URL that is not one or that names no Gateway the Hub holds, a
      backup restore cannot use, or a data dir that already holds a Hub's
      files; an invalid Hub page URL, or none set; setup off Linux, as root,
      off a terminal, or beside a unit that serves, or would serve, another
@@ -940,9 +1198,10 @@ Exit codes:
      update
   5  serve: another maxprice-hub held the data dir's serve.lock for ${SERVE_LOCK_RETRY_MS} ms
   100  update --check: a newer maxprice-hub is available
-  130  Ctrl-C at a prompt: password set or key set, which write nothing,
-       purge-machine, which purges nothing, or setup, which keeps every
-       step it completed
+  130  Ctrl-C at a prompt: password set, which writes nothing, key set,
+       which stores nothing at its key prompt and keeps the key at its label
+       prompt, gateway connect, which stores nothing, purge-machine, which
+       purges nothing, or setup, which keeps every step it completed
 
 User guide: ${USER_GUIDE_URL}${USER_GUIDE_PAGES.headlessHub}
 `;

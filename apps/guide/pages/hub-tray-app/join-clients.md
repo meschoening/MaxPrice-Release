@@ -28,7 +28,7 @@ A client that has joined appears in the console's Machines card, named after its
 
 Rename the machine from its row's **⋯** menu, if its hostname isn't the name you want ([the Machines card](popout-and-console.md#machines)).
 
-If the Hub has no session key yet, the first client that joins with Auto-heal on sends it its own, and the Popout's claude.ai row turns **Connected**.
+If the Hub has no session key yet, the first client that joins with Send keys to the Hub on sends it its own, and the Popout's claude.ai row turns **Connected**. A client that uses another claude.ai Account sends that Account's key too, and the console's [Accounts card](popout-and-console.md#accounts) lists it beside the first. A client that holds a [Gateway](popout-and-console.md#gateways) sends it up once, and the Hub drains it from then on.
 
 ## With a Hub password
 

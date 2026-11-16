@@ -2,9 +2,9 @@ import type { Column } from "./data-table";
 
 /* Wide's ink (map #151 / T13 #164, ADR-0073).
 
-   At content 2256 the sessions table is 578px of ink in 2245 — three flexible
-   tracks holding 869/609/435 for 248/77/52 of text — and a row whose label and
-   value are 1300px apart is not spacious, it is untrackable. The bar is the
+   At content 2256 the retired sessions table was 578px of ink in 2245 — three
+   flexible tracks holding 869/609/435 for 248/77/52 of text — and a row whose
+   label and value are 1300px apart is not spacious, it is untrackable. The bar is the
    answer to that: NOT a new number (nothing on this map touches the wire), but
    the row's own cost, drawn instead of merely printed.
 

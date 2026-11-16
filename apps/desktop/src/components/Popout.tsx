@@ -1,10 +1,22 @@
 import { Component, useEffect, type ErrorInfo, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
-import { popoutView, type PopoutHead, type PopoutViewState } from "@maxprice/shared";
+import {
+  LIMIT_STATE_WORDS,
+  popoutView,
+  rankedPopoutView,
+  type MembershipName,
+  type PopoutHead,
+  type PopoutViewState,
+  type RankedPopoutHead,
+  type RankedPopoutRow,
+  type RankedPopoutViewState,
+} from "@maxprice/shared";
 import { insideTauri } from "../lib/tauri";
 import { relaunchApp } from "../lib/relaunch";
 import { ringStrokeDasharray } from "../lib/ring-stroke";
+import { cn } from "../lib/utils";
+import { MembershipNameView } from "./membership-name";
 import { usePendingUpdate, usePopoutData } from "../state/use-popout-data";
 import { useNowTick } from "../state/use-now-tick";
 import { useSettings, useTimeDisplay } from "../state/use-settings";
@@ -48,14 +60,31 @@ export function Popout(): React.ReactElement {
 }
 
 function PopoutDash(): React.ReactElement {
-  const data = usePopoutData();
-  const pendingUpdate = usePendingUpdate();
-  const display = useTimeDisplay();
-  const { data: settings } = useSettings();
   // 1Hz so the ring countdown crawls, like the Live tile. Throttled by the OS
   // while the window is hidden, which is exactly when nobody is looking.
   const now = useNowTick(1000);
+  const data = usePopoutData(now);
+  const pendingUpdate = usePendingUpdate();
+  const display = useTimeDisplay();
+  const { data: settings } = useSettings();
 
+  const ranked =
+    data.ranked === null
+      ? null
+      : rankedPopoutView({
+          anyError: data.anyError,
+          engineStopped: data.engineStopped,
+          settled: data.settled,
+          ready: data.ready,
+          hasData: data.hasData,
+          todayCost: data.todayCost,
+          todayTokens: data.todayTokens,
+          now,
+          display,
+          allOrganizations: data.allOrganizations,
+          memberships: data.ranked.memberships,
+          headBlocks: data.ranked.headBlocks,
+        });
   const view = popoutView({
     anyError: data.anyError,
     engineStopped: data.engineStopped,
@@ -77,12 +106,14 @@ function PopoutDash(): React.ReactElement {
     fiveHourState: data.fiveHourState,
   });
 
+  const drawn = ranked ?? view;
+
   return (
     <div className="popout-root" role="group" aria-label="MaxPrice">
-      <PopoutBody view={view} />
+      {ranked === null ? <PopoutBody view={view} /> : <RankedPopoutBody view={ranked} />}
       <div className="pdivider" aria-hidden />
       {pendingUpdate !== null ? <UpdateRow version={pendingUpdate} /> : null}
-      <PopoutActions relaunch={view.kind === "down" && view.stopped} />
+      <PopoutActions relaunch={drawn.kind === "down" && drawn.stopped} />
     </div>
   );
 }
@@ -127,13 +158,116 @@ export function PopoutBody({ view }: { view: PopoutViewState }): React.ReactElem
       {view.modelRow !== null ? (
         <LimitRow label={view.modelRow.label} pct={view.modelRow.pct} />
       ) : null}
-      <div className="prow">
-        <span className="name">{view.todayLabel}</span>
+      <TodayRow label={view.todayLabel} cost={view.todayText} tokens={view.todayTokensText} />
+    </div>
+  );
+}
+
+function TodayRow({
+  label,
+  cost,
+  tokens,
+}: {
+  label: string;
+  cost: string;
+  tokens: string;
+}): React.ReactElement {
+  return (
+    <div className="prow">
+      <span className="name">{label}</span>
+      <span className="state">
+        <b className="num">{cost}</b>
+        <span className="num">· {tokens}</span>
+      </span>
+    </div>
+  );
+}
+
+// The ranked Popout (#638; #610's "head + ranked"): the head, the four most
+// used Memberships a row each, `+N more` past four, then Today. Every row is
+// one `.prow` (30px and a 1px gap), the height the shell gives each limit row
+// (`ranked_popout_content_height`). Exported for its test; the ladder's
+// other states are `PopoutBody`'s.
+export function RankedPopoutBody({ view }: { view: RankedPopoutViewState }): React.ReactElement {
+  if (view.kind !== "ranked") return <PopoutBody view={view} />;
+  return (
+    <div className="pbody">
+      <RankedHeadRow head={view.head} />
+      {view.rows.map((row) => (
+        <RankedRow key={row.key} row={row} />
+      ))}
+      {view.more !== null ? (
+        <div className={cn("prow pmore", view.more.hot && "hot")}>
+          <span className="name">{view.more.text}</span>
+          {view.more.note !== null ? <span className="state num">{view.more.note}</span> : null}
+        </div>
+      ) : null}
+      <TodayRow label={view.todayLabel} cost={view.todayText} tokens={view.todayTokensText} />
+    </div>
+  );
+}
+
+// One Membership: its name (`wk` for a window that is not the 5-hour one),
+// then its most used live window's meter and percent. A stale reading keeps
+// its last-known percent, greyed, with "key expired" in the meter's place; an
+// idle one the em-dash on an empty track (#320); the rest its state's words
+// (`LIMIT_STATE_WORDS`), dimmed. The name keeps its Account half whole while
+// the Organization part ellipsizes (`MembershipNameView`).
+function RankedRow({ row }: { row: RankedPopoutRow }): React.ReactElement {
+  const name = (
+    <span className="name pname">
+      <MembershipNameView name={row.name} className="pname-text" title={row.label} />
+      {row.windowTag !== null ? <span className="pwtag">{row.windowTag}</span> : null}
+    </span>
+  );
+  if (row.state === "readable" && row.pct !== null) {
+    return (
+      <div className="prow limit">
+        {name}
         <span className="state">
-          <b className="num">{view.todayText}</b>
-          <span className="num">· {view.todayTokensText}</span>
+          <span
+            className="limit-meter"
+            role="meter"
+            aria-valuenow={row.pct}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-label={`${row.label} used`}
+          >
+            <i style={{ width: `${row.pct}%` }} data-tone={row.tone ?? undefined} />
+          </span>
+          <b className="num">{row.pct}%</b>
         </span>
       </div>
+    );
+  }
+  if (row.state === "stale") {
+    return (
+      <div className="prow limit stale" data-state="stale">
+        {name}
+        <span className="state">
+          <span className="pnote">{LIMIT_STATE_WORDS.stale}</span>
+          <b className="num">{row.pct === null ? "—" : `${row.pct}%`}</b>
+        </span>
+      </div>
+    );
+  }
+  if (row.state === "idle" || row.state === "readable") {
+    return (
+      <div className="prow limit dim">
+        {name}
+        <span className="state">
+          <span className="limit-meter" aria-hidden />
+          <span className="num">—</span>
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div className="prow limit dim" data-state={row.state}>
+      {name}
+      <span className="state">
+        <span className="pnote">{LIMIT_STATE_WORDS[row.state]}</span>
+      </span>
     </div>
   );
 }
@@ -185,53 +319,113 @@ function LimitRow({
 
 const RING_VIEWBOX = 96; // the globals.css ring recipe: viewBox 96, r 40, stroke 7
 
-function PopoutHeadRow({ head }: { head: PopoutHead }): React.ReactElement {
+// The ranked head: today's ring or idle inset, or the `Most used:`
+// Membership drawn idle (#622 item 6): an empty ring with "—", the eyebrow
+// naming it, and no number, since it has no Active block to read.
+function RankedHeadRow({ head }: { head: RankedPopoutHead }): React.ReactElement {
+  if (head.kind === "ring") {
+    return (
+      <PopoutHeadRow
+        head={head}
+        eyebrow={<NamedEyebrow lead="Active block" name={head.eyebrowName} />}
+      />
+    );
+  }
+  if (head.kind !== "idle-ring") return <PopoutHeadRow head={head} />;
+  return (
+    <div className="a-head idle-ring">
+      <HeadRing frac={0} label={null} ariaLabel="No active block" />
+      <div className="hd">
+        <NamedEyebrow lead="Most used" name={head.eyebrowName} />
+        <div className="value idle-value">No active block</div>
+      </div>
+    </div>
+  );
+}
+
+// The ranked head's eyebrow: its words, then the Membership's name, whose
+// Organization part ellipsizes before its Account half.
+function NamedEyebrow({ lead, name }: { lead: string; name: MembershipName }): React.ReactElement {
+  return (
+    <span className="eyebrow eyebrow-named">
+      <span className="eyebrow-lead">{lead}</span>
+      <span className="eyebrow-tag eyebrow-sep"> · </span>
+      <MembershipNameView name={name} className="eyebrow-tag" />
+    </span>
+  );
+}
+
+// `eyebrow` replaces the head's own (the ranked head names its Membership).
+function PopoutHeadRow({
+  head,
+  eyebrow,
+}: {
+  head: PopoutHead;
+  eyebrow?: React.ReactNode;
+}): React.ReactElement {
   if (head.kind === "idle") {
     return <div className="pinset">No active block — start a Claude Code session to open one.</div>;
   }
-  const dash = ringStrokeDasharray(head.ringFrac);
   return (
     <div className="a-head">
-      <div className="ring-wrap">
-        <svg
-          viewBox={`0 0 ${RING_VIEWBOX} ${RING_VIEWBOX}`}
-          aria-label={`Block time elapsed: ${Math.round(head.ringFrac * 100)}%`}
-        >
-          <defs>
-            <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0" className="stop-a" />
-              <stop offset="1" className="stop-b" />
-            </linearGradient>
-          </defs>
-          <circle className="ring-track" cx="48" cy="48" r="40" />
-          {dash === null ? null : (
-            <circle
-              className="ring-fill"
-              cx="48"
-              cy="48"
-              r="40"
-              strokeDasharray={dash}
-              transform="rotate(-90 48 48)"
-            />
-          )}
-        </svg>
-        <span className="ring-label">
-          <b className="num">{head.centerLabel ?? "—"}</b>
-        </span>
-      </div>
+      <HeadRing
+        frac={head.ringFrac}
+        label={head.centerLabel}
+        ariaLabel={`Block time elapsed: ${Math.round(head.ringFrac * 100)}%`}
+      />
       <div className="hd">
-        <span className="eyebrow">
-          Active block
-          {head.eyebrowTag !== null ? (
-            <span className="eyebrow-tag"> · {head.eyebrowTag}</span>
-          ) : null}
-        </span>
+        {eyebrow ?? (
+          <span className="eyebrow">
+            Active block
+            {head.eyebrowTag !== null ? (
+              <span className="eyebrow-tag"> · {head.eyebrowTag}</span>
+            ) : null}
+          </span>
+        )}
         <div className="value num">
           {head.costText}
           <span className="tokens">· {head.tokensText}</span>
         </div>
         <div className="meta num">{head.metaText}</div>
       </div>
+    </div>
+  );
+}
+
+function HeadRing({
+  frac,
+  label,
+  ariaLabel,
+}: {
+  frac: number;
+  label: string | null;
+  ariaLabel: string;
+}): React.ReactElement {
+  const dash = ringStrokeDasharray(frac);
+  return (
+    <div className="ring-wrap">
+      <svg viewBox={`0 0 ${RING_VIEWBOX} ${RING_VIEWBOX}`} aria-label={ariaLabel}>
+        <defs>
+          <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" className="stop-a" />
+            <stop offset="1" className="stop-b" />
+          </linearGradient>
+        </defs>
+        <circle className="ring-track" cx="48" cy="48" r="40" />
+        {dash === null ? null : (
+          <circle
+            className="ring-fill"
+            cx="48"
+            cy="48"
+            r="40"
+            strokeDasharray={dash}
+            transform="rotate(-90 48 48)"
+          />
+        )}
+      </svg>
+      <span className="ring-label">
+        <b className="num">{label ?? "—"}</b>
+      </span>
     </div>
   );
 }

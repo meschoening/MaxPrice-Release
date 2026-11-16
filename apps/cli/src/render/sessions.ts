@@ -1,14 +1,14 @@
 import {
-  aggregateSessions,
   formatCalendarDay,
   formatCost,
   machineName,
   organizationCellLabels,
   sessionProjectName,
   type SessionRow,
-  type SessionsAggregate,
 } from "@maxprice/shared";
+import { type AccountCells, accountsText } from "../account-column";
 import { modelFamilies, paintModels } from "./models";
+import type { ProjectsTotal } from "./projects";
 import {
   type Column,
   formatTokens,
@@ -22,22 +22,29 @@ import {
 } from "./table";
 
 // `maxprice sessions` as #445's Variant A table: one row per session, newest
-// last activity first, as the Desktop's Sessions table sorts by default, and
-// a Total row that is the Desktop's Filter totals for the same rows.
+// last activity first, as the retired Sessions table sorted by default, and a
+// Total row that is the Desktop's Projects strip filter total for the same
+// range and Scope (ADR-0140 §11's #642 note), not a sum of the rows above it.
 
 export type SessionsReport = ReportContext & {
   // The route's answer, in its order.
   rows: readonly SessionRow[];
+  // The Projects strip's filter total for the same request (`projectsTotal`
+  // over `/api/projects` folded as the Desktop folds it).
+  total: ProjectsTotal;
+  // The Account column's labels by session id (`account-column.ts`); null
+  // while the column is hidden.
+  accounts: AccountCells | null;
 };
 
 // A body line is a session; the Total line carries only what it prints.
-type Line = { session: SessionRow } | { total: SessionsAggregate };
+type Line = { session: SessionRow } | { total: ProjectsTotal };
 
 // A column's text for a session, and for the Total line, blank by default:
 // the Total never shows a body row's value.
 function text(
   session: (s: SessionRow) => string,
-  total: (t: SessionsAggregate) => string = () => "",
+  total: (t: ProjectsTotal) => string = () => "",
 ): (line: Line) => string {
   return (line) => ("session" in line ? session(line.session) : total(line.total));
 }
@@ -58,26 +65,33 @@ function organizationCell(s: SessionRow, labels: ReadonlyMap<string, string>): s
   return ownerlessLabel === undefined ? label : `${label} (owner-less part · ${ownerlessLabel})`;
 }
 
-// The Desktop's Filter totals for the Sessions strip. It reduces the route's
-// answer in the route's order, not the sorted table, so this does too:
-// float addition is not associative, and another order can move the cost.
-export function sessionsTotal(rows: readonly SessionRow[]): SessionsAggregate {
-  return aggregateSessions([...rows]);
-}
-
 // The columns, left to right. `drop` is the order they go when the terminal
 // is too narrow: Input and Output together, then Models, Total tokens,
-// Machine, Organization, Last activity. Session, Project and Cost always
-// stay. `maxprice sessions --help` says the same.
+// Machine, Organization, Account, Last activity. Session, Project and Cost
+// always stay. `maxprice sessions --help` says the same.
 export function sessionsColumns(
-  report: Pick<ReportContext, "tz" | "now" | "isAll" | "labels" | "machines">,
+  report: Pick<
+    SessionsReport,
+    "tz" | "now" | "spansOrganizations" | "labels" | "machines" | "accounts"
+  >,
 ): Column<Line>[] {
-  const { tz, now, labels, machines } = report;
+  const { tz, now, labels, machines, accounts } = report;
   const machine: Column<Line>[] =
     machines === null
       ? []
       : [{ header: "Machine", text: text((s) => machineName(s.machineId, machines)), drop: 3 }];
-  const organization: Column<Line>[] = report.isAll
+  const account: Column<Line>[] =
+    accounts === null
+      ? []
+      : [
+          {
+            header: "Account",
+            text: text((s) => accountsText(accounts, accounts.byKey.get(s.sessionId) ?? [])),
+            min: NAME_MIN.account,
+            drop: 5,
+          },
+        ];
+  const organization: Column<Line>[] = report.spansOrganizations
     ? [
         {
           header: "Organization",
@@ -97,6 +111,7 @@ export function sessionsColumns(
     },
     { header: "Project", text: text(sessionProjectName), min: NAME_MIN.project },
     ...machine,
+    ...account,
     ...organization,
     {
       header: "Models",
@@ -119,7 +134,7 @@ export function sessionsColumns(
       header: "Cost",
       text: text(
         (s) => formatCost(s.totalCost),
-        (t) => formatCost(t.totalCost),
+        (t) => formatCost(t.costRange),
       ),
       align: "right",
     },
@@ -127,7 +142,7 @@ export function sessionsColumns(
       header: "Last activity",
       text: text((s) => formatCalendarDay(s.lastActivity, tz, now)),
       align: "right",
-      drop: 5,
+      drop: 6,
     },
   ];
 }
@@ -136,6 +151,6 @@ export function renderSessions(report: SessionsReport, out: Output): string {
   const title = reportTitle("Sessions", report);
   if (report.rows.length === 0) return `${titleLine(title, out)}\nNo sessions in this range.\n`;
   const rows: Line[] = sortSessions(report.rows).map((session) => ({ session }));
-  const total: Line = { total: sessionsTotal(report.rows) };
+  const total: Line = { total: report.total };
   return renderTable({ title, columns: sessionsColumns(report), rows, total }, out);
 }

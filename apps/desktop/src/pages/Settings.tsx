@@ -1,8 +1,9 @@
+import { useEffect } from "react";
+import { useLocation } from "react-router-dom";
 import { ChevronDown } from "lucide-react";
 import { DEFAULT_SETTINGS } from "@maxprice/shared";
 import { useSettings, useUpdateSettings } from "@/state/use-settings";
-import { useOrganizations } from "@/state/use-organizations";
-import { ORGANIZATION_LIST_DESCRIPTION, showOrganizationList } from "@/lib/organization-list-view";
+import { useLiveStatus } from "@/state/use-live-status";
 import { PathList } from "@/components/settings/PathList";
 import { TimezoneSelect } from "@/components/settings/TimezoneSelect";
 import { TimeFormatControl } from "@/components/settings/TimeFormatControl";
@@ -14,25 +15,29 @@ import { PRICING_SECTION_DESCRIPTION } from "@/lib/pricing-section";
 import { BackgroundSection } from "@/components/settings/background-section";
 import { backgroundResidencySupported } from "@/lib/background-residency";
 import { isMacOS } from "@/lib/platform";
+import { SETTINGS_SECTIONS as SECTION } from "@/lib/settings-sections";
 import { AutostartSection } from "@/components/settings/autostart-section";
 import { useAutostart } from "@/state/use-autostart";
 import { TransparencySection } from "@/components/settings/TransparencySection";
 import { ResetSection } from "@/components/settings/ResetSection";
 import { AppInfoSection } from "@/components/settings/app-info-section";
-import { UsageConnectionSection } from "@/components/settings/usage-connection-section";
 import { HubSection } from "@/components/settings/hub-section";
 import { StorageSection } from "@/components/settings/storage-section";
 import { StorageActions } from "@/components/settings/storage-actions";
 import { STORAGE_COPY } from "@/lib/storage-view";
 import { disconnectHub } from "@/lib/hub-config";
+import { Section } from "@/components/settings/settings-section";
+import { AccountsCluster } from "@/components/settings/accounts/accounts-cluster";
 
 // Settings page (`/settings`, ADR-0014) — the single-column editor for the
 // durable `settings.json`, wearing Glass (M6, the T7
-// `clusters` variant): three grouped panels — Data / Connections /
-// Application — sections hairlined inside, the wash breathing between groups.
+// `clusters` variant): grouped panels — Accounts (first since #639, #621's
+// layout) / Data / Storage / Connections / Application — sections hairlined
+// inside, the wash breathing between groups.
 // The page title/subtitle live in the pill topbar (the T5/T6 rule). Reads via
-// `useSettings`, writes via `useUpdateSettings`; the topbar cost-mode chip
-// shares both.
+// `useSettings`, writes via `useUpdateSettings`; its Cost mode section is the
+// client's only control for the cost mode, the topbar's cost-mode chip having
+// been retired.
 
 // macOS is the one platform whose Reduce-transparency accessibility setting
 // never reaches the WebView (no prefers-reduced-transparency in WebKit), so
@@ -43,40 +48,27 @@ const IS_MAC = isMacOS();
 // running renderer.
 const BACKGROUND_RESIDENCY = backgroundResidencySupported();
 
-// One settings section — heading, dim description, and the control block
-// (the T7 section grammar; hairline dividers come from `.s-section`).
-function Section({
-  title,
-  description,
-  children,
-}: {
-  title: string;
-  description: string;
-  children: React.ReactNode;
-}): React.ReactElement {
-  return (
-    <section className="s-section" aria-label={title}>
-      <h2>{title}</h2>
-      <p className="desc">{description}</p>
-      <div className="control">{children}</div>
-    </section>
-  );
-}
-
 export function SettingsPage(): React.ReactElement {
   // While the settings query loads, fall back to defaults so the page renders
   // a coherent form rather than blank controls.
   const { data: settings } = useSettings();
   const current = settings ?? DEFAULT_SETTINGS;
   const update = useUpdateSettings();
-  // Past one Organization, Claude account describes the Organizations list.
-  const { data: roster } = useOrganizations();
+  const unlistedConfigDirRoots = useLiveStatus((s) => s.unlistedConfigDirRoots);
 
   // Gates the whole "Start at login" section: hidden until the shell answers
   // (an IPC round trip, so no flash) and hidden for good on "unsupported" —
   // Linux (autostart is out of this map's scope there, T6) and the Tauri-less
   // Vite debug host. The section component shares the query via its cache.
   const autostartState = useAutostart().data;
+
+  // The ⌘K finder opens a section as `/settings#settings-<title>` (#640).
+  // Keyed on the location, so choosing the same section again scrolls again.
+  const location = useLocation();
+  useEffect(() => {
+    if (location.hash === "") return;
+    document.getElementById(location.hash.slice(1))?.scrollIntoView({ block: "start" });
+  }, [location.key, location.hash]);
 
   // Reset tears down the hub too: writing DEFAULT_SETTINGS alone clears hubUrl
   // in settings.json but leaves the running sidecar hub-connected and the
@@ -92,15 +84,21 @@ export function SettingsPage(): React.ReactElement {
 
   return (
     <div className="settings-form">
+      {/* Settings › Accounts (#621, #639): the strips, the Home membership,
+          each Provider's Account cards, the Gateways and Unattributed usage.
+          `?connect=<account>` opens that Account's Connect (#638's D3). */}
+      <AccountsCluster />
+
       <div className="cluster panel">
         <span className="cluster-head eyebrow">Data</span>
 
         <Section
-          title="Claude data paths"
+          title={SECTION.claudePaths}
           description="Directories scanned for Claude Code JSONL usage logs."
         >
           <PathList
             paths={current.claudePaths}
+            unlisted={unlistedConfigDirRoots}
             onChange={(claudePaths) => void update({ claudePaths })}
           />
         </Section>
@@ -111,7 +109,7 @@ export function SettingsPage(): React.ReactElement {
             control, following this page's habit of explaining in the dim line
             rather than in the title. */}
         <Section
-          title="Timezone"
+          title={SECTION.timezone}
           description="Used for bucketing daily totals, and how times are displayed."
         >
           <TimezoneSelect
@@ -126,18 +124,21 @@ export function SettingsPage(): React.ReactElement {
 
         {/* Week sits under Timezone because the anchored modes are wall-clock:
             a custom weekday/time resolves in the zone chosen just above. */}
-        <Section title="Week" description="What “this week” means across the app.">
+        <Section title={SECTION.week} description="What “this week” means across the app.">
           <WeekControl value={current.week} onChange={(week) => void update({ week })} />
         </Section>
 
-        <Section title="Cost mode" description="How each row's cost is sourced from the JSONL.">
+        <Section
+          title={SECTION.costMode}
+          description="How each row's cost is sourced from the JSONL."
+        >
           <CostModeControl
             value={current.costMode}
             onChange={(costMode) => void update({ costMode })}
           />
         </Section>
 
-        <Section title="Currency" description="Display currency for all costs.">
+        <Section title={SECTION.currency} description="Display currency for all costs.">
           <div className="row-line" style={{ width: "auto", gap: 10 }}>
             <div className="select-wrap cur-wrap">
               <select disabled value="USD" aria-label="Currency" className="input">
@@ -159,11 +160,11 @@ export function SettingsPage(): React.ReactElement {
       <div className="cluster panel">
         <span className="cluster-head eyebrow">Storage</span>
 
-        <Section title={STORAGE_COPY.title} description={STORAGE_COPY.desc}>
+        <Section title={SECTION.diskUsage} description={STORAGE_COPY.desc}>
           <StorageSection />
         </Section>
 
-        <Section title={STORAGE_COPY.actTitle} description={STORAGE_COPY.actDesc}>
+        <Section title={SECTION.cleanUp} description={STORAGE_COPY.actDesc}>
           <StorageActions />
         </Section>
       </div>
@@ -172,18 +173,7 @@ export function SettingsPage(): React.ReactElement {
         <span className="cluster-head eyebrow">Connections</span>
 
         <Section
-          title="Claude account"
-          description={
-            showOrganizationList(roster)
-              ? ORGANIZATION_LIST_DESCRIPTION
-              : "Which organization's usage MaxPrice shows, and the claude.ai session key for real 5-hour and weekly limits."
-          }
-        >
-          <UsageConnectionSection />
-        </Section>
-
-        <Section
-          title="Usage hub"
+          title={SECTION.usageHub}
           description="Connect to an always-on hub that polls usage limits for every machine."
         >
           <HubSection />
@@ -199,19 +189,22 @@ export function SettingsPage(): React.ReactElement {
             Both self-hide where they cannot mean anything: Background off
             Linux/outside Tauri, Start at login on an "unsupported" state. */}
         {BACKGROUND_RESIDENCY ? (
-          <Section title="Background" description="Keep MaxPrice running after the window closes.">
+          <Section
+            title={SECTION.background}
+            description="Keep MaxPrice running after the window closes."
+          >
             <BackgroundSection />
           </Section>
         ) : null}
 
         {autostartState !== undefined && autostartState !== "unsupported" ? (
-          <Section title="Start at login" description="Open MaxPrice automatically at sign-in.">
+          <Section title={SECTION.autostart} description="Open MaxPrice automatically at sign-in.">
             <AutostartSection />
           </Section>
         ) : null}
 
         <Section
-          title="Updates"
+          title={SECTION.updates}
           description="Check for a newer release of MaxPrice and install it."
         >
           <UpdatesSection />
@@ -219,20 +212,20 @@ export function SettingsPage(): React.ReactElement {
 
         {/* Directly after Updates: the two "ask upstream" actions share a
             grammar and a job, so they read as a pair (ADR-0085). */}
-        <Section title="Pricing" description={PRICING_SECTION_DESCRIPTION}>
+        <Section title={SECTION.pricing} description={PRICING_SECTION_DESCRIPTION}>
           <PricingSection />
         </Section>
 
         {IS_MAC ? (
           <Section
-            title="Reduce transparency"
+            title={SECTION.transparency}
             description="Render surfaces opaque instead of frosted glass — stands in for the system Reduce-transparency setting, which macOS doesn't surface to the app."
           >
             <TransparencySection />
           </Section>
         ) : null}
 
-        <Section title="Reset" description="Restore all settings to their defaults.">
+        <Section title={SECTION.reset} description="Restore all settings to their defaults.">
           <ResetSection onReset={reset} />
         </Section>
 
@@ -243,7 +236,7 @@ export function SettingsPage(): React.ReactElement {
             so rather than letting a live row hide under "versions", as it
             names the User guide row that closes the section (#564). */}
         <Section
-          title="App info"
+          title={SECTION.appInfo}
           description="Versions, whether the sidecar is running, and the User guide."
         >
           <AppInfoSection />

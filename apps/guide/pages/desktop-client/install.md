@@ -63,4 +63,4 @@ Quit MaxPrice first (see [Tray and Popout](tray.md#quit)). On macOS and Windows,
   sudo apt remove max-price
   ```
 
-Uninstalling leaves your data. Your settings and [Local archive](../concepts/archive.md#the-local-archive) are in a folder of their own, which [where data lives](../concepts/archive.md#desktop-client) names for each system, and your session key and Hub password are in the system's keychain. To remove them too, delete that folder and MaxPrice's keychain entries.
+Uninstalling leaves your data. Your settings and [Local archive](../concepts/archive.md#the-local-archive) are in a folder of their own, which [where data lives](../concepts/archive.md#desktop-client) names for each system, and your claude.ai session keys, Gateway management keys and Hub password are in the system's keychain. To remove them too, delete that folder and MaxPrice's keychain entries.

@@ -27,6 +27,9 @@ export function createLiveUsagePoller(
     liveHub: Pick<LiveHub, "emitUsageSample" | "patchStatus">;
     // The persisted scope's Quota organization; null only with no Home.
     getQuotaOrganization: () => string | null;
+    // Hears every status publish, after it (#633: the keyset's report and
+    // its legacy retry follow the poller's state).
+    onPublish?: () => void;
   },
 ): LiveUsagePoller {
   function publish(status: Partial<PollerStatus>): void {
@@ -34,6 +37,7 @@ export function createLiveUsagePoller(
       ...status,
       usageConnection: poller.getCurrent(opts.getQuotaOrganization()).connection,
     });
+    opts.onPublish?.();
   }
   const poller = createUsagePoller({
     ...opts,

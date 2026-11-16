@@ -75,8 +75,25 @@ const blockRowSchema = z.object({
   windowSource: windowSourceSchema,
 });
 
+// One Membership's Blocks (ADR-0136 §2, ADR-0108 as amended by #632): its
+// Organization uuid, its Account key (an account uuid, a Pending account's
+// `pending:<hash>`, or null for an Account not known), and the rows formed from
+// its rows and samples alone.
+const membershipBlocksSchema = z.object({
+  organizationUuid: z.string(),
+  accountUuid: z.string().nullable(),
+  blocks: z.array(blockRowSchema),
+});
+
+// `blocks` is the Scope's head Membership's (`compareMemberships`, ./scope):
+// the Home membership under the default Scope and under All organizations, so
+// every surface that shows one Membership's Blocks reads it as it always read
+// the Quota organization's. `memberships` is present only when the Scope spans
+// two or more Memberships, and then lists every one, head first, each formed
+// on its own — so a single-Membership Scope's body is byte-identical to before.
 export const blocksResponseSchema = z.object({
   blocks: z.array(blockRowSchema),
+  memberships: z.array(membershipBlocksSchema).optional(),
 });
 
 export type TokenCounts = z.infer<typeof tokenCountsSchema>;
@@ -84,3 +101,4 @@ export type BurnRate = z.infer<typeof burnRateSchema>;
 export type Projection = z.infer<typeof projectionSchema>;
 export type BlockRow = z.infer<typeof blockRowSchema>;
 export type BlocksResponse = z.infer<typeof blocksResponseSchema>;
+export type MembershipBlocks = z.infer<typeof membershipBlocksSchema>;

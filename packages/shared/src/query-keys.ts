@@ -1,5 +1,6 @@
 import type { CostMode } from "./cost-mode";
 import type { Span } from "./intraday";
+import { scopeKeyPart, type ScopeQueryParams } from "./scope-params";
 
 // Centralized TanStack Query key builders. Part 1's `dailyQueryKey` was an
 // ad-hoc shape inside the hook module; Parts 2–5 grow more hooks and need
@@ -20,11 +21,25 @@ export type FilterSubset = { projects?: string[]; models?: string[]; machines?: 
 // `tz` (Part 6, ADR-0015) — the IANA zone reports bucket local days into,
 // carried alongside `mode`. Optional: an omitted `tz` defaults to the host
 // zone sidecar-side, preserving the pre-Part-6 behaviour.
-// `organization` (#278) — the resolved Organization scope: a tracked uuid or
-// "all". Absent = the Home organization, so a single-Organization machine's
-// keys stay byte-identical (an undefined property drops out of the hash).
+// `organization` (#278, #637) — the Scope's Organization axis (`./scope`):
+// tokens, each a uuid, `home` or "all". Absent = the Home membership, so a
+// single-Organization machine's keys stay byte-identical (an undefined
+// property drops out of the hash).
+// `account` (#632, #637) — the Scope's Account axis (`./scope`): tokens, each
+// an Account key, `home` or `all`. Absent with `organization` absent = the
+// Home membership; absent beside an `organization` = any Account.
+// Both sorted, and absent when empty, like every list here.
+// `memberships` (#637) — the Scope as `membership` tokens (`./scope`); any
+// present names the Scope alone. Sorted, and absent when empty, so every key
+// that names none stays byte-identical.
 export type QueryInput = DateWindow &
-  FilterSubset & { mode: CostMode; tz?: string; organization?: string };
+  FilterSubset & {
+    mode: CostMode;
+    tz?: string;
+    organization?: string[];
+    account?: string[];
+    memberships?: string[];
+  };
 
 // Drop empty arrays to `undefined` and sort the surviving ones so the TanStack
 // cache key is identical regardless of the order the user picked filters in.
@@ -42,7 +57,9 @@ function normalize(input: QueryInput): QueryInput {
     projects: normalizeList(input.projects),
     models: normalizeList(input.models),
     machines: normalizeList(input.machines),
-    organization: input.organization,
+    organization: normalizeList(input.organization),
+    account: normalizeList(input.account),
+    memberships: normalizeList(input.memberships),
   };
 }
 
@@ -60,6 +77,11 @@ export function projectsKey(input: QueryInput): ["projects", QueryInput] {
 
 export function blocksKey(input: QueryInput): ["blocks", QueryInput] {
   return ["blocks", normalize(input)];
+}
+
+// The /api/membership-totals key (#637): the common report query, like daily.
+export function membershipTotalsKey(input: QueryInput): ["membership-totals", QueryInput] {
+  return ["membership-totals", normalize(input)];
 }
 
 export function dailyByProjectKey(input: QueryInput): ["daily-by-project", QueryInput] {
@@ -110,8 +132,11 @@ export type IntradayQueryInput = {
   // body, so it must re-key. Omitted/false → the byMachine-free (pre-M6,
   // byte-identical) payload.
   includeByMachine?: boolean;
-  // The resolved Organization scope (#278), as on `QueryInput`: absent = Home.
-  organization?: string;
+  // The Scope's two axes (#278, #632) and its Membership list (#637), as on
+  // `QueryInput`.
+  organization?: string[];
+  account?: string[];
+  memberships?: string[];
 } & FilterSubset;
 
 // Normalize the intraday input the same way `normalize` does for the daily
@@ -130,7 +155,9 @@ function normalizeIntraday(input: IntradayQueryInput): IntradayQueryInput {
     projects: normalizeList(input.projects),
     models: normalizeList(input.models),
     machines: normalizeList(input.machines),
-    organization: input.organization,
+    organization: normalizeList(input.organization),
+    account: normalizeList(input.account),
+    memberships: normalizeList(input.memberships),
   };
 }
 
@@ -190,4 +217,16 @@ export const DATA_QUERY_KEYS = new Set<string>([
   "sessions",
   "projects",
   "blocks",
+  "membership-totals",
+  // The Scope's head (`scopeHeadKey`): no money, but its candidates gain rows
+  // as usage lands, so it refreshes with the reports.
+  "scope-head",
 ]);
+
+// The /api/scope-head key (#637): the Scope's params alone (`scopeKeyPart`),
+// the head being neither windowed nor filtered.
+export function scopeHeadKey(
+  scope: ScopeQueryParams,
+): ["scope-head", ScopeQueryParams | undefined] {
+  return ["scope-head", scopeKeyPart(scope)];
+}

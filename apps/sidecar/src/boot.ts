@@ -1,12 +1,30 @@
 import { stat } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
-import type { OrganizationsResponse, UsageCredential } from "@maxprice/shared";
+import {
+  foldTrackedAccounts,
+  homeMembershipOf,
+  homeOrganizationOf,
+  hubKeysReport,
+  hubMembershipProjection,
+  scopeSettingsEqual,
+  type AccountsResponse,
+  type AccountsSeed,
+  type HomeMembership,
+  type OrganizationsResponse,
+  type PendingFold,
+  type ScopeSetting,
+  type UsageKeyset,
+  type GatewayConfigEntry,
+} from "@maxprice/shared";
 import {
   createHubClient,
+  createSampleExchangeMarkerFile,
   createSampleStore,
   discoverOrgs,
+  fetchAccount,
   type DiscoverOrgResult,
+  type FetchAccountResult,
   monotonicClock,
   type HubClientConfig,
 } from "@maxprice/usage-core";
@@ -16,6 +34,7 @@ import {
   wireIdentityProbe,
   wireReadySignal,
   wireScanCachePersist,
+  type SidecarApp,
 } from "./index";
 import { createBootTrace } from "./boot-trace";
 import {
@@ -32,16 +51,17 @@ import {
 import { HOSTNAME_ENV, hostnameSeamLine, seamHostname } from "./hostname-seam";
 import { createLiveHub, type LiveHub } from "./live-hub";
 import { createWatcher, type CreateWatcherOptions, type Watcher } from "./watcher";
-import { resolveWatchRoots } from "./watch-roots";
+import { resolveWatchRoots, unlistedConfigDirRoots } from "./watch-roots";
 import {
   readClaudePathsFromSettings,
   readSettingsFile,
+  resolveTrackedAccounts,
   resolveTrackedOrganizations,
 } from "./settings-file";
 import { createFleetSync } from "./fleet";
 import {
   createStorageReporter,
-  forgetOrganizationOf,
+  forgetMembershipOf,
   parseWebviewProfileDirs,
   STORAGE_FILE,
 } from "./storage";
@@ -51,35 +71,65 @@ import {
   createOrganizationRegistry,
   createOrganizationRename,
   listOrganizations,
+  loginPairs,
   readCurrentLogins,
+  readLoginEmails,
   readRemoteControlAtStartup,
+  type CurrentLogin,
   type LearnedOrg,
 } from "./organizations";
-import { createKeyListing } from "./key-listing";
-import { createOrganizationLabels } from "./organization-labels";
 import {
+  accountKnowledgeOf,
+  composeAccounts,
+  createAccountRename,
+  decidePendingFolds,
+  firstLaunchAccounts,
+  keyHomeAccount,
+  pairMoves,
+  upgradeAccounts,
+  hubKeyKnowledge,
+  type KeyKnowledge,
+} from "./account-tracking";
+import { createKeyListing } from "./key-listing";
+import { createUsageKeyset, keyRoster } from "./usage-keyset";
+import {
+  createAccountLabels,
+  createFleetLabels,
+  createLabelUnionLock,
+  createOrganizationLabels,
+} from "./organization-labels";
+import {
+  assertionsResponse,
   createOrganizationAssert,
   createOrganizationAssertions,
   presumptionWithAssertions,
 } from "./organization-assertions";
 import { gateOrganizationWatcher, prepareOrganizationStore } from "./organization-boot";
 import { createOrganizationRepair } from "./organization-repair";
-import { createOrganizationScope, quotaOrganization } from "./organization-scope";
+import {
+  createOrganizationScope,
+  effectivePersistedScope,
+  statusHeadOrganization,
+} from "./organization-scope";
 import { createLiveUsagePoller } from "./usage-poller";
 import {
   createOrganizationSettingsDriver,
   createReingestState,
   dormantChange,
+  pairChange,
 } from "./organization-lifecycle";
 import { createSettingsWatch, type SettingsWatch } from "./settings-watch";
 import { createWatcherRestarts } from "./watcher-restarts";
 import { createScanCache } from "./engine/scan-cache";
+import type { OnAccountPair } from "./engine/jsonl";
+import { createAccountPairs } from "./account-pairs";
 import { createEventStore, type EventStore } from "./engine/store";
 import {
   createPresumption,
   dormantSessions,
   NO_DORMANT,
-  withPublishedHomes,
+  withMachineDirectory,
+  withMembershipRoster,
   withSelfHome,
   type Presumption,
 } from "./engine/presumption";
@@ -88,6 +138,11 @@ import { startSaturationReporting } from "./saturation";
 import { createBootProgressReporter } from "./boot-progress";
 import { deferredShutdown } from "./sidecar-shutdown";
 import { whenBootResolves } from "./when-boot-resolves";
+import { createGatewayEvidenceStore } from "./gateway-evidence";
+import { createGatewayMatcher } from "./gateway-matcher";
+import { createGatewayPendingStore } from "./gateway-pending";
+import { createGatewayClient } from "./gateway-client";
+import { composeAccountSources } from "./account-sources";
 import pkg from "../package.json";
 
 // The sidecar's boot (ADR-0118 §3): the engine, the Local archive, the usage
@@ -126,15 +181,41 @@ export type BootOptions = {
   // The Hub to connect to at boot (ADR-0035/0037), or null for none. A change
   // after boot arrives through POST /api/hub/config.
   hub: HubClientConfig | null;
-  // The session key to poll with from boot (ADR-0023), applied as POST
+  // The keyset to poll with from boot (ADR-0023, ADR-0138 §6), applied as POST
   // /api/usage/credential applies a pushed one, or null. A change after boot
   // arrives through that route.
-  usageCredential: UsageCredential | null;
+  usageKeyset: UsageKeyset | null;
   // Hears the Home a first boot's seed chose (ADR-0122 §3), once, when the
   // seeded store installs, so a host with no renderer can save it. Never
   // called when a persisted Home was the boot's, nor for a later Home change.
   // The sidecar entry passes none: its renderer saves the seed (ADR-0098 §1).
   onHomeSeeded?: (uuid: string) => void;
+  // Hears the Account seed (#631 decision 2): the tracked Account list and the
+  // Home membership's Account the boot decided while settings.json names no
+  // `trackedAccounts`, ADR-0136 §8's upgrade set or §4's first-launch set.
+  // Once, when the boot's store installs, so a host with no renderer can save
+  // it (`seedAccountsPatch`). The sidecar entry passes none: its renderer
+  // saves the seed GET /api/accounts carries.
+  onAccountsSeeded?: (seed: AccountsSeed) => void;
+  // Hears the Pending account folds (ADR-0137 §1) the persisted list still
+  // names, each time the boot or a pair change decides one, so a host with no
+  // renderer can write them (`foldAccountsPatch`). The sidecar entry passes
+  // none: its renderer writes the folds GET /api/accounts carries.
+  onAccountsFolded?: (folds: readonly PendingFold[]) => void;
+  // Hears the legacy key's Account once the sidecar has resolved it and
+  // stamped the history with it (ADR-0138 §12), so a host with no renderer
+  // can move the key into that Account's entry in its own store. It answers
+  // the keyset its store then holds, which is applied as a push would be, or
+  // undefined to apply nothing (its write failed: the legacy key stays the
+  // one key, and the next boot resolves and moves it again). Heard at each
+  // change of GET /api/usage/keys while the legacy key is resolved. The
+  // sidecar entry passes none: its renderer moves the key from that route.
+  onLegacyResolved?: (accountUuid: string) => UsageKeyset | null | undefined;
+  // The Gateways to hold from boot (ADR-0141 §5, §7, #651), applied as POST
+  // /api/gateways/config applies a pushed set: the Headless client's, from
+  // secrets.json. A change after boot arrives through that route. Absent or
+  // empty holds none; the sidecar entry passes none (its renderer pushes).
+  gateways?: readonly GatewayConfigEntry[];
 };
 
 function parsePort(raw: string | undefined): number {
@@ -195,7 +276,7 @@ export function bootOptionsFromEnv(env: Record<string, string | undefined>): Boo
           autoHeal: !["0", "false"].includes((env.MAXPRICE_HUB_AUTO_HEAL ?? "").toLowerCase()),
         }
       : null,
-    usageCredential: null,
+    usageKeyset: null,
   };
 }
 
@@ -262,6 +343,25 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // timeout — loud and specific, not the silent post-handshake wedge #183 was.
   let watchRoots = await resolveRoots();
 
+  // #679: a listed `claudePaths` wins over `$CLAUDE_CONFIG_DIR`, and the
+  // Desktop client lists the two defaults from its first launch (ADR-0014's
+  // 2026-11-14 note). The status names the variable's existing `projects`
+  // directories the list leaves out, so Settings can offer to add them. Which
+  // of them exist is learned once, after the handshake (below): the variable
+  // may name a dead network mount whose `stat` never returns (#183), and the
+  // list may not need it. The comparison runs again on every settings edit.
+  let configDirRoots: string[] = [];
+  let unlistedRoots: string[] = [];
+  function refreshUnlistedRoots(): void {
+    const unlisted =
+      settingsPath === undefined
+        ? []
+        : unlistedConfigDirRoots(configDirRoots, readClaudePathsFromSettings(settingsPath));
+    if (unlisted.join("\n") === unlistedRoots.join("\n")) return;
+    unlistedRoots = unlisted;
+    liveHub.patchStatus({ unlistedConfigDirRoots: unlisted });
+  }
+
   // Saturation self-report (issue #116 / F4): starts sampling immediately so
   // even the boot scan is measured. The patch sink is installed once `liveHub`
   // exists, a few statements below. A holder rather than a closure over a
@@ -292,8 +392,13 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // user signs in elsewhere. `currentHome` anchors the tracked set every store
   // this process builds is given (`trackedNow`, below); its only writers are
   // the seed and the settings watch.
-  const bootLogin = (await readCurrentLogins(watchRoots))[0] ?? null;
-  let currentHome: string | null = bootSettings?.homeOrganization ?? null;
+  // Every root's login, read once here: the first is the seed's, and all of
+  // them teach the pair table below (ADR-0137 §1).
+  const bootLogins = await readCurrentLogins(watchRoots);
+  const bootLogin = bootLogins[0] ?? null;
+  // The Home membership's Organization (ADR-0136 §5): a v0.9.2 file's
+  // `homeOrganization` reads as it (`settingsSchema`).
+  let currentHome: string | null = bootSettings === null ? null : homeOrganizationOf(bootSettings);
   // The persisted tracked list (the #260 lifecycle decision, item 1). The SET
   // every store is built with is this list unioned with `currentHome`. The
   // union POLICY is single-sourced in `resolveTrackedOrganizations` —
@@ -304,12 +409,99 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   let currentTracked: readonly string[] = bootSettings?.trackedOrganizations ?? [];
   const trackedNow = (): ReadonlySet<string> | null =>
     resolveTrackedOrganizations(currentHome, currentTracked);
-  // The persisted Organization scope (#278), raw: `null` for Home, "all", or a
-  // uuid. The renderer sends it with every request; the sidecar holds it only
-  // so the status's usage connection can describe its Quota organization
-  // (`quotaOrganization`, resolved live, so a stale value reads as Home). Its
-  // only writers are the boot snapshot and the settings watch.
-  let currentScope: string | null = bootSettings?.organizationScope ?? null;
+  // The poll set the tracked set makes: its Organizations, or with no Home
+  // (`null`, nothing excluded) every Organization a held key's listing names,
+  // so a key stored on a fresh install is polled before any Home exists
+  // (#673).
+  const pollSetNow = (): readonly string[] | null => {
+    const tracked = trackedNow();
+    return tracked === null ? null : [...tracked];
+  };
+  // The persisted Home membership's Account (ADR-0136 §5), `null` while
+  // unknown: a v0.9.2 file, a seeded Home, or a machine that knows no Account.
+  // Its writers are the boot snapshot and the settings watch.
+  let currentHomeAccount: string | null =
+    bootSettings === null ? null : (homeMembershipOf(bootSettings)?.accountUuid ?? null);
+  // The persisted tracked Account list (ADR-0136 §3), `null` when the file
+  // names none (every v0.9.2 file, and a first launch: #631 decision 2). Its
+  // writers are the boot snapshot and the settings watch.
+  let currentTrackedAccounts: readonly string[] | null = bootSettings?.trackedAccounts ?? null;
+  // The Account seed (#631 decision 2): what the boot walk decided while the
+  // file names no list — ADR-0136 §8's upgrade set on a machine with a Home,
+  // §4's first-launch set on one the walk seeded — and what stands in for the
+  // list and the Home membership's Account until the host persists it, as
+  // `seededHome` stands in for Home. Announced through `onAccountsSeeded` and
+  // GET /api/accounts' `seed`. Its only writer is the boot walk's settle.
+  let seededAccounts: AccountsSeed | null = null;
+  // Whether the settings watch has seen a `trackedAccounts` list persisted
+  // (#631 review): from then on the file decides, and the seed is never
+  // served or announced again, though it still stands in while the file names
+  // no list, as `seededHome` stands in for Home. So a Reset, which writes no
+  // list, is not undone by a host writing the seed back: until the next
+  // launch the set is the one in force, and that launch, finding no list and
+  // (after a Reset) no Home, is a first launch. Its only writer is the
+  // settings watch.
+  let accountsSeedPersisted = false;
+  // ADR-0137 §1's Pending account folds, decided once each (`decidePendingFolds`)
+  // and applied at read time to the list (`accountListNow`) until the host
+  // writes them (`onAccountsFolded`, GET /api/accounts' `folds`), after which
+  // the list no longer names the Pending key and the fold applies to nothing.
+  // Its writers are the boot walk's settle, the settings watch and the pair
+  // check.
+  const foldDecisions = new Map<string, PendingFold>();
+  // The tracked Account list in force: the persisted list, else the seed's,
+  // with every decided fold applied.
+  const accountListNow = (): readonly string[] | null => {
+    const list = currentTrackedAccounts ?? seededAccounts?.trackedAccounts ?? null;
+    return list === null || foldDecisions.size === 0
+      ? list
+      : foldTrackedAccounts(list, [...foldDecisions.values()]);
+  };
+  // The Home membership's Account for the Home `home`: the persisted one, else
+  // the seed's, while the seed belongs to that Home.
+  const homeAccountFor = (home: string | null): string | null =>
+    currentHomeAccount ??
+    (seededAccounts !== null && seededAccounts.homeOrganizationUuid === home
+      ? seededAccounts.homeAccountUuid
+      : null);
+  const homeMembershipNow = (): HomeMembership | null =>
+    currentHome === null
+      ? null
+      : { organizationUuid: currentHome, accountUuid: homeAccountFor(currentHome) };
+  // The SET every store is built with: `resolveTrackedAccounts`'s union of the
+  // list in force with the Home membership's Account, `null` (no Account
+  // excluded) while there is no Home or no list at all.
+  const trackedAccountsFor = (home: string | null): ReadonlySet<string> | null =>
+    resolveTrackedAccounts(
+      home === null ? null : { organizationUuid: home, accountUuid: homeAccountFor(home) },
+      accountListNow(),
+    );
+  const trackedAccountsNow = (): ReadonlySet<string> | null => trackedAccountsFor(currentHome);
+  // The seed while it still stands in for the list and no list has been
+  // persisted since the boot, folds applied: what the host persists
+  // (`seedAccountsPatch`).
+  const accountsSeedNow = (): AccountsSeed | null =>
+    accountsSeedPersisted || currentTrackedAccounts !== null || seededAccounts === null
+      ? null
+      : {
+          ...seededAccounts,
+          trackedAccounts: foldTrackedAccounts(seededAccounts.trackedAccounts, [
+            ...foldDecisions.values(),
+          ]),
+        };
+  // The decided folds the persisted list still names: what the host writes.
+  const foldsToPersist = (): PendingFold[] => {
+    const list = currentTrackedAccounts;
+    if (list === null) return [];
+    return [...foldDecisions.values()].filter((fold) => list.includes(fold.pendingKey));
+  };
+  // The persisted Scope (#637), raw: `null` for the default Scope, else its
+  // tokens (`Settings.scope`). The renderer sends them with every request; the
+  // sidecar holds them only so the status's usage connection can describe the
+  // Scope's head Organization (`statusHeadOrganization`, resolved live by the
+  // app's own head rule, so it answers as every request's does). Its only
+  // writers are the boot snapshot and the settings watch.
+  let currentScope: ScopeSetting | null = bootSettings?.scope ?? null;
   // Which Organizations a settings edit is re-walking into the engine right now
   // (#276). Declared here, beside the set it describes; the settings driver
   // below marks it, and the roster (`organizations.list`, #287) reads it into
@@ -323,19 +515,20 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // value would clear every entry on every single query. It has three writers,
   // one per half: the Home — the seed, and the settings driver through
   // `installHome` — via `withSelfHome`; the Machine directory — the fleet,
-  // through `installPublishedHomes` — via `withPublishedHomes` (#281); and the
+  // through `installMachineDirectory` — via `withMachineDirectory` (#281: the
+  // published Home Organizations); and the
   // Organization assertions — `installAssertions` below, at boot once
   // organization-assertions.json has loaded, after a PUT that wrote, and after
   // the fleet adopts a union that changed a claim — via `withAssertions` (#309,
   // #310). Each swap carries the other writers' halves unchanged, so none drops
   // another's. `createPresumption` builds the initial cell only.
-  let currentPresumption: Presumption = createPresumption(currentHome);
+  let currentPresumption: Presumption = createPresumption(homeMembershipNow());
   const presumptionNow = (): Presumption => currentPresumption;
   // #278: scope and owner-less rows read the same installed presumption. A
   // requested Home may still be queued behind a tracked-set rebuild, so the
   // Home this answers is the installed one. The endpoints and the live usage
   // channel both read it.
-  const organizationScope = createOrganizationScope(presumptionNow, trackedNow);
+  const organizationScope = createOrganizationScope(presumptionNow, trackedNow, trackedAccountsNow);
   // What a null setting falls back to once the seed has run. Null until then,
   // so a settings edit that beats the walk is never overridden.
   let seededHome: string | null = null;
@@ -360,6 +553,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
       // the renderer's replace-whole handling would drop it between edges.
       saturation: saturationReporting.snapshot(),
       watchedPaths: watchRoots,
+      unlistedConfigDirRoots: unlistedRoots,
       // The honest boot value (ADR-0053): the vendored floor, with no attempt
       // settled yet. `null` is the whole point — it says "nothing has been
       // tried", which a bare capture stamp could not, and it is the state
@@ -443,6 +637,43 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     path: join(appDataDir, STORAGE_FILE.scanCache),
   });
 
+  // ADR-0137 §1: the pair table, email hash → account uuid, local only. Its
+  // load rides its write queue, so a pair learned before the load finishes is
+  // never written over by the file's older copy. Its sources: every root's
+  // login (here, and at each roster read), and each main transcript's
+  // co-positioned pairs, from every scan and every watcher read. Every store
+  // resolves Email records through its `snapshot()` as it stands when the
+  // store is built, so the boot walk waits for the load (`accountPairsReady`).
+  // A change re-resolves rows through `accountPairs.onChange`, which queues a
+  // pair change through the settings driver (`checkPairs`, below). The load
+  // never rejects. A table the load finds lost (absent or unreadable, after
+  // the first boot wrote one) discards the scan cache before the walk, so
+  // every transcript re-parses and teaches its pairs again: a cache hit
+  // teaches none (account-pairs.ts's header).
+  const accountPairs = createAccountPairs({
+    path: join(appDataDir, STORAGE_FILE.accountPairs),
+  });
+  const accountPairsReady: Promise<void> = accountPairs.load().then((found) => {
+    if (found !== "present") scanCache.discard();
+  });
+  // Every root's login as last read: the boot's, then each roster read's. The
+  // Account decisions read it (`accountKnowledgeOf`).
+  let currentLogins: readonly CurrentLogin[] = [];
+  // A transcript's co-positioned pair, from every scan and watcher read.
+  const learnTranscriptPair: OnAccountPair = (pair) => {
+    accountPairs.learn(pair.emailHash, pair.accountUuid, "transcript");
+  };
+  // Every root's login pairs, which outrank a transcript's (account-pairs.ts).
+  // #633: a connected session key's `/api/account` (ADR-0137 §1's second
+  // source) learns its pair at this rank too.
+  const learnLoginPairs = (logins: readonly CurrentLogin[]): void => {
+    for (const pair of loginPairs(logins)) {
+      accountPairs.learn(pair.emailHash, pair.accountUuid, "login");
+    }
+  };
+  learnLoginPairs(bootLogins);
+  currentLogins = bootLogins;
+
   // ADR-0098: plan words per organization, so a label survives logging out.
   const organizationRegistry = createOrganizationRegistry({
     path: join(appDataDir, STORAGE_FILE.organizations),
@@ -462,9 +693,12 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     .catch((err: unknown) => console.error("[sidecar] organization registry load failed:", err));
   // Every listing's answer records through here, after the boot load: Connect's
   // discovery (#283), the Hub's roster and the key listing (#366).
-  const recordIntoRegistry = async (orgs: readonly LearnedOrg[]): Promise<boolean> => {
+  const recordIntoRegistry = async (
+    orgs: readonly LearnedOrg[],
+    opts?: { readonly complete?: boolean },
+  ): Promise<boolean> => {
     await registryReady;
-    return organizationRegistry.recordDiscovery(orgs);
+    return organizationRegistry.recordDiscovery(orgs, opts);
   };
   // #287: the user's renames — durable, unlike the registry above, and under
   // the same rule: its write queue does not order a write against `load()`, and
@@ -473,9 +707,23 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   const organizationLabels = createOrganizationLabels({
     path: join(appDataDir, STORAGE_FILE.organizationLabels),
   });
-  const labelsReady: Promise<void> = organizationLabels
-    .load()
-    .catch((err: unknown) => console.error("[sidecar] organization labels load failed:", err));
+  // #635: the user's Account labels, the same store keyed by account uuid,
+  // under the same rule; `labelsReady` covers both loads.
+  const accountLabels = createAccountLabels({
+    path: join(appDataDir, STORAGE_FILE.accountLabels),
+  });
+  // One lock for every step that checks the union of both label maps and
+  // grows it: both renames' cap check and write, and the fleet's adoption
+  // (ADR-0139 §7's note).
+  const labelUnionLock = createLabelUnionLock();
+  const labelsReady: Promise<void> = Promise.all([
+    organizationLabels
+      .load()
+      .catch((err: unknown) => console.error("[sidecar] organization labels load failed:", err)),
+    accountLabels
+      .load()
+      .catch((err: unknown) => console.error("[sidecar] account labels load failed:", err)),
+  ]).then(() => undefined);
   // #310: the user's Organization assertions — durable and user-authored like
   // the labels. Its load rides the queue every `set` and `merge` joins, so no
   // edit or adoption can write ahead of it; readers and writers here still
@@ -490,7 +738,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // swapped. The PUT and the fleet's adoption follow a swap with the wholesale
   // invalidation; the boot install precedes every reader and needs none.
   const installAssertions = (): boolean => {
-    const next = presumptionWithAssertions(currentPresumption, organizationAssertions.resolved());
+    const next = presumptionWithAssertions(currentPresumption, organizationAssertions.claims());
     if (next === null) return false;
     currentPresumption = next;
     return true;
@@ -507,24 +755,73 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // the fleet builds take it as their snapshot at construction; the boot walk's
   // stores compute theirs against the walk's own set.
   const dormantNow = (): ReadonlySet<string> =>
-    dormantSessions(currentPresumption.assertedBySession, trackedNow());
+    dormantSessions(currentPresumption.assertedBySession, trackedNow(), trackedAccountsNow());
   // The dormant set the LAST queued change installs (its `nextDormant`), so a
   // queued change's `previousDormant` is its predecessor's `nextDormant`, as
   // with the tracked set. Re-anchored at the boot seed.
   let queuedDormant: ReadonlySet<string> = NO_DORMANT;
+  // #631: the tracked Account set and the pair table the LAST queued change
+  // installs, read the same way: a settings edit's and a pair change's
+  // `previousTrackedAccounts` is its predecessor's next, and a pair change's
+  // moves are judged against the table the queued rebuilds already apply.
+  // Re-anchored at the boot seed, to the installed store's own.
+  let queuedAccounts: ReadonlySet<string> | null = null;
+  let queuedPairs: ReadonlyMap<string, string> = new Map();
   // After an assertion install: queue a dormant-only change when the install
   // moved the dormant set. The driver (declared below) is only reached from
   // the PUT, the fleet's adoption and the seed, all after it exists.
   const admitAssertions = (): void => {
     const change = dormantChange({
       home: currentHome,
+      homeAccount: homeAccountFor(currentHome),
       tracked: trackedNow(),
+      trackedAccounts: queuedAccounts,
       previousDormant: queuedDormant,
       nextDormant: dormantNow(),
     });
     if (change === null) return;
     queuedDormant = change.nextDormant;
     void organizationSettings.apply(change);
+  };
+
+  // ADR-0141 (#651): the Gateway evidence store, the pending Gateway records
+  // (with the fallback drain's outbox) and the matcher that joins them to this
+  // machine's lines. Neither file is written until a Gateway record is
+  // offered. Every store this process builds reads the evidence live and feeds
+  // its local lines to the matcher (`gatewayStore`), the boot walk's included,
+  // so the index holds the boot's lines however the store is swapped later.
+  // The matcher matches only from the boot's install on (`start` below),
+  // against whatever store is live then. THE SEAM for the drain (Task D): a
+  // drain or the Hub feed hands its reduced records to
+  // `gatewayMatcher.offer`, a fallback drain also puts them in
+  // `gatewayPending.addOutbox`, and a push-up's ack drops them with
+  // `gatewayPending.ack`.
+  const gatewayEvidence = createGatewayEvidenceStore({
+    path: join(appDataDir, STORAGE_FILE.gatewayEvidence),
+  });
+  const gatewayPending = createGatewayPendingStore({
+    path: join(appDataDir, STORAGE_FILE.gatewayPending),
+  });
+  let gatewayMatchingLive = false;
+  const gatewayMatcher = createGatewayMatcher({
+    getStore: () => (gatewayMatchingLive ? getEngineStore() : null),
+    evidence: gatewayEvidence,
+    pending: gatewayPending,
+    // A match re-appended rows: the renderers refetch, and the fleet pushes
+    // the rows' new tags, as after a watcher flush.
+    onApplied: (count) => {
+      liveHub.emitUsage({
+        project: "",
+        sessionId: "",
+        timestamp: new Date().toISOString(),
+        count,
+      });
+      fleet.notifyLocalChange();
+    },
+  });
+  const gatewayStore = (store: EventStore): EventStore => {
+    store.onLocalAppend(gatewayMatcher.onLines);
+    return store;
   };
 
   // An empty placeholder while the private selection walk runs. No source
@@ -534,8 +831,12 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     selfMachineId: machineId,
     scanCache,
     trackedOrganizations: trackedNow(),
+    trackedAccounts: trackedAccountsNow(),
+    accountPairs: accountPairs.snapshot(),
     dormantSessions: dormantNow(),
     getPresumption: presumptionNow,
+    onAccountPair: learnTranscriptPair,
+    gatewayEvidence,
   });
   const getEngineStore = (): EventStore => engineStore;
   let resolveLocalReady!: () => void;
@@ -613,32 +914,41 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     // under whatever Homes are current when it is QUERIED — this machine's and
     // its peers' published ones — not when it was built.
     createStore: () =>
-      createEventStore({
-        selfMachineId: machineId,
-        scanCache,
-        trackedOrganizations: trackedNow(),
-        dormantSessions: dormantNow(),
-        getPresumption: presumptionNow,
-      }),
-    // The directory half of the presumption cell (#281). Runs synchronously
-    // INSIDE `createFleetSync` when the persisted directory cache already names
-    // peer Homes — safe, because `currentPresumption` is declared above, and it
-    // is how a peer's rows are presumed under its Home offline, before any
-    // connect. The fleet pokes the renderers itself after a refresh's swap.
-    installPublishedHomes: (homes) => {
-      currentPresumption = withPublishedHomes(currentPresumption, homes);
+      gatewayStore(
+        createEventStore({
+          selfMachineId: machineId,
+          scanCache,
+          trackedOrganizations: trackedNow(),
+          trackedAccounts: trackedAccountsNow(),
+          accountPairs: accountPairs.snapshot(),
+          dormantSessions: dormantNow(),
+          getPresumption: presumptionNow,
+          onAccountPair: learnTranscriptPair,
+          gatewayEvidence,
+        }),
+      ),
+    // The directory half of the presumption cell (#281): the published Home
+    // Organizations. Runs synchronously
+    // INSIDE `createFleetSync` when the persisted directory cache already
+    // implies either — safe, because `currentPresumption` is declared above,
+    // and it is how a peer's rows are presumed under its Home offline, before
+    // any connect. The fleet pokes the renderers itself after a refresh's swap.
+    installMachineDirectory: (homes) => {
+      currentPresumption = withMachineDirectory(currentPresumption, homes);
     },
-    // The user's renames (#288), synced with the Hub's Organization directory:
-    // the store is built above, and nothing is pushed or adopted before its
-    // load. An adopted label change pokes the roster here and the reports
-    // through the fleet's own wholesale invalidation, as a local rename does.
-    organizationLabels: {
+    // The user's renames (#288, #635), synced with the Hub's Label directory:
+    // both stores are built above, and nothing is pushed or adopted before
+    // their loads. An adopted label change pokes its roster (organizations:
+    // changed or accounts:changed) and the reports through the fleet's own
+    // wholesale invalidation, as a local rename does.
+    labels: createFleetLabels({
       ready: labelsReady,
-      entries: () => organizationLabels.entries(),
-      merge: (incoming) => organizationLabels.merge(incoming),
-    },
+      organizations: organizationLabels,
+      accounts: accountLabels,
+      unionLock: labelUnionLock,
+    }),
     // The user's Organization assertions (#310), synced with the Hub's
-    // Organization assertion directory: nothing is pushed or adopted before
+    // Membership assertion directory: nothing is pushed or adopted before
     // the boot load. An adoption that changed some session's claim installs
     // the new claims here; the fleet's own wholesale invalidation follows.
     organizationAssertions: {
@@ -650,12 +960,26 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
       installAssertions();
       admitAssertions();
     },
-    // #366: the Hub's roster seeds this machine's.
-    learnOrganizations: recordIntoRegistry,
+    // #366: the Hub's roster seeds this machine's. A Hub row carries no
+    // Limits answer since v7 (ADR-0139 §9): each learned row takes the one the
+    // Hub's status answers for its Organization, as this client shows it
+    // (`hubMembershipProjection`, the Home membership's Account preferred),
+    // else none, which leaves a recorded answer in place.
+    learnOrganizations: (orgs) => {
+      const answered = hubMembershipProjection(
+        hubClient.hubAccounts() ?? [],
+        homeAccountFor(currentHome),
+        Date.now(),
+      ).organizations;
+      return recordIntoRegistry(
+        orgs.map((org) => ({ ...org, limits: org.limits ?? answered[org.id]?.limits ?? null })),
+      );
+    },
     getRoots: () => watchRoots,
     emitMachinesChanged: () => liveHub.emitMachinesChanged(),
     emitIdentityChanged: () => liveHub.emitIdentityChanged(),
     emitOrganizationsChanged: () => liveHub.emitOrganizationsChanged(),
+    emitAccountsChanged: () => liveHub.emitAccountsChanged(),
     initial: {
       shareEvents: bootShareEvents,
       fleetReplica: bootFleetReplica,
@@ -671,6 +995,8 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   const organizationRepair = createOrganizationRepair({
     markerPath: join(appDataDir, STORAGE_FILE.organizationRepair),
     trackedOrganizations: () => trackedNow(),
+    // #631: the Account half of the repair's key (ADR-0136 §3).
+    trackedAccounts: () => trackedAccountsNow(),
     foreignSessions: () => getEngineStore().foreignSessions(),
     hubTarget: () => hubTargetNow,
     hubEpoch: (target) => fleet.hubEpoch(target),
@@ -694,10 +1020,22 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // below hands it a change per edit and it applies them one at a time, in
   // arrival order. A fresh driver per edit would be no queue at all.
   const organizationSettings = createOrganizationSettingsDriver({
-    setPollingOrganizations: (ids, home) => usagePoller.setOrganizations([...(ids ?? [])], home),
-    installHome: (home) => {
-      currentPresumption = withSelfHome(currentPresumption, home);
-      // The status's Quota organization follows the install.
+    // A null set excludes nothing, so the poller polls every listed
+    // Organization (#673).
+    setPollingOrganizations: (ids, home) =>
+      usagePoller.setOrganizations(ids === null ? null : [...ids], home),
+    // The Home membership the change carries, its Account included (#631).
+    installHome: (home, homeAccount) => {
+      currentPresumption = withSelfHome(
+        currentPresumption,
+        home === null ? null : { organizationUuid: home, accountUuid: homeAccount },
+      );
+      // Which key reads an Organization no listing names, and which
+      // Membership an Organization read by several shows (#633).
+      usagePoller.setHomeAccount(homeAccount);
+      // …and which Membership a hub-connected client shows (ADR-0139 §10).
+      hubClient.homeAccountChanged();
+      // The status's head Organization follows the install.
       usagePoller.republish();
     },
     releaseRetainedView: () => fleet.releaseRetainedView(),
@@ -706,9 +1044,15 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     resetRepair: () => organizationRepair.reset(),
     invalidateReports: () => fleet.invalidateReports(),
     reingest,
-    rosterChanged: () => liveHub.emitOrganizationsChanged(),
+    // The Account roster moves with every change too (#631): its `tracked`
+    // flags, or the Accounts a pair re-resolved.
+    rosterChanged: () => {
+      liveHub.emitOrganizationsChanged();
+      liveHub.emitAccountsChanged();
+    },
     trackedNow,
     dormantNow,
+    trackedAccountsNow,
   });
 
   // The Repo identity prober (ADR-0062 §2) — the ONE producer of this
@@ -769,12 +1113,12 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     // session's awaiting the scoped repair or a pruned session's that
     // ADR-0103's accepted departure keeps on the Hub for good.
     // The breakdown resolves each unbacked row the way every report does, minus
-    // any Organization the store does not track (`forgetOrganizationOf`). Both
-    // read the store PER CALL: a rebuild swaps it, and with it the tracked set
-    // and the dormant snapshot. The presumption is not swapped by a rebuild —
+    // any Organization or Account the store does not track
+    // (`forgetMembershipOf`). Both read the store PER CALL: a rebuild swaps it,
+    // and with it the tracked sets and the dormant snapshot. The presumption is not swapped by a rebuild —
     // `installAssertions` replaces it live, ahead of the rebuild it queues.
     withheld: (row) => getEngineStore().isWithheld(row),
-    organizationOf: (row) => forgetOrganizationOf(getEngineStore(), row),
+    membershipOf: (row) => forgetMembershipOf(getEngineStore(), row),
   });
 
   // engineReady gates every data handler on BOTH local sources — the initial
@@ -796,37 +1140,175 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // — the on-disk history is loaded by `sampleStore.loadHistory()` *after* the
   // handshake (below), so a large read can't delay the LISTENING line past the
   // Rust shell's 5s timeout.
-  const sampleStore = createSampleStore({ path: usageHistoryPath });
+  // Its own stamping's time persists beside it (ADR-0139 §8): the hub-client's
+  // cursorless sample exchange runs again once it moves.
+  const sampleStore = createSampleStore({
+    path: usageHistoryPath,
+    stampsPath: join(appDataDir, STORAGE_FILE.sampleStamps),
+  });
+  // Either stamp of the history, then the exchange if one is due (#634).
+  const stampAccountless = async (accountUuid: string): Promise<number> => {
+    const stamped = await sampleStore.stampAccountless(accountUuid);
+    if (stamped > 0) hubClient.samplesStamped();
+    return stamped;
+  };
+  const stampUnstamped = async (organizationUuid: string): Promise<number> => {
+    const stamped = await sampleStore.stampUnstamped(organizationUuid);
+    if (stamped > 0) hubClient.samplesStamped();
+    return stamped;
+  };
   // The first load settles even on failure or an absent file. Keep this
   // separate from engineReady: Desktop routes and splash timing stay as they
   // are; one-shot Headless reports can wait for history before reading it.
   void sampleStore.ready.then(() => liveHub.patchStatus({ usageHistoryReady: true }));
+  // The app's head rule (`SidecarApp.scopeHead`), assigned once `buildApp`
+  // returns: the poller is built first, and a publish before then (none is
+  // expected) applies the rule over no candidates.
+  let appScopeHead: SidecarApp["scopeHead"] | null = null;
+  // The persisted Scope as the status applies it (#637): the shared rule
+  // (`effectiveScope`) over the Account roster's tracked entries, the count
+  // GET /api/accounts gives the renderer's Account filter, so a saved Account
+  // or Membership Scope on a one-Account install heads the status as the
+  // default Scope does. Composed only when the Scope names Accounts or
+  // Memberships; before the boot's store installs the roster is not known,
+  // and the Scope applies as written, as the renderer's does before
+  // /api/accounts answers.
+  let statusRosterKnown = false;
+  const statusScope = (): ScopeSetting | null =>
+    effectivePersistedScope(currentScope, () =>
+      statusRosterKnown ? composeAccountRoster(new Map()).accounts : undefined,
+    );
   const usagePoller = createLiveUsagePoller({
     store: sampleStore,
     liveHub,
-    getQuotaOrganization: () => quotaOrganization(currentScope ?? undefined, organizationScope()),
+    // The persisted Scope, as the renderer's requests carry it; its head
+    // Organization, by the app's head rule over its candidates once the app
+    // is built, is the reading the status's usage connection describes.
+    getQuotaOrganization: () =>
+      statusHeadOrganization(appScopeHead, statusScope(), organizationScope()),
     baseUrl: process.env.MAXPRICE_CLAUDE_BASE_URL,
+    // The keyset declared below hears every status publish; none runs before
+    // it exists (the poll set is installed after it).
+    onPublish: () => usageKeys.pollerPublished(),
+    // GET /api/accounts carries every Membership's reading (#637), the
+    // unprojected ones too, which emit no usage:sample.
+    membershipsChanged: () => liveHub.emitAccountsChanged(),
   });
-
-  usagePoller.setOrganizations([...(trackedNow() ?? [])], currentHome);
+  // GET /api/accounts' `staleOrganizations` and `expiredReaderOrganizations`
+  // (ADR-0138 §8): the poller's, or
+  // none while the Hub owns live state (the keyset pokes the roster when the
+  // poller's moves; the renderer drops it while hub-connected on its own).
+  // `hubClient` is declared below; these run only from requests.
+  function staleOrganizationsNow(): string[] {
+    return hubClient.hubOwnsLiveState() ? [] : usagePoller.staleOrganizations();
+  }
+  function expiredReaderOrganizationsNow(): string[] {
+    return hubClient.hubOwnsLiveState() ? [] : usagePoller.expiredReaderOrganizations();
+  }
 
   // Connect's discovery with a session key, under the same dev/test override
   // the poller and the Hub's discovery read: what POST /api/usage/discover-orgs
-  // proxies and what the key listing below runs.
+  // proxies and what the key listing below runs. The key's `/api/account`
+  // likewise (#633).
   const discoverWithKey = (sessionKey: string): Promise<DiscoverOrgResult> =>
     discoverOrgs({ sessionKey, baseUrl: process.env.MAXPRICE_CLAUDE_BASE_URL });
+  const fetchAccountWithKey = (sessionKey: string): Promise<FetchAccountResult> =>
+    fetchAccount({ sessionKey, baseUrl: process.env.MAXPRICE_CLAUDE_BASE_URL });
 
-  // #366 (#360's resolution): a client with no Hub configured lists its key's
-  // Organizations into the roster itself — on every key arrival and hourly.
-  // A Hub-configured client never does, even in fallback; the fleet's roster
-  // pull is its source.
+  // #633: the held keyset (usage-keyset.ts). Each key's `/api/account` teaches
+  // its pair at a login's rank (ADR-0137 §1) and resolves the legacy key's
+  // Account, which re-keys it, stamps the Account-less history and reports the
+  // move for the host (ADR-0138 §12). A held Account or listing that moved
+  // re-derives the held keys' roster, which presumes unstamped readings.
+  const usageKeys = createUsageKeyset({
+    poller: usagePoller,
+    fetchAccount: fetchAccountWithKey,
+    learnPair: (hash, accountUuid) => {
+      accountPairs.learn(hash, accountUuid, "key");
+    },
+    stampAccountless,
+    // A key's connection is also its Account's on GET /api/accounts.
+    keysChanged: () => {
+      liveHub.emitUsageKeysChanged();
+      liveHub.emitAccountsChanged();
+      moveLegacyIfResolved();
+    },
+    accountsChanged: () => installKeyRoster(),
+    retryLegacy: (sessionKey) => void keyListing.readAccount(sessionKey),
+  });
+
+  // #366 (#360's resolution), per key since #633: a client with no Hub
+  // configured lists each key's Organizations into the roster and into the
+  // poller as that key's listing — on its arrival and hourly on its own
+  // clock. A Hub-configured client never does, even in fallback; the fleet's
+  // roster pull is its source. Every client reads each arriving key's Account.
   const keyListing = createKeyListing({
     hubConfigured: () => hubTargetNow !== null,
-    currentKey: () => usagePoller.getCredential()?.sessionKey ?? null,
     discover: discoverWithKey,
+    fetchAccount: usageKeys.readAccount,
+    onListed: usageKeys.listed,
     record: recordIntoRegistry,
     changed: () => liveHub.emitOrganizationsChanged(),
   });
+
+  // ADR-0138 §12 for a host with no renderer (`onLegacyResolved`): once the
+  // report names the legacy key's Account, the host moves it and answers its
+  // keyset, applied after the announcement that heard it. That keyset holds
+  // the same key under the same Account, so nothing arrives and nothing is
+  // listed again (a key a hand edit added meanwhile would arrive, and is
+  // listed as the boot's are); the report loses its legacy key, which ends
+  // the calls.
+  function moveLegacyIfResolved(): void {
+    const onResolved = options.onLegacyResolved;
+    if (onResolved === undefined) return;
+    const resolved = usageKeys.report().legacy?.accountUuid ?? null;
+    if (resolved === null) return;
+    queueMicrotask(() => {
+      if (usageKeys.report().legacy?.accountUuid !== resolved) return;
+      const next = onResolved(resolved);
+      if (next === undefined) return;
+      for (const sessionKey of applyKeyset(next)) void keyListing.keyArrived(sessionKey);
+    });
+  }
+
+  // A pushed keyset (POST /api/usage/credential, the boot's own): the keyset
+  // and the poller take it, and each held key keeps its listing clock. Answers
+  // the push's arrivals, the only keys its caller hands to the listing.
+  const applyKeyset = (keyset: UsageKeyset | null): readonly string[] => {
+    const { held, arrived } = usageKeys.apply(keyset);
+    keyListing.hold(held);
+    return arrived;
+  };
+
+  // The held keys' roster (#633, `keyRoster`): the held keys' listings only.
+  // The Hub's keyed Accounts are not part of it (#634 left the Hub's half to
+  // #660). It names no usage row's Account since #635 (ADR-0137 §3's current
+  // rule), only the Account an unstamped usage-limits reading presumes to
+  // (`sampleAccount`). A change swaps the presumption, so every report and
+  // Block formation rebinds, and pokes the Account roster.
+  function installKeyRoster(): void {
+    const roster = keyRoster(usageKeys.heldAccounts());
+    if (!sameRoster(roster, currentPresumption.membershipRoster)) {
+      currentPresumption = withMembershipRoster(currentPresumption, roster);
+      fleet.invalidateReports();
+    }
+    liveHub.emitAccountsChanged();
+  }
+  function sameRoster(
+    a: ReadonlyMap<string, ReadonlySet<string>>,
+    b: ReadonlyMap<string, ReadonlySet<string>>,
+  ): boolean {
+    if (a.size !== b.size) return false;
+    for (const [organization, holders] of a) {
+      const other = b.get(organization);
+      if (other === undefined || other.size !== holders.size) return false;
+      for (const account of holders) if (!other.has(account)) return false;
+    }
+    return true;
+  }
+
+  usagePoller.setOrganizations(pollSetNow(), currentHome);
+  usagePoller.setHomeAccount(homeAccountFor(currentHome));
 
   // Hub client (ADR-0035): connect/backfill/stream toward an optional hub;
   // pauses usagePoller while connected. machineId (computed above, beside the
@@ -835,8 +1317,29 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // this machine, acknowledged before the handshake below. Read once, so the
   // name acknowledged is the name sent.
   const testHostname = seamHostname(process.env[HOSTNAME_ENV]);
+  // ADR-0141 §5, §7 (#651): the Gateways this machine holds, their fallback
+  // drain and the relay through the Hub (gateway-client.ts). Its predicate
+  // reads the hub-client below, through closures run only from its timers,
+  // its routes and the hub-client's hooks, all after `hubClient` exists. It
+  // hands what it drains, and the Hub's feed, to the matcher's seam above.
+  const gatewayClient = createGatewayClient({
+    pending: gatewayPending,
+    matcher: gatewayMatcher,
+    pairs: () => accountPairs.snapshot(),
+    hub: {
+      target: () => hubTargetNow,
+      state: () => hubClient.getState(),
+      gateways: () => hubClient.hubGateways(),
+    },
+    relayPath: join(appDataDir, STORAGE_FILE.gatewayRelay),
+    onChanged: () => liveHub.emitGatewaysChanged(),
+  });
   const hubClient = createHubClient({
     store: sampleStore,
+    // The cursorless sample exchange's marker (ADR-0139 §8, #634).
+    sampleExchange: createSampleExchangeMarkerFile(
+      join(appDataDir, STORAGE_FILE.hubSampleExchange),
+    ),
     liveHub,
     localPoller: usagePoller,
     machineId,
@@ -844,17 +1347,35 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     // x-maxprice-hostname. Empty string ⇒ header omitted (handled in hub-client).
     // The User guide capture names each machine instead (hostname-seam.ts).
     hostname: testHostname ?? hostname(),
-    // Auto-heal read seam (ADR-0035 M2): the hub-client pushes this machine's
-    // key to a hub whose own credential died.
-    getLocalCredential: () => usagePoller.getCredential(),
+    // Auto-heal read seam (ADR-0035 M2, per key since ADR-0138 §7): every
+    // held key, each with its Account and `setAt`; the hub-client pushes each
+    // one the Hub wants.
+    getLocalKeys: () => usageKeys.localKeys(),
+    // The Home membership's Account, which the Hub's per-Organization
+    // projection prefers (ADR-0139 §10).
+    homeAccount: () => homeAccountFor(currentHome),
+    // The Hub's Accounts moved: GET /api/accounts lists them, so its
+    // readers refetch. No report reads them (they are not in ADR-0137 §3
+    // step 1's roster, #634), so nothing is invalidated.
+    onHubAccounts: () => liveHub.emitAccountsChanged(),
+    // GET /api/accounts' key half changed sides (`keyKnowledge`, #685): the
+    // Hub's Accounts or this machine's poller. A read from the other side,
+    // such as one a first connect's `onHubAccounts` prompted, refetches.
+    onHubOwnsLiveState: () => liveHub.emitAccountsChanged(),
     // The ADR-0041 event-sync seam: hub-client owns connection custody and
     // fires these hooks; fleet.ts drives the event-sync from them.
     fleet: {
       ...fleet.hooks,
       onConnected: (context) => {
         fleet.hooks.onConnected(context);
+        gatewayClient.onConnected({ url: context.url, headers: context.headers });
         void whenBootResolves(engineReady, () => organizationRepair.run());
       },
+      onDisconnected: () => {
+        fleet.hooks.onDisconnected();
+        gatewayClient.onDisconnected();
+      },
+      onGatewayRecordsPoke: () => gatewayClient.onGatewayRecordsPoke(),
     },
   });
 
@@ -874,6 +1395,9 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     // After the boot load, never beside it: the write queue does not order a
     // write against `load()` (see registryReady).
     await registryReady;
+    // …and the pair table (ADR-0137 §1): a pair learned once is kept.
+    currentLogins = logins;
+    learnLoginPairs(logins);
     // Every login file seen feeds the plan-word registry (labels decision 2).
     for (const login of logins) {
       await organizationRegistry.remember(login.organizationUuid, login.organizationType);
@@ -901,7 +1425,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // label emits the same wholesale invalidation a Home change does (labels
   // decision 10), so every window refetches, and the roster's own
   // organizations:changed poke, so every window rereads the roster. Then it
-  // pushes the label map to the Hub's Organization directory (#288), so every
+  // pushes the label map to the Hub's Label directory (#288), so every
   // other machine adopts it.
   const renameOrganization = createOrganizationRename({
     list: listOrganizationRoster,
@@ -910,21 +1434,112 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
         await labelsReady;
         return organizationLabels.set(uuid, label);
       },
+      // Read after `list`, which awaited the loads.
+      entries: () => organizationLabels.entries(),
     },
+    accountLabels,
+    unionLock: labelUnionLock,
     invalidateReports: () => fleet.invalidateReports(),
     rosterChanged: () => liveHub.emitOrganizationsChanged(),
-    labelsWritten: () => fleet.organizationLabelsChanged(),
+    labelsWritten: () => fleet.labelsChanged(),
   });
+  // PUT /api/accounts/:uuid/label (#635, ADR-0136 §7): the Account label's
+  // rename, beside the Organization's, under one cap on the union of both
+  // label maps. A label that changes emits the wholesale invalidation and
+  // accounts:changed, then pushes both maps to the Hub's Label directory.
+  const renameAccount = createAccountRename({
+    ready: labelsReady,
+    list: listAccountRoster,
+    labels: accountLabels,
+    organizationLabels,
+    unionLock: labelUnionLock,
+    invalidateReports: () => fleet.invalidateReports(),
+    accountsChanged: () => liveHub.emitAccountsChanged(),
+    labelsWritten: () => fleet.labelsChanged(),
+  });
+  // GET /api/accounts (#631): every Account this machine knows, with the
+  // seed and the folds its host persists. Answers once the boot walk has
+  // installed its store, never before: the walk is what decides the upgrade's
+  // and a first launch's seed (ADR-0136 §4, §8). A failed walk rejects the
+  // request, as the roster's does (#340). Every root's login is read live,
+  // for the pairs it teaches and the address shown "as read here" (ADR-0136
+  // §7), which is kept nowhere.
+  async function listAccountRoster(): Promise<AccountsResponse> {
+    await localReady;
+    await labelsReady;
+    const [logins, emails] = await Promise.all([
+      readCurrentLogins(watchRoots),
+      readLoginEmails(watchRoots),
+    ]);
+    currentLogins = logins;
+    learnLoginPairs(logins);
+    return composeAccountRoster(emails);
+  }
+  // The roster as it stands, over the logins last read (`currentLogins`):
+  // GET /api/accounts' composition, synchronous. `emails` only fills each
+  // entry's `email`.
+  function composeAccountRoster(emails: ReadonlyMap<string, string>): AccountsResponse {
+    return composeAccounts({
+      knowledge: accountKnowledgeOf(getEngineStore(), currentLogins, accountPairs.snapshot()),
+      keys: keyKnowledge(),
+      list: accountListNow(),
+      tracked: trackedAccountsNow(),
+      home: homeMembershipNow(),
+      emails,
+      labels: accountLabels,
+      seed: accountsSeedNow(),
+      folds: foldsToPersist(),
+    });
+  }
+
+  // GET /api/accounts' key half (#633, ADR-0138 §7–§8): each held key's
+  // Account and listing, its connection and each Membership's state as the
+  // poller holds it. While the Hub owns live state (#634, ADR-0139 §1):
+  // hub-connected, or reconnecting to the same Hub with the poller still
+  // paused (#685, `hubOwnsLiveState`), every Account its status lists, with
+  // its connection and each Membership's state as the Hub read it (stale
+  // while its key is expired), and each Account held here that the Hub does
+  // not list, `disconnected` there, with no Membership state.
+  function keyKnowledge(): KeyKnowledge {
+    const held = usageKeys.heldAccounts();
+    if (hubClient.hubOwnsLiveState()) {
+      return hubKeyKnowledge({
+        hubAccounts: hubClient.hubAccounts() ?? [],
+        held,
+        staleOrganizations: staleOrganizationsNow(),
+        expiredReaderOrganizations: expiredReaderOrganizationsNow(),
+      });
+    }
+    const memberships = usagePoller.memberships();
+    return {
+      held,
+      connection: (account) => usagePoller.keyConnection(account),
+      membership: (account, organization) => {
+        const m = memberships.find((e) => e.account === account && e.organization === organization);
+        return m === undefined
+          ? null
+          : {
+              limits: m.status?.limits ?? null,
+              stale: m.stale,
+              current: m.current,
+              lastReadAt: m.lastReadAt,
+            };
+      },
+      staleOrganizations: staleOrganizationsNow(),
+      expiredReaderOrganizations: expiredReaderOrganizationsNow(),
+    };
+  }
+
   // PUT /api/organization-assertions (#310). The target is checked against the
   // roster the rename reads; a set that wrote installs the claims, invalidates
   // every report when the presumption swapped, and pushes the map to the Hub's
-  // Organization assertion directory.
+  // Membership assertion directory.
   const assertOrganizations = createOrganizationAssert({
     roster: listOrganizationRoster,
     assertions: {
-      set: async (sessionIds, organizationUuid) => {
+      set: async (sessionIds, organizationUuid, accountUuid) => {
         await assertionsReady;
-        return organizationAssertions.set(sessionIds, organizationUuid);
+        return organizationAssertions.set(sessionIds, organizationUuid, accountUuid);
       },
     },
     install: () => {
@@ -974,9 +1589,10 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     organizations: {
       list: listOrganizationRoster,
       rename: renameOrganization,
-      // #283: Connect's discovery seeds the roster.
+      // #283: Connect's discovery seeds the roster, one key's partial listing
+      // (#646).
       recordDiscovery: async (orgs) => {
-        await recordIntoRegistry(orgs);
+        await recordIntoRegistry(orgs, { complete: false });
       },
       // #283: a legacy credential push keeps its Organization in the roster.
       // `remember` never downgrades a known plan word, so a null here only
@@ -988,11 +1604,32 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
       learnFromKey: (sessionKey) => void keyListing.keyArrived(sessionKey),
     },
     organizationScope,
+    // #631: the Account roster; #635: its labels.
+    accounts: { list: listAccountRoster, rename: renameAccount },
+    // #639: where this machine sees each Account (ADR-0141 §8): every root's
+    // login, read live, and each held Gateway's credential emails as last
+    // read, each resolved through the pair table once its load has landed.
+    accountSources: {
+      list: async () => {
+        await accountPairsReady;
+        return composeAccountSources({
+          logins: await readCurrentLogins(watchRoots),
+          gateways: gatewayClient.credentialEmails(),
+          pairs: accountPairs.snapshot(),
+        });
+      },
+    },
+    // ADR-0141 §5, §7 (#651): the held Gateways.
+    gateways: {
+      configure: (entries) => gatewayClient.configure(entries),
+      check: (entry) => gatewayClient.check(entry),
+      list: () => gatewayClient.list(),
+    },
     // #310: the Organization assertions, read and edited.
     organizationAssertions: {
       list: async () => {
         await assertionsReady;
-        return { assertions: Object.fromEntries(organizationAssertions.resolved()) };
+        return assertionsResponse(organizationAssertions.claims());
       },
       assert: assertOrganizations,
     },
@@ -1003,10 +1640,17 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     now: () => Date.now(),
     usage: {
       getCurrent: usagePoller.getCurrent,
-      setCredential: usagePoller.setCredential,
+      setKeyset: applyKeyset,
       pollOnce: usagePoller.pollOnce,
       discoverOrgs: discoverWithKey,
-      stampHistory: sampleStore.stampUnstamped,
+      readAccount: async (sessionKey) => {
+        const result = await usageKeys.readAccount(sessionKey);
+        return result.ok ? { accountUuid: result.accountUuid } : null;
+      },
+      keys: usageKeys.report,
+      // #642: the joined Hub's keys as its last status listed them.
+      hubKeys: () => hubKeysReport(hubClient.hubAccounts()),
+      stampHistory: stampUnstamped,
     },
     // Every POST endpoint, and the Organization rename PUT (#287), requires a
     // matching `x-maxprice-auth` header when this is set (f22).
@@ -1019,8 +1663,12 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
       // reconciles live. `c === null` ⇒ hub off.
       configure: (c) => {
         hubClient.configure(c);
+        const hubTurnedOff = hubTargetNow !== null && c === null;
         // ADR-0098: the repair skips its hub half when no hub is configured.
         hubTargetNow = c?.url ?? null;
+        // #646: a key held while the Hub was configured never listed, so
+        // nothing polls it until it does.
+        if (hubTurnedOff) void keyListing.listAll();
         fleet.onHubConfigured(c !== null);
         void whenBootResolves(engineReady, () => organizationRepair.run());
       },
@@ -1043,6 +1691,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     // is picked up by the one gesture that means "re-read my world".
     onRescan: () => identityProber.runAll(),
   });
+  appScopeHead = app.scopeHead;
 
   // SSE connections (/api/stream) are long-lived and idle between events;
   // Bun's 10s default idleTimeout would sever them well before the 15s
@@ -1106,6 +1755,15 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // Unix socket announces nothing; its path is its host's own (ADR-0119 §1).
   await announce();
 
+  // #679's roots, after the handshake (see `refreshUnlistedRoots`).
+  const configDir = process.env.CLAUDE_CONFIG_DIR;
+  if (configDir !== undefined && configDir.trim() !== "") {
+    void resolveWatchRoots({ configDir, homedir: homedir(), dirExists: isDir }).then((roots) => {
+      configDirRoots = roots;
+      refreshUnlistedRoots();
+    });
+  }
+
   // Issue #183: everything below is `void`ed and says nothing until it
   // finishes, which is why a launch that answered the handshake and then went
   // silent for minutes could only be narrowed to "somewhere in here". The
@@ -1113,6 +1771,136 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // set, so a gap in the ticks localizes the block instead of merely proving
   // it happened. Constructed HERE so `+0ms` means the handshake.
   const bootTrace = createBootTrace();
+
+  // #631: whether the boot's store has installed. Before it, the boot walk
+  // owns every Account decision (`settleBootAccounts`); after it, a pair
+  // change queues its own (`checkPairs`).
+  let accountsInstalled = false;
+
+  // The Account decisions one read of the store makes (#631): every Pending
+  // account fold it can decide (ADR-0137 §1), held in `foldDecisions`. True
+  // when it decided one.
+  function decideFolds(store: EventStore, pairs: ReadonlyMap<string, string>): boolean {
+    const list = currentTrackedAccounts ?? seededAccounts?.trackedAccounts ?? null;
+    if (list === null) return false;
+    const folds = decidePendingFolds({
+      list,
+      homeAccount: homeAccountFor(currentHome),
+      knowledge: accountKnowledgeOf(store, currentLogins, pairs),
+      decided: foldDecisions,
+    });
+    for (const fold of folds) foldDecisions.set(fold.pendingKey, fold);
+    return folds.length > 0;
+  }
+
+  // The folds the persisted list still names, to the host (`onAccountsFolded`).
+  function announceFolds(): void {
+    const folds = foldsToPersist();
+    if (folds.length > 0) options.onAccountsFolded?.(folds);
+  }
+
+  // The boot walk's Account settle (organization-boot.ts), after its first
+  // walk: decides ADR-0136 §8's upgrade seed (a Home and no list) or §4's
+  // first-launch seed (a Home the walk just seeded), from that walk's
+  // evidence and every root's login, then the folds. `stale` when a pair the
+  // walk learned moves a row it read, so the store must be built again under
+  // the table as it stands.
+  function settleBootAccounts(
+    home: string | null,
+    store: EventStore,
+    seeded: boolean,
+  ): { stale: boolean } {
+    const pairs = accountPairs.snapshot();
+    if (home !== null && currentTrackedAccounts === null) {
+      const homeSessionCounts = store.accountSessionCounts(home);
+      // #633: the held keys as they stand when the walk settles. A key whose
+      // Account is resolved joins "every Account known", and the one whose
+      // listing names Home decides the Home membership's Account first
+      // (ADR-0136 §8). The legacy key's Account resolves only over the
+      // network, so with it down this decides what it did before.
+      const held = usageKeys.heldAccounts();
+      seededAccounts = seeded
+        ? firstLaunchAccounts({
+            homeOrganizationUuid: home,
+            pairs,
+            logins: currentLogins,
+            homeSessionCounts,
+            keyHomeAccount: keyHomeAccount(held, home),
+          })
+        : upgradeAccounts({
+            home: { organizationUuid: home, accountUuid: currentHomeAccount },
+            knowledge: accountKnowledgeOf(store, currentLogins, pairs),
+            homeSessionCounts,
+            keyAccounts: held.map((k) => k.accountUuid),
+            keyHomeAccount: keyHomeAccount(held, home),
+          });
+    }
+    decideFolds(store, pairs);
+    const moves = pairMoves(store.accountEvidenceSeen().hashes, store.accountPairs(), pairs);
+    return { stale: moves.length > 0 };
+  }
+
+  // A pair-table change after the boot (ADR-0137 §1, #631 decision 4): a pair
+  // re-resolves every row of its email hash to another Account, which only a
+  // rebuild from the scan cache applies, and may fold a Pending account the
+  // tracked list names. Coalesced: a burst of pairs (one walk's, one roster
+  // read's) is judged once, in a microtask, against the table the last queued
+  // change installed, and queues at most one change through the settings
+  // driver. Nothing is queued when no row the engine read names a moved hash
+  // and no set moved, so a pair for an address with no usage rebuilds
+  // nothing. No loop: a rebuild reads the scan cache, whose hits teach no
+  // pair, and a pair re-learned as it stands is no change at all. Neither
+  // flips: a transcript pair never replaces a login's (account-pairs.ts), and
+  // a table that changed and changed back within one burst (two roots'
+  // logins naming one address under two Accounts) is judged by its content,
+  // so it pokes nothing. `accounts:changed` is sent only when the table's
+  // content moved, since every roster read re-reads the logins and a poke
+  // that answered no change would ask for that read again.
+  let pairCheckScheduled = false;
+  function schedulePairCheck(): void {
+    if (pairCheckScheduled) return;
+    pairCheckScheduled = true;
+    queueMicrotask(() => {
+      pairCheckScheduled = false;
+      checkPairs();
+    });
+  }
+  function checkPairs(): void {
+    if (!accountsInstalled) return;
+    const pairs = accountPairs.snapshot();
+    if (pairs === queuedPairs) return;
+    if (samePairs(pairs, queuedPairs)) {
+      queuedPairs = pairs;
+      return;
+    }
+    const store = getEngineStore();
+    if (decideFolds(store, pairs)) announceFolds();
+    const nextAccounts = trackedAccountsNow();
+    const nextDormant = dormantNow();
+    const change = pairChange({
+      home: currentHome,
+      homeAccount: homeAccountFor(currentHome),
+      tracked: trackedNow(),
+      previousTrackedAccounts: queuedAccounts,
+      nextTrackedAccounts: nextAccounts,
+      previousDormant: queuedDormant,
+      nextDormant,
+      moves: pairMoves(store.accountEvidenceSeen().hashes, queuedPairs, pairs),
+    });
+    queuedPairs = pairs;
+    // The roster's labels and keys follow the table whether or not rows move.
+    liveHub.emitAccountsChanged();
+    if (change === null) return;
+    queuedAccounts = nextAccounts;
+    queuedDormant = nextDormant;
+    void organizationSettings.apply(change);
+  }
+  accountPairs.onChange(() => schedulePairCheck());
+  function samePairs(a: ReadonlyMap<string, string>, b: ReadonlyMap<string, string>): boolean {
+    if (a.size !== b.size) return false;
+    for (const [hash, accountUuid] of a) if (b.get(hash) !== accountUuid) return false;
+    return true;
+  }
 
   // First-launch selection stays private, including on repeated launches
   // where no settings writer has persisted the seed. Publish only after the
@@ -1123,22 +1911,32 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     loginOrganization: bootLogin?.organizationUuid ?? null,
     roots: watchRoots,
     assertionsReady,
+    accountPairsReady,
     // The dormant snapshot is the set THIS walk admits under: the claims live
-    // when the store is built against the set the walk is handed. For the
+    // when the store is built against the sets the walk is handed. For the
     // first store those are the claims installed at `assertionsReady`; a first
     // launch's seeded second walk reads whatever claims are live by then. A
-    // first launch's null set makes nothing dormant.
-    createStore: (trackedOrganizations) =>
-      createEventStore({
-        selfMachineId: machineId,
-        scanCache,
-        trackedOrganizations,
-        dormantSessions: dormantSessions(
-          currentPresumption.assertedBySession,
+    // first launch's null sets make nothing dormant.
+    createStore: (trackedOrganizations, trackedAccounts) =>
+      gatewayStore(
+        createEventStore({
+          selfMachineId: machineId,
+          scanCache,
           trackedOrganizations,
-        ),
-        getPresumption: presumptionNow,
-      }),
+          trackedAccounts,
+          accountPairs: accountPairs.snapshot(),
+          dormantSessions: dormantSessions(
+            currentPresumption.assertedBySession,
+            trackedOrganizations,
+            trackedAccounts,
+          ),
+          getPresumption: presumptionNow,
+          onAccountPair: learnTranscriptPair,
+          gatewayEvidence,
+        }),
+      ),
+    // #631: the Account half of each walk (organization-boot.ts).
+    accounts: { tracked: trackedAccountsFor, settle: settleBootAccounts },
     onProgress: (p) => {
       bootTrace.detail("scan", `${p.filesParsed}/${p.filesTotal} files`);
       bootProgress.onScanProgress(p);
@@ -1146,7 +1944,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   }).then(({ home, store }) => {
     if (currentHome === null) seededHome = home;
     currentHome = home;
-    usagePoller.setOrganizations([...(trackedNow() ?? [])], currentHome);
+    usagePoller.setOrganizations(pollSetNow(), currentHome);
     // A seeded Home is a Home INSTALL, so it installs the presumption too
     // (#277): without this, a machine whose Home was just chosen from its own
     // corpus would presume nothing for the life of the process. Before
@@ -1154,27 +1952,49 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     // owner-less rows under it. `withSelfHome`, never `createPresumption`:
     // the fleet may already have installed peer Homes from the persisted
     // directory, and a fresh presumption would drop them.
-    const installedHome = currentPresumption.selfHome;
-    currentPresumption = withSelfHome(currentPresumption, currentHome);
-    // The status's Quota organization follows a Home the seed just chose; a
+    const installedHome = currentPresumption.selfHome?.organizationUuid ?? null;
+    currentPresumption = withSelfHome(currentPresumption, homeMembershipNow());
+    usagePoller.setHomeAccount(homeAccountFor(currentHome));
+    hubClient.homeAccountChanged();
+    // The status's head Organization follows a Home the seed just chose; a
     // persisted Home was installed at construction.
     if (currentHome !== installedHome) usagePoller.republish();
-    // The first publish of this machine's Home (#281). It waits for the seed so
-    // a first launch never publishes a placeholder that every peer would then
-    // presume under, and drop its caches for, only to see it replaced.
-    fleet.setHome(currentHome);
+    // The first publish of this machine's Home membership (#281, #635), its
+    // Account included once known. It waits for the seed so a first launch
+    // never publishes a placeholder that every peer would then presume under,
+    // and drop its caches for, only to see it replaced.
+    fleet.setHome(homeMembershipNow());
     installStore(store);
     // #311: the installed store's snapshot is what the engine now admits
     // under. A claim adopted during the walk queues the change that
     // reconciles it.
     queuedDormant = store.dormantSessions();
+    // #631: likewise the Account set and the pair table the store was built
+    // with. A pair learned after the store was built is checked now, and
+    // every later one as it lands (`checkPairs`).
+    queuedAccounts = store.trackedAccounts();
+    queuedPairs = store.accountPairs();
     admitAssertions();
+    accountsInstalled = true;
+    statusRosterKnown = true;
+    checkPairs();
     resolveLocalReady();
+    // ADR-0141: the boot's store is live, its walk indexed: match what the
+    // last process left pending, and from now on every offer and new line.
+    gatewayMatchingLive = true;
+    gatewayMatcher.start();
     // ADR-0122 §3: a Home this walk chose goes to the host once its store is
     // installed. `seededHome` is set only above, and only when no persisted
     // Home was the walk's input, so a persisted Home, a seed of none and every
     // later install or Home change report nothing.
     if (seededHome !== null) options.onHomeSeeded?.(seededHome);
+    // #631: the Account seed and the folds the same way, after the Home seed
+    // so a host persisting both writes the Home first. The renderer reads
+    // both from GET /api/accounts, which the poke asks it to refetch.
+    const accountsSeed = accountsSeedNow();
+    if (accountsSeed !== null) options.onAccountsSeeded?.(accountsSeed);
+    announceFolds();
+    liveHub.emitAccountsChanged();
   }, rejectLocalReady);
 
   // Gate data handlers on the installed home corpus and its disk feeders.
@@ -1195,6 +2015,11 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
       bootTrace.track("assertions", assertionsReady),
     ]).then(() => {
       fleet.notifyLocalChange();
+      // The status's head Organization over the installed corpus: a Scope
+      // the Home membership does not head is headed by the store's candidates
+      // (`statusHeadOrganization`), which the walk has only now filled. Later
+      // row arrivals reach it at the poller's next publish.
+      usagePoller.republish();
     }),
   );
 
@@ -1334,21 +2159,20 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // own, below, or POST /api/usage/credential). Standalone interval (not SSE-ref-counted) so
   // history accrues on any page (ADR-0024).
   usagePoller.start();
-  // The hourly key listing (#366) beside it: idle on a Hub-configured client,
-  // and until a key is pushed.
-  keyListing.start();
+  // Each held key's hourly listing (#366, #633) runs on its own clock, armed
+  // as the key arrives: idle on a Hub-configured client.
 
-  // The boot's session key (ADR-0121 §3), applied as POST
-  // /api/usage/credential applies a pushed one, at the point the renderer's
-  // launch push lands: after the poller and the key listing start, ahead of
-  // its Hub push. The route's ack waits for the first poll before the key
-  // listing; nothing waits here, so the same order runs as a chain.
-  if (options.usageCredential !== null) {
-    const credential = options.usageCredential;
-    usagePoller.setCredential(credential);
+  // The boot's keyset (ADR-0121 §3), applied as POST /api/usage/credential
+  // applies a pushed one, at the point the renderer's launch push lands: after
+  // the poller starts, ahead of its Hub push. The route's ack waits for the
+  // first poll before the key listing; nothing waits here, so the same order
+  // runs as a chain. The boot's keyset carries no `orgId` (the Headless
+  // client's secrets never held one).
+  if (options.usageKeyset !== null) {
+    const arrived = applyKeyset(options.usageKeyset);
     void usagePoller
       .pollOnce()
-      .then(() => keyListing.keyArrived(credential.sessionKey))
+      .then(() => Promise.all(arrived.map((k) => keyListing.keyArrived(k))))
       .catch((err: unknown) => console.error("[sidecar] boot credential poll failed:", err));
   }
 
@@ -1358,6 +2182,11 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // hub-client needs the poller/liveHub wiring live. Password optional
   // (ADR-0037).
   if (options.hub !== null) hubClient.configure(options.hub);
+  // The boot's Gateways (the Headless client's), as POST /api/gateways/config
+  // applies a pushed set.
+  if (options.gateways !== undefined && options.gateways.length > 0) {
+    gatewayClient.configure(options.gateways);
+  }
 
   // Watcher comes up after the handshake so a large initial filesystem scan
   // can't delay the LISTENING line past the Rust shell's 5s timeout.
@@ -1434,6 +2263,9 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
         // void-call poller.stop() when it connects/fails, so tearing it down
         // first ensures nothing re-toggles the poller mid-teardown.
         await hubClient.stop();
+        // The Gateways' drain and relay (ADR-0141 §5): no drain starts after
+        // this, and none is in flight.
+        await gatewayClient.stop();
         // Then the fleet (ADR-0041): hubClient.stop() above fires onDisconnected
         // into the fleet's hooks, so fleet.stop() runs after that has settled —
         // it stops the event-sync loops and closes the replica store.
@@ -1467,6 +2299,9 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
         // and closes the file handle. Best-effort like every close above — the
         // shared catch keeps a failure from skipping process.exit.
         await localArchive.stop();
+        // Drain the pair table's queued writes (ADR-0137 §1), after the
+        // watcher, its live feeder.
+        await accountPairs.flushed();
         await server.stop(true);
       } catch (err) {
         console.error("[sidecar] shutdown teardown error:", err);
@@ -1498,6 +2333,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // the events that triggered it.
   const jsonlWatcherOptions = (roots: string[]): CreateWatcherOptions => ({
     roots,
+    onAccountPair: learnTranscriptPair,
     onRecords: (records, projectSlug, sessionId, isSubagent) => {
       // Through the live accessor (ADR-0041): a fleet rebuild swaps the store, so
       // a watcher flush must feed whatever store is current, not the boot one.
@@ -1629,6 +2465,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
         // changed or not), so a share/replica toggle applies in-session without a
         // relaunch. `settingsPath` is narrowed to string inside this block.
         onSettingsChanged: () => {
+          refreshUnlistedRoots();
           const s = readSettingsFile(settingsPath);
           if (s !== null) {
             // The resolved tracked set this edit REPLACES — captured before
@@ -1638,6 +2475,11 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
             // whole, which is the only comparison that can see the two cancel.
             const previousTracked = trackedNow();
             const previousDormant = queuedDormant;
+            // #631: the Account side's predecessor is the set the last queued
+            // change installed, and the Home membership's Account as it
+            // stands now (the persisted one, else the seed's).
+            const previousTrackedAccounts = queuedAccounts;
+            const previousHomeAccount = homeAccountFor(currentHome);
             // The tracked list (the #260 lifecycle decision, item 1) is
             // re-read on every settings edit so the NEXT store this process
             // builds uses it — the fleet's `createStore` closes over
@@ -1647,8 +2489,21 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
             // below nor the set comparison can read a stale list, and so a
             // combined edit rebuilds under both.
             currentTracked = s.trackedOrganizations;
-            const scopeChanged = s.organizationScope !== currentScope;
-            currentScope = s.organizationScope;
+            // The Account half (#631), read the same way: the list and the
+            // Home membership's Account. A host persisting the boot's seed
+            // writes exactly the set the seed stood in for, so that write
+            // moves nothing.
+            const trackedAccountsChanged =
+              JSON.stringify(s.trackedAccounts) !== JSON.stringify(currentTrackedAccounts);
+            currentTrackedAccounts = s.trackedAccounts;
+            if (s.trackedAccounts !== null) accountsSeedPersisted = true;
+            currentHomeAccount = homeMembershipOf(s)?.accountUuid ?? null;
+            // The tracked Accounts decide whether a saved Account or
+            // Membership Scope applies (`statusScope`), so a change to them
+            // republishes the status's head too.
+            const scopeChanged =
+              !scopeSettingsEqual(s.scope, currentScope) || trackedAccountsChanged;
+            currentScope = s.scope;
             fleet.applySettings({
               hubShareEvents: s.hubShareEvents,
               hubFleetReplica: s.hubFleetReplica,
@@ -1662,25 +2517,40 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
             // exclude/track flow. The driver queues it behind whatever edit is
             // still being applied, so the six values captured here are the
             // ones it runs with however long it waits.
-            const nextHome = s.homeOrganization ?? seededHome;
-            const homeChanged = nextHome !== currentHome;
+            const nextHome = homeOrganizationOf(s) ?? seededHome;
+            const organizationChanged = nextHome !== currentHome;
             currentHome = nextHome;
-            // Publish a changed Home at ARRIVAL, not in the driver's queue
-            // (#281): it is directory metadata and moves no row here, and the
-            // Hub's answer is idempotent, so nothing it could race with is
-            // waiting in that queue. The Hub's machines poke then carries it
-            // to every peer's directory refresh.
-            if (homeChanged) fleet.setHome(currentHome);
+            // A Home-Account-only change reinstalls the presumption too: it
+            // re-answers the Account of every owner-less row (ADR-0137 §4).
+            const nextHomeAccount = homeAccountFor(currentHome);
+            const homeChanged = organizationChanged || nextHomeAccount !== previousHomeAccount;
+            // Publish a changed Home membership at ARRIVAL, not in the
+            // driver's queue (#281): it is directory metadata and moves no row
+            // here, and the Hub's answer is idempotent, so nothing it could
+            // race with is waiting in that queue. A change of its Account alone
+            // publishes too (#635, ADR-0139 §6), so a machine whose Home
+            // membership's Account becomes known republishes with it. The
+            // Hub's machines poke then carries it to every peer's directory
+            // refresh.
+            if (homeChanged) fleet.setHome(homeMembershipNow());
+            // A hand-edited list can name a Pending key a pair already maps.
+            if (decideFolds(getEngineStore(), accountPairs.snapshot())) announceFolds();
             // #311: computed after both writes, from the new tracked set and the installed claims.
             const nextDormant = dormantNow();
             queuedDormant = nextDormant;
+            const nextTrackedAccounts = trackedAccountsNow();
+            queuedAccounts = nextTrackedAccounts;
             void organizationSettings.apply({
               home: currentHome,
+              homeAccount: nextHomeAccount,
               homeChanged,
               previousTracked,
               nextTracked: trackedNow(),
+              previousTrackedAccounts,
+              nextTrackedAccounts,
               previousDormant,
               nextDormant,
+              reresolved: "none",
             });
             // A scope change moves only which Organization the status's usage
             // connection describes: one status patch, no reading.

@@ -37,7 +37,7 @@ import { storedEventToWire } from "./stored-event-wire";
 // Writes converge by RECONCILIATION (the ADR-0055 shape): the engine store's
 // onChanged feed appends promptly; the boot/interval sweep is the guarantee —
 // it re-offers every self row the archive does not hold at ≥ its fullness
-// (token total, then Organization evidence — the stamp predicate, pointed at
+// (token total, then the Organization and Account tags — the stamp predicate, pointed at
 // the archive instead of the replica). That sweep is what makes crash-loss, a
 // deleted file, and the first boot after upgrade all self-heal from whatever
 // the corpus still holds.
@@ -162,8 +162,8 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
 
   // The stamp predicate, pointed at the archive: a row is archived ⇔ the
   // archive holds its key at ≥ its fullness — i.e. the row does not supersede
-  // the held copy under the one merge rule (ADR-0103: a larger total, or an
-  // equal total with Organization evidence against none), asked of the held
+  // the held copy under the one merge rule (ADR-0103, ADR-0137 §6: a larger
+  // total, or an equal total with more tags or better ones), asked of the held
   // record's fullness parts (ADR-0111 §2). `eligible` asks the same question of
   // the local contribution: the row is this machine's own unless it is fuller
   // than anything the transcripts gave.
@@ -182,8 +182,10 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
       !fleetFullnessPartsExceed(
         fleetDedupTokenTotal(row),
         row.organizationUuid,
+        row.accountUuid,
         held.total,
         held.organizationUuid,
+        held.accountUuid,
       )
     );
   }

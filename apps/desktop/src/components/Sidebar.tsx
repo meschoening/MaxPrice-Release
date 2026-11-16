@@ -8,7 +8,6 @@ import {
   PanelLeftOpen,
   Settings,
   SlidersHorizontal,
-  Terminal,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useFilters } from "@/state/filters";
@@ -19,7 +18,6 @@ import { StatusBar } from "./StatusBar";
 
 const NAV = [
   { to: "/live", label: "Live", icon: Activity, showDot: true },
-  { to: "/sessions", label: "Sessions", icon: Terminal, showDot: false },
   { to: "/projects", label: "Projects", icon: Folder, showDot: false },
   { to: "/blocks", label: "Blocks", icon: Layers, showDot: false },
   { to: "/settings", label: "Settings", icon: Settings, showDot: false },
@@ -133,7 +131,7 @@ export function Sidebar() {
                       collapsed — it is zero-width, not removed. */}
                   <span className="sb-label">{n.label}</span>
                   {/* The Live pulse rides the nav item on every page (T5 mock:
-                      "Live keeps the pulse dot" while Sessions is active), and
+                      "Live keeps the pulse dot" while another page is active), and
                       travels from the icon's corner to the pill's right edge
                       as the panel widens. */}
                   {n.showDot ? <span className="pulse" aria-label="live" /> : null}
@@ -164,7 +162,7 @@ export function Sidebar() {
 
         {/* `visibility: hidden` while collapsed, not just zero-height: an
             invisible rail that is still tabbable is a trap. */}
-        <div className="sb-fields">
+        <div className="sb-fields thin-scroll">
           <FilterRail />
         </div>
 

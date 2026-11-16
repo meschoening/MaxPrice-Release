@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DEFAULT_CLAUDE_PATHS } from "@maxprice/shared";
 
 // Expand a leading `~` in a tilde path to an absolute path under `homedir`,
@@ -52,4 +52,20 @@ export async function resolveWatchRoots(params: ResolveWatchRootsParams): Promis
     if (await dirExists(path)) roots.push(path);
   }
   return roots;
+}
+
+// The `projects` directories `$CLAUDE_CONFIG_DIR` names that a listed
+// `claudePaths` leaves out (#679). `listed` is the settings file's list,
+// tilde-expanded, or null when the file names no `claudePaths` (or there is no
+// file): the variable then decides the roots itself (ADR-0122 §5), so nothing
+// is left out. `configDirRoots` is `resolveWatchRoots` with the variable set,
+// the existing directories only; an unset variable is no roots. Compared as
+// resolved paths, so a trailing separator or a `..` does not hide a match.
+export function unlistedConfigDirRoots(
+  configDirRoots: readonly string[],
+  listed: readonly string[] | null,
+): string[] {
+  if (listed === null) return [];
+  const named = new Set(listed.map((path) => resolve(path)));
+  return configDirRoots.filter((root) => !named.has(resolve(root)));
 }

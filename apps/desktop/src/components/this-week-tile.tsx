@@ -9,7 +9,7 @@ import {
 import type { NoLimit } from "@/lib/organization-scope-view";
 import { useLiveStatus } from "@/state/use-live-status";
 import { useNowTick } from "@/state/use-now-tick";
-import { useOrganizationScope } from "@/state/use-organization-scope";
+import { useScope } from "@/state/use-scope";
 import { useQuotaSurface } from "@/state/use-quota-surface";
 import { useUsageCurrent } from "@/state/use-usage-current";
 import { useBump } from "@/state/use-bump";
@@ -17,6 +17,8 @@ import { NoLimitsNote } from "@/components/no-limits-note";
 import { UsageExpiredHint } from "@/components/usage-expired-hint";
 import { DeltaChip } from "./delta-chip";
 import { UnpricedChip } from "./unpriced-chip";
+import { MoneySplitBar } from "./money-split";
+import { moneySplit, type MoneySplit, type SplitInput } from "@/lib/money-split";
 import { weekEyebrowTag, weekRefLabel, weekSubLine } from "@/lib/week-copy";
 import { cn } from "@/lib/utils";
 
@@ -30,6 +32,12 @@ export type ThisWeekTileProps = {
   // and the fallback line all read it; `display` renders an anchored start.
   week: WeekWindow;
   display: TimeDisplay;
+  // The split bar's rows and labels (#637 D6); absent, or rule "none", for a
+  // one-Membership Scope. The bar apportions this tile's own total.
+  split?: SplitInput;
+  // The Scope holds two or more Memberships: the weekly meter lives in Live's
+  // limit area, one per Membership (#613 §4), and the tile drops its own.
+  meterMoved?: boolean;
 };
 
 // The This-week tile (Glass, ADR-0043): eyebrow, 800-weight value, the week
@@ -45,15 +53,21 @@ export function ThisWeekTile({
   rollingStart,
   week,
   display,
+  split,
+  meterMoved = false,
 }: ThisWeekTileProps): React.ReactElement {
   const total = useMemo(() => rows.reduce((s, r) => s + r.totalCost, 0), [rows]);
   const prevTotal = useMemo(() => prevRows.reduce((s, r) => s + r.totalCost, 0), [prevRows]);
   const bumping = useBump(weekValueText(total));
   const weekModels = useMemo(() => rows.flatMap((r) => r.modelsUsed), [rows]);
+  const bar = useMemo(
+    () => (split ? moneySplit({ ...split, totalUsd: total }) : null),
+    [split, total],
+  );
 
   const now = useNowTick(60_000);
   // The weekly meter reads the Quota organization's reading (ADR-0106 §8).
-  const { quotaOrganization } = useOrganizationScope();
+  const { quotaOrganization } = useScope();
   const { data: usage } = useUsageCurrent(quotaOrganization);
   // The weekly window's note: an Enterprise organization has no weekly limit,
   // while an idle one is a limit like any other (#384).
@@ -82,14 +96,18 @@ export function ThisWeekTile({
       usageExpired={usageConnection === "expired"}
       quotaTag={quotaTag}
       noLimit={noLimit}
+      split={bar}
+      meterMoved={meterMoved}
     />
   );
 }
 
 export type ThisWeekTileContentProps = Pick<
   ThisWeekTileProps,
-  "rollingStart" | "week" | "display"
+  "rollingStart" | "week" | "display" | "meterMoved"
 > & {
+  // The split bar, over this tile's total.
+  split?: MoneySplit | null;
   total: number;
   prevTotal: number;
   // The week's raw model names — the unpriced chip's join input (#110).
@@ -118,8 +136,13 @@ export function ThisWeekTileContent({
   weeklyPct,
   usageExpired,
   quotaTag,
-  noLimit,
+  noLimit: surfaceNoLimit,
+  split,
+  meterMoved = false,
 }: ThisWeekTileContentProps): React.ReactElement {
+  // With the meter moved to the limit area, so is its note: the cards say
+  // which Membership has no weekly limit.
+  const noLimit = meterMoved ? null : surfaceNoLimit;
   const delta = total - prevTotal;
   const pct = prevTotal === 0 ? null : (delta / prevTotal) * 100;
   const eyebrowTag = weekEyebrowTag(week);
@@ -150,7 +173,8 @@ export function ThisWeekTileContent({
           would. Under All the meter's label names whose limit it is; the
           tile's width is the grid's, so a long label ellipsizes, titled in
           full, and the meter and the percentage keep their room. */}
-      {weeklyPct !== null && noLimit === null ? (
+      {split ? <MoneySplitBar split={split} /> : null}
+      {weeklyPct !== null && noLimit === null && !meterMoved ? (
         <div className="limit-row">
           {quotaTag !== null ? (
             <label className="min-w-0 truncate" title={`weekly limit used · ${quotaTag}`}>
@@ -176,7 +200,7 @@ export function ThisWeekTileContent({
       {/* "prior 7d" / "prior week to date", not the mock's "last week": the
           copy stays honest about which window the delta compares. */}
       <DeltaChip delta={delta} pct={pct} refLabel={weekRefLabel(week)} refValue={prevTotal} />
-      {usageExpired ? <UsageExpiredHint /> : null}
+      {usageExpired && !meterMoved ? <UsageExpiredHint /> : null}
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { settingsSchema, type Settings } from "@maxprice/shared";
+import { type HomeMembership, settingsSchema, type Settings } from "@maxprice/shared";
 
 function expandTilde(path: string): string {
   if (path === "~") return homedir();
@@ -73,5 +73,27 @@ export function resolveTrackedOrganizations(
   if (home === null) return null;
   const set = new Set<string>([home]);
   for (const uuid of tracked) if (uuid !== "") set.add(uuid);
+  return set;
+}
+
+// The tracked Account set (ADR-0136 §3): the Accounts whose usage this machine
+// counts, as the persisted `trackedAccounts` list UNION the Home membership's
+// Account, so that Account is always tracked (§5). Computed fresh on every
+// settings read, like `resolveTrackedOrganizations`.
+//
+// Returns `null`, excluding nothing, when there is no Home membership (the
+// first-launch selection walk, as for Organizations) and when the list is
+// absent (`null`): a file that predates Accounts, whose upgrade set the
+// sidecar derives and announces for the host to persist (ADR-0136 §8, #631
+// decision 2). A Home membership whose Account is unknown adds nothing; an
+// empty string is no Account.
+export function resolveTrackedAccounts(
+  home: HomeMembership | null,
+  tracked: readonly string[] | null,
+): ReadonlySet<string> | null {
+  if (home === null || tracked === null) return null;
+  const set = new Set<string>();
+  if (home.accountUuid !== null) set.add(home.accountUuid);
+  for (const key of tracked) if (key !== "") set.add(key);
   return set;
 }

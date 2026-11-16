@@ -1,8 +1,11 @@
 import { useMemo } from "react";
 import {
   activeBlockOf,
+  blocksHeadAccountNotKnown,
+  homeMembershipOf,
   type BlockRow,
   type DailyRow,
+  type MembershipTotal,
   type ProjectRow,
   type SessionRow,
   isoFromYmd,
@@ -13,7 +16,7 @@ import {
 } from "@maxprice/shared";
 import { useFilters } from "./filters";
 import { useSettings } from "./use-settings";
-import { useOrganizationScope } from "./use-organization-scope";
+import { useScope } from "./use-scope";
 import { useNowTick } from "./use-now-tick";
 import { useWeekWindow } from "./use-week";
 import { useChartWindow } from "./use-chart-window";
@@ -23,6 +26,9 @@ import { useSessions } from "./use-sessions";
 import { useProjects } from "./use-projects";
 import { useMachineAxis } from "./use-machine-axis";
 import { useProjectAxis } from "./use-project-axis";
+import { useMembershipTotals } from "./use-membership-totals";
+import { useScopeMemberships } from "./use-scope-memberships";
+import type { SplitRule } from "@/lib/money-split";
 
 // Today/yesterday/week derive from a 14-day window — covers the current and
 // prior week tiles + today and yesterday tiles in one cache entry per range.
@@ -43,6 +49,10 @@ export type LiveData = {
   // the first day with spend and misreported where the week began.
   rollingWeekStart: string;
   activeBlock: BlockRow | null;
+  // The head Blocks are the Unknown Membership's, heading in place of an
+  // empty Home membership (#644, `blocksHeadAccountNotKnown`): the Active
+  // block tile says "account not known".
+  activeBlockAccountNotKnown: boolean;
   typicalBlockTokens: number;
   chartRows: DailyRow[];
   prevChartRows: DailyRow[];
@@ -57,6 +67,13 @@ export type LiveData = {
   chartIsPending: boolean;
   chartIsError: boolean;
   chartError: unknown;
+  // The split money tiles (#637 D6): how they split, and each tile's window
+  // split by Membership (`/api/membership-totals`, the tile's own window and
+  // filters), undefined while loading or with no split. Never in `isPending`:
+  // the tiles' numbers do not wait for their split.
+  splitRule: SplitRule;
+  todaySplitRows: MembershipTotal[] | undefined;
+  weekSplitRows: MembershipTotal[] | undefined;
 };
 
 const TODAY = (tz?: string) => ymdShift(0, tz);
@@ -77,7 +94,7 @@ export function useLiveData(): LiveData {
   const tz = settings?.timezone;
   // ADR-0106: the Organization scope rides every Live query beside `mode` and
   // `tz` — absent under Home, so a single-Organization machine's keys stay put.
-  const { organization } = useOrganizationScope();
+  const { params: scope } = useScope();
   // ADR-0062: the project filter reaches the wire closure-expanded across Repo
   // identity — selecting one checkout of a repo queries every checkout of it —
   // and `index` folds the Top-projects rail the same way the Projects table
@@ -111,7 +128,7 @@ export function useLiveData(): LiveData {
     until: today,
     mode: costMode,
     tz,
-    organization,
+    ...scope,
     projects,
     models,
     machines,
@@ -127,7 +144,7 @@ export function useLiveData(): LiveData {
       since: anchored ? new Date(week.startMs).toISOString() : undefined,
       mode: costMode,
       tz,
-      organization,
+      ...scope,
       projects,
       models,
       machines,
@@ -160,7 +177,7 @@ export function useLiveData(): LiveData {
       until: anchored ? new Date(week.prevStartMs + elapsedMs).toISOString() : undefined,
       mode: costMode,
       tz,
-      organization,
+      ...scope,
       projects,
       models,
       machines,
@@ -180,12 +197,29 @@ export function useLiveData(): LiveData {
   // the model filter narrows each block's cost/token sums (ADR-0017) — the
   // active-block tile's cost honours the rail's model filter; its projection
   // stays all-model.
+  // The split tiles' windows, exactly the tiles' own: Today is the local
+  // date `today` (the 14-day window's today row), This week the rolling
+  // window's dates or the anchored week's instant-bounded window, under the
+  // same mode, zone, Scope and rail filters as the rows the tiles sum.
+  const { rule: splitRule } = useScopeMemberships();
+  const splitOn = splitRule !== "none";
+  const splitFilters = { mode: costMode, tz, ...scope, projects, models, machines };
+  const todaySplitQ = useMembershipTotals(
+    { since: today, until: today, ...splitFilters },
+    { enabled: splitOn },
+  );
+  const weekSplitQ = useMembershipTotals(
+    anchored
+      ? { since: new Date(week.startMs).toISOString(), ...splitFilters }
+      : { since: weekStart, until: today, ...splitFilters },
+    { enabled: splitOn },
+  );
   const blocksQ = useBlocks({
     since: railSince,
     until: railUntil,
     mode: costMode,
     tz,
-    organization,
+    ...scope,
     models,
     machines,
   });
@@ -194,7 +228,7 @@ export function useLiveData(): LiveData {
     until: railUntil,
     mode: costMode,
     tz,
-    organization,
+    ...scope,
     projects,
     models,
     machines,
@@ -204,7 +238,7 @@ export function useLiveData(): LiveData {
     until: railUntil,
     mode: costMode,
     tz,
-    organization,
+    ...scope,
     projects,
     models,
     machines,
@@ -237,6 +271,10 @@ export function useLiveData(): LiveData {
       null;
 
     const activeBlock = activeBlockOf(blocks) ?? null;
+    const activeBlockAccountNotKnown = blocksHeadAccountNotKnown(
+      blocksQ.data,
+      settings === undefined ? null : homeMembershipOf(settings),
+    );
     // The "typical" block — median tokens across the range's completed blocks
     // (excludes the active block + gaps). Backs the Active block tile's
     // "typical" row.
@@ -262,6 +300,7 @@ export function useLiveData(): LiveData {
       prevWeekRows,
       rollingWeekStart: weekStartIso,
       activeBlock,
+      activeBlockAccountNotKnown,
       typicalBlockTokens: typical,
       chartRows: chart.chartRows,
       prevChartRows: chart.prevChartRows,
@@ -286,6 +325,9 @@ export function useLiveData(): LiveData {
       chartIsPending: chart.chartIsPending,
       chartIsError: chart.chartIsError,
       chartError: chart.chartError,
+      splitRule,
+      todaySplitRows: splitOn ? todaySplitQ.data?.memberships : undefined,
+      weekSplitRows: splitOn ? weekSplitQ.data?.memberships : undefined,
     };
   }, [
     weekWindowQ.data,
@@ -300,6 +342,7 @@ export function useLiveData(): LiveData {
     anchoredPrevWeekQ.isError,
     chart,
     blocksQ.data,
+    settings,
     blocksQ.isPending,
     blocksQ.isError,
     sessionsQ.data,
@@ -314,5 +357,9 @@ export function useLiveData(): LiveData {
     weekStart,
     prevWeekStart,
     prevWeekEnd,
+    splitRule,
+    splitOn,
+    todaySplitQ.data,
+    weekSplitQ.data,
   ]);
 }

@@ -1,13 +1,19 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+  GATEWAY_STATE_TONE,
+  GATEWAY_STATE_WORDS,
+  type GatewayStateTone,
   accessDot,
   accessShortLabel,
   hubClientsLine,
   hubDaemonDot,
   hubDaemonLabel,
   hubDaemonState,
-  hubKeyLabel,
+  hubKeyHeld,
+  hubKeyProvenance,
+  hubKeyRow,
+  type HubGateway,
   hubPageViewSchema,
   hubStatusReportSchema,
   hubStatusSchema,
@@ -15,7 +21,10 @@ import {
   noFreshReading,
   usageConnectionDot,
   usageConnectionShortLabel,
+  type HubAccount,
   type HubStatusReport,
+  type HubStatusReportKey,
+  type LabelEntry,
   type UsageConnection,
 } from "@maxprice/shared";
 import { displayPath, type Env } from "@maxprice/usage-core/home-path";
@@ -29,17 +38,22 @@ import {
 } from "@maxprice/usage-core/update-check";
 import { CliError, EXIT, type Io } from "./cli";
 import { requireHub } from "./config";
+import { gatewayLastRecord } from "./gateway-words";
+import { labelledAccounts, liveAccountLabels } from "./hub-names";
 import { HubNoAnswer, reachHub, type ReachOptions, refusal, unreadable } from "./operator-client";
 import { readOnlyLockHolder, serveLockPath, UNIT } from "./serve-lock";
+import { terminalJson } from "./terminal-output";
 import { VERSION } from "./version";
 
 // `maxprice-hub status [--json]` (ADR-0127 §8): the running daemon described
 // as the hub tray app's Popout describes its own, the Hub, claude.ai and
 // Access rows and the clients line, all from @maxprice/shared's Hub rows
-// (hub-rows.ts), then the key's row (ADR-0126 §3, the console's own words),
-// the daemon's version, the Update row (ADR-0129 §6), the data dir and the
-// pid. `service status` keeps describing the unit (§6). Linux only, as
-// serve.lock and the operator token are (§3, ADR-0126 §8).
+// (hub-rows.ts), then the keys' rows (ADR-0126 §3, the console's own words;
+// one per Account when the Hub knows several, #614 §13), one row per Gateway
+// it drains (ADR-0141 §8), the daemon's version, the Update row (ADR-0129
+// §6), the data dir and the pid. `service status` keeps describing the unit
+// (§6). Linux only, as serve.lock and the operator token are (§3, ADR-0126
+// §8).
 //
 // Once the lock says a Hub runs (below), the daemon is read the way §7's
 // commands reach it, through reachHub (operator-client.ts): serve.lock's
@@ -49,9 +63,13 @@ import { VERSION } from "./version";
 // §4), which carries exactly what the rows read, the live clients count and
 // the daemon's version, the one ADR-0129 §5's `update` waits on. A view's
 // rows are its full status's (#491's tests pin it), and the page and the
-// Popout show the same. The Update row reads the data dir's update-check.json
-// instead, which a Headless serve writes (ADR-0129 §6), in the text form
-// alone.
+// Popout show the same. When the status names an Account, one
+// `GET /api/label-directory` follows, whose account entries label it
+// (ADR-0139 §9). The claude.ai row, the Key rows and the Gateway rows read
+// the probe's status (`StatusFleet`), which the page view does not carry:
+// every Account it lists, and its Gateways. The Update row reads the data
+// dir's update-check.json instead, which a Headless serve writes (ADR-0129
+// §6), in the text form alone.
 //
 // Exit 0 once the daemon has answered, whatever its rows say; 3 when no
 // daemon holds the lock, ADR-0119 §6's "not running" code; 1 when a holder
@@ -229,9 +247,18 @@ function updateCheckRow(answered: Answered | null, inUnit: boolean, update: Upda
   return { ...updateRow(update, VERSION, "maxprice-hub update"), label: "Update" };
 }
 
-function rows(report: HubStatusReport, update: UpdateCheckRead, env: Env, now: number): Row[] {
+function rows(
+  report: HubStatusReport,
+  update: UpdateCheckRead,
+  env: Env,
+  now: number,
+  given: StatusFleet | undefined,
+): Row[] {
   const state = report.state;
   const answered = fresh(report) ? report : null;
+  // A report alone (the hub-update rig's renderer check) knows the keys it
+  // carries and no Gateway.
+  const fleet = given ?? { accounts: answered?.keys ?? [], gateways: [] };
   const warning = answered?.bindWarning ?? null;
   // A stopped daemon has no clients line; a report never carries one (it is
   // exit 3), so the line is always there, dimmed with the rows that read.
@@ -247,11 +274,7 @@ function rows(report: HubStatusReport, update: UpdateCheckRead, env: Env, now: n
       // serve's log is its own terminal.
       ...(state === "events-down" && report.inUnit ? { remedy: "maxprice-hub service logs" } : {}),
     },
-    reading("claude.ai", true, answered, ({ usageConnection: conn }) => ({
-      mark: markOf(usageConnectionDot(conn)),
-      detail: usageConnectionShortLabel(conn),
-      ...(KEY_REMEDY[conn] === undefined ? {} : { remedy: KEY_REMEDY[conn] }),
-    })),
+    reading("claude.ai", true, answered, () => claudeRow(fleet.accounts)),
     reading("Access", true, answered, ({ passwordProtected }) => {
       const passworded = passwordProtected ?? false;
       return {
@@ -263,17 +286,8 @@ function rows(report: HubStatusReport, update: UpdateCheckRead, env: Env, now: n
     ...(clients === null
       ? []
       : [{ mark: null, label: "", detail: `${clients.count ?? "—"} ${clients.noun}` }]),
-    reading("Key", false, answered, ({ key }) => ({
-      mark: null,
-      detail: hubKeyLabel(
-        {
-          credentialPresent: key.present,
-          credentialUpdatedAt: key.updatedAt,
-          credentialSource: key.source,
-        },
-        now,
-      ),
-    })),
+    ...keyRows(answered, fleet.accounts, now),
+    ...(answered === null ? [] : gatewayRows(fleet.gateways, now)),
     reading("Version", false, answered, ({ version }) => ({ mark: null, detail: version })),
     updateCheckRow(answered, report.inUnit, update),
     { mark: null, label: "Data dir", detail: displayPath(report.dataDir, env) },
@@ -287,6 +301,133 @@ function rows(report: HubStatusReport, update: UpdateCheckRead, env: Env, now: n
   ];
 }
 
+// What `status` shows of the Hub's Accounts and Gateways beyond its report
+// (ADR-0141 §8, #614 §12–§13): every Account its status lists, each
+// labelled here, a key held or not (removed, or named only by an event tag or
+// a Label directory entry), and every Gateway it drains. The report's `keys`
+// are the held and removed ones among them (`reportKeys`).
+export type StatusFleet = {
+  accounts: readonly HubStatusReportKey[];
+  gateways: readonly HubGateway[];
+};
+
+// `--json`'s keys (ADR-0139 §9): every key the Hub holds, the legacy one
+// included, and every Account whose key it removed; never an Account the
+// fleet names only by an event tag, a published Home or a label, which never
+// had a key here.
+export function reportKeys(
+  accounts: readonly HubAccount[],
+  labels: Readonly<Record<string, LabelEntry>> = {},
+): HubStatusReportKey[] {
+  return labelledAccounts(accounts, labels).filter(
+    (account) => hubKeyHeld(account) || account.removedAt !== null,
+  );
+}
+
+// The claude.ai row (#614 §12): one Provider today. With one Account or none,
+// its words are the single key's, as they always were (`hubKeyRow`'s state,
+// No key with none). With several, every one the status lists counted, one
+// with no key (removed, or named only by an event tag or a label) as `no
+// key`: `N connected` when each key works, else how many are connected of
+// how many, then each other state with its count, `expired`, `poll failing`
+// and `no key` in that order, a zero left out. Warn while any key works;
+// with none working, the mark of the one state the row would show for them
+// (`hubKeyRow`'s order: expired, then poll failing, then no key). A key to
+// set is the fix while any expired or has none.
+function claudeRow(accounts: readonly HubStatusReportKey[]): Omit<Row, "label"> {
+  const { counts, state } = hubKeyRow(accounts)[0]!;
+  const total = accounts.length;
+  if (total <= 1) {
+    return {
+      mark: markOf(usageConnectionDot(state)),
+      detail: usageConnectionShortLabel(state),
+      ...(KEY_REMEDY[state] === undefined ? {} : { remedy: KEY_REMEDY[state] }),
+    };
+  }
+  if (counts.connected === total) return { mark: "ok", detail: `${total} connected` };
+  const others = (
+    [
+      [counts.expired, "expired"],
+      [counts.error, "poll failing"],
+      [counts.disconnected, "no key"],
+    ] as const
+  )
+    .filter(([count]) => count > 0)
+    .map(([count, word]) => `${count} ${word}`);
+  return {
+    mark: counts.connected > 0 ? "warn" : markOf(usageConnectionDot(state)),
+    detail: `${counts.connected} of ${total} connected · ${others.join(", ")}`,
+    ...(counts.expired > 0 || counts.disconnected > 0 ? { remedy: KEY_REMEDY.expired } : {}),
+  };
+}
+
+// The unfiled legacy key once claude.ai refused it (ADR-0140 §6): a pasted
+// key replaces it once filed, so its row says so in place of `Key expired`.
+const UNFILED_EXPIRED = "Your saved key has expired; maxprice-hub key set replaces it";
+
+function unfiledExpired(account: HubStatusReportKey): boolean {
+  return account.accountUuid === null && account.connection === "expired";
+}
+
+// One Account's Key row among several (#614 §13): its label, then its key's
+// provenance (ADR-0126 §3) while the key works or awaits its first read; else
+// what stops it, `Key expired` or `Poll failing`, or `No key on this Hub` for
+// an Account the Hub holds no key for, the two a key fixes naming `key set`.
+// The unfiled key, expired, says `key set` replaces it (UNFILED_EXPIRED).
+// Never its Memberships.
+function accountKeyRow(account: HubStatusReportKey, now: number): Row {
+  const row = (detail: string, remedy?: string): Row => ({
+    mark: null,
+    label: "Key",
+    detail: `${account.label}: ${detail}`,
+    ...(remedy === undefined ? {} : { remedy }),
+  });
+  if (!hubKeyHeld(account)) return row("No key on this Hub", KEY_REMEDY.disconnected);
+  if (unfiledExpired(account)) return row(UNFILED_EXPIRED);
+  switch (account.connection) {
+    case "expired":
+      return row("Key expired", KEY_REMEDY.expired);
+    case "error":
+      return row("Poll failing");
+    default:
+      return row(hubKeyProvenance(account, now));
+  }
+}
+
+// The Key rows (ADR-0126 §3, ADR-0139 §9, #614 §13). One Account or none:
+// one row, as before, its key's provenance alone, or `No key set`, or the
+// unfiled key's UNFILED_EXPIRED. Several:
+// one row per Account the status lists (`accountKeyRow`). Dimmed while the
+// Hub gives no fresh reading.
+function keyRows(
+  answered: Answered | null,
+  accounts: readonly HubStatusReportKey[],
+  now: number,
+): Row[] {
+  if (answered === null) return [{ mark: null, label: "Key", detail: "—" }];
+  if (accounts.length <= 1) {
+    const held = accounts.filter(hubKeyHeld)[0];
+    const detail =
+      held !== undefined && unfiledExpired(held) ? UNFILED_EXPIRED : hubKeyProvenance(held, now);
+    return [{ mark: null, label: "Key", detail }];
+  }
+  return accounts.map((account) => accountKeyRow(account, now));
+}
+
+// One Gateway row per Gateway the Hub drains (ADR-0141 §8): its URL's host,
+// its state and the age of its last record, marked by its shared tone
+// (`GATEWAY_STATE_TONE`), as the console's Gateways card tints it: draining
+// ok, statistics-off a warning, and the rest faults. None while the Hub holds
+// no Gateway.
+const GATEWAY_MARK: Record<GatewayStateTone, Mark> = { good: "ok", warn: "warn", bad: "bad" };
+function gatewayRows(gateways: readonly HubGateway[], now: number): Row[] {
+  return gateways.map((gateway) => ({
+    mark: GATEWAY_MARK[GATEWAY_STATE_TONE[gateway.state]],
+    label: "Gateway",
+    detail: `${gateway.urlHost}: ${GATEWAY_STATE_WORDS[gateway.state]} · ${gatewayLastRecord(gateway.lastRecordAt, now)}`,
+  }));
+}
+
 // Every detail and remedy goes through `terminalText`: a bind warning, a
 // version, a check's error, a path and the machine that healed the key all
 // come from outside this process, the last from a client's own header.
@@ -295,8 +436,9 @@ export function renderHubStatus(
   update: UpdateCheckRead,
   env: Env,
   now: number,
+  fleet?: StatusFleet,
 ): string {
-  const all = rows(report, update, env, now);
+  const all = rows(report, update, env, now, fleet);
   const width = Math.max(...all.map((row) => row.label.length)) + 2;
   return (
     all
@@ -310,25 +452,20 @@ export function renderHubStatus(
   );
 }
 
-// `--json`'s one object, as JSON.stringify writes it, which already escapes
-// every C0 control character. DEL, C1 and the two Unicode line separators
-// it leaves raw are escaped too, so no value can act on a terminal: JSON
-// reads each `\u` escape back as the character it names, so the object
-// parses to the same values. Not `terminalText`, which would change them.
-function reportJson(report: HubStatusReport): string {
-  return (
-    JSON.stringify(report).replace(
-      /[\u007f-\u009f\u2028\u2029]/g,
-      (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
-    ) + "\n"
-  );
-}
-
 // update-check.json is read for the text form alone: `--json` is the report,
 // which carries no Update row, and reads no file beside it.
-function print(io: Io, json: boolean, report: HubStatusReport, env: Env, now: number): void {
+function print(
+  io: Io,
+  json: boolean,
+  report: HubStatusReport,
+  env: Env,
+  now: number,
+  fleet?: StatusFleet,
+): void {
   io.stdout.write(
-    json ? reportJson(report) : renderHubStatus(report, readUpdateCheck(report.dataDir), env, now),
+    json
+      ? terminalJson(report)
+      : renderHubStatus(report, readUpdateCheck(report.dataDir), env, now, fleet),
   );
 }
 
@@ -372,22 +509,24 @@ export async function hubStatus(
     }
     const view = hubPageViewSchema.safeParse(answer.body);
     if (!view.success) throw unreadable(PAGE_VIEW_PATH);
+    // The Account labels, read only when the status names an Account: the
+    // legacy key's label is the Hub's own word.
+    const labels = await liveAccountLabels(hub, status.data.accounts);
     // The view always arrives here, and the Hub answered: never `starting`,
     // `not-responding` or `stopped`, which the schema refuses.
     const report = hubStatusReportSchema.safeParse({
       ...view.data,
       state: hubDaemonState(false, view.data, undefined, false),
-      key: {
-        present: status.data.credentialPresent,
-        updatedAt: status.data.credentialUpdatedAt ?? null,
-        source: status.data.credentialSource ?? null,
-      },
+      keys: reportKeys(status.data.accounts, labels),
       ...daemonFacts(dataDir, hub.holder),
     });
     // The view parsed, so only the lock's record can fail here: digits that
     // name no pid or port a Hub writes, pid 0, say.
     if (!report.success) throw corruptRecord(env, dataDir, hub.holder);
-    print(io, json, report.data, env, now());
+    print(io, json, report.data, env, now(), {
+      accounts: labelledAccounts(status.data.accounts, labels),
+      gateways: status.data.gateways ?? [],
+    });
     return EXIT.OK;
   } catch (error) {
     // A Hub that sent no whole answer (`no-answer`): its probe unanswered,

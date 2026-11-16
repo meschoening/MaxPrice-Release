@@ -1,13 +1,30 @@
-import { abbreviate, activeBlockOf } from "./active-block";
-import { activeBlockTileState } from "./active-block-tile-state";
+import { abbreviate, activeBlockOf, minuteParts } from "./active-block";
+import { activeBlockTileState, type ActiveBlockTileState } from "./active-block-tile-state";
 import type { BlockRow, BlocksResponse } from "./blocks";
 import { corpusIsEmpty } from "./corpus-empty";
 import type { CostMode } from "./cost-mode";
 import type { DailyResponse } from "./daily";
 import { isoFromYmd, ymdShift } from "./dates";
 import type { StatusSnapshot } from "./live";
+import {
+  membershipLimitState,
+  mostUsedWindow,
+  rankMemberships,
+  USE_BAD_PCT,
+  usageTone,
+  windowTag,
+  type MembershipLimitState,
+} from "./membership-rank";
+import {
+  membershipNameText,
+  popoutHeadMembership,
+  RANKED_POPOUT_TOP,
+  type MembershipName,
+  type ScopeMembershipReading,
+} from "./membership-readout";
 import { organizationLabel, organizationLabelMap, type OrganizationEntry } from "./organizations";
 import type { ReportQueryInput } from "./report-url";
+import type { ScopeQueryParams } from "./scope-params";
 import { formatWallClock, type TimeDisplay } from "./time-format";
 import type {
   ModelScopedWindow,
@@ -182,22 +199,9 @@ export function popoutView(input: PopoutViewInput): PopoutViewState {
     };
   }
 
-  const active = tile.active;
-  const startMs = active?.startMs ?? tile.accountWindow?.startMs ?? input.now;
-  const endMs = active?.endMs ?? tile.accountWindow?.endMs ?? input.now;
-  const head: PopoutHead = {
-    kind: "ring",
-    ringFrac: tile.ringFrac,
-    centerLabel: tile.ringCenterLabel,
-    costText: active !== null ? `$${active.block.costUSD.toFixed(2)}` : "$0.00",
-    tokensText: `${abbreviate(active?.block.totalTokens ?? 0)} tok`,
-    metaText: `${formatElapsed(input.now - startMs)} · resets ${formatWallClock(endMs, input.display)}`,
-    eyebrowTag: input.quotaTag,
-  };
-
   return {
     kind: "dash",
-    head,
+    head: ringHead(tile, input.now, input.display, input.quotaTag),
     limitPct: tile.limitPct,
     weeklyPct,
     modelRow,
@@ -205,6 +209,28 @@ export function popoutView(input: PopoutViewInput): PopoutViewState {
     todayText,
     todayTokensText,
     noFiveHourLimit,
+  };
+}
+
+// The ring head over a tile with a reading (an Active block, or a live 5-hour
+// window): `popoutView`'s head, and the ranked view's live one.
+function ringHead(
+  tile: Extract<ActiveBlockTileState, { kind: "tile" }>,
+  now: number,
+  display: TimeDisplay,
+  eyebrowTag: string | null,
+): Extract<PopoutHead, { kind: "ring" }> {
+  const active = tile.active;
+  const startMs = active?.startMs ?? tile.accountWindow?.startMs ?? now;
+  const endMs = active?.endMs ?? tile.accountWindow?.endMs ?? now;
+  return {
+    kind: "ring",
+    ringFrac: tile.ringFrac,
+    centerLabel: tile.ringCenterLabel,
+    costText: active !== null ? `$${active.block.costUSD.toFixed(2)}` : "$0.00",
+    tokensText: `${abbreviate(active?.block.totalTokens ?? 0)} tok`,
+    metaText: `${formatElapsed(now - startMs)} · resets ${formatWallClock(endMs, display)}`,
+    eyebrowTag,
   };
 }
 
@@ -220,10 +246,9 @@ function freshPct(window: UsageWindow | null, connected: boolean, now: number): 
 // adds the word "elapsed", and the popout's head, which drops it per the T3
 // head contract.
 export function formatElapsed(ms: number): string {
-  const totalMin = Math.max(0, Math.floor(ms / 60_000));
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  const { days, hours, mins } = minuteParts(Math.max(0, ms));
+  const h = days * 24 + hours;
+  return h > 0 ? `${h}h ${mins}m` : `${mins}m`;
 }
 
 // The popout's two report windows, as its hook (`use-popout-data.ts`) and the
@@ -248,18 +273,19 @@ export function popoutQueryInputs(options: {
   mode: CostMode;
   // The Settings timezone; undefined is the host zone, as `ymdShift` reads it.
   tz: string | undefined;
-  // The routes' `organization` param for the scope (`scopeParams`).
-  organization: string | undefined;
+  // The routes' Scope params (`scopeQueryParams`, or the Headless client's
+  // `scopeParams`): absent for the default Scope.
+  scope: ScopeQueryParams;
   // Pins "today"; the wall clock by default.
   now?: number;
 }): PopoutQueryInputs {
-  const { mode, tz, organization, now } = options;
+  const { mode, tz, scope, now } = options;
   const today = ymdShift(0, tz, now);
   const yesterday = ymdShift(-1, tz, now);
   return {
     todayYmd: today,
-    today: { since: today, until: today, mode, tz, organization },
-    blocks: { since: yesterday, until: today, mode, tz, organization },
+    today: { since: today, until: today, mode, tz, ...scope },
+    blocks: { since: yesterday, until: today, mode, tz, ...scope },
   };
 }
 
@@ -346,4 +372,194 @@ export function quotaWindowState(
   if (organizations === undefined || quotaOrganization === undefined) return undefined;
   if (!Object.hasOwn(organizations, quotaOrganization)) return undefined;
   return organizations[quotaOrganization]!.windowStates?.fiveHour;
+}
+
+// --- The ranked Popout (#638) -------------------------------------------------
+//
+// The Popout over the Scope's multi-Membership set (`scopeMembershipSet`, two
+// or more Memberships): #610's "head + ranked" (ADR-0136 §6's Popout
+// paragraph, #622 item 6). A head, then the four most used Memberships a row
+// each, then one `+N more` row past four, then Today. The shell sizes the
+// window by the same count (`rankedPopoutLimitRows`). A one-Membership Scope
+// never comes here: `popoutView` draws it, unchanged.
+
+// A row's state: `membershipLimitState`'s, with a Readable membership that
+// holds no live window split out as `idle` ("—" on an empty bar, #610: an
+// idle 5-hour window is no reading).
+export type RankedPopoutRowState = MembershipLimitState | "idle";
+
+export type RankedPopoutRow = {
+  key: string;
+  // The Popout is 236px wide: the Organization's label, with the Account's
+  // only where another Membership of the set shares that Organization label
+  // (the #610 prototype's `shortName`). The row ellipsizes the Organization
+  // part first, so the Account half that tells the two apart stays.
+  name: MembershipName;
+  // The full label (`scopeMembershipLabel`), for the row's title.
+  label: string;
+  state: RankedPopoutRowState;
+  // The most used live window's percent, rounded: a readable one, or a stale
+  // one's last known (drawn greyed). Null for every other state, and for a
+  // stale reading whose windows have all reset.
+  pct: number | null;
+  // `wk` while that window is not the 5-hour one (#610, `windowTag`).
+  windowTag: "wk" | null;
+  // The meter's tone (`usageTone`), a Readable reading's only: a stale
+  // percent is never coloured as a live one.
+  tone: "bad" | "warn" | null;
+};
+
+// The head names its Membership in the eyebrow as a row does (`name`), its
+// text in the ring head's `eyebrowTag`.
+export type RankedPopoutHead =
+  | (Extract<PopoutHead, { kind: "ring" }> & { eyebrowName: MembershipName })
+  | Extract<PopoutHead, { kind: "idle" }>
+  // No 5-hour window in flight while the readout shows money (#622 item 6):
+  // the `Most used:` Membership drawn idle, an empty ring with "—", named.
+  | { kind: "idle-ring"; eyebrowName: MembershipName };
+
+export type RankedPopoutMore = {
+  // "+3 more": the set's Memberships past the four rows.
+  text: string;
+  // "2 at 90% or more" while any of them is hot (Readable, at 90% or more),
+  // else "none above 41%" over the highest percent any of them shows, else
+  // null when none shows one.
+  note: string | null;
+  hot: boolean;
+};
+
+export type RankedPopoutViewState =
+  | Extract<PopoutViewState, { kind: "loading" | "down" | "no-data" }>
+  | {
+      kind: "ranked";
+      head: RankedPopoutHead;
+      rows: RankedPopoutRow[];
+      more: RankedPopoutMore | null;
+      todayLabel: string;
+      todayText: string;
+      todayTokensText: string;
+    };
+
+export type RankedPopoutViewInput = Pick<
+  PopoutViewInput,
+  | "anyError"
+  | "engineStopped"
+  | "settled"
+  | "ready"
+  | "hasData"
+  | "todayCost"
+  | "todayTokens"
+  | "now"
+  | "display"
+  | "allOrganizations"
+> & {
+  memberships: readonly ScopeMembershipReading[];
+  // The Active block of the Membership whose Blocks were asked for
+  // (`/api/blocks?membership=<token>`), keyed by that token. Read only when
+  // the token is still the head's, so a head that moved between the fetch and
+  // this render never wears another Membership's block. Null when none asked.
+  headBlocks: { token: string; block: BlockRow | null } | null;
+};
+
+// The ranked Popout's Blocks request: the head Membership's own
+// (`membership=<token>`, the Scope's params dropped, since a Membership list
+// names the Scope alone) over the popout's blocks window. Null while the
+// head is drawn idle or there is none: no Active block to read. The
+// Desktop's ranked Popout and the Headless client's `live` ask it alike.
+export function rankedHeadBlocksInput(
+  blocks: ReportQueryInput,
+  head: { key: string; idle: boolean } | null,
+): ReportQueryInput | null {
+  if (head === null || head.idle) return null;
+  const { since, until, mode, tz } = blocks;
+  return { since, until, mode, tz, memberships: [head.key] };
+}
+
+export function rankedPopoutView(input: RankedPopoutViewInput): RankedPopoutViewState {
+  // The ladder is `popoutView`'s.
+  if (input.anyError) {
+    return { kind: "down", stopped: input.engineStopped && input.ready !== null };
+  }
+  if (!input.settled || input.ready !== true) return { kind: "loading" };
+  if (corpusIsEmpty(input.ready, input.hasData)) return { kind: "no-data" };
+
+  const { memberships, now } = input;
+  const nameOf = (m: ScopeMembershipReading): MembershipName => ({
+    organization: m.organizationLabel,
+    account: memberships.some((x) => x.key !== m.key && x.organizationLabel === m.organizationLabel)
+      ? m.accountLabel
+      : null,
+  });
+  const rows = rankMemberships(memberships, now).map((m) => rankedRow(m, nameOf(m), now));
+  const rest = rows.slice(RANKED_POPOUT_TOP);
+
+  return {
+    kind: "ranked",
+    head: rankedHead(input, nameOf),
+    rows: rows.slice(0, RANKED_POPOUT_TOP),
+    more: rest.length === 0 ? null : moreOf(rest),
+    todayLabel: input.allOrganizations ? "Today · all" : "Today",
+    todayText: `$${input.todayCost.toFixed(2)}`,
+    todayTokensText: `${abbreviate(input.todayTokens)} tok`,
+  };
+}
+
+// The head (ADR-0136 §6's Popout paragraph, `popoutHeadMembership`): the
+// head Membership's Active block, today's ring, its eyebrow naming it; the
+// `Most used:` Membership drawn idle while no 5-hour window is in flight;
+// today's idle inset with no Readable membership holding a live window.
+function rankedHead(
+  input: RankedPopoutViewInput,
+  nameOf: (m: ScopeMembershipReading) => MembershipName,
+): RankedPopoutHead {
+  const pick = popoutHeadMembership(input.memberships, input.now);
+  const head = pick === null ? undefined : input.memberships.find((m) => m.key === pick.key);
+  if (pick === null || head === undefined) return { kind: "idle" };
+  const name = nameOf(head);
+  if (pick.idle) return { kind: "idle-ring", eyebrowName: name };
+  const block = input.headBlocks?.token === head.token ? input.headBlocks.block : null;
+  const tile = activeBlockTileState(
+    block,
+    head.reading?.fiveHour ?? null,
+    head.connection === "connected",
+    input.now,
+  );
+  // A live head is Readable with its 5-hour window in flight, so its tile
+  // always has a ring; the guard only keeps the type honest.
+  if (tile.kind === "empty-inset") return { kind: "idle-ring", eyebrowName: name };
+  return {
+    ...ringHead(tile, input.now, input.display, membershipNameText(name)),
+    eyebrowName: name,
+  };
+}
+
+function rankedRow(m: ScopeMembershipReading, name: MembershipName, now: number): RankedPopoutRow {
+  const limitState = membershipLimitState(m.connection, m.limits, m.reading);
+  const numbers = limitState === "readable" || limitState === "stale";
+  const window = numbers ? mostUsedWindow(m.reading, now) : null;
+  const state: RankedPopoutRowState =
+    limitState === "readable" && window === null ? "idle" : limitState;
+  return {
+    key: m.key,
+    name,
+    label: m.label,
+    state,
+    pct: window === null ? null : Math.round(window.utilizationPct),
+    windowTag: window === null ? null : windowTag(window.kind),
+    tone: state === "readable" && window !== null ? usageTone(window.utilizationPct) : null,
+  };
+}
+
+// The `+N more` row over the Memberships past the four: Live's board foot's
+// rule (`restOf`, `restPill`) at the Popout's width.
+function moreOf(rest: readonly RankedPopoutRow[]): RankedPopoutMore {
+  const hot = rest.filter((r) => r.tone === "bad").length;
+  const read = rest.map((r) => r.pct).filter((p): p is number => p !== null);
+  const note =
+    hot > 0
+      ? `${hot} at ${USE_BAD_PCT}% or more`
+      : read.length > 0
+        ? `none above ${Math.max(...read)}%`
+        : null;
+  return { text: `+${rest.length} more`, note, hot: hot > 0 };
 }

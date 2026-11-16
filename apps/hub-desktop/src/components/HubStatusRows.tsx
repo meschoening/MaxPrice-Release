@@ -5,16 +5,18 @@ import {
   hubDaemonDot,
   hubDaemonLabel,
   hubDotPulse,
+  HUB_PROVIDER_HOST,
+  hubKeyRow,
   isDeliberateLoopback,
   noFreshReading,
-  usageConnectionDot,
-  usageConnectionShortLabel,
+  type HubAccount,
   type HubDaemonState,
+  type HubKeys,
   type HubRowStatus,
 } from "@maxprice/shared";
 import { dotVariant } from "@/lib/dot-variant";
 
-// The hub Popout's three status rows and its clients line (ADR-0050), as one
+// The hub Popout's status rows (Hub, a key row per Provider, Access) and its clients line (ADR-0050), as one
 // props-only component (ADR-0124 §7): the Popout renders it, and so does the
 // Hub page (src/page/HubPage.tsx), over the same CSS recipe
 // (styles/hub-rows.css). It reads only
@@ -31,11 +33,16 @@ import { dotVariant } from "@/lib/dot-variant";
 export function HubStatusRows({
   daemon,
   status,
+  keys,
   liveClients,
 }: {
   daemon: HubDaemonState;
   // The Popout passes its full HubStatus; the page passes its view.
   status: HubRowStatus | undefined;
+  // The claude.ai row's input (ADR-0139 §9/§10): the Popout passes the
+  // status's Accounts, the page its view's key counts, which name no Account.
+  // Missing (no status yet) reads as no key.
+  keys: ReadonlyArray<Pick<HubAccount, "provider" | "connection">> | HubKeys | undefined;
   // The live clients count; null while the roster has not been fetched.
   liveClients: number | null;
 }): React.ReactElement {
@@ -43,7 +50,9 @@ export function HubStatusRows({
   // the dependent rows dim to a soft dot + em-dash rather than rendering stale
   // claims beside a dead-daemon row (the trayTooltip rule, applied twice).
   const dim = noFreshReading(daemon);
-  const conn = status?.usageConnection ?? "disconnected";
+  // One row per Provider (#614 §8), counting its Accounts and never naming
+  // one; one key, or none, reads today's words. v7 carries one Provider.
+  const keyRows = hubKeyRow(keys ?? []);
   const passworded = status?.passwordProtected ?? false;
   const clients = hubClientsLine(daemon, liveClients);
 
@@ -55,12 +64,15 @@ export function HubStatusRows({
         pulse={hubDotPulse(daemon)}
         state={hubDaemonLabel(daemon)}
       />
-      <Row
-        name="claude.ai"
-        dim={dim}
-        dot={dim ? "soft" : dotVariant(usageConnectionDot(conn))}
-        state={dim ? "—" : usageConnectionShortLabel(conn)}
-      />
+      {keyRows.map((row) => (
+        <Row
+          key={row.provider}
+          name={HUB_PROVIDER_HOST[row.provider]}
+          dim={dim}
+          dot={dim ? "soft" : dotVariant(row.dot)}
+          state={dim ? "—" : row.words}
+        />
+      ))}
       <Row
         name="Access"
         dim={dim}

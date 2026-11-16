@@ -1,10 +1,9 @@
 import { useCallback, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { ArrowUpRight, Ellipsis } from "lucide-react";
 import {
   abbreviate,
   aggregateProjectsRange,
-  ALL_ORGANIZATIONS,
   deriveProjectName,
   deriveProjectPath,
   formatCalendarDay,
@@ -12,13 +11,13 @@ import {
   parentProjectSlug,
   projectOrganizationsCell,
   RANGE_LABEL,
-  resolveOrganizationScope,
   topModelFamily,
   type CostMode,
   type ProjectAnchorSnapshot,
   type ProjectRow,
+  type ScopeQueryParams,
+  type SessionRow,
   type ProjectsRangeAggregate,
-  resolveDateRange,
   ymdShift,
   foldMachineIdList,
   expandProjectFilter,
@@ -26,17 +25,26 @@ import {
   groupChildren,
 } from "@maxprice/shared";
 import { useFilters } from "@/state/filters";
-import { useWeekWindow } from "@/state/use-week";
 import { useSettings } from "@/state/use-settings";
-import { useOrganizationScope } from "@/state/use-organization-scope";
+import { useScope } from "@/state/use-scope";
+import { useAllMembershipsScope } from "@/state/use-all-memberships-scope";
 import { useOrganizationLabels } from "@/state/use-organizations";
 import { useProjects } from "@/state/use-projects";
-import { useMachineAxis } from "@/state/use-machine-axis";
+import { useSessions } from "@/state/use-sessions";
+import { useRailReportInput } from "@/state/use-rail-report";
+import { useMachineAxis, type MachineAxis } from "@/state/use-machine-axis";
 import { useProjectAxis } from "@/state/use-project-axis";
 import { useCorpusEmpty } from "@/state/use-corpus-empty";
 import { useDaily } from "@/state/use-daily";
 import { densifyDays } from "@/lib/daily-rows";
 import { useEscapeToDeselect } from "@/state/use-escape-deselect";
+import {
+  selectedIdFromParams,
+  withoutSelectedParam,
+  withSelectedParam,
+} from "@/lib/session-selection";
+import { indexSessionsBySlug, sessionIdsOf, sessionsOfSlugs } from "@/lib/project-sessions";
+import { ProjectSessionList } from "@/components/project-session-list";
 import { EmptyState } from "@/components/EmptyState";
 import { DataTable, type Column, type TreeSpec } from "@/components/data-table";
 import { MachineChip } from "@/components/machine-chip";
@@ -79,11 +87,17 @@ const projectRowId = (r: ProjectTableRow): string =>
 // Deliberately the row's OWN text only, never its members'. The table matches
 // children itself and discloses the ones that hit; folding member names in here
 // would make a worktree search look like a parent match and leave the row shut
-// with no indication of why it appeared.
-const projectSearchKeys = (r: ProjectTableRow): string[] => [
+// with no indication of why it appeared. The same holds for session ids (#640):
+// a row's keys carry the ids filed under its own slug, so a worktree's session
+// id discloses the worktree.
+const projectSearchKeys = (
+  r: ProjectTableRow,
+  sessionsBySlug: ReadonlyMap<string, SessionRow[]>,
+): string[] => [
   r.project.path,
   deriveProjectName(r.project.path),
   deriveProjectPath(r.project.path),
+  ...sessionIdsOf(sessionsBySlug, r.project.slug),
 ];
 
 // Lift a column written against a ProjectRow onto the wrapper, so the cell
@@ -131,10 +145,11 @@ export function ProjectsPage(): React.ReactElement {
   const { data: settings } = useSettings();
   const costMode = settings?.costMode ?? "auto";
   const tz = settings?.timezone;
-  // ADR-0106: the Organization scope rides every query here beside `mode` and
+  // ADR-0106, #637: the Scope rides every query here beside `mode` and
   // `tz`, the strips' charts included.
-  const { organization, isAll } = useOrganizationScope();
+  const { params: scope, spansOrganizations: isAll, multi } = useScope();
   const labels = useOrganizationLabels();
+  const [searchParams, setSearchParams] = useSearchParams();
   // ADR-0062: `projectParams` is the selection closure-expanded across Repo
   // identity before it reaches the wire (both the table's query and the
   // aggregate strip's `filterProjects`); `index` is the fold context the table
@@ -145,38 +160,36 @@ export function ProjectsPage(): React.ReactElement {
   const models = useFilters((s) => s.models);
   const setProjects = useFilters((s) => s.setProjects);
   const machineAxis = useMachineAxis();
-  const week = useWeekWindow();
-  const { since, until } = resolveDateRange(dateRange, tz, week);
 
-  const query = useProjects({
-    since,
-    until,
-    mode: costMode,
-    tz,
-    organization,
-    projects,
-    models,
-    machines: machineAxis.machineParams,
-  });
+  // The table and the rail's sessions (#640) send one input, so the session
+  // ids the search matches and the detail panel lists answer the question the
+  // table does. The sessions are `useRailSessions`' entry, which the session
+  // page's topbar reads too (`useSessionRow`): warm when opened from here.
+  const railInput = useRailReportInput();
+  const query = useProjects(railInput);
+  const sessionsQuery = useSessions(railInput);
+  const sessionsBySlug = useMemo(
+    () => indexSessionsBySlug(sessionsQuery.data?.sessions ?? []),
+    [sessionsQuery.data],
+  );
+  const searchKeys = useCallback(
+    (r: ProjectTableRow) => projectSearchKeys(r, sessionsBySlug),
+    [sessionsBySlug],
+  );
+  // The table's search text, debounced as the table filters by it, so the
+  // detail panel's matches always agree with the rows on screen.
+  const [search, setSearch] = useState("");
   // The picker is deliberately independent of the page's current date,
-  // project, model and machine filters and of the Organization scope: a dead
-  // checkout must remain available as a merge source even when the visible
-  // table has no row for it. So it asks for All organizations whenever two or
-  // more are tracked, offering a checkout whose only usage is in another
-  // Organization under every scope, and sends no param otherwise, where All is
-  // Home and the request is Home's own.
-  const mergeOrganization =
-    resolveOrganizationScope(
-      ALL_ORGANIZATIONS,
-      settings?.homeOrganization ?? null,
-      settings?.trackedOrganizations ?? [],
-    ) === ALL_ORGANIZATIONS
-      ? ALL_ORGANIZATIONS
-      : undefined;
+  // project, model and machine filters and of the Scope: a dead checkout must
+  // remain available as a merge source even when the visible table has no row
+  // for it. So it asks for every tracked Membership (`useAllMembershipsScope`),
+  // offering a checkout whose only usage is in another Membership under every
+  // Scope.
+  const mergeScope = useAllMembershipsScope();
   const allTimeQuery = useProjects({
     mode: costMode,
     tz,
-    organization: mergeOrganization,
+    ...mergeScope,
     projects: [],
     models: [],
     machines: [],
@@ -223,14 +236,17 @@ export function ProjectsPage(): React.ReactElement {
   // for the detail strip rather than falling back to its parent's. Keeps the
   // wrapper (not the bare ProjectRow): the strip's query scope depends on the
   // parent/child bit — see stripProjects below.
+  //
+  // `slugs` is the directories the row's session list draws on (#640): a
+  // top-level row every member of its fold, a child its own directory.
   const byId = useMemo(() => {
-    const m = new Map<string, ProjectTableRow>();
+    const m = new Map<string, { row: ProjectTableRow; slugs: string[] }>();
     for (const g of groups) {
       const top: ProjectTableRow = { project: g.row, child: false };
-      m.set(projectRowId(top), top);
+      m.set(projectRowId(top), { row: top, slugs: g.members.map((mem) => mem.slug) });
       for (const mem of g.members) {
         const child: ProjectTableRow = { project: mem, child: true };
-        m.set(projectRowId(child), child);
+        m.set(projectRowId(child), { row: child, slugs: [mem.slug] });
       }
     }
     return m;
@@ -244,9 +260,34 @@ export function ProjectsPage(): React.ReactElement {
   );
 
   // The table's row id, not the project slug — a disclosed worktree selects as
-  // itself, and its own-directory sibling carries the same slug.
-  const [selectedId, setSelectedId] = useState<string>();
-  const selected = selectedId === undefined ? undefined : byId.get(selectedId);
+  // itself, and its own-directory sibling carries the same slug. It lives in
+  // `?selected=` (#640), written with `replace`, so opening a session (a push)
+  // and the session page's Back (history back) return to this project. An id
+  // no row carries, a stale link or a range that dropped it, reads as no
+  // selection: the strip shows the filter totals.
+  const selectedId = selectedIdFromParams(searchParams);
+  const selectedEntry = selectedId === undefined ? undefined : byId.get(selectedId);
+  const selected = selectedEntry?.row;
+  // The one writer of `?selected=`: `next` maps the URL's current selection
+  // (read from the updater's `prev`, never this render's) to the new one.
+  const updateSelectedId = useCallback(
+    (next: (current: string | undefined) => string | undefined) =>
+      setSearchParams(
+        (prev) => {
+          const id = next(selectedIdFromParams(prev));
+          return id === undefined ? withoutSelectedParam(prev) : withSelectedParam(prev, id);
+        },
+        { replace: true },
+      ),
+    [setSearchParams],
+  );
+  const selectedSessions = useMemo(
+    () =>
+      selectedEntry === undefined || sessionsQuery.data === undefined
+        ? undefined
+        : sessionsOfSlugs(sessionsBySlug, selectedEntry.slugs),
+    [selectedEntry, sessionsBySlug, sessionsQuery.data],
+  );
   const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
   const [mergeSource, setMergeSource] = useState<ProjectAnchorSnapshot | null>(null);
 
@@ -276,9 +317,9 @@ export function ProjectsPage(): React.ReactElement {
   // click on any dead space on the page do too.
   const onSelect = (r: ProjectTableRow): void => {
     const id = projectRowId(r);
-    setSelectedId((prev) => (prev === id ? undefined : id));
+    updateSelectedId((current) => (current === id ? undefined : id));
   };
-  const deselect = useCallback(() => setSelectedId(undefined), []);
+  const deselect = useCallback(() => updateSelectedId(() => undefined), [updateSelectedId]);
   useEscapeToDeselect(deselect);
 
   // Range-scoped filter totals for the strip's no-selection state (ADR-0016).
@@ -523,13 +564,20 @@ export function ProjectsPage(): React.ReactElement {
       strip={
         selected ? (
           <ProjectDetailStrip
+            rowKey={selectedId ?? ""}
             project={selected.project}
             filterProjects={stripProjects}
             costMode={costMode}
             tz={tz}
-            organization={organization}
+            scope={scope}
             filterModels={models}
             onOpenInLive={openInLive}
+            sessions={selectedSessions}
+            sessionsFailed={sessionsQuery.isError}
+            search={search}
+            multi={multi}
+            labels={labels}
+            machineAxis={machineAxis.enabled ? machineAxis : null}
           />
         ) : query.isPending ? (
           // The projects query hasn't resolved yet — a quiet shell rather than
@@ -551,7 +599,7 @@ export function ProjectsPage(): React.ReactElement {
             rangeLabel={RANGE_LABEL[dateRange]}
             costMode={costMode}
             tz={tz}
-            organization={organization}
+            scope={scope}
             filterProjects={projects}
             filterModels={models}
           />
@@ -584,9 +632,10 @@ export function ProjectsPage(): React.ReactElement {
             // narrow, where the row wraps and nothing is off-screen (ADR-0073).
             minWidth={720 + (machineAxis.enabled ? 130 : 0) + (isAll ? 140 : 0)}
             defaultSort={{ columnId: "costRange", dir: "desc" }}
-            searchKeys={projectSearchKeys}
+            searchKeys={searchKeys}
+            onSearchChange={setSearch}
             rowClassName={(r) => (staleDays(r.project, tz) != null ? "opacity-[0.46]" : undefined)}
-            searchPlaceholder="Search projects…"
+            searchPlaceholder="Search projects or session ids…"
             emptyMessage={query.isPending ? "Loading…" : "No projects in this range."}
             error={query.error}
             headerAction={
@@ -607,7 +656,7 @@ export function ProjectsPage(): React.ReactElement {
             initialSource={mergeSource}
             catalog={mergeCatalog}
             identity={projectAxis.index}
-            onMerged={(target) => setSelectedId(target.anchor)}
+            onMerged={(target) => updateSelectedId(() => target.anchor)}
           />
         </section>
       }
@@ -618,14 +667,24 @@ export function ProjectsPage(): React.ReactElement {
 // The selected project's strip: identity, all-time stats, the compact 30-day
 // chart, the per-model split, and "Open in Live →".
 function ProjectDetailStrip({
+  rowKey,
   project,
   filterProjects,
   costMode,
   tz,
-  organization,
+  scope,
   filterModels,
   onOpenInLive,
+  sessions,
+  sessionsFailed,
+  search,
+  multi,
+  labels,
+  machineAxis,
 }: {
+  // The selected row's table id: keys the session list, so All resets when
+  // the selection moves.
+  rowKey: string;
   project: ProjectRow;
   // The strip chart's project scope — the caller resolves it from the row
   // KIND (ADR-0062): a top-level row carries its identity group's expansion,
@@ -633,9 +692,15 @@ function ProjectDetailStrip({
   filterProjects: string[];
   costMode: CostMode;
   tz: string | undefined;
-  organization: string | undefined;
+  scope: ScopeQueryParams;
   filterModels: string[];
   onOpenInLive: (slug: string) => void;
+  sessions: SessionRow[] | undefined;
+  sessionsFailed: boolean;
+  search: string;
+  multi: boolean;
+  labels: ReadonlyMap<string, string>;
+  machineAxis: MachineAxis | null;
 }): React.ReactElement {
   // A 30-day daily window scoped to this row — the strip's compact chart.
   // Mounting only happens on selection, so the query is lazy by construction;
@@ -647,7 +712,7 @@ function ProjectDetailStrip({
     until: chartUntil,
     mode: costMode,
     tz,
-    organization,
+    ...scope,
     projects: filterProjects,
     models: filterModels,
   });
@@ -670,8 +735,8 @@ function ProjectDetailStrip({
           <span className="sub num">{deriveProjectPath(project.path)}</span>
         </StripIdentity>
 
-        {/* Range-scoped, like every other number on this page — and the same
-            shape as the Sessions strip, which restates its row's own cost. */}
+        {/* Range-scoped, like every other number on this page: it restates
+            the row's own cost, as the retired Sessions strip did. */}
         <StripStat label="cost">
           {formatCost(project.costRange)}
           <UnpricedChip models={project.modelBreakdowns.map((b) => b.modelName)} />
@@ -707,6 +772,20 @@ function ProjectDetailStrip({
           Open in Live →
         </button>
       </div>
+
+      {/* Third row (#640): the project's sessions in range, each opening its
+          session page. Where the retired Sessions page's browsing went. */}
+      <ProjectSessionList
+        key={rowKey}
+        sessions={sessions}
+        failed={sessionsFailed}
+        search={search}
+        multi={multi}
+        labels={labels}
+        machineAxis={machineAxis}
+        tz={tz}
+        now={Date.now()}
+      />
     </DetailStrip>
   );
 }
@@ -719,7 +798,7 @@ function ProjectsAggregateStrip({
   rangeLabel,
   costMode,
   tz,
-  organization,
+  scope,
   filterProjects,
   filterModels,
 }: {
@@ -727,7 +806,7 @@ function ProjectsAggregateStrip({
   rangeLabel: string;
   costMode: CostMode;
   tz: string | undefined;
-  organization: string | undefined;
+  scope: ScopeQueryParams;
   filterProjects: string[];
   filterModels: string[];
 }): React.ReactElement {
@@ -741,7 +820,7 @@ function ProjectsAggregateStrip({
     until: chartUntil,
     mode: costMode,
     tz,
-    organization,
+    ...scope,
     projects: filterProjects,
     models: filterModels,
   });

@@ -43,62 +43,105 @@ export function fleetDedupTokenTotal(r: FleetDedupTokens): number {
   return r.inputTokens + r.outputTokens + r.cacheCreationTokens + r.cacheReadTokens;
 }
 
-/** How full one copy of a key is: its token total and its Organization evidence, if any. */
+/**
+ * How full one copy of a key is: its token total and its Attribution evidence
+ * tags, an Organization and an Account, each if any.
+ */
 export interface FleetFullness {
   total: number;
   organizationUuid: string | undefined;
+  accountUuid: string | undefined;
 }
 
-// `organizationUuid` is owner evidence only: present when a record resolved
-// it, absent for "no evidence" — never the Home organization or a presumption
-// (ADR-0103).
-export function fleetDedupFullness(
-  row: FleetDedupTokens & { organizationUuid?: string },
-): FleetFullness {
-  return { total: fleetDedupTokenTotal(row), organizationUuid: row.organizationUuid };
+/** The tags a copy of a key may carry (ADR-0103 §1, ADR-0137 §6). */
+export type FleetTags = { organizationUuid?: string; accountUuid?: string };
+
+// `organizationUuid` and `accountUuid` are evidence only: present when a
+// record resolved them, absent for "no evidence" — never the Home
+// organization, a Presumed membership or an email hash (ADR-0103, ADR-0137).
+export function fleetDedupFullness(row: FleetDedupTokens & FleetTags): FleetFullness {
+  return {
+    total: fleetDedupTokenTotal(row),
+    organizationUuid: row.organizationUuid,
+    accountUuid: row.accountUuid,
+  };
+}
+
+// One tag against another, at an equal tag count: a present value beats an
+// absent one, and of two present values the lexicographically smaller wins.
+// +1: `a` wins, -1: `b` wins, 0: equal (both absent, or the same value).
+function compareTag(a: string | undefined, b: string | undefined): number {
+  if (a === b) return 0;
+  if (a === undefined) return -1;
+  if (b === undefined) return 1;
+  return a < b ? 1 : -1;
 }
 
 /**
- * THE fullness order, on its parts: a copy of `aTotal` tokens with evidence
- * `aOrganization` is strictly fuller than one of `bTotal` with `bOrganization`
- * — a larger total; at an equal total, a tag against none, or of two tags the
- * lexicographically smaller (#374). Two equal tags, or two absent ones, are a
- * tie. Every comparison below reads this one definition; it takes parts rather
- * than `FleetFullness` objects because the merge rule runs on every upsert of
- * every feeder and must not allocate (#361).
+ * THE fullness order, on its parts: a copy of `aTotal` tokens tagged
+ * (`aOrganization`, `aAccount`) is strictly fuller than one of `bTotal`
+ * tagged (`bOrganization`, `bAccount`) when
+ *
+ * 1. its total is larger; else, at an equal total,
+ * 2. it carries more tags (0–2, a tag being a present `organizationUuid` or
+ *    `accountUuid`); else, at an equal count,
+ * 3. its Organization tag wins (`compareTag`); else, at an equal one,
+ * 4. its Account tag wins.
+ *
+ * Identical tags are a tie. On distinct tag pairs this is a strict total
+ * order, so every store ends on the same copy in any arrival order. With no
+ * Account tag anywhere it is exactly #374's order. Every comparison below
+ * reads this one definition; it takes parts rather than `FleetFullness`
+ * objects because the merge rule runs on every upsert of every feeder and
+ * must not allocate (#361).
  */
 export function fleetFullnessPartsExceed(
   aTotal: number,
   aOrganization: string | undefined,
+  aAccount: string | undefined,
   bTotal: number,
   bOrganization: string | undefined,
+  bAccount: string | undefined,
 ): boolean {
   if (aTotal !== bTotal) return aTotal > bTotal;
-  return (
-    aOrganization !== undefined && (bOrganization === undefined || aOrganization < bOrganization)
-  );
+  const aCount = (aOrganization === undefined ? 0 : 1) + (aAccount === undefined ? 0 : 1);
+  const bCount = (bOrganization === undefined ? 0 : 1) + (bAccount === undefined ? 0 : 1);
+  if (aCount !== bCount) return aCount > bCount;
+  const organization = compareTag(aOrganization, bOrganization);
+  if (organization !== 0) return organization > 0;
+  return compareTag(aAccount, bAccount) > 0;
 }
 
 /** `a` is strictly fuller than `b` (`fleetFullnessPartsExceed`). */
 export function fleetFullnessExceeds(a: FleetFullness, b: FleetFullness): boolean {
-  return fleetFullnessPartsExceed(a.total, a.organizationUuid, b.total, b.organizationUuid);
+  return fleetFullnessPartsExceed(
+    a.total,
+    a.organizationUuid,
+    a.accountUuid,
+    b.total,
+    b.organizationUuid,
+    b.accountUuid,
+  );
 }
 
 /**
- * The one merge rule: `candidate` replaces `incumbent`. An untagged tie and a
- * same-tag tie keep first-seen, so single-Organization bytes never move; a tie
- * between two different tags goes to the smaller uuid (#374).
+ * The one merge rule: `candidate` replaces `incumbent`. An untagged tie and an
+ * identical-tags tie keep first-seen, so single-Organization and
+ * single-Account bytes never move; a tie between different tags goes by
+ * `fleetFullnessPartsExceed` (#374, ADR-0137 §6).
  */
 export function fleetCopySupersedes(
-  candidate: FleetDedupTokens & { organizationUuid?: string },
-  incumbent: FleetDedupTokens & { organizationUuid?: string },
+  candidate: FleetDedupTokens & FleetTags,
+  incumbent: FleetDedupTokens & FleetTags,
 ): boolean {
   // Monotone: a tag is never lost at an equal total, and a strictly larger
   // untagged copy still beats a smaller tagged one — no field merging.
   return fleetFullnessPartsExceed(
     fleetDedupTokenTotal(candidate),
     candidate.organizationUuid,
+    candidate.accountUuid,
     fleetDedupTokenTotal(incumbent),
     incumbent.organizationUuid,
+    incumbent.accountUuid,
   );
 }

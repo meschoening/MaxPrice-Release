@@ -363,6 +363,70 @@ button:disabled {
 .mflow {
   margin-top: 8px;
 }
+/* An Account row's state, amber while it needs a key (#614 §2). */
+.mcount.warn {
+  color: var(--warn);
+}
+
+/* The Accounts card's Memberships, nested under their Account (#614 §3): a
+   hairline rail at the dot's inset, one compact line each. */
+.anest {
+  margin: 4px 0 2px 15px;
+  border-left: 1px solid var(--hairline);
+  padding-left: 9px;
+}
+.aline-wrap {
+  position: relative;
+}
+.aline {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 0;
+  font-size: 11.5px;
+  min-width: 0;
+}
+.aline .dot {
+  transform: scale(0.8);
+}
+.aname {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.aval {
+  margin-left: auto;
+  color: var(--soft);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+/* A dead key's last reading, greyed (ADR-0138 §8). */
+.aval.stale {
+  opacity: 0.6;
+  font-style: italic;
+}
+.aline .kebab {
+  width: 20px;
+  height: 20px;
+  font-size: 10px;
+}
+.aline-wrap .kmenu {
+  top: 24px;
+}
+.amore {
+  display: block;
+  margin: 4px 0 0;
+  padding: 2px 0;
+  background: none;
+  border: 0;
+  color: var(--soft);
+  font-size: 11px;
+  cursor: pointer;
+  text-align: left;
+}
+.amore:hover {
+  color: var(--text);
+}
 
 /* ============================================================
    Tray popout (ADR-0050) — T1 variant A "leaf" (ADR-0050). The popout floats over the user's DESKTOP,

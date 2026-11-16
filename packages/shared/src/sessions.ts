@@ -62,6 +62,15 @@ const sessionRowSchema = z.object({
   organizationSplit: z
     .object({ ownerless: z.string().min(1), owned: z.string().min(1) })
     .optional(),
+  // ADR-0141 §4: the Gateway signature. PRESENT (`true`) exactly when no event
+  // of the session carries a `requestId` and none carries transcript
+  // Attribution evidence (a Login, Email or Owner record's, never a matched
+  // Gateway record's): the session looks like it ran through a Gateway, so
+  // Unattributed usage can offer Connect a Gateway. ABSENT otherwise, never
+  // `false`. A hint only: it changes no attribution. Its rows have no Login
+  // record and no Email record as far as rows can tell; an Email record
+  // without a Login record names no evidence a row keeps (D6).
+  gatewaySignature: z.literal(true).optional(),
 });
 
 export const sessionsResponseSchema = z.object({

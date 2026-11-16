@@ -1,6 +1,6 @@
 # The MaxPrice Headless client
 
-`maxprice` is the Headless client: MaxPrice with no window, for a Linux server. It tracks this machine's Claude Code usage from its session logs, prints the Desktop client's reports in a terminal, and can join a Hub as a Connected client. It is one binary, for Linux x64 with glibc.
+`maxprice` is the Headless client: MaxPrice with no window, for a Linux server. It tracks this machine's Claude Code usage from its session logs, prints the Desktop client's reports in a terminal, and can join a Hub as a Connected client. Its commands also do what the Desktop client's Settings do: choose the Accounts, Organizations and Home membership it counts, and connect session keys and Gateways. It is one binary, for Linux x64 with glibc.
 
 ## Contents
 
@@ -177,19 +177,24 @@ Every command takes `-h` or `--help`, and `maxprice help <command>` prints the s
 
 ### Report options
 
-`daily`, `sessions` and `projects` take every one of these; `blocks` takes all but `--project`, and `live` only `--org` and `--json`.
+`daily`, `sessions` and `projects` take every one of these; `blocks` takes all but `--project`, and `live` only `--account`, `--org` and `--json`.
 
-| Option             | Meaning                                                                                                           |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| `--since <date>`   | The first day, `YYYYMMDD` or `YYYY-MM-DD`                                                                         |
-| `--until <date>`   | The last day, in the same forms. With neither, the range is this week, as the Week setting defines it             |
-| `--model <family>` | Only this Model family: Fable, Opus, Sonnet or Haiku                                                              |
-| `--project <name>` | Only this project, by its path or its folder name                                                                 |
-| `--machine <name>` | Only this machine, by its name, its id or an 8-character id prefix; needs a Hub joined with the Fleet replica on  |
-| `--org <org>`      | `all`, `home`, or one Tracked organization by its uuid, an 8-character uuid prefix or its label (default: `home`) |
-| `--json`           | Print the daemon's response verbatim                                                                              |
+| Option                | Meaning                                                                                                          |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `--since <date>`      | The first day, `YYYYMMDD` or `YYYY-MM-DD`                                                                        |
+| `--until <date>`      | The last day, in the same forms. With neither, the range is this week, as the Week setting defines it            |
+| `--model <family>`    | Only this Model family: Fable, Opus, Sonnet or Haiku                                                             |
+| `--project <name>`    | Only this project, by its path or its folder name                                                                |
+| `--machine <name>`    | Only this machine, by its name, its id or an 8-character id prefix; needs a Hub joined with the Fleet replica on |
+| `--account <account>` | Only this Account, by its label, its uuid, an 8-character uuid prefix, or its email as read here                 |
+| `--org <org>`         | Only this Organization, by its label, its uuid or an 8-character uuid prefix                                     |
+| `--json`              | Print the daemon's response verbatim                                                                             |
 
 `--model`, `--project` and `--machine` repeat to name more. Days are local dates in the timezone setting, or with none set, the shell's `TZ`.
+
+`--account` and `--org` name the Scope, the Memberships a report describes. Each repeats to name more, and the two intersect: every tracked Membership whose Account is one `--account` names and whose Organization is one `--org` names. One left out matches any; with neither, the Scope is the Home membership, so a single-Account install's reports read as they always did. `all` on either matches any, so `--org all` is still every Tracked organization, and `home` names that side of the Home membership: `--account home` is every tracked Membership of the Home membership's Account, `--org home` every one in the Home membership's Organization, and both together the Home membership. The usage whose Account is not known is in the Scope unless every `--account` is a name rather than `all` or `home`.
+
+A name that matches no Account or Organization, or several, exits 2, and so does an excluded one, `<label> is excluded`, with the `maxprice account track` or `maxprice org track` line that tracks it, and a Scope that holds no tracked Membership, `no tracked Membership matches …`. A report never prints for an empty Scope.
 
 With `--json`, a report pipes into a tool such as `jq`:
 
@@ -202,73 +207,79 @@ maxprice live --json | jq '.usage'
 
 `maxprice daily [options]`: usage and cost per day, oldest first, then a Total row that sums the days. Its columns are Date, Models, Input, Output, Cache create, Cache read, Total tokens and Cost. On a terminal too narrow for them all, columns drop; piped output keeps every column.
 
-Options: `--since`, `--until`, `--model`, `--project`, `--machine`, `--org`, `--json` ([Report options](#report-options)).
+Options: `--since`, `--until`, `--model`, `--project`, `--machine`, `--account`, `--org`, `--json` ([Report options](#report-options)).
 
-| Exit | Meaning                                                                                         |
-| ---- | ----------------------------------------------------------------------------------------------- |
-| 1    | A daemon error, a timeout or a bad response, or a settings.json it cannot read as a JSON object |
-| 2    | A bad option or argument, or a name that matches no or several things                           |
-| 3    | The daemon is not running                                                                       |
-| 4    | The daemon runs another version than this maxprice                                              |
+| Exit | Meaning                                                                                                                                              |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | A daemon error, a timeout or a bad response, or a settings.json it cannot read as a JSON object                                                      |
+| 2    | A bad option or argument, a name that matches no or several things, an excluded Account or Organization, or a Scope that holds no tracked Membership |
+| 3    | The daemon is not running                                                                                                                            |
+| 4    | The daemon runs another version than this maxprice                                                                                                   |
 
 ### `maxprice sessions`
 
-`maxprice sessions [options]`: usage and cost per session, newest last activity first, then a Total row. Its columns are Session, Project, Machine, Organization, Models, Input, Output, Total tokens, Cost and Last activity. Machine appears while a Hub is joined with the Fleet replica on, and Organization only under `--org all`.
+`maxprice sessions [options]`: usage and cost per session, newest last activity first, then a Total row. Its columns are Session, Project, Machine, Account, Organization, Models, Input, Output, Total tokens, Cost and Last activity. Machine appears while a Hub is joined with the Fleet replica on, Account while the Scope spans two or more Accounts, and Organization while it spans two or more Organizations. Account lists the Accounts with usage on that row in the range; rows carry no Account, so `sessions` asks the daemon once more for each Account in the Scope to fill it, and not at all under `--json` or while the column is hidden.
 
-Options: `--since`, `--until`, `--model`, `--project`, `--machine`, `--org`, `--json` ([Report options](#report-options)).
+The Total row is the Desktop's Projects strip total for the same range and Scope, not the sum of the rows above it. A session counts whole in its row, but only its usage in the range counts in the Total: a session that began before the range makes the Total smaller than the rows' sum. A session with usage in the range under two projects counts in the Total once for each. `--json` prints `/api/sessions`' answer alone.
 
-| Exit | Meaning                                                                                         |
-| ---- | ----------------------------------------------------------------------------------------------- |
-| 1    | A daemon error, a timeout or a bad response, or a settings.json it cannot read as a JSON object |
-| 2    | A bad option or argument, or a name that matches no or several things                           |
-| 3    | The daemon is not running                                                                       |
-| 4    | The daemon runs another version than this maxprice                                              |
+Options: `--since`, `--until`, `--model`, `--project`, `--machine`, `--account`, `--org`, `--json` ([Report options](#report-options)).
+
+| Exit | Meaning                                                                                                                                              |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | A daemon error, a timeout or a bad response, or a settings.json it cannot read as a JSON object                                                      |
+| 2    | A bad option or argument, a name that matches no or several things, an excluded Account or Organization, or a Scope that holds no tracked Membership |
+| 3    | The daemon is not running                                                                                                                            |
+| 4    | The daemon runs another version than this maxprice                                                                                                   |
 
 ### `maxprice projects`
 
-`maxprice projects [options]`: usage and cost per project over the range, by cost, then a Total row. A project folded from several directories, its own, its worktrees and its other checkouts, lists each beneath it. Its columns are Project, Path, Top model, Machines, Organizations, Sessions, Total tokens, Cost and Last activity. Machines appears while a Hub is joined with the Fleet replica on, and Organizations only under `--org all`.
+`maxprice projects [options]`: usage and cost per project over the range, by cost, then a Total row. A project folded from several directories, its own, its worktrees and its other checkouts, lists each beneath it. Its columns are Project, Path, Top model, Machines, Accounts, Organizations, Sessions, Total tokens, Cost and Last activity. Machines appears while a Hub is joined with the Fleet replica on, Accounts while the Scope spans two or more Accounts, and Organizations while it spans two or more Organizations. Accounts lists the Accounts with usage on that row in the range, filled as `sessions` fills its Account column.
 
-Options: `--since`, `--until`, `--model`, `--project`, `--machine`, `--org`, `--json` ([Report options](#report-options)).
+Options: `--since`, `--until`, `--model`, `--project`, `--machine`, `--account`, `--org`, `--json` ([Report options](#report-options)).
 
-| Exit | Meaning                                                                                         |
-| ---- | ----------------------------------------------------------------------------------------------- |
-| 1    | A daemon error, a timeout or a bad response, or a settings.json it cannot read as a JSON object |
-| 2    | A bad option or argument, or a name that matches no or several things                           |
-| 3    | The daemon is not running                                                                       |
-| 4    | The daemon runs another version than this maxprice                                              |
+| Exit | Meaning                                                                                                                                              |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | A daemon error, a timeout or a bad response, or a settings.json it cannot read as a JSON object                                                      |
+| 2    | A bad option or argument, a name that matches no or several things, an excluded Account or Organization, or a Scope that holds no tracked Membership |
+| 3    | The daemon is not running                                                                                                                            |
+| 4    | The daemon runs another version than this maxprice                                                                                                   |
 
 ### `maxprice blocks`
 
-`maxprice blocks [options]`: the 5-hour blocks, newest first, with the Active block first. They are the Quota organization's: the one `--org` names, or Home under `--org all`. Blocks are cross-project, so there is no `--project`. Its columns are Window, Status, Burn rate, Total tokens, Cost, Projected and 5h limit. A window marked `~` is heuristic, estimated with no Usage sample; one marked `×` was cut short by an Out-of-band reset.
+`maxprice blocks [options]`: the 5-hour blocks, newest first, with the Active block first. They are one Organization's: Home's while the Scope holds the Home membership, as with no flag and under `--org all`, else the one Organization it names. Blocks are cross-project, so there is no `--project`. Its columns are Window, Status, Burn rate, Total tokens, Cost, Projected and 5h limit. A window marked `~` is heuristic, estimated with no Usage sample; one marked `×` was cut short by an Out-of-band reset. Usage whose Account is not known is in none of these Blocks: while the scope has some in the range, a line under the table names its cost and tokens, `Account not known: $2.75 · 2,500,000 tokens, outside these Blocks' limits`. When the Home membership's Account has no usage at all and its Organization's usage whose Account is not known has some, the table is that usage's Blocks instead, and the header ends `quota: account not known`.
 
-Options: `--since`, `--until`, `--model`, `--machine`, `--org`, `--json` ([Report options](#report-options)).
+While two or more Accounts are tracked and the Scope holds two or more of their Memberships (`--account all` or `--org all`, for one), the table becomes one section per Membership that forms Blocks in the range, as the Desktop client's Blocks page shows a tab per Membership. The sections run most used first: by the highest percent of any live limit window, an expired key's last reading included, then the Memberships with no reading, by name. Each is headed by the Membership (`Organization · Account` while the sections span Accounts), its plan and every limit window, over that Membership's own Blocks, as in `Acme Research · Alex (Max plan): 5-hour 41% · weekly 20%`. A window with no live reading prints `—`; an expired key's last reading is marked `stale`; a Membership with no reading says `not connected`, `not readable now` or `no limits`. The Memberships that form no Blocks in the range, with no 5-hour limit or no usage, share one line after the sections, `No Blocks: Third · Blair, Side project · Alex`. A Scope that holds one Membership, as with no flag, prints the one table, and `--json` prints `/api/blocks`' answer whatever the Scope, its `memberships` listing each Membership's Blocks while the Scope spans two or more.
 
-| Exit | Meaning                                                                                         |
-| ---- | ----------------------------------------------------------------------------------------------- |
-| 1    | A daemon error, a timeout or a bad response, or a settings.json it cannot read as a JSON object |
-| 2    | A bad option or argument, or a name that matches no or several things                           |
-| 3    | The daemon is not running                                                                       |
-| 4    | The daemon runs another version than this maxprice                                              |
+Options: `--since`, `--until`, `--model`, `--machine`, `--account`, `--org`, `--json` ([Report options](#report-options)).
+
+| Exit | Meaning                                                                                                                                              |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | A daemon error, a timeout or a bad response, or a settings.json it cannot read as a JSON object                                                      |
+| 2    | A bad option or argument, a name that matches no or several things, an excluded Account or Organization, or a Scope that holds no tracked Membership |
+| 3    | The daemon is not running                                                                                                                            |
+| 4    | The daemon runs another version than this maxprice                                                                                                   |
 
 ### `maxprice live`
 
-`maxprice live [options]`: one snapshot of what the Desktop client's tray popout shows, the Active block, the Usage limits and today. It prints once and does not refresh. The Active block and the limits are the Quota organization's. A limit with no fresh reading prints `—`.
+`maxprice live [options]`: one snapshot of what the Desktop client's tray popout shows, the Active block, the Usage limits and today. It prints once and does not refresh. The Active block and the limits are one Organization's, the one `blocks` describes. A limit with no fresh reading prints `—`. Usage whose Account is not known is in no Active block: while the scope has some since yesterday, a last line names its cost and tokens, `Account not known: $2.75  2.5M tok since yesterday, outside these limits`. When the Home membership's Account has no usage at all and its Organization's usage whose Account is not known has some, the Active block is that usage's, marked `Active block · account not known`, as `blocks` shows it.
 
-Options: `--org` ([Report options](#report-options)) and `--json`, which prints `{"blocks":…,"usage":…,"today":…}`: the three daemon responses the panel reads, each verbatim.
+While two or more Accounts are tracked and the Scope holds two or more of their Memberships, the panel is the ranked popout's, with nothing folded. The Active block is the most used Membership's whose 5-hour window is in flight, an expired key's aside, named in full (`Active block · Acme Research · Alex`); with none in flight the top section reads `Most used · <Membership>` over `No active block`. Under it, `Limits` lists every Membership in the Scope, one line each, most used first as `maxprice blocks` ranks its sections: every limit window with its reset (`5-hour 41% (resets 2:36 AM) · weekly 20% (resets in 3d 3h)`), a window with no live reading as `—`, an expired key's last reading marked `stale`, and a Membership with no reading as `not connected`, `not readable now` or `no limits`. Today is the Scope's day, `Today · <scope>`, named as the report headers name the Scope. It asks what the ranked popout asks: `/api/accounts` for every reading, the head Membership's own Blocks, and Today, with no `/api/usage/current`. A Scope that holds one Membership, as with no flag, prints the panel above.
 
-| Exit | Meaning                                                                                         |
-| ---- | ----------------------------------------------------------------------------------------------- |
-| 1    | A daemon error, a timeout or a bad response, or a settings.json it cannot read as a JSON object |
-| 2    | A bad option or argument, or a name that matches no or several things                           |
-| 3    | The daemon is not running                                                                       |
-| 4    | The daemon runs another version than this maxprice                                              |
+Options: `--account` and `--org` ([Report options](#report-options)), and `--json`, which prints `{"blocks":…,"usage":…,"today":…}`: the three daemon responses the panel reads, each verbatim. For the ranked panel it prints `{"blocks":…,"accounts":…,"today":…}`: the head Membership's `/api/blocks` (`null` while no Membership has a 5-hour window in flight), `/api/accounts` and `/api/daily`.
+
+| Exit | Meaning                                                                                                                                              |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | A daemon error, a timeout or a bad response, or a settings.json it cannot read as a JSON object                                                      |
+| 2    | A bad option or argument, a name that matches no or several things, an excluded Account or Organization, or a Scope that holds no tracked Membership |
+| 3    | The daemon is not running                                                                                                                            |
+| 4    | The daemon runs another version than this maxprice                                                                                                   |
 
 ### `maxprice serve`
 
 `maxprice serve`: run the daemon in the foreground, as [First run](#first-run) does. It takes no options.
 
 - It keeps its files in the [data dir](#the-data-dir), tightens that dir to 0700, listens on `daemon.sock` there (0600), and holds a lock on `serve.lock`, so one daemon runs per data dir.
-- It reads `settings.json` and refuses to start on a file it cannot read as a JSON object, or one whose Home organization or tracked list is a value the setting does not take. On a first boot it saves the Home organization it chose there.
+- It reads `settings.json` and refuses to start on a file it cannot read as a JSON object, or one whose Home membership or a tracked list is a value the setting does not take. On a first boot it saves the Home membership it chose there. On the first boot of a file that names no tracked Accounts (a first boot, or the first after an upgrade from a release before them) it saves which Accounts it tracks, and the Account of its Home: every Account it knew of at the upgrade, or on a first boot only its Home's.
 - It reads `secrets.json` once, at start. It tightens one that group or others can reach to 0600, and skips one it cannot use with one log line; it never exits for that file. A change made by hand applies at the next start.
 - It checks the update channel at boot and every 6 hours, writes what it found to `update-check.json`, and never installs anything.
 - It logs to stderr, and its boot trace to stdout. SIGTERM, SIGINT and SIGHUP stop it cleanly, with exit 0.
@@ -278,7 +289,7 @@ Options: `--org` ([Report options](#report-options)) and `--json`, which prints 
 | 1    | A crash or a failed bind                                                                                              |
 | 2    | An option or an argument: `serve` takes none                                                                          |
 | 5    | Another `maxprice serve` holds this data dir                                                                          |
-| 6    | settings.json cannot be read, or its Home organization or tracked list is rejected; fix the file, then start it again |
+| 6    | settings.json cannot be read, or its Home membership or a tracked list is rejected; fix the file, then start it again |
 
 ### `maxprice service install|uninstall|status|logs`
 
@@ -297,7 +308,25 @@ Options: `--org` ([Report options](#report-options)) and `--json`, which prints 
 
 ### `maxprice status`
 
-`maxprice status [--json]`: the daemon's state as a checklist. Daemon (its version and socket), Engine (the scan, a saturated event loop, a stalled watcher, an archive it cannot write), Limits (whether the session key is set, and its age), Hub and Pricing come first; then each Tracked organization's limits once the scan is done, Update (the daemon's last check of the update channel), a Settings line for each value in settings.json the setting does not take, a Secrets line when secrets.json is open to group or others or cannot be used, and the [double-join warning](#a-desktop-client-on-the-same-machine). Each line is marked `✓` ok, `!` warn, `✗` bad or `–` off, and one with a fix names the command for it. No line shows any part of the session key or the Hub password.
+`maxprice status [--json]`: the daemon's state as a checklist. Daemon (its version and socket), Engine (the scan, a saturated event loop, a stalled watcher, an archive it cannot write), Limits, Hub and Pricing come first; then each Tracked organization's limits once the scan is done, or while two or more Accounts are tracked each tracked Membership's; a line per Gateway; Update (the daemon's last check of the update channel); a Settings line for each value in settings.json the setting does not take; a Secrets line when secrets.json is open to group or others or cannot be used; and the [double-join warning](#a-desktop-client-on-the-same-machine). Each line is marked `✓` ok, `!` warn, `✗` bad or `–` off, and one with a fix names the command for it. No line shows any part of a session key, a Gateway's management key or the Hub password.
+
+- **Limits.** With one session key stored, or none, it is one line: the limits' connection, the age of the last sample, and the date the key was set and its age, or `key not set`. With several, it is one line per key, the Home membership's Account first: the Account's label, the key's connection, and the date it was set and its age. When any Account's key has expired, a first line counts them, as in `2 Accounts need reconnecting`, and each expired key's line names `maxprice key set`. A key stored before keys were kept per Account is `Unfiled key`; once it has expired, its line reads `Your saved key has expired; maxprice key set replaces it`.
+- **Memberships.** While two or more Accounts are tracked, the Organization lines give way to one line per tracked Membership, named by its Organization's label and, while the lines span several Accounts, its Account's (`Work · Blair`), the Home membership marked `(Home)`. They are ranked most used first, as `live`'s Limits list is, and none is folded. Each says `not connected` or `key expired` for an Account whose key is missing or has expired, else its last limits answer, as an Organization line does.
+- **Gateways.** One line per Gateway this client holds: its host, its state (Draining, Statistics off, Unreachable, Key refused or Error) and the age of its last record, and `drained by the Hub` while the joined Hub drains it. A Gateway that refuses its key names `maxprice gateway connect <url>`; one with statistics off says what to turn on.
+
+```
+✓ Daemon    running 0.10.0 · ~/.local/share/maxprice/daemon.sock
+✓ Engine    ready · 62 files · watching 1 path
+! Limits    1 Account needs reconnecting
+✓           Alex: Connected · key set 2026-11-02 (9d ago)
+!           Blair: Session expired · key set 2026-10-20 (22d ago)   → maxprice key set
+– Hub       Not configured   → maxprice hub join <url>
+✓ Pricing   vendored · 419 models · captured Nov 9
+            Work · Blair: key expired
+            Personal · Alex (Home): 5h active, wk active
+✓ Gateways  gw.example:8317 · draining · last record 2m ago
+✓ Update    current
+```
 
 Once the daemon answers, `status` exits 0, whatever the marks say. `--json` prints the daemon's `/api/status` answer verbatim. Colour shows only on a terminal, and `NO_COLOR` or `TERM=dumb` turns it off.
 
@@ -356,47 +385,133 @@ maxprice settings set week custom mon 09:00
 | 2    | A bad command, option, setting or value                                                                                                                                                                      |
 | 4    | The daemon runs another version than this maxprice; the change is still written                                                                                                                              |
 
-### `maxprice org list|track|exclude|home`
+### `maxprice account list|track|exclude|label`
 
-`maxprice org list`, `maxprice org track <org>`, `maxprice org exclude <org> [--confirm <label>]` and `maxprice org home <org>`: list this machine's Organizations, or change which of them it counts. Home and the Tracked organizations are kept in settings.json. Every verb needs the daemon, and first waits for its initial scan.
+`maxprice account list [--json]`, `maxprice account track <account>`, `maxprice account exclude <account> [--confirm <label>]`, `maxprice account label <account> <label>` and `maxprice account label <account> --unset`: list the Accounts this machine knows, change which of them it counts, or label one. The tracked Accounts are kept in settings.json. Tracking is two levels: a session counts only when both its Account and its Organization are tracked, and an Account's Organizations are [`maxprice org`](#maxprice-org-listtrackexcludelabel)'s. Every verb needs the daemon, and first waits for its initial scan.
 
-- `list` shows each Organization, Home first. Its columns are Organization, Id, Tracking (Home, Tracked or Excluded), Current login (a login on this machine names it), Seen on and Re-walking.
+- `list` shows each Account, the Home membership's first. Its columns are Account, Id (its uuid's first 8, or `pending`), Email (as read here, from a login on this machine), Tracking (Home, Tracked or Excluded), Connection (its session key's), Current login (a login on this machine names it) and Organizations (how many it is known in, and how many of those are tracked: `3, 2 tracked`). On a narrow terminal Email drops first, then Current login, then Organizations. `--json` prints the daemon's answer verbatim.
+- `track` counts an Excluded account again: its usage is re-walked from the session files into every report.
+- `exclude` stops counting a Tracked account: its usage leaves every report on this machine, and while a Hub is joined, this machine's sessions for it leave the Hub. It asks for the Account's label exactly as `org exclude` does, or takes `--confirm <label>`. There is no `--yes`.
+- `label` sets the Account label, which rides the Hub's Label directory to every machine; `--unset` removes it, so the Account shows its email as read here, else `Account <first 8>`. A label is trimmed, 1 to 40 characters, and no other Account's. A Pending account takes no label: this machine keeps only a hash of its email, so it shows as `Account <first 8>` of that hash until a key or a login names its Account.
+
+`<account>` is an Account's label, exact and case-sensitive, its uuid, an 8-character uuid prefix, or its email as read here. A Pending account, one known only by an email no login or key has paired with its Account, is named by that email alone. The Home membership's Account is always tracked: to exclude it, make a Membership of another Account Home first, with [`maxprice home set`](#maxprice-home-set). Until the daemon has saved this machine's tracked Accounts after its first scan, every Account is counted and `track` and `exclude` refuse. After a change, `account` waits until the daemon shows it and nothing is being re-walked; Ctrl-C stops the wait, and the daemon finishes on its own.
+
+```sh
+maxprice account exclude Alex --confirm Alex
+```
+
+| Exit | Meaning                                                                                                                                                                                                                                                                                                                                                                               |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | No Home membership yet, or no tracked Account list yet; exclude of the Home membership's Account; a label that does not match; label of a Pending account; a label another Account already shows, or a full Label directory; settings.json cannot be read, or its Home or a tracked list is rejected (it is left as it is); another maxprice held the lock for 5 s; or a daemon error |
+| 2    | A bad command or option, a name that matches no or several Accounts, an empty or overlong label, or exclude off a terminal with no `--confirm`                                                                                                                                                                                                                                        |
+| 3    | The daemon is not running                                                                                                                                                                                                                                                                                                                                                             |
+| 4    | The daemon runs another version than this maxprice; nothing is written                                                                                                                                                                                                                                                                                                                |
+| 130  | `exclude`: Ctrl-C at the label prompt; nothing is written                                                                                                                                                                                                                                                                                                                             |
+
+### `maxprice org list|track|exclude|label`
+
+`maxprice org list [--json]`, `maxprice org track <org>`, `maxprice org exclude <org> [--confirm <label>]`, `maxprice org label <org> <label>` and `maxprice org label <org> --unset`: list this machine's Organizations, change which of them it counts, or label one. The Tracked organizations are kept in settings.json. Every verb needs the daemon, and first waits for its initial scan. The Home membership is [`maxprice home`](#maxprice-home-set)'s.
+
+- `list` shows each Organization, Home first. Its columns are Organization, Id, Tracking (Home, Tracked or Excluded), Current login (a login on this machine names it), Seen on and Re-walking. `--json` prints the daemon's answer verbatim.
 - `track` counts an Excluded organization again: its usage is re-walked from the session files into every report.
 - `exclude` stops counting a Tracked organization: its usage leaves every report on this machine, and while a Hub is joined, this machine's sessions for it leave the Hub. It prints what it removes, then on a terminal asks you to type the Organization's label. Off a terminal, `--confirm <label>` gives the label instead. There is no `--yes`.
-- `home` makes a Tracked organization Home. The old Home stays tracked, so nothing is re-walked.
+- `label` sets the Organization label, which rides the Hub's Label directory to every machine as the Desktop's Rename does; `--unset` removes it, back to its default. A label is trimmed, 1 to 40 characters, and no other Organization's.
 
-`<org>` is an Organization's uuid, an 8-character uuid prefix (the Id `org list` prints), or its label, exact and case-sensitive. Home is always tracked: to exclude it, make another Tracked organization Home first. After a change, `org` waits until the daemon shows it and nothing is being re-walked; Ctrl-C stops the wait, and the daemon finishes on its own.
+`<org>` is an Organization's uuid, an 8-character uuid prefix (the Id `org list` prints), or its label, exact and case-sensitive. The Home membership's Organization is always tracked: to exclude it, make a Membership in another Organization Home first, with `maxprice home set`. After a change, `org` waits until the daemon shows it and nothing is being re-walked; Ctrl-C stops the wait, and the daemon finishes on its own.
 
 ```sh
 maxprice org exclude 1a2b3c4d --confirm "Example Research"
 ```
 
-| Exit | Meaning                                                                                                                                                                                                                                                                     |
-| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1    | No Home organization yet; exclude of Home; home of an Organization that is not tracked; a label that does not match; settings.json cannot be read, or its Home or tracked list is rejected (it is left as it is); another maxprice held the lock for 5 s; or a daemon error |
-| 2    | A bad command or option, a name that matches no or several Organizations, or exclude off a terminal with no `--confirm`                                                                                                                                                     |
-| 3    | The daemon is not running                                                                                                                                                                                                                                                   |
-| 4    | The daemon runs another version than this maxprice; nothing is written                                                                                                                                                                                                      |
-| 130  | `exclude`: Ctrl-C at the label prompt; nothing is written                                                                                                                                                                                                                   |
+| Exit | Meaning                                                                                                                                                                                                                                                                                                                             |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | No Home membership yet; exclude of the Home membership's Organization; a label that does not match; a label another Organization already shows, or a full Label directory; settings.json cannot be read, or its Home or a tracked list is rejected (it is left as it is); another maxprice held the lock for 5 s; or a daemon error |
+| 2    | A bad command or option, a name that matches no or several Organizations, an empty or overlong label, or exclude off a terminal with no `--confirm`                                                                                                                                                                                 |
+| 3    | The daemon is not running                                                                                                                                                                                                                                                                                                           |
+| 4    | The daemon runs another version than this maxprice; nothing is written                                                                                                                                                                                                                                                              |
+| 130  | `exclude`: Ctrl-C at the label prompt; nothing is written                                                                                                                                                                                                                                                                           |
 
-### `maxprice key set|clear`
+### `maxprice home [set]`
 
-`maxprice key set` and `maxprice key clear`: store or remove the claude.ai session key the daemon reads the Usage limits with. It is kept in `secrets.json` in the data dir, readable by this user alone (0600), and never in settings.json.
+`maxprice home [--json]` and `maxprice home set [--account <account>] [--org <org>]`: show or choose the Home membership, the Account and Organization a report describes with no `--account` or `--org`, and the one this machine's usage with no Account or Organization evidence counts under. Both need the daemon, and first wait for its initial scan.
 
-- `set` reads the key, checks it with claude.ai through the daemon, stores it, then hands it to the daemon. On a terminal it asks for the key and shows nothing as it is typed or pasted; otherwise it reads all of stdin, as in `maxprice key set < key.txt`. The key is never an argument, since argv lands in shell history and `ps`. It needs the daemon running.
-- `clear` removes the stored key, and the daemon's copy when it runs. It needs no daemon.
+- `home` prints one line per Provider, the Home membership's Organization and Account by their labels, or `Account not known` while no evidence names its Account:
+
+  ```
+  Claude  Example Research · Alex
+  ```
+
+  `--json` prints `{"organizations":…,"accounts":…}`: the daemon's `/api/organizations` and `/api/accounts` answers verbatim, since no one route holds the Home membership.
+
+- `set` makes a Membership Home. `--account` and `--org` name it as a report's do, one of each: a name, `home` (that side of the Home membership) or `all` (any). Either may be left out while the other names exactly one tracked Membership. With both, the Account must hold a Membership in that Organization; an Excluded organization is tracked in the same write, and `set` waits through its re-walk. As in Settings, the Account must be tracked and not Pending. The old Home's Account and Organization stay tracked, so moving Home excludes nothing.
+
+A change takes a lock on `settings.lock`, writes the Home membership and the tracked lists alone, and waits as `org track` does. It prints a `Tracked …` line for an Organization it tracked, then the new Home and the one that stays tracked; choosing the Home membership says so and exits 0.
+
+```sh
+maxprice home set --account Alex --org "Example Research"
+```
+
+| Exit | Meaning                                                                                                                                                                                                                  |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1    | No Home membership yet; an Account that is excluded or Pending; settings.json cannot be read, or its Home or a tracked list is rejected (it is left as it is); another maxprice held the lock for 5 s; or a daemon error |
+| 2    | A bad command or option, a name that matches no or several Accounts or Organizations, an Account with no Membership in the Organization, or flags that leave no or several tracked Memberships                           |
+| 3    | The daemon is not running                                                                                                                                                                                                |
+| 4    | The daemon runs another version than this maxprice; nothing is written                                                                                                                                                   |
+
+### `maxprice key set|list|remove`
+
+`maxprice key set`, `maxprice key list [--json]`, `maxprice key remove <account>` and `maxprice key remove --unfiled`: connect, list or remove the claude.ai session keys the daemon reads the Usage limits with, one for each Account. They are kept in `secrets.json` in the data dir, readable by this user alone (0600), and never in settings.json. No command prints any part of a key.
+
+- `set` connects an Account. It reads a key, checks it with claude.ai through the daemon, and stores it as the key of the Account it signs in to, replacing that Account's earlier key. It then hands the daemon every stored key and tracks that Account. A key for another Account is stored beside the first. On a terminal it asks for the key and shows nothing as it is typed or pasted; otherwise it reads all of stdin, as in `maxprice key set < key.txt`. The key is never an argument, since argv lands in shell history and `ps`. It needs the daemon running, waits for its initial scan, and stores nothing until claude.ai lists the key's Organizations and names its Account. It then prints `Connected Blair (22222222), now tracked` and each of the key's Memberships with its Organization's tracking (Home, Tracked or Excluded), marked `(new)` when this machine did not know the Organization before the key:
+
+  ```
+  Connected Blair (22222222), now tracked
+    Personal · Blair  Tracked
+    Lab · Blair       Excluded (new)
+  ```
+
+  A new Organization starts Excluded. On a terminal `set` asks `Track <org>? [y/N]` for each, and tracks the ones answered `y` as `maxprice org track` does, waiting through the re-walk. Off a terminal it asks nothing and prints a `maxprice org track <org>` line for each.
+
+- `list` shows each stored key, one row each: Account (its label), Id (its uuid's first 8), Connection (the key's, as the daemon holds it) and Set at (the date and its age). While a Hub is joined, At Hub says what the Hub holds for the Account, as its last status said: `connected`, `expired`, `error`, `not read yet` (a key it has not read), `no key`, or `unknown` before the daemon has reached the Hub. A local key never stands in for the Hub's. A key stored before keys were kept per Account, whose Account is not read yet, is one row, `Unfiled key`, with Id `—`. On a narrow terminal Set at drops. It needs the daemon running. `--json` prints `{"hubJoined":…,"keys":[…]}`: each row's `account` (its uuid, null for the unfiled key), `label`, `connection` (`connected`, `expired`, `error`, `disconnected`, or null when the daemon holds no such key), `setAt` and `atHub` (`connected`, `expired`, `error`, `pending`, `none`, `unknown`, or null with no Hub joined and for the unfiled key).
+- `remove` removes one Account's key, and the daemon's copy when it runs. `--unfiled` removes the unfiled key, the only way to name it. It needs no daemon: one that is down starts without the key. It never touches the Hub's key. When the joined Hub holds one for the Account, it still exits 0 and adds the line `The Hub still holds a key for this Account; remove it on the Hub with maxprice-hub key remove <id>.` When that is not known, with no daemon or no answer from it, and settings.json names a Hub, the line is `If the Hub holds a key for this Account, remove it there with maxprice-hub key remove <id>.` An Account that holds no key, or `--unfiled` with no unfiled key, exits 2.
+
+`<account>` is an Account's label, exact and case-sensitive, its uuid, an 8-character uuid prefix, or its email as read here, as for [`maxprice account`](#maxprice-account-listtrackexcludelabel). With the daemon not running, or not listing its Accounts, only a stored key's uuid or its prefix names one. The name is never printed back, since it may be a key pasted in its place.
+
+A key stored before keys were kept per Account moves into its Account's entry by itself, once the daemon has read which Account it signs in to. While that key is expired or claude.ai cannot be reached it stays as it is, as the one key, and the daemon tries again at each start. A `set` of a key for its Account replaces it, as does any `set` while it is expired with its Account never read.
+
+Joined to a Hub, the keys are the fallback poller's, and auto-heal pushes each one the Hub holds no working key for its Account, unless that Account's key was removed at the Hub after this key was set. A key stored before keys were kept per Account goes only to a Hub none of whose keys works.
 
 The key is the `sessionKey` cookie of a browser signed in to claude.ai, a value starting `sk-ant-sid01-`. To copy it from a browser on another machine, open the developer tools at claude.ai, then Application (Chrome, Edge) or Storage (Firefox), Cookies, `https://claude.ai`, and copy the value of `sessionKey`. It is not Claude Code's OAuth token (`sk-ant-oat…`), which `set` refuses; maxprice never reads `~/.claude/.credentials.json`.
 
-Ctrl-C at the prompt exits 130, having stored nothing.
+Ctrl-C at the key prompt exits 130, having stored nothing. Ctrl-C at a Track prompt exits 130 too: the key and its Account's tracking stay, and no Organization is tracked.
 
-| Exit | Meaning                                                                                                                                                                                                                                |
-| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1    | The key is a Claude Code OAuth token, claude.ai refused it or could not be reached, secrets.json cannot be used or written, the daemon did not take the key (it is still stored, for the daemon's next start), or another daemon error |
-| 2    | A bad command or option, an argument after `set`, or no key given                                                                                                                                                                      |
-| 3    | `set`: the daemon is not running                                                                                                                                                                                                       |
-| 4    | The daemon runs another version than this maxprice; for `clear`, the change is still written                                                                                                                                           |
-| 130  | `set`: Ctrl-C at the prompt; nothing is stored                                                                                                                                                                                         |
+| Exit | Meaning                                                                                                                                                                                                                                                                                                                  |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1    | The key is a Claude Code OAuth token, claude.ai refused it or could not be reached, secrets.json cannot be used or written, the daemon did not take the key (it is still stored, for the daemon's next start), its Account could not be tracked in settings.json (the key is stored and in use), or another daemon error |
+| 2    | A bad command or option, an argument after `set` or `list`, no key given, a name that matches no or several Accounts, or one whose Account holds no key to remove, or no unfiled key to remove                                                                                                                           |
+| 3    | `set`, `list`: the daemon is not running                                                                                                                                                                                                                                                                                 |
+| 4    | The daemon runs another version than this maxprice; for `remove`, the change is still written                                                                                                                                                                                                                            |
+| 130  | `set`: Ctrl-C at the key prompt (nothing is stored) or at a Track prompt (the key stays)                                                                                                                                                                                                                                 |
+
+### `maxprice gateway connect|list|remove`
+
+`maxprice gateway connect <url>`, `maxprice gateway list [--json]` and `maxprice gateway remove <url>`: connect, list or remove the Gateways this client drains, CLIProxyAPI services that serve Claude Code's requests on credentials of their own and keep a Gateway record of each. Each Gateway's URL and management key are kept in `secrets.json` in the data dir, readable by this user alone (0600), under its Gateway id, the first 16 hex digits of a hash of its URL. No command prints any part of a management key.
+
+- `connect` reads the Gateway's management key, checks through the daemon that the Gateway at `<url>` answers and takes the key, and stores the URL and key, replacing the key of a Gateway already connected at that URL. It then hands the daemon every stored Gateway. On a terminal it asks for the key and shows nothing as it is typed or pasted; otherwise it reads all of stdin, as in `maxprice gateway connect http://gw.example:8317 < key.txt`. The key is never an argument, since argv lands in shell history and `ps`. It needs the daemon running, and stores nothing when the check fails: a Gateway that does not answer, refuses the key, or answers something unreadable exits 1, saying `The Gateway didn't answer at that URL.`, `The Gateway refused that management key.` or `The Gateway answered, but not as CLIProxyAPI's management API does.`, then `Nothing was stored.` It then prints `Connected Gateway gw.example:8317 (0123456789abcdef)` and two warnings, since MaxPrice can read neither: set the Gateway's usage queue retention to 3600 seconds or more, and let nothing else drain its usage queue, since anything else that drains it takes records MaxPrice then never sees. Connecting tracks nothing: an Account first seen through the Gateway starts Excluded, which [`maxprice account list`](#maxprice-account-listtrackexcludelabel) shows and `maxprice account track` changes.
+- `list` shows each stored Gateway, one row each: Gateway (its URL), Id (its Gateway id), State (`Draining`, `Statistics off`, `Unreachable`, `Key refused`, `Error`, or `not in use` when the daemon does not hold it), Last record (the age of the last record drained this run, or `none yet`), Drained by (`this machine`, or `the Hub` while the joined Hub drains it) and Set at (the date and its age). On a narrow terminal Set at, Last record and Drained by drop in that order. It needs the daemon running. `--json` prints `{"gateways":[…]}`: each row's `id`, `url`, `state` (`draining`, `unreachable`, `unauthorized`, `statistics-off`, `error`, or null), `lastRecordAt`, `drainedBy` (`this-machine`, `hub`, or null) and `setAt`.
+- `remove` removes one Gateway, named by its URL or its Gateway id, and the daemon's copy when it runs. It needs no daemon: one that is down starts without the Gateway. A Gateway this client sent to its Hub stays on the Hub, where a Gateway is removed only at the Hub; while settings.json names a Hub, a line says so.
+
+A URL is `http` or `https`, with no username, password, query or fragment. Its scheme and host are read in any case and a trailing slash is dropped, so `http://GW.example:8317/` is `http://gw.example:8317`. A URL that is not one is never printed back, since it may be a key pasted in its place.
+
+Joined to a Hub, the daemon sends each Gateway up to the Hub once, and the Hub drains it while it holds a working connection to it; this client drains it only while the Hub cannot. Ctrl-C at the key prompt exits 130, having stored nothing.
+
+| Exit | Meaning                                                                                                                                                                                                                                                                       |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | The Gateway did not answer, refused the management key or answered something unreadable (nothing is stored), secrets.json cannot be used or written, the daemon did not take the Gateways (the Gateway is still stored, for the daemon's next start), or another daemon error |
+| 2    | A bad command or option, no URL or more than one argument, a URL that is not a Gateway URL, no Gateway with that URL or id connected to remove, no management key given, or one that is not printable ASCII with no spaces                                                    |
+| 3    | `connect`, `list`: the daemon is not running                                                                                                                                                                                                                                  |
+| 4    | The daemon runs another version than this maxprice; for `remove`, the change is still written                                                                                                                                                                                 |
+| 130  | `connect`: Ctrl-C at the key prompt; nothing is stored                                                                                                                                                                                                                        |
 
 ### `maxprice hub join|leave`
 
@@ -405,7 +520,7 @@ Ctrl-C at the prompt exits 130, having stored nothing.
 - `join` joins the Hub at `<url>`: a host, `host:port` or a full URL, with `http://` and port 47100 when it names none. The URL cannot carry a username or password. It needs the daemon running, saves the config, hands it to the daemon and waits up to 10 s for the daemon to reach the Hub. Each join writes the URL, the password and auto-heal together, so re-run it to change any one of them.
 - `leave` removes the Hub's URL and password, and tells the daemon when it runs. It needs no daemon, and keeps the auto-heal setting.
 - `--password`: the Hub has a password. `join` asks for it, showing nothing as it is typed, or with no terminal reads all of stdin. Without it the join is passwordless, and a stored password is removed.
-- `--no-auto-heal`: never push this client's session key to the Hub when the Hub's own key stops working. Auto-heal is on without it.
+- `--no-auto-heal`: never push this client's session keys to the Hub when it holds no working key for their Account. Auto-heal is on without it.
 
 A rejected password, a Hub version mismatch or no answer in 10 s exits 1, with the config still saved; the daemon keeps retrying a Hub that did not answer. While the Desktop client on this machine is joined to a Hub too, `join` [warns](#a-desktop-client-on-the-same-machine). Ctrl-C at the password prompt exits 130, having saved nothing.
 
@@ -449,19 +564,19 @@ maxprice hub join hub.example:47100 --password
 
 ## Exit codes
 
-| Exit | Meaning                                                               |
-| ---- | --------------------------------------------------------------------- |
-| 0    | Success                                                               |
-| 1    | Failure: a daemon error, a timeout, a bad response or a crash         |
-| 2    | Usage error                                                           |
-| 3    | The daemon is not running                                             |
-| 4    | The daemon runs another version than this maxprice                    |
-| 5    | Another `maxprice serve` holds this data dir                          |
-| 6    | `maxprice serve` refused its settings.json                            |
-| 100  | `maxprice update --check` found an update                             |
-| 130  | Ctrl-C at a prompt: `key set`, `hub join --password` or `org exclude` |
+| Exit | Meaning                                                                                                                                 |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| 0    | Success                                                                                                                                 |
+| 1    | Failure: a daemon error, a timeout, a bad response or a crash                                                                           |
+| 2    | Usage error                                                                                                                             |
+| 3    | The daemon is not running                                                                                                               |
+| 4    | The daemon runs another version than this maxprice                                                                                      |
+| 5    | Another `maxprice serve` holds this data dir                                                                                            |
+| 6    | `maxprice serve` refused its settings.json                                                                                              |
+| 100  | `maxprice update --check` found an update                                                                                               |
+| 130  | Ctrl-C at a prompt: `key set` (the key or a Track prompt), `gateway connect`, `hub join --password`, `org exclude` or `account exclude` |
 
-Nothing is written when a prompt is interrupted. `key set` and `hub join --password` exit 130 themselves; at `org exclude`'s prompt the SIGINT ends the process, which a shell reports as 130 and a supervisor as a signal.
+Nothing is written when a prompt is interrupted, but for a `key set` Track prompt, which comes after the key is stored. `key set`, `gateway connect` and `hub join --password` exit 130 themselves; at the `org exclude` and `account exclude` prompts the SIGINT ends the process, which a shell reports as 130 and a supervisor as a signal.
 
 ## Updating
 
@@ -491,31 +606,37 @@ The Headless client cannot tell whether the Desktop client's Hub is its own, so 
 
 The data dir is `$XDG_DATA_HOME/maxprice`, or `~/.local/share/maxprice` when `XDG_DATA_HOME` is unset or not absolute. The daemon and every command compute it the same way, so a shell with another `XDG_DATA_HOME` reaches another daemon; `maxprice service status` flags a unit whose data dir is not the shell's. `serve` creates it 0700 and tightens one that group or others can reach, so only this user can open the files in it. Keep it on a local filesystem: its locks, its socket and its SQLite files are unsupported on a network filesystem.
 
-| File                                           | What it holds                                                                                             | Mode                 |
-| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------- | -------------------- |
-| `daemon.sock`                                  | The daemon's socket, which every other command connects to. The next `serve` removes a stale one          | 0600                 |
-| `serve.lock`                                   | The lock that keeps one `serve` per data dir, and the pid of the last `serve` that took it                | 0600                 |
-| `settings.json`                                | This client's settings, written by `settings`, `org` and `hub`, and by a first boot's Home                | 0600                 |
-| `settings.lock`                                | The lock every settings write takes                                                                       | 0600                 |
-| `secrets.json`                                 | The claude.ai session key and the Hub password; there is no file while neither is stored                  | 0600                 |
-| `update-check.json`                            | The daemon's last check of the update channel, which `status` shows                                       | 0600                 |
-| `machine-id`                                   | This machine's id, minted at its first boot; a Hub knows the machine by it                                | umask                |
-| `local-archive.sqlite`, with `-wal` and `-shm` | The Local archive: this machine's own usage events, kept after Claude Code prunes their JSONL             | 0644, less the umask |
-| `usage-history.jsonl`                          | The Usage history: the usage-limit samples the daemon took or received from a Hub                         | umask                |
-| `scan-cache.json`                              | The parse cache, so a restart re-reads only the JSONL that changed                                        | umask                |
-| `pricing-cache.json`                           | The last LiteLLM price list fetched                                                                       | umask                |
-| `organizations.json`                           | The Organizations the daemon has seen, with their plans                                                   | umask                |
-| `organization-labels.json`                     | The Organization labels                                                                                   | umask                |
-| `organization-assertions.json`                 | The Organization assertions                                                                               | umask                |
-| `organization-repair.json`                     | The record of the repair a change to the tracked set runs                                                 | umask                |
-| `fleet-events.sqlite`, with `-wal` and `-shm`  | The Fleet replica, while a Hub is joined and `fleet-replica` is on; a disposable copy of the Hub's events | 0644, less the umask |
-| `fleet-forget.json`                            | A forget on the Hub still in progress, with its receipts, so a lost answer never repeats it               | umask                |
-| `machine-directory.json`                       | A copy of the Hub's Machine directory, for machine names while the Hub is away                            | umask                |
-| `identity-directory.json`                      | The Identity directory, which folds a project's checkouts across machines                                 | umask                |
+| File                                           | What it holds                                                                                                                                           | Mode                 |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `daemon.sock`                                  | The daemon's socket, which every other command connects to. The next `serve` removes a stale one                                                        | 0600                 |
+| `serve.lock`                                   | The lock that keeps one `serve` per data dir, and the pid of the last `serve` that took it                                                              | 0600                 |
+| `settings.json`                                | This client's settings, written by `settings`, `account`, `org`, `home`, `key set` and `hub`, and by a first boot's Home                                | 0600                 |
+| `settings.lock`                                | The lock every settings write takes                                                                                                                     | 0600                 |
+| `secrets.json`                                 | The claude.ai session keys, the Hub password, and each Gateway's URL and management key; there is no file while none is stored                          | 0600                 |
+| `update-check.json`                            | The daemon's last check of the update channel, which `status` shows                                                                                     | 0600                 |
+| `machine-id`                                   | This machine's id, minted at its first boot; a Hub knows the machine by it                                                                              | umask                |
+| `local-archive.sqlite`, with `-wal` and `-shm` | The Local archive: this machine's own usage events, kept after Claude Code prunes their JSONL                                                           | 0644, less the umask |
+| `usage-history.jsonl`                          | The Usage history: the usage-limit samples the daemon took or received from a Hub                                                                       | umask                |
+| `scan-cache.json`                              | The parse cache, so a restart re-reads only the JSONL that changed                                                                                      | umask                |
+| `pricing-cache.json`                           | The last LiteLLM price list fetched                                                                                                                     | umask                |
+| `organizations.json`                           | The Organizations the daemon has seen, with their plans                                                                                                 | umask                |
+| `organization-labels.json`                     | The Organization labels                                                                                                                                 | umask                |
+| `organization-assertions.json`                 | The Organization assertions                                                                                                                             | umask                |
+| `organization-repair.json`                     | The record of the repair a change to the tracked sets runs                                                                                              | umask                |
+| `account-pairs.json`                           | Which Account each email seen in the logs belongs to, by a hash of the address; never sent anywhere                                                     | umask                |
+| `sample-stamps.json`                           | When the Usage history last stamped its own samples with an Account or Organization                                                                     | umask                |
+| `hub-sample-exchange.json`                     | The Hub and stamp times of the last whole-history sample exchange with a joined Hub                                                                     | umask                |
+| `fleet-events.sqlite`, with `-wal` and `-shm`  | The Fleet replica, while a Hub is joined and `fleet-replica` is on; a disposable copy of the Hub's events                                               | 0644, less the umask |
+| `fleet-forget.json`                            | A forget on the Hub still in progress, with its receipts, so a lost answer never repeats it                                                             | umask                |
+| `machine-directory.json`                       | A copy of the Hub's Machine directory, for machine names while the Hub is away                                                                          | umask                |
+| `identity-directory.json`                      | The Identity directory, which folds a project's checkouts across machines                                                                               | umask                |
+| `gateway-evidence.json`                        | Which Account and Organization each matched Gateway record names, by the log line it matched; never sent anywhere                                       | umask                |
+| `gateway-pending.json`                         | The Gateway records not yet matched (kept 24 hours), the ids of those already seen, and the records drained here that a joined Hub has not yet received | umask                |
+| `gateway-relay.json`                           | Per Hub, where its Gateway record feed was last read, and the Gateways already sent to it                                                               | umask                |
 
 A file marked umask has the mode the umask gives a new file. A write to most of these goes through a temporary file beside it, renamed into place. A file the daemon cannot read is kept beside it as `<name>.bak`, and the daemon starts that part empty.
 
-A first boot over Claude Code logs, with no session key and no Hub, writes `daemon.sock`, `serve.lock`, `settings.json` (its Home organization), `settings.lock`, `update-check.json`, `machine-id`, the Local archive, `scan-cache.json`, `organizations.json` and `organization-repair.json`. The others appear with what they hold.
+A first boot over Claude Code logs, with no session key and no Hub, writes `daemon.sock`, `serve.lock`, `settings.json` (its Home membership and tracked Accounts), `settings.lock`, `update-check.json`, `machine-id`, the Local archive, `scan-cache.json`, `organizations.json`, `organization-repair.json` and `account-pairs.json`. The others appear with what they hold.
 
 Both the archive reset below and the data deletion in [Uninstalling](#uninstalling) require `realpath` with `-m -s` support (GNU coreutils or a compatible implementation). These options normalize `.` and `..` lexically without following symlinks, matching the client's path calculation even when a symlink precedes `..` or a component does not exist. Deletion runs only if normalization succeeds. If the tool is missing or rejects these options, install a compatible coreutils tool before retrying. This requirement applies to these shell cleanup recipes.
 
@@ -571,7 +692,7 @@ Start with `maxprice status`: each line that has a fix names the command for it.
 | The unit failed, or stops when you log out                         | `maxprice service logs -n 100` says why; `maxprice service install` clears a failed state, and `loginctl enable-linger` keeps it running after logout                                                   |
 | Every `service` verb exits 1: `no systemd user manager here (…)`   | Run `maxprice serve` under another init; see [Other inits](#other-inits)                                                                                                                                |
 | Limits print `—`                                                   | No fresh reading: with no Hub, set the session key with `maxprice key set`, then check the Limits line of `maxprice status`                                                                             |
-| A report misses recent sessions                                    | Try `--org all`, check `maxprice settings get claude-paths`, then `maxprice rescan`                                                                                                                     |
+| A report misses recent sessions                                    | Try `--account all --org all`, check `maxprice settings get claude-paths`, then `maxprice rescan`                                                                                                       |
 | A model shows no cost                                              | `maxprice pricing refresh`, then the Pricing line of `maxprice status`. Under `cost-mode display` a request counts only the cost its log recorded, and current Claude Code records none, so it reads $0 |
 | `'alpha' names 2 projects; give its path` (exit 2)                 | Pass the project's path, such as `--project ~/git/alpha`                                                                                                                                                |
 | `--machine needs the Fleet replica, which is off here: …` (exit 2) | Join a Hub, and leave `fleet-replica` on                                                                                                                                                                |

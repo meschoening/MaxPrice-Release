@@ -50,6 +50,10 @@ export function createBlockFlushCache() {
       machines: string[],
       organizations: string[],
       samples: readonly UsageSample[],
+      // The Account a Membership-scoped formation chose its rows by (#631), a
+      // formation input like the Quota organization and keyed beside it for
+      // the same reason. `null` = the Organization's every Account.
+      account: string | null = null,
     ): BlockFlushContext {
       const currentPricing = activePricingSnapshot();
       if (pricing !== currentPricing) {
@@ -76,7 +80,7 @@ export function createBlockFlushCache() {
       // and samples blocks form from. Listing it there would advertise a
       // narrowing the blocks aggregator does not perform.
       const organizationIds = [...new Set(organizations)].sort();
-      const key = JSON.stringify([mode, loweredModels, machineIds, organizationIds]);
+      const key = JSON.stringify([mode, loweredModels, machineIds, organizationIds, account]);
       let entry = entries.get(key);
       if (entry === undefined) {
         if (entries.size >= MAX_ENTRIES) entries.delete(entries.keys().next().value as string);

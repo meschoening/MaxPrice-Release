@@ -1,13 +1,33 @@
 import { chmodSync, mkdirSync, statSync, unlinkSync } from "node:fs";
-import type { Settings } from "@maxprice/shared";
+import {
+  isAccountUuid,
+  type AccountsSeed,
+  type PendingFold,
+  type Settings,
+  type UsageKeyset,
+} from "@maxprice/shared";
 import { startUpdateChecks } from "@maxprice/usage-core/update-check";
 import { desktopHubUrl, doubleJoinWarning } from "../double-join";
 import { displayHubUrl } from "../hub-url";
 import { EXIT } from "../exit";
 import { dataDir, type Env, settingsPath, socketPath } from "../paths";
-import { bootSecrets, type Secrets } from "../secrets";
+import {
+  bootSecrets,
+  editSecrets,
+  keysetOf,
+  gatewaysOf,
+  type Secrets,
+  sessionKeyCount,
+  withLegacyMoved,
+} from "../secrets";
 import { type ServeLock, takeServeLock } from "../serve-lock";
-import { checkSettingsForServe, joinedHubUrl, saveHomeSeed } from "../settings";
+import {
+  checkSettingsForServe,
+  joinedHubUrl,
+  saveAccountFolds,
+  saveAccountsSeed,
+  saveHomeSeed,
+} from "../settings";
 import { PRODUCT } from "../update-channel";
 import { VERSION } from "../version";
 
@@ -17,9 +37,11 @@ import { VERSION } from "../version";
 // launching shell exits must keep running (ADR-0118 §4). It refuses a
 // settings.json it cannot trust, and saves the Home a first boot's seed
 // chose (ADR-0122 §3, §7). It reads secrets.json once, at boot, for the
-// session key and the Hub password: a loose file is tightened to 0600, and
+// session keys and the Hub password: a loose file is tightened to 0600, and
 // one it cannot use is skipped, never an exit (ADR-0121 §3, §5). Nothing
-// watches that file, so a hand edit applies at the next start. Once it
+// watches that file, so a hand edit applies at the next start. It writes it
+// only to move a legacy key into its Account's entry once the sidecar
+// learns that Account (ADR-0138 §12, `moveLegacyKey`). Once it
 // listens, it checks the update channel at boot and every 6 h, and never
 // installs (ADR-0123 §8).
 //
@@ -100,9 +122,12 @@ function installSignalLogs(): void {
 
 // What secrets.json held, for the log: which secrets, never their values.
 function secretsLine(secrets: Secrets): string {
+  const keys = sessionKeyCount(secrets);
+  const gateways = gatewaysOf(secrets).length;
   const held = [
-    secrets.sessionKey && "a session key",
+    keys === 1 ? "a session key" : keys > 1 ? `${keys} session keys` : null,
     secrets.hubPassword && "a Hub password",
+    gateways === 1 ? "a Gateway key" : gateways > 1 ? `${gateways} Gateway keys` : null,
   ].filter(Boolean);
   return `[serve] secrets.json: ${held.length === 0 ? "no secrets" : held.join(" and ")}`;
 }
@@ -136,6 +161,75 @@ function saveSeed(env: Env, uuid: string): void {
       );
     },
   );
+}
+
+// #631: the Account seed and the Pending account folds, saved as the Home
+// seed is: under the settings lock, never awaited by the boot, a failure
+// logged. The next boot decides the seed again; a fold is decided again at the
+// next pair change or boot.
+function saveAccounts(env: Env, seed: AccountsSeed): void {
+  const path = settingsPath(dataDir(env));
+  void saveAccountsSeed(env, seed).then(
+    (outcome) =>
+      console.error(
+        outcome === "saved"
+          ? `[serve] saved the tracked Accounts seed to ${path}`
+          : "[serve] settings.json already names its tracked Accounts; the seed is not saved",
+      ),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        `[serve] cannot save the tracked Accounts seed: ${message}; the next boot chooses it again`,
+      );
+    },
+  );
+}
+
+function saveFolds(env: Env, folds: readonly PendingFold[]): void {
+  void saveAccountFolds(env, folds).then(
+    (outcome) => {
+      if (outcome === "saved") console.error("[serve] saved the resolved Pending accounts");
+    },
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[serve] cannot save the resolved Pending accounts: ${message}`);
+    },
+  );
+}
+
+// ADR-0138 §12: the sidecar resolved the legacy key's Account, so its key
+// moves into that Account's entry in secrets.json, through the commands' own
+// read-modify-write, and the legacy key leaves in that same write, never
+// before. Answers the keyset the file then holds, for the sidecar to apply.
+// A file this cannot read or write keeps the legacy key, and the daemon runs
+// on with it as the one key: logged by path and errno, never the key, and
+// tried again at the next boot.
+export function moveLegacyKey(
+  env: Env,
+  accountUuid: string,
+  now: () => Date = () => new Date(),
+): UsageKeyset | null | undefined {
+  // Never a name for an entry the file would then refuse.
+  if (!isAccountUuid(accountUuid)) {
+    console.error("[serve] the session key's Account is no account uuid; the key is not moved");
+    return undefined;
+  }
+  let next: Secrets = {};
+  try {
+    const moved = editSecrets(env, (secrets) => {
+      next = withLegacyMoved(secrets, accountUuid, now().toISOString());
+      return next;
+    });
+    if (moved) console.error("[serve] moved the session key into its Account's entry");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(
+      `[serve] cannot move the session key into its Account's entry: ${message}; ` +
+        "the next boot tries again",
+    );
+    return undefined;
+  }
+  return keysetOf(next);
 }
 
 export async function serve(env: Env = process.env, deps: ServeDeps = {}): Promise<number> {
@@ -175,8 +269,16 @@ export async function serve(env: Env = process.env, deps: ServeDeps = {}): Promi
     listen: { unix: socket },
     authToken: null,
     hub,
-    usageCredential: secrets.sessionKey ? { sessionKey: secrets.sessionKey.value } : null,
+    // Every key secrets.json holds (ADR-0138 §6): each Account's, and the
+    // legacy key until it moves.
+    usageKeyset: keysetOf(secrets),
+    // Every Gateway secrets.json holds (ADR-0141 §7): the daemon drains them
+    // in fallback and relays them through its Hub (§5).
+    gateways: gatewaysOf(secrets),
     onHomeSeeded: (uuid) => saveSeed(env, uuid),
+    onAccountsSeeded: (seed) => saveAccounts(env, seed),
+    onAccountsFolded: (folds) => saveFolds(env, folds),
+    onLegacyResolved: (uuid) => moveLegacyKey(env, uuid),
   });
 
   try {

@@ -5,14 +5,20 @@ import { cors } from "hono/cors";
 import { stream, streamSSE } from "hono/streaming";
 import {
   ALL_ORGANIZATIONS,
+  PERSISTED_SCOPE_PARAM,
   costModeSchema,
   displayOrganizationLabels,
   hubConfigSchema,
   MAX_INTRADAY_BUCKETS,
   nativeBucketMs,
   ORGANIZATION_ASSERTIONS_PATH,
-  ORGANIZATION_LABEL_MAX,
   ORGANIZATIONS_PATH,
+  ACCOUNTS_PATH,
+  ACCOUNT_SOURCES_PATH,
+  type AccountSourcesResponse,
+  LABEL_MAX,
+  accountLabelRequestSchema,
+  type AccountsResponse,
   organizationAssertRequestSchema,
   organizationRenameRequestSchema,
   PROJECT_IDENTITY_PATH,
@@ -31,7 +37,18 @@ import {
   STORAGE_FORGET_PATH,
   STORAGE_PATH,
   storageForgetRequestSchema,
-  storedUsageCredentialSchema,
+  usageKeysetSchema,
+  USAGE_KEYS_PATH,
+  USAGE_HUB_KEYS_PATH,
+  SIDECAR_GATEWAYS_CHECK_PATH,
+  SIDECAR_GATEWAYS_CONFIG_PATH,
+  SIDECAR_GATEWAYS_PATH,
+  gatewayConnectRequestSchema,
+  gatewaysConfigRequestSchema,
+  type GatewayCheckResponse,
+  type GatewaysConfigAck,
+  type GatewayConfigEntry,
+  type LocalGatewaysResponse,
   type CostMode,
   type CredentialAck,
   type DiscoveredOrg,
@@ -39,6 +56,8 @@ import {
   type ErrorResponse,
   type ForgetSessionRef,
   type IntradayResponse,
+  type MembershipTotalsResponse,
+  MEMBERSHIP_TOTALS_PATH,
   type OrganizationAssertionsResponse,
   type OrganizationAssertResponse,
   type OrganizationsResponse,
@@ -53,8 +72,20 @@ import {
   type SessionEventFrame,
   type SidecarMachinesResponse,
   type SidecarProjectIdentityResponse,
-  type UsageCredential,
+  type UsageKeyset,
+  type UsageKeysResponse,
+  type UsageHubKeysResponse,
   type UsageSample,
+  SCOPE_HEAD_PATH,
+  scopeHasMembership,
+  scopeMembershipReadings,
+  scopeMembershipSet,
+  rankedPopoutLimitRows,
+  readoutPick,
+  headOrganizationWithoutHome,
+  type HomeMembership,
+  type ResolvedScope,
+  type ScopeHeadResponse,
 } from "@maxprice/shared";
 import { aggregateSessionEvents, type SessionEventsAggregate } from "./engine/session-events";
 // The entry block's boot. `boot.ts` imports `buildApp` back from this module;
@@ -64,13 +95,15 @@ import type { LiveHub } from "./live-hub";
 import type { FleetForgetResult, FleetSync } from "./fleet";
 import type { StorageSnapshot } from "./storage";
 import type { OrganizationRenameResult } from "./organizations";
+import type { AccountRenameResult } from "./account-tracking";
 import type { OrganizationAssertResult } from "./organization-assertions";
 import {
-  quotaOrganization,
-  quotaSampleScope,
-  scopeOrganizations,
-  type OrganizationScopeState,
+  effectiveScopeTokens,
+  requestScope,
+  type ScopeState,
+  type ScopeTokens,
 } from "./organization-scope";
+import { readoutWideScope } from "./readout-scope";
 import { mintRescanWalkKey, scanGate } from "./scan-gate";
 import type { ScanCache } from "./engine/scan-cache";
 import type { EventStore, ScanProgress } from "./engine/store";
@@ -90,9 +123,10 @@ import { defaultTimeZone, isValidTimeZone } from "./engine/timezone";
 import { localDateUncached } from "./engine/local-date";
 import { isInstantBound, parseRangeBound } from "./engine/range";
 import { aggregateDaily, aggregateDailyByMachine, aggregateDailyByProject } from "./engine/daily";
+import { aggregateMembershipTotals } from "./engine/membership-totals";
 import { aggregateIntraday } from "./engine/intraday";
 import { createReportCache } from "./engine/report-cache";
-import { createBlockReports } from "./engine/block-formation-cache";
+import { createBlockReports, formationRows, noHomeFormation } from "./engine/block-formation-cache";
 
 export type BuildAppDeps = {
   allowedOrigins: string[];
@@ -128,20 +162,33 @@ export type BuildAppDeps = {
   // whose span window ends at "now"). Injected so tests can pin a deterministic
   // instant rather than depending on `Date.now()` at run time.
   now: () => number;
-  // Usage-limits (ADR-0023/0024). The renderer pushes a credential via
-  // POST /api/usage/credential; GET /api/usage/current returns last-known state;
-  // POST /api/usage/discover-orgs proxies org discovery (CORS workaround).
+  // Usage-limits (ADR-0023/0024). The host pushes its keyset via
+  // POST /api/usage/credential (#633); GET /api/usage/current returns
+  // last-known state; GET /api/usage/keys the held keyset; POST
+  // /api/usage/discover-orgs proxies org discovery (CORS workaround).
   usage: {
     // INTERNAL poller state — the WIRE shape of GET /api/usage/current is
     // narrower (`{ sample, weeklyResetAt }`, f10): the handler projects those
     // off this. `connection` / `lastSampleAt` stay on the internal type for the
     // poller's own bookkeeping and the status snapshot. One Organization's
-    // state: the handlers pass the Quota organization, and `null` (no Home) is
-    // the answer that names none.
+    // state: the handlers pass the Scope's head Organization
+    // (`scopeHead`), and `null` (no Home) is the answer that names none.
     getCurrent: (organization?: string | null) => UsagePollerCurrent;
-    setCredential: (c: UsageCredential | null) => void;
+    // Replaces the held keyset (ADR-0138 §6, #633); null holds none. Answers
+    // the push's arrivals: each session key the push before it did not hold.
+    setKeyset: (keyset: UsageKeyset | null) => readonly string[];
     pollOnce: () => Promise<void>;
     discoverOrgs: (sessionKey: string) => Promise<DiscoverOrgResult>;
+    // The key's Account, read from its `/api/account` for Connect's discovery
+    // (ADR-0138 §2), its pair learned; null when the read failed. Never the
+    // address.
+    readAccount: (sessionKey: string) => Promise<{ accountUuid: string } | null>;
+    // GET /api/usage/keys: the held keyset, as its host finishes the move.
+    keys: () => UsageKeysResponse;
+    // GET /api/usage/hub-keys (#642, ADR-0140 §6): what the joined Hub's last
+    // status says it holds for each Account (`hubKeysReport`). Absent, the
+    // route is not served.
+    hubKeys?: () => UsageHubKeysResponse;
     // Stamps every unstamped usage-history line with a legacy pushed blob's
     // `orgId` (#279) — the sample store's stampUnstamped: resolves the
     // number stamped (0, with no file I/O, once nothing is left), rejects when
@@ -156,8 +203,10 @@ export type BuildAppDeps = {
   authToken: string | null;
   // The usage-history samples — /api/blocks and the `block` span read them for
   // observed-window formation + the 5h limit % (ADR-0028). No scope is every
-  // sample held (no Home); a scope is the Quota organization's, unstamped lines
-  // counting as its `home`'s — the sample store's `all(scope)`. An accessor
+  // sample held (no Home); a scope is one Organization's, unstamped lines
+  // counting as its `home`'s — the sample store's `all(scope)`. Block formation
+  // gives a Membership its Organization's samples when they resolve to its
+  // Account (`sampleAccount`). An accessor
   // (not a snapshot) so the handler reads whatever the poller has appended at
   // request time.
   samples: (scope?: SampleScope) => readonly UsageSample[];
@@ -234,9 +283,11 @@ export type BuildAppDeps = {
   // also reads. `rename` applies PUT /api/organizations/:uuid's rules
   // (`createOrganizationRename`) and answers the fresh roster or a refusal.
   // `recordDiscovery` seeds the roster with what Connect's discovery answered
-  // (#283) — POST /api/usage/discover-orgs calls it on every success.
+  // (#283) — POST /api/usage/discover-orgs calls it on every success — as one
+  // key's partial listing, which marks no other Organization off (#646); the
+  // key listing that follows its arrival does that.
   // `rememberOrganization` keeps one Organization in that roster: POST
-  // /api/usage/credential records a legacy blob's `orgId` there (#283). It is
+  // /api/usage/credential records each pushed key's `orgId` there (#283). It is
   // the Organization the history was stamped with, which the key may no longer
   // list. The key's other Organizations arrive by `learnFromKey` on a client
   // with no Hub, or by the Hub's roster on a hub-connected one (#366).
@@ -245,16 +296,41 @@ export type BuildAppDeps = {
     rename: (uuid: string, label: string | null) => Promise<OrganizationRenameResult>;
     recordDiscovery: (orgs: readonly DiscoveredOrg[]) => Promise<void>;
     rememberOrganization: (uuid: string) => Promise<void>;
-    // #366: a key arrived; a client with no Hub lists that key's Organizations
-    // into the roster (key-listing.ts). Fire-and-forget: never gates the ack.
+    // #366: a key arrived, once per key a push carries; a client with no Hub
+    // lists that key's Organizations into the roster (key-listing.ts), and
+    // every client reads its Account (#633). Fire-and-forget: never gates the
+    // ack.
     learnFromKey?: (sessionKey: string) => void;
   };
   // What the `organization` query param resolves against (#278): the effective
   // Home and the resolved tracked set, as a LIVE accessor — a settings edit
   // moves either in-session, and the next request must resolve under it.
-  // `scopeOrganizations` turns the param plus this into the store's
-  // `organizations` axis; `{ home: null, tracked: null }` narrows nothing.
-  organizationScope: () => OrganizationScopeState;
+  // `requestScope` turns the `account` and `organization` params plus this into
+  // the store's two axes; no Home narrows nothing.
+  organizationScope: () => ScopeState;
+  // #631: the Account roster. GET /api/accounts answers `list`. Optional:
+  // absent ⇒ the route is not mounted (the test apps that wire no roster).
+  // #635: `rename` applies PUT /api/accounts/:uuid/label's rules
+  // (`createAccountRename`) and answers the fresh roster or a refusal; absent
+  // ⇒ that route is not mounted.
+  accounts?: {
+    list: () => Promise<AccountsResponse>;
+    rename?: (uuid: string, label: string | null) => Promise<AccountRenameResult>;
+  };
+  // #639: GET /api/account-sources (account-sources.ts), where this machine
+  // sees each Account. Optional: absent ⇒ the route is not mounted.
+  accountSources?: {
+    list: () => Promise<AccountSourcesResponse>;
+  };
+  // ADR-0141 §5, §7 (#651): the Gateways this machine holds
+  // (gateway-client.ts). POST /api/gateways/config replaces the held set,
+  // POST /api/gateways/check runs Connect's checks, GET /api/gateways lists
+  // them. Optional: absent ⇒ none of the three is mounted.
+  gateways?: {
+    configure: (entries: readonly GatewayConfigEntry[]) => void;
+    check: (entry: GatewayConfigEntry) => Promise<GatewayCheckResponse>;
+    list: () => LocalGatewaysResponse["gateways"];
+  };
   // #310: the Organization assertions. GET /api/organization-assertions reads
   // this machine's resolved claims; PUT sets or clears them in bulk under
   // `createOrganizationAssert`'s rules. Optional: absent ⇒ neither route is
@@ -264,6 +340,7 @@ export type BuildAppDeps = {
     assert: (
       sessionIds: readonly string[],
       organizationUuid: string | null,
+      accountUuid?: string,
     ) => Promise<OrganizationAssertResult>;
   };
   // Live Loop-lag summary (issue #116 / F4). GET /api/status composes this
@@ -463,11 +540,26 @@ type CommonQuery = {
   // Machine ids to include (ADR-0041 M5) — repeated `machine=` params, exact
   // match on the event's machineId. An empty array means "no filter".
   machines: string[];
-  // The Organization scope (#278) — the one `organization=` param resolved by
-  // `scopeOrganizations`: Home's uuid when the param is absent or stale, the
-  // tracked set under `all`, and `[]` (no narrowing) on a machine with no Home.
-  organizations: string[];
+  // The Scope (#278, #632, #637) — the repeated `account=`, `organization=`
+  // and `membership=` params resolved by `requestScope`, kept as one object:
+  // its fields (`organizations`, `accounts`, `unknownAccount`, `memberships`)
+  // are the store query's and the report cache's Scope axes by the same
+  // names, so a handler spreads it whole (`filterAxes`) and never copies an
+  // axis by hand. Neither axis param is the Home membership; `[]` on an axis
+  // narrows nothing, as on a machine with no Home.
+  scope: ResolvedScope;
 };
+
+// A report query's non-date filter axes as the store query and the report
+// cache both take them: the project, model and machine filters and the
+// resolved Scope's axes.
+function filterAxes(q: CommonQuery): {
+  projects: string[];
+  models: string[];
+  machines: string[];
+} & ResolvedScope {
+  return { projects: q.projects, models: q.models, machines: q.machines, ...q.scope };
+}
 
 // Parse + validate the shared `mode` query param. Returns the parsed CostMode,
 // or a Response carrying the pinned 400 envelope (packages/shared/src/error.ts)
@@ -535,12 +627,14 @@ function withEngineErrors(
 // on validation failure so handlers can early-return. The shape matches the
 // pinned ErrorResponse envelope from packages/shared/src/error.ts.
 //
-// `scope` is the live Organization scope state (`deps.organizationScope()`),
-// read once per request. The `organization` param never 400s: a value that
-// names nothing tracked resolves to Home (#262 items 2 and 11) — a scope left
-// stale by an exclusion or a shrunken set is answered as Home, the same rule
-// the renderer's `parseSettings` applies, rather than refused.
-function parseCommonQuery(c: Context, scope: OrganizationScopeState): CommonQuery | Response {
+// `scope` is the live Scope state (`deps.organizationScope()`), read once per
+// request. Neither Scope param ever 400s (`resolveScope`): an Organization that
+// names nothing tracked is dropped and an axis left empty is Home's part (#262
+// items 2 and 11) — an Organization scope left stale by an exclusion or a
+// shrunken set is answered as Home, the same rule the renderer's
+// `parseSettings` applies, rather than refused. An Account key is kept as
+// named, so a stale one matches no row (#635).
+function parseCommonQuery(c: Context, scope: ScopeState): CommonQuery | Response {
   // Empty since/until (?until=) coerce to absent — an empty bound must not
   // reach the store, where `date.ymd > ""` is true for every date (a silent
   // empty report). Consistent with the empty-array-means-no-filter convention.
@@ -587,8 +681,28 @@ function parseCommonQuery(c: Context, scope: OrganizationScopeState): CommonQuer
     return c.json(body, 400);
   }
 
-  const organizations = scopeOrganizations(c.req.query("organization"), scope);
-  return { since, until, mode, tz, projects, models, machines, organizations };
+  return {
+    since,
+    until,
+    mode,
+    tz,
+    projects,
+    models,
+    machines,
+    scope: requestScope(scopeTokens(c), scope),
+  };
+}
+
+// A request's raw Scope tokens (#632): the repeated `account=` and
+// `organization=` params, and the repeated `membership=` params (#637), which
+// name the Scope alone when present, the two axes beside them ignored. Each
+// list is empty when absent.
+function scopeTokens(c: Context): ScopeTokens {
+  return {
+    account: c.req.queries("account") ?? [],
+    organization: c.req.queries("organization") ?? [],
+    membership: c.req.queries("membership") ?? [],
+  };
 }
 
 // Whether the report cache can answer an `/api/daily` window (#423, ADR-0116):
@@ -603,7 +717,18 @@ function windowIsLocalDates(q: CommonQuery): boolean {
   );
 }
 
-export function buildApp(deps: BuildAppDeps): Hono {
+// The head of a Scope on a machine with no Home: no Organization, no Account.
+const NO_HEAD: ScopeHeadResponse = { organizationUuid: null, accountUuid: null };
+
+// The sidecar's app, and the head rule it applies to a Scope's tokens
+// (`scopeHeadOf`), which the status's usage connection reads for the persisted
+// Scope (boot.ts), so the status never describes another Organization than
+// /api/scope-head answers for the same tokens. Exposed here because the
+// candidates come from the block reports, built inside `buildApp` over the
+// handlers' own store accessor and never injected.
+export type SidecarApp = Hono & { scopeHead: (tokens: ScopeTokens) => ScopeHeadResponse };
+
+export function buildApp(deps: BuildAppDeps): SidecarApp {
   const app = new Hono();
 
   // This app's own rescan coalescing slot on the shared gate (ADR-0059). The
@@ -709,9 +834,10 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // (#278, `parseCommonQuery`) is one more such axis on every money endpoint,
   // the readout's `todayCost` included. The quota-shaped reads —
   // /api/usage/current, the readout's utilization half, /api/blocks and the
-  // intraday `block` span — answer the Quota organization alone
-  // (`quotaOrganization`): Blocks form from that one Organization's events and
-  // samples.
+  // intraday `block` span — read one Membership or Organization: Blocks form
+  // per Membership from its own rows and samples (`createBlockReports`), and
+  // the usage-limits reads take the head Membership's Organization
+  // (`scopeHead`).
   // `aggregateDaily` does the date grouping and returns `{ daily, totals? }` —
   // `totals` is omitted on the 2+-project path per the E1 golden.
   //
@@ -732,10 +858,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         const body = await reportCache.daily({
           mode: q.mode,
           timeZone: q.tz,
-          projects: q.projects,
-          models: q.models,
-          machines: q.machines,
-          organizations: q.organizations,
+          ...filterAxes(q),
           since: q.since,
           until: q.until,
           projectFilterCount: q.projects.length,
@@ -749,15 +872,46 @@ export function buildApp(deps: BuildAppDeps): Hono {
         since: q.since,
         until: q.until,
         timeZone: q.tz,
-        projects: q.projects,
-        models: q.models,
-        machines: q.machines,
-        organizations: q.organizations,
+        ...filterAxes(q),
       });
       const body = aggregateDaily(events, q.mode, {
         projectFilterCount: q.projects.length,
         timeZone: q.tz,
       });
+      return c.json(body);
+    }),
+  );
+
+  // --- /api/membership-totals (#637) ---------------------------------------
+  //
+  // The scoped money split by Membership, for the split money tiles: the
+  // common report query (window, filters, Scope, `membership=` included) as
+  // one direct store query, the same query `/api/daily` answers off-cache,
+  // grouped by each row's resolved (Organization, Account). Each row's numbers
+  // are `/api/daily`'s `totals` for that Membership's rows under the same
+  // cost mode (`aggregateMembershipTotals`). Never cached: one O(rows) pass.
+  app.get(
+    MEMBERSHIP_TOTALS_PATH,
+    withEngineErrors(MEMBERSHIP_TOTALS_PATH, async (c) => {
+      const q = parseCommonQuery(c, deps.organizationScope());
+      if (q instanceof Response) return q;
+      await deps.engineReady();
+      const store = reportStore();
+      // The presumption read before the query: the store reads its one source
+      // synchronously in `query`, so both resolve every row under one Home.
+      const presumption = store.presumption();
+      const events = store.query({
+        since: q.since,
+        until: q.until,
+        timeZone: q.tz,
+        ...filterAxes(q),
+      });
+      const body: MembershipTotalsResponse = aggregateMembershipTotals(
+        events,
+        q.mode,
+        q.tz,
+        presumption,
+      );
       return c.json(body);
     }),
   );
@@ -787,10 +941,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         const body = await reportCache.dailyByProject({
           mode: q.mode,
           timeZone: q.tz,
-          projects: q.projects,
-          models: q.models,
-          machines: q.machines,
-          organizations: q.organizations,
+          ...filterAxes(q),
         });
         return c.json(body);
       }
@@ -800,10 +951,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         since: q.since,
         until: q.until,
         timeZone: q.tz,
-        projects: q.projects,
-        models: q.models,
-        machines: q.machines,
-        organizations: q.organizations,
+        ...filterAxes(q),
       });
       return c.json(aggregateDailyByProject(events, q.mode, q.tz));
     }),
@@ -834,10 +982,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         const body = await reportCache.dailyByMachine({
           mode: q.mode,
           timeZone: q.tz,
-          projects: q.projects,
-          models: q.models,
-          machines: q.machines,
-          organizations: q.organizations,
+          ...filterAxes(q),
           includeProjects,
         });
         return c.json(body);
@@ -847,10 +992,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         since: q.since,
         until: q.until,
         timeZone: q.tz,
-        projects: q.projects,
-        models: q.models,
-        machines: q.machines,
-        organizations: q.organizations,
+        ...filterAxes(q),
       });
       return c.json(aggregateDailyByMachine(events, q.mode, q.tz, includeProjects));
     }),
@@ -876,7 +1018,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
   //
   // `span=block` (ADR-0031): the active 5-hour quota block's growing frame
   // (`[block start → now]`). The handler resolves the frame server-side via
-  // `blockReports.span` over the Quota organization's formation (never
+  // `blockReports.span` over the Scope's head Membership's formation (never
   // project/model/machine-filtered — ADR-0017/0028; every row with no Home —
   // ADR-0108) and passes it to the engine. No active block ⇒ 200 with empty
   // buckets and `blockWindow: null`. `bucketMs` is optional for `block` — the
@@ -974,13 +1116,10 @@ export function buildApp(deps: BuildAppDeps): Hono {
       const mode = parseMode(c);
       if (mode instanceof Response) return mode;
       const { projects, models, machines } = readFilters(c);
-      // The Organization scope (#278), resolved exactly as `parseCommonQuery`
+      // The Scope (#278, #632), resolved exactly as `parseCommonQuery`
       // resolves it. Every span but `block` narrows by it; `block` answers the
-      // Quota organization instead (see the block branch).
-      const organizations = scopeOrganizations(
-        c.req.query("organization"),
-        deps.organizationScope(),
-      );
+      // Scope's head Membership instead (see the block branch).
+      const scope = requestScope(scopeTokens(c), deps.organizationScope());
       // The IANA zone — REQUIRED for the `today` calendar-day span (ADR-0020),
       // which anchors its window to local midnight in this zone; the other
       // spans ignore it. Same validation + host-zone default as
@@ -1013,10 +1152,19 @@ export function buildApp(deps: BuildAppDeps): Hono {
         // the empty state).
         const now = deps.now();
         // Resolved after the engine is ready, from one scope read, right before
-        // the synchronous formation: the Home that picks Q is the Home that
-        // presumes the store's owner-less rows and Q's unstamped samples.
-        const quota = quotaSampleScope(c.req.query("organization"), deps.organizationScope());
-        const resolved = blockReports.span(now, quota);
+        // the synchronous formation: the Home that picks the head Membership
+        // is the Home that presumes the store's owner-less rows and its
+        // unstamped samples. No Home is the unscoped formation, narrowed by
+        // the Scope's explicit Account keys (`noHomeFormation`, #635); a Scope
+        // with no Membership has no Block.
+        const scopeState = deps.organizationScope();
+        const home = scopeState.home;
+        const blockScope = requestScope(scopeTokens(c), scopeState);
+        const quota =
+          home === null
+            ? noHomeFormation(blockScope)
+            : blockReports.head({ scope: blockScope, home });
+        const resolved = home !== null && quota === null ? null : blockReports.span(now, quota);
         if (resolved === null) {
           const body: IntradayResponse = {
             buckets: [],
@@ -1027,16 +1175,12 @@ export function buildApp(deps: BuildAppDeps): Hono {
           };
           return c.json(body);
         }
-        // The series describes the frame's Organization: Q's events, never the
-        // money scope's (All sums Organizations; a quota cannot). Frame and
-        // series then both describe Q, the ADR-0031 parity with `/api/blocks`
-        // under the same param. No Home is no scope: every event.
-        const events = reportStore().query({
-          projects,
-          models,
-          machines,
-          organizations: quota === null ? undefined : [quota.organization],
-        });
+        // The series describes the frame's Membership: its formation's rows,
+        // never the money scope's (All sums Memberships; a quota cannot).
+        // Frame and series then both describe it, the ADR-0031 parity with
+        // `/api/blocks`' head under the same params. No Home is no scope:
+        // every event, or the named Accounts' alone.
+        const events = formationRows(reportStore(), quota, { projects, models, machines });
         return c.json(
           aggregateIntraday(events, mode, {
             span: "block",
@@ -1050,7 +1194,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
         );
       }
 
-      const events = reportStore().query({ projects, models, machines, organizations });
+      const events = reportStore().query({ projects, models, machines, ...scope });
       if (span === "week") {
         if (weekStartMs === undefined) throw new Error("intraday: span week without weekStart");
         return c.json(
@@ -1103,10 +1247,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
       const body = await reportCache.sessions({
         mode: q.mode,
         timeZone: q.tz,
-        projects: q.projects,
-        models: q.models,
-        machines: q.machines,
-        organizations: q.organizations,
+        ...filterAxes(q),
         since: q.since,
         until: q.until,
       });
@@ -1136,10 +1277,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
       const body = await reportCache.projects({
         mode: q.mode,
         timeZone: q.tz,
-        projects: q.projects,
-        models: q.models,
-        machines: q.machines,
-        organizations: q.organizations,
+        ...filterAxes(q),
         since: q.since,
         until: q.until,
       });
@@ -1149,10 +1287,11 @@ export function buildApp(deps: BuildAppDeps): Hono {
 
   // --- /api/blocks --------------------------------------------------------
   //
-  // Blocks describe the Quota organization — the one axis that shapes
-  // formation: its events and samples alone form the windows, annulment,
-  // grace evidence, burn rate, projection and limit %, so two Organizations'
-  // overlapping quota windows never meet. Cross-project by design — the 5-hour
+  // Blocks describe the Scope's Memberships, each formed on its own — the one
+  // axis that shapes formation: a Membership's events and samples alone form
+  // the windows, annulment, grace evidence, burn rate, projection and limit %,
+  // so two Memberships' overlapping quota windows never meet. `blocks` is the
+  // head Membership's; `memberships` lists each while there are two or more. Cross-project by design — the 5-hour
   // quota window is inherently cross-project, so the project filter never
   // reaches it. The MODEL and MACHINE filters (ADR-0017, ADR-0041) are honoured
   // as sum-narrowing options inside that formation: boundaries, isActive and
@@ -1164,30 +1303,34 @@ export function buildApp(deps: BuildAppDeps): Hono {
       const q = parseCommonQuery(c, deps.organizationScope());
       if (q instanceof Response) return q;
       await deps.engineReady();
-      // `q.organizations` is the money scope and never reaches formation: All
-      // sums Organizations, a quota cannot. The Quota organization is resolved
-      // here instead — after the engine is ready, from one scope read, right
-      // before the synchronous formation — so the Home that picks Q is the
-      // Home that presumes the store's owner-less rows and Q's unstamped
-      // samples.
-      const quota = quotaSampleScope(c.req.query("organization"), deps.organizationScope());
+      // `q.scope` is the money scope and never reaches formation: All sums
+      // Memberships, a quota cannot. The Scope is resolved
+      // again here — after the engine is ready, from one scope read, right
+      // before the synchronous formation — so the Home that orders the
+      // Memberships is the Home that presumes the store's owner-less rows and
+      // their unstamped samples. Each Membership forms on its own.
+      const scopeState = deps.organizationScope();
+      const home = scopeState.home;
+      const scope = requestScope(scopeTokens(c), scopeState);
       // One pass (ADR-0028): observed reset windows from the usage history
       // partition block formation; the heuristic survives only in history
       // holes; fiveHourLimitPct fills from the same samples. With an empty
       // history this is the pure heuristic port.
+      const options = {
+        since: q.since,
+        until: q.until,
+        timeZone: q.tz,
+        models: q.models,
+        machines: q.machines,
+        now: deps.now(),
+      };
+      // No Home: the unscoped formation, narrowed by the Scope's explicit
+      // Account keys as the money reports are (#635), so `account=` never
+      // shows every row's Blocks.
       return c.json(
-        blockReports.blocks(
-          q.mode,
-          {
-            since: q.since,
-            until: q.until,
-            timeZone: q.tz,
-            models: q.models,
-            machines: q.machines,
-            now: deps.now(),
-          },
-          quota,
-        ),
+        home === null
+          ? blockReports.blocks(q.mode, options, noHomeFormation(scope))
+          : blockReports.scoped(q.mode, options, { scope, home }),
       );
     }),
   );
@@ -1228,7 +1371,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
     // The Organization scope (#278), resolved as every report resolves it — a
     // store-query axis too, so a mixed session streams only the scope's events
     // and the summary covers exactly those.
-    const organizations = scopeOrganizations(c.req.query("organization"), deps.organizationScope());
+    const scope = requestScope(scopeTokens(c), deps.organizationScope());
 
     // The pre-stream phase — the `store.query` + `aggregateSessionEvents` fold
     // — runs before the HTTP 200 header is committed, so a throw here still
@@ -1240,7 +1383,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
     try {
       await deps.engineReady();
       aggregate = aggregateSessionEvents(
-        reportStore().query({ sessions: [id], models, machines, organizations }),
+        reportStore().query({ sessions: [id], models, machines, ...scope }),
         mode,
         id,
       );
@@ -1335,6 +1478,67 @@ export function buildApp(deps: BuildAppDeps): Hono {
     ),
   );
 
+  // The Scope's head for the surfaces that read one usage-limits reading: the
+  // shared head rule (`scopeHeadOrganization`, @maxprice/shared, applied in
+  // its two parts: `homeHeadOf`, then `headOrganizationWithoutHome`), which the
+  // renderer's quota surfaces apply too. Home's Organization while the Scope
+  // holds the Home membership, which then heads it (no store needed), else
+  // the Organization of the head Membership Blocks form, so the reading and
+  // the Blocks shown never name two Organizations.
+  //
+  // Synchronous, over the store and samples as they stand: the candidates are
+  // read from memory (`blockReports.candidates`). The handlers await the
+  // engine first whenever the store is needed (`scopeHeadMembership`); the
+  // status's usage connection calls it as it is (`SidecarApp.scopeHead`).
+  function scopeHeadOf(tokens: ScopeTokens): ScopeHeadResponse {
+    const state = deps.organizationScope();
+    if (state.home === null) return NO_HEAD;
+    const scope = requestScope(tokens, state);
+    return homeHeadOf(scope, state.home) ?? candidateHeadOf(scope, state.home);
+  }
+  // The Home membership's head when the Scope holds it, else null.
+  function homeHeadOf(scope: ResolvedScope, home: HomeMembership): ScopeHeadResponse | null {
+    return scopeHasMembership(scope, home.organizationUuid, home.accountUuid ?? undefined)
+      ? { organizationUuid: home.organizationUuid, accountUuid: home.accountUuid }
+      : null;
+  }
+  // The head of a Scope that does not hold the Home membership, over the
+  // store's candidates.
+  function candidateHeadOf(scope: ResolvedScope, home: HomeMembership): ScopeHeadResponse {
+    const candidates = blockReports.candidates({ scope, home });
+    const organizationUuid = headOrganizationWithoutHome(scope, home, candidates);
+    const head = candidates[0]?.membership;
+    return {
+      organizationUuid,
+      accountUuid: head?.organizationUuid === organizationUuid ? head.accountUuid : null,
+    };
+  }
+  // A request's head: the store is awaited only when the Home membership does
+  // not head its Scope, so a Home-headed reading never waits on the engine and
+  // resolves its tokens once. A Scope the store must head is resolved again
+  // after the wait, from the Scope state as it then stands: the Home that
+  // orders the candidates is the Home that presumes the store's rows.
+  async function scopeHeadMembership(
+    c: Context,
+    tokens: ScopeTokens = scopeTokens(c),
+  ): Promise<ScopeHeadResponse> {
+    const state = deps.organizationScope();
+    if (state.home === null) return NO_HEAD;
+    const homeHead = homeHeadOf(requestScope(tokens, state), state.home);
+    if (homeHead !== null) return homeHead;
+    await deps.engineReady();
+    return scopeHeadOf(tokens);
+  }
+  const scopeHead = async (c: Context, tokens?: ScopeTokens): Promise<string | null> =>
+    (await scopeHeadMembership(c, tokens)).organizationUuid;
+
+  // --- /api/scope-head --- (#637) the head `scopeHead` applies to these Scope
+  // params, for the renderer's quota surfaces when settings alone cannot tell
+  // it (`settledHeadOrganization`): the Organization whose reading
+  // /api/usage/current answers for the same params, and the head Membership's
+  // Account. GET, unauthenticated like every report.
+  app.get(SCOPE_HEAD_PATH, async (c) => c.json(await scopeHeadMembership(c)));
+
   // --- /api/usage/current ---  (ADR-0023) last-known sample for the rings'
   // first paint; live updates arrive via the usage:sample SSE event. The WIRE
   // shape is the projected `{ sample }` (f10) — `connection` / `lastSampleAt`
@@ -1342,9 +1546,10 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // `weeklyResetAt` rides beside `sample` (ADR-0083): the Week resolver needs
   // the weekly window even while a poll legitimately reports `sample: null`.
   //
-  // Both describe ONE Organization, the Quota organization the `organization`
-  // param resolves to (`quotaOrganization`): the scoped Organization, or Home
-  // when the param is absent, `all`, or names nothing tracked — never a 400.
+  // Both describe ONE Organization, the head Membership's (`scopeHead`): the
+  // Home organization whenever the Scope holds the Home membership (no params,
+  // `all`, a stale value), else the Organization Blocks' head forms in —
+  // never a 400. One reading per Membership is #633's.
   // With no live reading yet, the poller answers from that Organization's own
   // persisted history (unstamped legacy lines count as Home's), so the Week
   // anchor never borrows another Organization's reset. No Home answers no
@@ -1352,10 +1557,8 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // request names the Organization, the response does not repeat it, so a
   // single-Organization machine answers exactly what it did before stamping.
   // The usage:sample SSE payload carries the stamp.
-  app.get("/api/usage/current", (c) => {
-    const cur = deps.usage.getCurrent(
-      quotaOrganization(c.req.query("organization"), deps.organizationScope()),
-    );
+  app.get("/api/usage/current", async (c) => {
+    const cur = deps.usage.getCurrent(await scopeHead(c));
     let sample = cur.sample;
     if (sample?.organizationUuid !== undefined) {
       // A copy: the poller's live sample is shared with the SSE payload.
@@ -1372,35 +1575,122 @@ export function buildApp(deps: BuildAppDeps): Hono {
   // hidden ever rides here. The rename PUT is below, behind the auth guard.
   app.get(ORGANIZATIONS_PATH, async (c) => c.json(await deps.organizations.list()));
 
+  // --- /api/accounts ---  (#631, ADR-0136 §7) every Account this machine
+  // knows, Tracked or Excluded, with its label and the Organizations its
+  // evidence names; plus the Account seed and the Pending account folds its
+  // host persists (the sidecar never writes settings.json, ADR-0014). An
+  // address rides only as read on this machine, live, and is kept nowhere.
+  const accounts = deps.accounts;
+  if (accounts !== undefined) {
+    app.get(ACCOUNTS_PATH, async (c) => c.json(await accounts.list()));
+  }
+  // --- /api/account-sources ---  (#639, ADR-0141 §8) where this machine
+  // sees each Account: a root's current login, and each held Gateway whose
+  // credential list names it. Account keys and Gateway ids only, never an
+  // email or a Gateway's URL; open like GET /api/accounts, whose keys it
+  // names.
+  const accountSources = deps.accountSources;
+  if (accountSources !== undefined) {
+    app.get(ACCOUNT_SOURCES_PATH, async (c) => c.json(await accountSources.list()));
+  }
+  // --- PUT /api/accounts/:uuid/label ---  (#635, ADR-0136 §7) label one
+  // Account, or clear its label (`label: null`) back to the email as read
+  // here, else `Account <first 8>`. The rules are `createAccountRename`'s; this
+  // maps its answer onto HTTP. 200 carries the fresh Account roster. A Pending
+  // key or any other target that is not an account uuid is a 400, since only
+  // an account uuid may key the Label directory; a label another Account here
+  // already shows (case-insensitively), or a new label past the Label
+  // directory's cap on this machine's union of Organization and Account
+  // labels, is a 409. A label is presentation: it moves no number.
+  const renameAccount = accounts?.rename;
+  if (renameAccount !== undefined) {
+    app.put(
+      `${ACCOUNTS_PATH}/:uuid/label`,
+      withEngineErrors(
+        "PUT /api/accounts/:uuid/label",
+        async (c) => {
+          const unauthorized = usageAuthGuard(c);
+          if (unauthorized) return unauthorized;
+          const parsed = accountLabelRequestSchema.safeParse(await c.req.json().catch(() => null));
+          if (!parsed.success) {
+            const body: ErrorResponse = {
+              error: "invalid account label",
+              issues: parsed.error.issues.map(({ code, path, message }) => ({
+                code,
+                path,
+                message,
+              })),
+            };
+            return c.json(body, 400);
+          }
+          // Always present on this route; `Context` is untyped for path params.
+          const uuid = c.req.param("uuid") ?? "";
+          const result = await renameAccount(uuid, parsed.data.label);
+          switch (result.kind) {
+            case "ok":
+              return c.json(result.body);
+            case "invalid-account": {
+              const body: ErrorResponse = { error: "not an account uuid" };
+              return c.json(body, 400);
+            }
+            case "invalid": {
+              const body: ErrorResponse = {
+                error:
+                  result.reason === "empty"
+                    ? "label is empty"
+                    : `label is longer than ${LABEL_MAX} characters`,
+              };
+              return c.json(body, 400);
+            }
+            case "duplicate": {
+              const body: ErrorResponse = { error: "another account already uses that label" };
+              return c.json(body, 409);
+            }
+            case "full": {
+              const body: ErrorResponse = { error: "label directory is full" };
+              return c.json(body, 409);
+            }
+          }
+        },
+        "account label failed",
+      ),
+    );
+  }
+
   // --- /api/readout ---  (map #168 T5/M3; ADR-0076) the tray readout's one
   // wire: the desktop shell's Rust ambient writer polls this ~1/min and renders
   // the Windows tray tooltip / macOS menu-bar title from it. Composed here, not
   // in Rust, so the tray is penny-exact with Live: `todayCost` is the direct
   // store query + `aggregateDaily` fold of the Today tile's window (bounded to
-  // today's local date in the requested zone, and narrowed by the
-  // `organization` scope as the tile is — #278). The tile itself reads that
+  // today's local date in the requested zone, and narrowed by the Scope as
+  // the tile is — #278, #637). The tile itself reads that
   // window as a slice of the report cache's daily entry since #423, equal to
   // this fold byte for byte (ADR-0116, pinned by test). And `blockLive`
   // mirrors the renderer's usage-ring rule — a current sample whose
   // fiveHour.resetAt is still ahead (NaN-guarded, like usageRingState). The
-  // shell supplies `mode`/`tz` from settings.json per poll, and `organization`
-  // when the `organizationScope` it resolves there names a tracked Organization
-  // other than Home, or All (absent means Home); the sidecar keeps its
-  // no-ambient-params invariant. GET, unauthenticated like every report.
+  // shell supplies `mode`/`tz` from settings.json per poll, and the persisted
+  // Scope's tokens (`scope`, #637) as the repeated `account`,
+  // `organization` and `membership` params, unresolved (none for the default
+  // Scope); the sidecar keeps its no-ambient-params invariant and resolves them
+  // as every report does. GET, unauthenticated like every report.
   //
-  // The one `organization` param answers the two halves by two rules, read off
-  // ONE scope state so they never disagree about Home: `todayCost` is money
-  // and sums the scope (`scopeOrganizations`, so All is every tracked
-  // Organization's today), while `blockLive`, `utilizationPct` and
-  // `hasModelWindow` are quota and describe the Quota organization alone
-  // (`quotaOrganization`, so All is Home's sample), the same Organization
-  // /api/usage/current answers for that param.
+  // The one Scope answers the two halves by two rules, read off ONE scope
+  // state so they never disagree about Home: `todayCost` is money and sums the
+  // Scope (`requestScope`, so All is every tracked Organization's today), while `blockLive`, `utilizationPct` and
+  // `hasModelWindow` are quota and describe the Scope's head Organization
+  // alone (`scopeHead`, so All is Home's sample), the same Organization
+  // /api/usage/current answers for that Scope.
   //
   // The optional `organizations` field (#291) names that Quota organization by
-  // its roster display label and says whether the scope resolved to All; it is
-  // filled from the roster only on a multi-Organization machine, so a
-  // single-Organization poll reads no roster and its body is unchanged. A
-  // failed roster read falls back to the short-id label, never to a 500.
+  // its roster display label; it is filled from the roster only on a
+  // multi-Organization machine, so a single-Organization poll reads no roster
+  // and its body is unchanged. A failed roster read falls back to the short-id
+  // label, never to a 500. The optional `wideScope` (#622 item 4, #637) says
+  // what the money half sums when the Scope holds more than one Membership
+  // (`readoutWideScope`), so the tooltip can name it. The optional `mostUsed`
+  // and `popoutLimitRows` (#638) are the most used Readout and the ranked
+  // Popout's row count over the Scope's multi-Membership set
+  // (`scopeMembershipSet`), absent on a one-Account install.
   app.get(
     "/api/readout",
     withEngineErrors("/api/readout", async (c) => {
@@ -1410,10 +1700,33 @@ export function buildApp(deps: BuildAppDeps): Hono {
       if (tz instanceof Response) return tz;
       await deps.engineReady();
 
-      const organization = c.req.query("organization");
+      // The Scope params, applied as the persisted Scope when the shell says
+      // they are it (`PERSISTED_SCOPE_PARAM`): as the visible controls can
+      // show them, by the Account roster's tracked count, so a one-Account
+      // install's tray answers the default Scope the Today tile does (#637).
+      // The Account roster, read at most once per poll and only when a rule
+      // below needs it; undefined when there is none or the read failed.
+      let roster: Promise<AccountsResponse["accounts"] | undefined> | undefined;
+      const accountRoster = (): Promise<AccountsResponse["accounts"] | undefined> => {
+        roster ??= (async () => {
+          if (deps.accounts === undefined) return undefined;
+          try {
+            return (await deps.accounts.list()).accounts;
+          } catch (err) {
+            console.warn("[sidecar] readout account roster read failed:", err);
+            return undefined;
+          }
+        })();
+        return roster;
+      };
+      let tokens = scopeTokens(c);
+      if (c.req.query(PERSISTED_SCOPE_PARAM) !== undefined) {
+        tokens = await effectiveScopeTokens(tokens, accountRoster);
+      }
       const scope = deps.organizationScope();
+      const resolved = requestScope(tokens, scope);
       const now = deps.now();
-      const quota = quotaOrganization(organization, scope);
+      const quota = await scopeHead(c, tokens);
       const sample = deps.usage.getCurrent(quota).sample;
       const resetMs = sample?.fiveHour == null ? Number.NaN : Date.parse(sample.fiveHour.resetAt);
       const blockLive = !Number.isNaN(resetMs) && resetMs > now;
@@ -1436,7 +1749,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
           since: today.ymd,
           until: today.ymd,
           timeZone: tz,
-          organizations: scopeOrganizations(organization, scope),
+          ...resolved,
         });
         const daily = aggregateDaily(events, mode, { projectFilterCount: 0, timeZone: tz });
         todayCost = daily.daily.find((row) => row.date === today.dashed)?.totalCost ?? 0;
@@ -1449,33 +1762,95 @@ export function buildApp(deps: BuildAppDeps): Hono {
         hasData: deps.liveHub.getStatus().hasData,
         hasModelWindow: sample?.weeklyModel !== undefined,
       };
-      const tracked = scope.tracked ?? [];
+      const tracked = scope.trackedOrganizations ?? [];
+      const homeOrganization = scope.home?.organizationUuid ?? null;
       const multi =
-        scope.home !== null &&
-        resolveOrganizationScope(ALL_ORGANIZATIONS, scope.home, tracked) === ALL_ORGANIZATIONS;
+        homeOrganization !== null &&
+        resolveOrganizationScope(ALL_ORGANIZATIONS, homeOrganization, tracked) ===
+          ALL_ORGANIZATIONS;
+      // The Organization labels, read at most once per poll. Display only: a
+      // roster read that fails (a registry write's temp-file rename, say)
+      // degrades every label to the short id rather than failing the readout,
+      // which would take the tray's numbers with it (ADR-0076).
+      let labels: Promise<Map<string, string>> | undefined;
+      const organizationLabels = (): Promise<Map<string, string>> => {
+        labels ??= (async () => {
+          let organizations: OrganizationsResponse["organizations"] = [];
+          try {
+            organizations = (await deps.organizations.list()).organizations;
+          } catch (err) {
+            console.warn("[sidecar] readout roster read failed:", err);
+          }
+          return displayOrganizationLabels(organizations);
+        })();
+        return labels;
+      };
       if (multi && quota !== null) {
-        // The label is display only: a roster read that fails (a registry
-        // write's temp-file rename, say) degrades it to the short id rather
-        // than failing the readout, which would take the tray's numbers with
-        // it (ADR-0076). The key stays, so the shell still names the
-        // Organization.
-        let roster: OrganizationsResponse["organizations"] = [];
-        try {
-          roster = (await deps.organizations.list()).organizations;
-        } catch (err) {
-          console.warn("[sidecar] readout roster read failed:", err);
-        }
+        // The key stays on a failed roster read, so the shell still names
+        // the Organization.
         body.organizations = {
           quotaLabel:
-            displayOrganizationLabels(roster).get(quota) ??
+            (await organizationLabels()).get(quota) ??
             resolveOrganizationLabel({
               uuid: quota,
               rename: null,
               organizationType: null,
               hints: null,
             }).label,
-          all: resolveOrganizationScope(organization, scope.home, tracked) === ALL_ORGANIZATIONS,
         };
+      }
+      // The money half's wide Scope (#622 item 4, #637). A machine that tracks
+      // one Organization and one Account holds one Membership under every
+      // Scope, so it reads no Account roster and its body is unchanged; the
+      // roster is read only past that, and a failed read counts no Membership
+      // rather than failing the readout.
+      const singleMembership =
+        !multi && scope.trackedAccounts !== null && scope.trackedAccounts.size <= 1;
+      if (!singleMembership) {
+        const accounts = (await accountRoster()) ?? [];
+        const wide = readoutWideScope(resolved, scope, accounts);
+        if (wide !== null) body.wideScope = wide;
+
+        // The most used Readout and the ranked Popout (#638; ADR-0136 §6's
+        // #610/#622 rows). Only the multi-Membership set switches them on
+        // (`scopeMembershipSet`: two or more tracked Accounts, the Memberships
+        // the Scope holds), the set Live's limit area reads, so a one-Account
+        // install's tray and Popout stay as they were. A failed roster read
+        // holds no Membership, and the body is today's.
+        const set = scopeMembershipSet(accounts, scope, resolved);
+        if (set.length >= 2) {
+          body.popoutLimitRows = rankedPopoutLimitRows(set.length);
+          const readings = scopeMembershipReadings(set, accounts, await organizationLabels());
+          const pick = readoutPick(readings, now);
+          switch (pick.kind) {
+            case "single":
+              break;
+            case "percent":
+              body.mostUsed = {
+                fiveHourLive: true,
+                count: pick.count,
+                top: pick.top,
+                next: pick.next,
+              };
+              break;
+            case "money":
+              // Idle means money (#622 item 1): with two or more Readable
+              // Memberships and no 5-hour window in flight among them, the
+              // head Organization's sample (which can be a dead key's stale
+              // reading, ADR-0138 §8) never switches the Readout to a percent.
+              body.blockLive = false;
+              body.utilizationPct = null;
+              if (pick.mostUsed !== null) {
+                body.mostUsed = {
+                  fiveHourLive: false,
+                  count: pick.count,
+                  top: pick.mostUsed,
+                  next: null,
+                };
+              }
+              break;
+          }
+        }
       }
       return c.json(body);
     }),
@@ -1537,12 +1912,16 @@ export function buildApp(deps: BuildAppDeps): Hono {
               error:
                 result.reason === "empty"
                   ? "label is empty"
-                  : `label is longer than ${ORGANIZATION_LABEL_MAX} characters`,
+                  : `label is longer than ${LABEL_MAX} characters`,
             };
             return c.json(body, 400);
           }
           case "duplicate": {
             const body: ErrorResponse = { error: "another organization already uses that label" };
+            return c.json(body, 409);
+          }
+          case "full": {
+            const body: ErrorResponse = { error: "label directory is full" };
             return c.json(body, 409);
           }
         }
@@ -1585,6 +1964,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
           const result = await organizationAssertions.assert(
             parsed.data.sessionIds,
             parsed.data.organizationUuid,
+            parsed.data.accountUuid,
           );
           switch (result.kind) {
             case "ok": {
@@ -1628,26 +2008,30 @@ export function buildApp(deps: BuildAppDeps): Hono {
     }
   });
 
-  // --- /api/usage/credential ---  the renderer pushes the keychain blob here,
-  // verbatim, so the poller can run (in memory only; never persisted). A
-  // literal `null` body clears it; an UNPARSEABLE body (an empty body
-  // included) is a 400, NOT a clear — the only shipped caller sends the
-  // literal "null" (F4). On a valid blob we arm its key alone (ADR-0104: the
-  // tracked set decides what is polled) AND poll immediately so the rings
-  // populate without waiting for the next interval tick. The key then goes to
-  // the key listing (#366), which lists its Organizations into the roster on a
-  // client with no Hub; it is never awaited, so a claude.ai failure or hang
-  // never reaches the ack. A legacy blob also carries `orgId`, the Organization
-  // the pre-#283 poller read: it stamps the usage history's unstamped (legacy)
-  // lines (#279), the only record of which Organization they were read for. It
-  // is then remembered in the roster, so Settings still offers it once the
-  // keychain forgets it: the key may no longer list it, and the key's other
+  // --- /api/usage/credential ---  the host pushes its whole keyset here
+  // (#633, ADR-0138 §6): `{ keys, legacy }` (`usageKeysetSchema`), each
+  // Account's key and the one legacy key whose Account is not yet known, held
+  // in memory only, never persisted. It replaces the held keyset. A literal
+  // `null` body clears it; an UNPARSEABLE body (an empty body included) is a
+  // 400, NOT a clear — the only shipped callers send the literal "null" (F4).
+  // On a valid keyset we arm its keys (ADR-0104: the tracked set decides what
+  // is polled) AND poll immediately so the rings populate without waiting for
+  // the next interval tick. Each arriving key (one the last push did not
+  // hold) then goes to the key listing (#366),
+  // which lists its Organizations into the roster on a client with no Hub and
+  // reads its Account (#633); it is never awaited, so a claude.ai failure or
+  // hang never reaches the ack. Any key may carry `orgId`, the Organization the
+  // pre-#283 poller read, moved with a legacy key into its Account's entry
+  // (ADR-0138 §12): it stamps the usage history's unstamped (legacy) lines
+  // (#279), the only record of which Organization they were read for. It is
+  // then remembered in the roster, so Settings still offers it once the host
+  // forgets it: the key may no longer list it, and the key's other
   // Organizations arrive by the listing (no Hub) or the Hub's roster (#366).
-  // The ack means the stamp and the record both landed, and it is what lets the
-  // renderer drop that `orgId` from the keychain: a failed stamp or roster
-  // record is a 500, and the credential stays armed either way. When a push
-  // finds nothing unstamped, the stamp does no file I/O. A key-only blob and a
-  // clear stamp and remember nothing, and a clear lists nothing.
+  // The ack means every stamp and record landed, and it is what lets the host
+  // drop those `orgId`s: a failed stamp or roster record is a 500, and the
+  // keyset stays armed either way. When a push finds nothing unstamped, the
+  // stamp does no file I/O. A keyset with no `orgId` and a clear stamp and
+  // remember nothing, and a clear lists nothing.
   app.post(
     "/api/usage/credential",
     withEngineErrors("/api/usage/credential", async (c) => {
@@ -1664,23 +2048,29 @@ export function buildApp(deps: BuildAppDeps): Hono {
         return c.json(body, 400);
       }
       if (raw === null) {
-        deps.usage.setCredential(null);
+        deps.usage.setKeyset(null);
         const body = { ok: true } satisfies CredentialAck;
         return c.json(body);
       }
-      const parsed = storedUsageCredentialSchema.safeParse(raw);
+      const parsed = usageKeysetSchema.safeParse(raw);
       if (!parsed.success) {
         const body: ErrorResponse = { error: "invalid credential" };
         return c.json(body, 400);
       }
-      const { sessionKey, orgId } = parsed.data;
-      deps.usage.setCredential({ sessionKey });
+      const keyset = parsed.data;
+      const arrived = deps.usage.setKeyset(keyset);
       await deps.usage.pollOnce();
-      // #366: list this key's Organizations into the roster (a client with no
-      // Hub only — `bootSidecar` decides). Never awaited: claude.ai can fail or hang
-      // and the ack must not.
-      deps.organizations.learnFromKey?.(sessionKey);
-      if (orgId !== undefined) {
+      // #366: list each arriving key's Organizations into the roster (a client
+      // with no Hub only — `bootSidecar` decides). Only an arrival (#633): a
+      // key the last push held already keeps its own hourly clock, so
+      // connecting one Account re-lists no other. Never awaited: claude.ai can
+      // fail or hang and the ack must not.
+      for (const sessionKey of arrived) {
+        deps.organizations.learnFromKey?.(sessionKey);
+      }
+      const entries = [...keyset.keys, ...(keyset.legacy === null ? [] : [keyset.legacy])];
+      const orgIds = new Set(entries.flatMap((k) => (k.orgId === undefined ? [] : [k.orgId])));
+      for (const orgId of orgIds) {
         try {
           await deps.usage.stampHistory(orgId);
         } catch (err) {
@@ -1693,8 +2083,8 @@ export function buildApp(deps: BuildAppDeps): Hono {
         try {
           await deps.organizations.rememberOrganization(orgId);
         } catch (err) {
-          // Same posture as the stamp: no ack, so the keychain keeps the
-          // `orgId` and the next push retries.
+          // Same posture as the stamp: no ack, so the host keeps the `orgId`
+          // and the next push retries.
           console.error("[sidecar] roster record failed:", err);
           const body: ErrorResponse = { error: "roster record failed" };
           return c.json(body, 500);
@@ -1705,13 +2095,85 @@ export function buildApp(deps: BuildAppDeps): Hono {
     }),
   );
 
+  // --- GET /api/usage/keys ---  (#633, ADR-0138 §12) the held keyset as its
+  // host needs it to finish the move: each pushed Account's key with its
+  // connection, and the legacy key with the Account its `/api/account`
+  // resolved. Never a key. Behind the same guard as the usage POSTs, since it
+  // says which Accounts this machine holds keys for.
+  app.get(USAGE_KEYS_PATH, (c) => {
+    const unauthorized = usageAuthGuard(c);
+    if (unauthorized) return unauthorized;
+    const body: UsageKeysResponse = deps.usage.keys();
+    return c.json(body);
+  });
+
+  // --- GET /api/usage/hub-keys ---  (#642, ADR-0140 §6) the Hub's key state
+  // per Account as this client last read it, for the Headless client's
+  // `key list` and `key remove`: loopback only, never on the hub wire, and
+  // never a key. Guarded as GET /api/usage/keys is, since it says which
+  // Accounts hold keys.
+  const hubKeys = deps.usage.hubKeys;
+  if (hubKeys !== undefined) {
+    app.get(USAGE_HUB_KEYS_PATH, (c) => {
+      const unauthorized = usageAuthGuard(c);
+      if (unauthorized) return unauthorized;
+      const body: UsageHubKeysResponse = hubKeys();
+      return c.json(body);
+    });
+  }
+
+  // --- /api/gateways ---  (ADR-0141 §5, §7, #651) the Gateways this machine
+  // holds. The host pushes the whole held set to POST /api/gateways/config
+  // (`{ gateways: [{ url, managementKey }] }`), which replaces it: the
+  // Desktop renderer at launch and on change, from its credential store. The
+  // keys are memory only here. POST /api/gateways/check runs Connect's checks
+  // on one `{ url, managementKey }` and holds nothing; a failed check is a 200
+  // `{ ok: false, failure }`, as the Hub's Connect answers. GET /api/gateways
+  // lists each held Gateway with who drains it, never its key. All three sit
+  // behind the auth guard: the keys reach a Gateway's OAuth tokens (§10).
+  const gatewayDeps = deps.gateways;
+  if (gatewayDeps !== undefined) {
+    app.post(SIDECAR_GATEWAYS_CONFIG_PATH, async (c) => {
+      const unauthorized = usageAuthGuard(c);
+      if (unauthorized) return unauthorized;
+      const parsed = gatewaysConfigRequestSchema.safeParse(await c.req.json().catch(() => null));
+      if (!parsed.success) {
+        const body: ErrorResponse = { error: "invalid Gateway config" };
+        return c.json(body, 400);
+      }
+      gatewayDeps.configure(parsed.data.gateways);
+      const body: GatewaysConfigAck = { ok: true };
+      return c.json(body);
+    });
+    app.post(SIDECAR_GATEWAYS_CHECK_PATH, async (c) => {
+      const unauthorized = usageAuthGuard(c);
+      if (unauthorized) return unauthorized;
+      const parsed = gatewayConnectRequestSchema.safeParse(await c.req.json().catch(() => null));
+      if (!parsed.success) {
+        const body: ErrorResponse = { error: "invalid Gateway check" };
+        return c.json(body, 400);
+      }
+      const body: GatewayCheckResponse = await gatewayDeps.check(parsed.data);
+      return c.json(body);
+    });
+    app.get(SIDECAR_GATEWAYS_PATH, (c) => {
+      const unauthorized = usageAuthGuard(c);
+      if (unauthorized) return unauthorized;
+      const body: LocalGatewaysResponse = { gateways: gatewayDeps.list() };
+      return c.json(body);
+    });
+  }
+
   // --- /api/usage/discover-orgs ---  the renderer can't call claude.ai directly
   // (CORS), so org discovery routes through here. Returns the orgs, each with
   // its roster hints (never its name, #283) and what its usage endpoint
   // answered (`limits`, #270). A successful discovery also seeds the roster
   // with those same orgs (#283), so Settings lists every Organization the key
   // can see; nothing picks one (ADR-0104). The roster is disposable, so a
-  // failed seed is logged and never fails Connect. On failure the
+  // failed seed is logged and never fails Connect. It also reads the key's
+  // `/api/account` (#633, ADR-0138 §2) and answers `account`, the Account the
+  // key is for, or null when that read failed; its address teaches the pair
+  // table and is dropped (ADR-0137 §1). On failure the
   // `failureKind` field carries the kind (`expired` vs `error`) so the
   // renderer can tell a bad session key from a transient network/shape
   // failure.
@@ -1726,7 +2188,10 @@ export function buildApp(deps: BuildAppDeps): Hono {
         const body: ErrorResponse = { error: "sessionKey required" };
         return c.json(body, 400);
       }
-      const result = await deps.usage.discoverOrgs(parsed.data.sessionKey);
+      const [result, account] = await Promise.all([
+        deps.usage.discoverOrgs(parsed.data.sessionKey),
+        deps.usage.readAccount(parsed.data.sessionKey),
+      ]);
       if (result.ok) {
         try {
           await deps.organizations.recordDiscovery(result.orgs);
@@ -1737,6 +2202,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
       const body: DiscoverOrgsResponse = {
         orgs: result.ok ? result.orgs : [],
         failureKind: result.ok ? null : result.kind,
+        account,
       };
       return c.json(body);
     }),
@@ -2032,7 +2498,7 @@ export function buildApp(deps: BuildAppDeps): Hono {
     ),
   );
 
-  return app;
+  return Object.assign(app, { scopeHead: scopeHeadOf });
 }
 
 // --- Entry (only when run as the entry point) ---

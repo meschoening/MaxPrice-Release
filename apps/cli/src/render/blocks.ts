@@ -1,16 +1,21 @@
+import { terminalText } from "@maxprice/usage-core/terminal-text";
 import {
+  ACCOUNT_NOT_KNOWN,
   abbreviate,
   activeBlockOf,
   type BlockRow,
+  type BlocksAggregate,
   blockKind,
   blockRemainingLabel,
   blockStartMs,
   formatCost,
   formatRange,
   formatWallDayMonth,
+  type OrganizationEntry,
   type TimeDisplay,
 } from "@maxprice/shared";
-import type { Style } from "./style";
+import { limitsText, type MembershipRow } from "./membership-limits";
+import { style, type Style } from "./style";
 import { type Column, formatTokens, type Output, renderTable, titleLine } from "./table";
 
 // `maxprice blocks` as #445's Variant A table: one row per block, gaps
@@ -124,7 +129,19 @@ export type BlocksReport = {
   quotaLabel: string | null;
   display: TimeDisplay;
   now: number;
+  // The usage whose Account is not known outside these Blocks
+  // (`unknownAccountUsage`, #635), else null.
+  unknown: BlocksAggregate | null;
 };
+
+// #635: one line under the table naming the usage whose Account is not known,
+// which forms its Organization's Unknown Membership and so is in none of
+// these Blocks, as the Desktop's Blocks strip names it. The owner's rule: all
+// usage still shows, and usage whose Account is unsure says so.
+export function unknownAccountLine(unknown: BlocksAggregate, s: Style): string {
+  const amount = `${formatCost(unknown.totalCost)} · ${formatTokens(unknown.totalTokens)} tokens`;
+  return `${ACCOUNT_NOT_KNOWN}: ${amount}${s.dim(", outside these Blocks' limits")}\n`;
+}
 
 export function blocksTitle(
   report: Pick<BlocksReport, "rangeLabel" | "scopeLabel" | "quotaLabel">,
@@ -139,8 +156,86 @@ export function blocksTitle(
 
 export function renderBlocks(report: BlocksReport, out: Output): string {
   const title = blocksTitle(report);
-  if (report.rows.length === 0) return `${titleLine(title, out)}\nNo blocks in this range.\n`;
+  const unknown = report.unknown === null ? "" : unknownAccountLine(report.unknown, out.style);
+  if (report.rows.length === 0) {
+    return `${titleLine(title, out)}\nNo blocks in this range.\n${unknown}`;
+  }
   const rows = sortBlocks(report.rows).map((b) => line(b, report.display, report.now));
   const table = renderTable({ title, columns: BLOCKS_COLUMNS, rows }, out);
-  return `${table}${out.style.dim(BLOCKS_LEGEND)}\n`;
+  return `${table}${out.style.dim(BLOCKS_LEGEND)}\n${unknown}`;
+}
+
+// --- One section per Membership (ADR-0140 §3, #642) --------------------------
+//
+// While the Scope's Membership set holds two or more (`scopeMembershipSet`:
+// two or more tracked Accounts, the Desktop's gate), `blocks` prints what
+// the Desktop's Blocks page shows a tab at a time: under the report's title,
+// a section per Membership that forms Blocks, most used first
+// (`rankMemberships`, the tabs' order), each headed by the Membership's name
+// (`Org · Account` while the set spans Accounts), its plan and its windows,
+// over its own Blocks' table. The Memberships that form none share one line
+// after them, in the same order, as the tabs label them "no Blocks". The
+// usage whose Account is not known forms no tracked Membership, so has no
+// section, and the line under the sections names it as the one-table
+// report does.
+
+export type MembershipBlocksSection = {
+  row: MembershipRow;
+  // Its Blocks, as /api/blocks formed them for it.
+  blocks: readonly BlockRow[];
+};
+
+export type MembershipBlocksReport = {
+  rangeLabel: string;
+  scopeLabel: string | null;
+  // Most used first: those that form Blocks, then those that form none.
+  sections: readonly MembershipBlocksSection[];
+  roster: readonly OrganizationEntry[];
+  display: TimeDisplay;
+  now: number;
+  // The usage of every Membership whose Account is not known, in no section,
+  // else null.
+  unknown: BlocksAggregate | null;
+};
+
+export const NO_BLOCKS = "No Blocks";
+
+const PLAIN = style(false);
+
+// A section's header: `Third · Blair (Max plan): 5-hour 82% · weekly 61%`,
+// the plan only when the roster has one, and the windows as the Blocks
+// strip's Limits name them, with no reset.
+export function sectionTitle(
+  row: MembershipRow,
+  roster: readonly OrganizationEntry[],
+  display: TimeDisplay,
+  now: number,
+): string {
+  const plan = roster.find((o) => o.uuid === row.organizationUuid)?.plan ?? null;
+  const limits = limitsText(row, { roster, now, display, resets: false }, PLAIN);
+  return `${row.label}${plan === null ? "" : ` (${plan})`}: ${limits}`;
+}
+
+export function renderMembershipBlocks(report: MembershipBlocksReport, out: Output): string {
+  const { display, now, roster } = report;
+  const title = blocksTitle({ ...report, quotaLabel: null });
+  const forming = report.sections.filter((section) => section.blocks.length > 0);
+  const none = report.sections.filter((section) => section.blocks.length === 0);
+  const tables = forming.map((section) =>
+    renderTable(
+      {
+        title: sectionTitle(section.row, roster, display, now),
+        columns: BLOCKS_COLUMNS,
+        rows: sortBlocks(section.blocks).map((b) => line(b, display, now)),
+      },
+      out,
+    ),
+  );
+  const body = tables.length === 0 ? "" : `\n${tables.join("\n")}${out.style.dim(BLOCKS_LEGEND)}\n`;
+  const noBlocks =
+    none.length === 0
+      ? ""
+      : `${NO_BLOCKS}: ${none.map((section) => terminalText(section.row.label)).join(", ")}\n`;
+  const unknown = report.unknown === null ? "" : unknownAccountLine(report.unknown, out.style);
+  return `${titleLine(title, out)}\n${body}${noBlocks}${unknown}`;
 }

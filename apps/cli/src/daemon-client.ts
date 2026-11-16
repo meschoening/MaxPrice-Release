@@ -78,6 +78,22 @@ export function restartHints(env: Env): Hint[] {
     : ["Stop the running 'maxprice serve' and start it again."];
 }
 
+// A push of what a file now holds, to a daemon `connect` returned: one the
+// daemon refuses leaves the file as written, for the daemon's next boot, and
+// exits 1 saying so.
+export async function pushSaved(env: Env, push: () => Promise<unknown>): Promise<void> {
+  try {
+    await push();
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    throw new CliError(
+      EXIT.FAILURE,
+      "saved, but the daemon did not accept it; restart it",
+      restartHints(env),
+    );
+  }
+}
+
 function skew(theirs: string, env: Env): CliError {
   return new CliError(
     EXIT.SKEW,
@@ -205,7 +221,7 @@ export async function connect(options: ConnectOptions = {}): Promise<Daemon> {
 // CliError it gave.
 export type Probed = Daemon | CliError;
 
-// ADR-0121 §7: a command that removes a secret (`key clear`, `hub leave`)
+// ADR-0121 §7: a command that removes a secret (`key remove`, `hub leave`)
 // probes first, writes, then pushes only to a daemon that is up and this
 // version.
 export async function probeFirst(env: Env): Promise<Probed> {

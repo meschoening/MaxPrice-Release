@@ -14,17 +14,33 @@ On a Linux server with no desktop, use the [Headless client](../headless-client/
 
 ## What it shows
 
-The sidebar holds four reports and Settings:
+The sidebar holds three reports and Settings:
 
 - [Live](live.md): today's and this week's cost, the [Active block](../concepts/blocks.md#active-block), your [usage limits](../concepts/blocks.md#usage-limits) and a cost chart.
-- [Sessions](sessions.md): each Claude Code session, and the detail of one.
-- [Projects](projects.md): your usage by [project](../concepts/projects.md).
+- [Projects](projects.md): your usage by [project](../concepts/projects.md), each project's Claude Code sessions, and the [detail](projects.md#session-detail) of one session.
 - [Blocks](blocks.md): your usage by [Block](../concepts/blocks.md#blocks), the 5-hour periods your plan limits.
 - [Settings](settings.md): where the logs are read from, your [claude.ai session key](../concepts/blocks.md#the-claudeai-session-key), a [Hub](../concepts/hubs.md), and the app itself.
 
-The [filters](filters.md) and the [Organization scope](../concepts/organizations.md#organization-scope) narrow every report.
+The [filters](filters.md) and the [Scope](filters.md#the-scope), which chooses whose usage counts by [Account and Organization](../concepts/organizations.md), narrow every report. **Find**, at the topbar's right, finds a session, a project or a setting from any page: see [Find](#find).
 
 On macOS and Windows a tray icon stays in the menu bar or notification area, with a small Popout of your limits and today's cost. By default, closing the window hides it and leaves MaxPrice running, with the tray icon as your way back to it. See [Tray and Popout](tray.md).
+
+## Find
+
+**Find** in the topbar, or ⌘K on macOS and Ctrl+K on Windows and Linux, opens a search over the sessions and projects of the Date range, your Accounts and the sections of Settings. Type the start of a session id, part of a project's name or directory, a model such as **opus**, an Account or a setting, and the results show in groups: **Sessions**, **Projects**, **Accounts** and **Settings**.
+
+![Find, open on northwind-web: its sessions, costliest first, above the project itself](../../screenshots/finder.light.png "Find")
+
+Find follows the Date range, but ignores the other filters and the [Scope](filters.md#the-scope): it searches the usage of every tracked [Membership](../concepts/organizations.md#memberships) in the range, so it finds what the current filters hide.
+
+The arrow keys move through the results, **Enter** opens the one marked (or the first), and **Esc** closes Find. Each kind of result does one thing:
+
+- a session opens its [detail](projects.md#session-detail), whole, whatever the filters and the Scope;
+- a project sets the Project filter to it and opens [Projects](projects.md);
+- an Account, listed only while the [Account filter](filters.md#the-account-filter) shows, sets the Account filter to it;
+- a setting opens Settings at its section.
+
+While two or more [Organizations](../concepts/organizations.md) are tracked, an [owner-less](../concepts/organizations.md#owner-less-usage) session still counted under its [Presumed organization](../concepts/organizations.md#presumed-organization) carries an **Unknown** tag, since its Account can't be determined, and typing **unknown** lists those sessions, with **Settings › Unattributed usage**, where you assign them ([Unattributed usage](settings.md#unattributed-usage)).
 
 ## How it works
 

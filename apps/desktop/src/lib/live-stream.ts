@@ -14,13 +14,16 @@ import {
   type UsageCurrent,
   type OrganizationsResponse,
   type WindowStates,
+  usageKeysQueryKey,
+  accountSourcesQueryKey,
 } from "@maxprice/shared";
 import { queryClient } from "@/lib/query";
 import { getSidecarUrl, resetSidecarUrl, SidecarStartupError, urlFailureKind } from "@/lib/sidecar";
 import { useLiveStatus } from "@/state/use-live-status";
 import { usageCurrentQueryKey } from "@/state/use-usage-current";
 import { machinesQueryKey } from "@/state/use-machines";
-import { organizationsQueryKey } from "@/state/use-organizations";
+import { accountsQueryKey, organizationsQueryKey } from "@/state/use-organizations";
+import { gatewaysQueryKey } from "@/state/use-gateways";
 import { organizationAssertionsQueryKey } from "@/state/use-organization-assertions";
 import { projectIdentityQueryKey } from "@/state/use-project-identity";
 
@@ -439,11 +442,57 @@ export function handleOrganizationsChanged(client: QueryClient): void {
   void client.cancelQueries(usageCurrent).then(() => client.invalidateQueries(usageCurrent));
 }
 
+// `accounts:changed` — the Account roster moved on the sidecar: its boot
+// store, a settings change, the pair table, or any Membership's reading
+// (#637: every one, the unprojected ones that emit no usage:sample too).
+// Refetches GET /api/accounts. Like the roster's poke it never cancels: the
+// read touches every root's login file, which can hang on a dead mount. It
+// does not merely join a fetch in flight either, whose answer can predate the
+// poke: that fetch owes one more after it settles, and pokes that land
+// meanwhile share that one.
+const accountsPokes = new WeakMap<QueryClient, { owed: boolean }>();
+// `gateways:changed` — the held Gateways moved (ADR-0141 §5, §7): refetch
+// GET /api/gateways, and GET /api/account-sources, whose Gateway half reads
+// each held Gateway's credential list (#639). Never cancels a fetch in flight,
+// as `usage-keys:changed` does not.
+export function handleGatewaysChanged(client: QueryClient): void {
+  void client
+    .invalidateQueries({ queryKey: gatewaysQueryKey() }, { cancelRefetch: false })
+    .catch(() => {});
+  handleAccountSourcesChanged(client);
+}
+
+// GET /api/account-sources (#639) after either poke that can move it. It
+// reads every root's login file, as GET /api/accounts does, so it never
+// cancels a fetch in flight.
+export function handleAccountSourcesChanged(client: QueryClient): void {
+  void client
+    .invalidateQueries({ queryKey: accountSourcesQueryKey() }, { cancelRefetch: false })
+    .catch(() => {});
+}
+
+export function handleAccountsChanged(client: QueryClient): void {
+  const held = accountsPokes.get(client);
+  if (held !== undefined) {
+    held.owed = true;
+    return;
+  }
+  const poke = { owed: client.isFetching({ queryKey: accountsQueryKey() }) > 0 };
+  accountsPokes.set(client, poke);
+  void client
+    .invalidateQueries({ queryKey: accountsQueryKey() }, { cancelRefetch: false })
+    .catch(() => {})
+    .finally(() => {
+      accountsPokes.delete(client);
+      if (poke.owed) handleAccountsChanged(client);
+    });
+}
+
 // `usage:sample` — one Organization's reading, keyed the way usage current is
 // (ADR-0106 §8). The sidecar emits every polled Organization's, and the
 // stream keeps one entry per Organization: each reading lands on
 // `usageCurrentQueryKey(organizationUuid)`, whatever the settings say. The
-// display picks its entry from the scope and Home (`useOrganizationScope`), so
+// display picks its entry from the Scope and Home (`useScope`), so
 // neither a scope change nor a Home change needs an event, and a reading never
 // paints another Organization's rings.
 //
@@ -597,6 +646,16 @@ async function openConnection(): Promise<void> {
     // about the identity directory catching up after an outage.)
     void queryClient.invalidateQueries({ queryKey: projectIdentityQueryKey });
     void queryClient.invalidateQueries({ queryKey: machinesQueryKey });
+    // The same for the Account roster's and the keyset's pokes (#633):
+    // `accounts:changed` and `usage-keys:changed` lost while the stream was
+    // down would leave Settings' key rows and stale marks (ADR-0138 §8) as
+    // they were.
+    void queryClient.invalidateQueries({ queryKey: accountsQueryKey() });
+    void queryClient.invalidateQueries({ queryKey: usageKeysQueryKey() });
+    // And for Settings › Accounts' Gateways and sources (#639):
+    // `gateways:changed` lost while down.
+    void queryClient.invalidateQueries({ queryKey: gatewaysQueryKey() });
+    void queryClient.invalidateQueries({ queryKey: accountSourcesQueryKey() });
   });
   es.addEventListener(SSE_EVENT.usageNew, (e) => {
     handleUsageEvent(queryClient, (e as MessageEvent).data);
@@ -629,6 +688,30 @@ async function openConnection(): Promise<void> {
   });
   es.addEventListener(SSE_EVENT.organizationsChanged, () => {
     handleOrganizationsChanged(queryClient);
+  });
+  es.addEventListener(SSE_EVENT.accountsChanged, () => {
+    // The Account roster moved on the sidecar (#631): its boot store
+    // installed, a settings change started or ended, the pair table moved,
+    // or a Membership's reading did (#637). Refetch GET /api/accounts, whose seed and folds the renderer persists
+    // (`useSeedAccounts`). A poke, never data. A root's login or the pair
+    // table moving also moves GET /api/account-sources.
+    handleAccountsChanged(queryClient);
+    handleAccountSourcesChanged(queryClient);
+  });
+  es.addEventListener(SSE_EVENT.gatewaysChanged, () => {
+    // The held Gateways moved (#651): the held set, a Gateway's state, its
+    // last record, who drains it, or a credential list's emails (#639).
+    // Refetch GET /api/gateways and GET /api/account-sources. A poke, never
+    // data.
+    handleGatewaysChanged(queryClient);
+  });
+  es.addEventListener(SSE_EVENT.usageKeysChanged, () => {
+    // The held keyset moved (#633): a push landed, a key's connection moved,
+    // or the legacy key's Account resolved (ADR-0138 §12). Refetch GET
+    // /api/usage/keys. A poke, never data.
+    void queryClient
+      .invalidateQueries({ queryKey: usageKeysQueryKey() }, { cancelRefetch: false })
+      .catch(() => {});
   });
   es.addEventListener("error", () => {
     // Take over reconnection ourselves rather than letting EventSource's

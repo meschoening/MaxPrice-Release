@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { clientFacingHost, type HubStatus, hubStatusSchema, isoFromDate } from "@maxprice/shared";
+import { clientFacingHost, type HubStatus, hubKeyHeld, hubStatusSchema } from "@maxprice/shared";
 import { displayPath, type Env } from "@maxprice/usage-core/home-path";
 import { EXIT_INTERRUPTED } from "@maxprice/usage-core/secret-input";
 import { lingerOff, readLinger, type UnitReading } from "@maxprice/usage-core/systemd-service";
@@ -8,7 +8,16 @@ import { terminalText } from "@maxprice/usage-core/terminal-text";
 import { CliError, EXIT, type Hint, type Io, renderError, type Writer } from "./cli";
 import { defaultDataDir, hasHub, loadOrInitConfig, readHubConfig } from "./config";
 import { octal, prepareDataDir } from "./data-dir";
-import { keySet, type KeyDeps, type ReadSecret } from "./operator";
+import {
+  askAccountLabel,
+  type KeyDeps,
+  type KeyListRow,
+  keyTable,
+  liveKeyRows,
+  offlineKeyRows,
+  setKey,
+} from "./key-commands";
+import type { ReadSecret } from "./operator";
 import {
   awaitRunningHub,
   NO_ANSWER_MS,
@@ -27,7 +36,6 @@ import {
 } from "./page-publish";
 import { hostAndPort } from "./rebind";
 import { RESTORE_STAGING, unfinishedRestore } from "./restore";
-import { createFileCredstore, secretsPath } from "./secrets";
 import { UNIT } from "./serve-lock";
 import { type HubAnswers, hubDataDirOnInstall, hubService, hubUnit } from "./service";
 import type { SetupTerminal } from "./setup-terminal";
@@ -36,10 +44,11 @@ import { VERSION } from "./version";
 // `maxprice-hub setup` (ADR-0128 §1–§5): the Headless Hub's first setup,
 // walked on a terminal. It adds no operation of its own. Each of its four
 // steps calls the code its command runs and has that command's effect: step
-// 1 is `key set`'s keySet, step 2 `password set`'s runPasswordSet or the
-// `password clear` verb, which index.ts hands in (setupPasswordSteps), step
-// 3 `page set`'s setHubPageUrl, its snippet left out (§3), or `page clear`,
-// and step 4 `service install`, its linger advice withheld for the ending.
+// 1 is `key set`'s setKey and askAccountLabel, once per key (ADR-0140 §10),
+// step 2 `password set`'s runPasswordSet or the `password clear` verb, which
+// index.ts hands in (setupPasswordSteps), step 3 `page set`'s setHubPageUrl,
+// its snippet left out (§3), or `page clear`, and step 4 `service install`,
+// its linger advice withheld for the ending.
 // Setup's own logic is the gates it passes before anything is created, the
 // unit's data dir among them (§1, §2), the prompting around the steps (§3),
 // the data dir and hub.json it makes first, as serve does (§2), and the
@@ -84,7 +93,7 @@ export type SetupDeps = {
   // /etc/passwd's text, which names the uid in the linger line; null when
   // it cannot be read.
   passwd?: string | null;
-  key?: Pick<KeyDeps, "discover" | "now">;
+  key?: Pick<KeyDeps, "discover" | "account" | "now">;
   reach?: ReachOptions;
   // How long the ending waits for the Hub; NO_ANSWER_MS by default.
   waitMs?: number;
@@ -96,7 +105,7 @@ export type SetupDeps = {
 // others refuse to run without (ADR-0127 §4).
 const COMMANDS: Hint[] = [
   "maxprice-hub service install  starts serve, which makes hub.json",
-  "maxprice-hub key set < key.txt",
+  "maxprice-hub key set --label <label> < key.txt",
   "maxprice-hub password set < password.txt",
   "maxprice-hub page set <url>",
   "maxprice-hub page",
@@ -136,16 +145,6 @@ export function indented(writer: Writer): Writer {
   };
 }
 
-// When the key was set, as the re-run's question shows it: local time to the
-// minute, the date as daily rows write theirs (isoFromDate), or null for a
-// timestamp that does not parse.
-export function localMinute(iso: string): string | null {
-  const at = new Date(iso);
-  if (Number.isNaN(at.getTime())) return null;
-  const two = (n: number) => String(n).padStart(2, "0");
-  return `${isoFromDate(at)} ${two(at.getHours())}:${two(at.getMinutes())}`;
-}
-
 // How clients join (§5): the host the hub Popout's Listening row shows,
 // clientFacingHost's one rule for both, on the daemon's port, an IPv6 one
 // bracketed; with none, the Hub is local only, and the line names the key
@@ -170,10 +169,10 @@ export function joinLines(
   ];
 }
 
-// What the steps show as the current state (§3): the key's provenance,
-// when and by whom it was set, and whether a Hub password is set.
+// What the steps show as the current state (§3; ADR-0140 §10): the keys the
+// Hub holds, as `key list` shows them, and whether a Hub password is set.
 type HubState = {
-  key: { setAt: string | null; source: string | null } | null;
+  keys: KeyListRow[];
   password: boolean;
 };
 
@@ -270,8 +269,11 @@ function refuseOtherDataDir(unit: UnitReading, dataDir: string, env: Env, cwd: s
 // §2: the data dir and hub.json, as serve makes them at boot, and the state
 // the steps start from. With the lock free it is held only for this, around
 // the refusal serve makes of a half-restored dir, loadOrInitConfig and the
-// reading of the key's file and hub.json; `created` says whether hub.json is
-// this run's. With a Hub running, the state is its own status.
+// reading of the keys' files and hub.json; `created` says whether hub.json is
+// this run's. With a Hub running, the state is its own status, its keys
+// labelled through its Label directory, a request made only when its status
+// lists an Account by its uuid (liveAccountLabels): one whose key it holds or
+// removed, or one the fleet names, though only the held keys are listed.
 async function init(walk: Walk): Promise<{ created: boolean; state: HubState }> {
   const { dataDir, env } = walk;
   const reached = await reachHub(dataDir, env, walk.deps.reach);
@@ -280,12 +282,7 @@ async function init(walk: Walk): Promise<{ created: boolean; state: HubState }> 
     return {
       created: false,
       state: {
-        key: status.credentialPresent
-          ? {
-              setAt: status.credentialUpdatedAt ?? null,
-              source: status.credentialSource ?? null,
-            }
-          : null,
+        keys: (await liveKeyRows(reached.hub)).filter(hubKeyHeld),
         password: status.passwordProtected === true,
       },
     };
@@ -294,22 +291,12 @@ async function init(walk: Walk): Promise<{ created: boolean; state: HubState }> 
     if (existsSync(join(dataDir, RESTORE_STAGING))) throw unfinishedRestore(dataDir, env);
     const created = !hasHub(dataDir);
     loadOrInitConfig(dataDir);
-    // The boot's read, with its lines unsaid: setup's question says what
-    // it found.
-    const stored = await createFileCredstore(secretsPath(dataDir), {
-      log: () => {},
-      warn: () => {},
-    }).get();
+    // The files as they stand, read without a line: step 1 lists what it
+    // found.
     return {
       created,
       state: {
-        key:
-          stored === null
-            ? null
-            : {
-                setAt: stored.provenance?.setAt ?? null,
-                source: stored.provenance?.source ?? null,
-              },
+        keys: offlineKeyRows(dataDir).filter(hubKeyHeld),
         password: readHubConfig(dataDir).config.passwordHash !== null,
       },
     };
@@ -318,39 +305,57 @@ async function init(walk: Walk): Promise<{ created: boolean; state: HubState }> 
   }
 }
 
-// Step 1, the claude.ai session key: `key set`'s code with the key read
-// here, behind setup's own prompt, so Enter can skip it. A stored key is
-// replaced only on a yes. A refusal (no Organizations, claude.ai unreachable,
-// an OAuth token, a Hub refusing it) prints its reason and asks again.
+// Step 1, the claude.ai session keys (ADR-0140 §10): the keys the Hub holds,
+// one line each as `key list` shows them, then `key set`'s code once per key,
+// each read here behind setup's own prompt, so Enter can end the step. After
+// each key it stores it asks that Account's label with `key set`'s prompt,
+// then for another key. Each key commits on its own, and the step removes
+// none. A refusal (no Organizations, claude.ai unreachable, an OAuth token, a
+// Hub refusing it, a label write failing) prints its reason and asks for a
+// key again. Enter with no key held is the skip; with keys held and none
+// added, it keeps them.
 async function stepKey(walk: Walk, state: HubState): Promise<void> {
-  let skipped = "Skipped: a client that joins with auto-heal on pushes its key.";
-  if (state.key === null) {
-    say(walk, "1/4 claude.ai session key");
-  } else {
-    const at = state.key.setAt === null ? null : localMinute(state.key.setAt);
-    const set = `set${at === null ? "" : ` ${at}`}${state.key.source === null ? "" : `, ${state.key.source}`}`;
-    if (!(await yesNo(walk, terminalText(`1/4 Session key: ${set}. Replace? [y/N] `), false))) {
-      return;
-    }
-    skipped = "Kept.";
-  }
+  say(walk, "1/4 claude.ai session keys");
+  if (state.keys.length > 0) walk.sub.stdout.write(keyTable(state.keys));
+  const keyDeps = { ...walk.deps.key, reach: walk.deps.reach };
+  let added = 0;
   for (;;) {
     const key = await walk.deps.terminal.secret(
-      "    Paste the sessionKey cookie (hidden; Enter skips): ",
+      "    Paste a session key (Enter to keep / finish): ",
     );
     if (key === null) throw new Interrupted();
     if (key === "") {
-      say(walk, `    ${skipped}`);
+      if (added === 0) {
+        say(
+          walk,
+          state.keys.length === 0
+            ? "    Skipped: a client that joins with auto-heal on pushes its key."
+            : "    Kept.",
+        );
+      }
       return;
     }
     try {
-      await keySet(walk.sub, walk.env, walk.platform, {
-        ...walk.deps.key,
+      const { accountUuid } = await setKey(walk.sub, {
+        env: walk.env,
+        platform: walk.platform,
+        ...keyDeps,
         readSecret: async () => key,
-        reach: walk.deps.reach,
+        // The label is asked below, once the key is counted as stored.
+        interactive: false,
       });
-      return;
+      if (accountUuid === null) throw new Interrupted();
+      added++;
+      const code = await askAccountLabel(
+        walk.sub,
+        walk.env,
+        walk.platform,
+        { ...keyDeps, readLine: (prompt) => walk.deps.terminal.line(`    ${prompt}`) },
+        accountUuid,
+      );
+      if (code === EXIT_INTERRUPTED) throw new Interrupted();
     } catch (error) {
+      if (error instanceof Interrupted) throw error;
       failed(walk, error);
     }
   }

@@ -126,6 +126,9 @@ export type SecretFileOptions = {
   // The uid the file must belong to; this process's by default. A test
   // passes another to make its own file a foreign one.
   uid?: number;
+  // The schema's `z.record` fields, whose keys a reason never names
+  // (`describeSecretIssue`).
+  recordFields?: readonly string[];
 };
 
 const NOT_REGULAR = "it is not a regular file";
@@ -138,12 +141,24 @@ function article(noun: string): string {
  * Why the schema refused a file, from zod's first issue, built only from the
  * issue's path and code: never its message, nor a received value or an
  * unknown key's name, any of which could be a pasted secret. A path names
- * schema fields only for schemas whose object keys are fixed, so a secrets
- * schema has no `z.record`.
+ * schema fields only: a `z.record`'s keys are the file's, not the schema's,
+ * so each segment under a field named in `recordFields` shows as `*`, as
+ * `sessionKeys.*.setAt` (the Headless client's per-Account keys, #633).
  */
-export function describeSecretIssue(issue: ZodIssue | undefined): string {
+export function describeSecretIssue(
+  issue: ZodIssue | undefined,
+  recordFields: readonly string[] = [],
+): string {
   if (issue === undefined) return "the file is invalid";
-  const where = issue.path.length === 0 ? "the file" : issue.path.join(".");
+  const where =
+    issue.path.length === 0
+      ? "the file"
+      : issue.path
+          .map((segment, i) => {
+            const parent = issue.path[i - 1];
+            return typeof parent === "string" && recordFields.includes(parent) ? "*" : segment;
+          })
+          .join(".");
   switch (issue.code) {
     case "unrecognized_keys":
       return `${where} has an unknown field`;
@@ -212,7 +227,10 @@ function examine<T>(
     }
     const result = schema.safeParse(raw);
     if (!result.success) {
-      return { kind: "invalid", reason: describeSecretIssue(result.error.issues[0]) };
+      return {
+        kind: "invalid",
+        reason: describeSecretIssue(result.error.issues[0], options.recordFields),
+      };
     }
     return { kind: "ok", value: result.data, mode };
   } finally {

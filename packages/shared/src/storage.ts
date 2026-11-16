@@ -141,21 +141,35 @@ export const storageReportSchema = z.object({
           detail: z.string(),
         })
         .nullable(),
-      // How the unbacked rows split across Organizations (#295) — the one
-      // disclosure Forget makes about them, because Storage itself is never
-      // scoped by Organization: Forget removes every unbacked session of this
-      // machine whatever its rows carry. Each row counts where every report
-      // counts it (evidence, then assertion, then presumption).
+      // How the unbacked rows split across Memberships (#295, per Membership
+      // since #631) — the one disclosure Forget makes about them, because
+      // Storage itself is never scoped by Organization or Account: Forget
+      // removes every unbacked session of this machine whatever its rows
+      // carry. Each row counts where every report counts it: its Organization
+      // by evidence, then assertion, then presumption (`eventOrganization`),
+      // and its Account the same way (`eventAccount`, ADR-0137 §3–§4).
+      // `accountKey` is the Account key (an account uuid, or `pending:<hash>`
+      // for a Pending account, as `/api/accounts`' `key`), or null when the
+      // row's Account is unknown (no evidence, and a Home membership whose
+      // Account is unknown): a Membership of its own, so the entries still
+      // sum to `unbackedRows`.
       //
-      // ABSENT unless the rows span MORE THAN ONE Organization and every one
-      // of them resolves to one, so a single-Organization machine's response
-      // is byte-identical to the one it got before, and the entries always sum
-      // to `unbackedRows`. Ordered biggest first, ties by uuid. INFORMATIONAL
+      // ABSENT unless the rows span MORE THAN ONE Membership and every one
+      // of them resolves to an Organization, so a single-Membership machine's
+      // response is byte-identical to the one it got before, and the entries
+      // always sum to `unbackedRows`. Ordered biggest first, ties by
+      // Organization uuid, then Account key (null first). INFORMATIONAL
       // only: never a ceiling (`unbackedRows` stays the one number the confirm
       // authorises) and never sent back — the forget request does not carry
       // it. Last in the object, so its absence leaves the key order alone too.
-      organizations: z
-        .array(z.object({ organizationUuid: z.string(), rows: z.number().int().positive() }))
+      memberships: z
+        .array(
+          z.object({
+            organizationUuid: z.string(),
+            accountKey: z.string().nullable(),
+            rows: z.number().int().positive(),
+          }),
+        )
         .optional(),
     })
     .nullable(),

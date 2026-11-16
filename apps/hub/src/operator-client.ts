@@ -134,7 +134,7 @@ export type RunningHub = {
   status: unknown;
   // One request with the operator token and the protocol header, and a JSON
   // body when one is given. Never `x-maxprice-machine`: an operator request
-  // is no fleet member, so it stays off the roster, and POST /api/credential
+  // is no fleet member, so it stays off the roster, and POST /api/credentials
   // records its provenance as "local". Sent once, with the bound of its own
   // (above).
   request(method: string, path: string, body?: unknown): Promise<HubAnswer>;

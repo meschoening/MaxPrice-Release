@@ -15,6 +15,7 @@ import {
   type ProjectsRangeAggregate,
   topModelFamily,
 } from "@maxprice/shared";
+import { type AccountCells, accountsText } from "../account-column";
 import { count } from "./count";
 import { paintFamily } from "./models";
 import {
@@ -38,6 +39,9 @@ import {
 export type ProjectsReport = ReportContext & {
   // `foldProjectRows` over the route's answer, in fold order.
   groups: readonly ProjectGroup[];
+  // The Accounts column's labels by directory slug, as the route's rows key
+  // them (`account-column.ts`); null while the column is hidden.
+  accounts: AccountCells | null;
 };
 
 // A project, or one of the directories it was folded from.
@@ -97,19 +101,51 @@ function machinesCell(ids: string[], machines: HubMachine[]): string {
   return folded.length === 1 ? machineName(only, machines) : `${folded.length} machines`;
 }
 
+// A project line's Accounts: every Account whose answer holds one of the
+// directories it stands for. A project folded from several directories lists
+// the Accounts of any of them, which is the folded project being present in
+// that Account's answer under the same fold; a directory line its own.
+function accountsCell(
+  project: ProjectRow,
+  child: boolean,
+  members: ReadonlyMap<string, readonly ProjectRow[]>,
+  cells: AccountCells,
+): string {
+  const slugs = child ? [project.slug] : (members.get(project.slug) ?? []).map((m) => m.slug);
+  return accountsText(
+    cells,
+    slugs.flatMap((slug) => cells.byKey.get(slug) ?? []),
+  );
+}
+
 // The columns, left to right. `drop` is the order they go when the terminal
-// is too narrow: Path, Top model, Sessions, Machines, Organizations, Total
-// tokens, Last activity. Project and Cost always stay. `maxprice projects
-// --help` says the same.
+// is too narrow: Path, Top model, Sessions, Machines, Organizations,
+// Accounts, Total tokens, Last activity. Project and Cost always stay.
+// `maxprice projects --help` says the same.
 export function projectsColumns(
-  report: Pick<ReportContext, "tz" | "now" | "isAll" | "labels" | "machines">,
+  report: Pick<
+    ProjectsReport,
+    "tz" | "now" | "spansOrganizations" | "labels" | "machines" | "groups" | "accounts"
+  >,
 ): Column<Line>[] {
-  const { tz, now, labels, machines } = report;
+  const { tz, now, labels, machines, accounts } = report;
   const machineColumn: Column<Line>[] =
     machines === null
       ? []
       : [{ header: "Machines", text: text((p) => machinesCell(p.machines, machines)), drop: 3 }];
-  const organizations: Column<Line>[] = report.isAll
+  const members = new Map(report.groups.map((g) => [g.row.slug, g.members]));
+  const accountColumn: Column<Line>[] =
+    accounts === null
+      ? []
+      : [
+          {
+            header: "Accounts",
+            text: text((p, child) => accountsCell(p, child, members, accounts)),
+            min: NAME_MIN.account,
+            drop: 5,
+          },
+        ];
+  const organizations: Column<Line>[] = report.spansOrganizations
     ? [
         {
           header: "Organizations",
@@ -142,6 +178,7 @@ export function projectsColumns(
       paint: paintFamily,
     },
     ...machineColumn,
+    ...accountColumn,
     ...organizations,
     {
       header: "Sessions",
@@ -159,7 +196,7 @@ export function projectsColumns(
         (t) => formatTokens(t.totalTokens),
       ),
       align: "right",
-      drop: 5,
+      drop: 6,
     },
     {
       header: "Cost",
@@ -173,7 +210,7 @@ export function projectsColumns(
       header: "Last activity",
       text: text((p) => formatCalendarDay(p.lastActivity, tz, now)),
       align: "right",
-      drop: 6,
+      drop: 7,
     },
   ];
 }

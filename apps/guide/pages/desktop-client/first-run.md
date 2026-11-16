@@ -22,15 +22,21 @@ If those folders hold no usage, every report shows **No Claude usage data yet**:
 Cost and tokens need nothing more. To see your real 5-hour and weekly [usage limits](../concepts/blocks.md#usage-limits), give MaxPrice your [claude.ai session key](../concepts/blocks.md#the-claudeai-session-key):
 
 1. Copy the key from your browser, as that page describes.
-2. Open Settings › **Claude account**, paste it into the key field and choose **Connect**.
+2. Open Settings › [**Accounts**](settings.md#accounts). Choose **Connect** on your Account's card, or **+ Add account** beside **Claude** if it has none, paste the key and choose **Connect**.
 
-The status above the field then reads **Connected**, and Live's tiles show how much of each limit you have used. Without a key, the limit meters don't show and every [Block](../concepts/blocks.md#blocks) is estimated. A computer [joined to a Hub](join-a-hub.md) reads the Hub's limits instead, but it still needs a key of its own to read them whenever it [can't reach the Hub](../concepts/hubs.md#fallback-polling).
+![Connect open under + Add account in Settings › Accounts: the session key field with Connect and Cancel, and how to copy the key](../../screenshots/settings-connect.light.png "Connect, in Settings › Accounts")
+
+The card then reads **Connected**, the step lists the key's Organizations, and Live's tiles show how much of each limit you have used. Without a key, the limit meters don't show and every [Block](../concepts/blocks.md#blocks) is estimated. A computer [joined to a Hub](join-a-hub.md) reads the Hub's limits instead, but it still needs a key of its own to read them whenever it [can't reach the Hub](../concepts/hubs.md#fallback-polling).
 
 ## Check your Organization
 
-MaxPrice picks a [Home organization](../concepts/organizations.md#home-organization) on its first run: the [Organization](../concepts/organizations.md) that owns the most sessions on this computer. If MaxPrice has seen only one on this computer, there is nothing to check.
+MaxPrice picks a [Home](../concepts/organizations.md#home) on its first run: the [Organization](../concepts/organizations.md) that owns the most sessions on this computer. If MaxPrice has seen only one on this computer, there is nothing to check.
 
-With two or more, open Settings › **Claude account** after the first run. It lists each Organization MaxPrice has seen, Home marked and each other one with a switch: on for a [Tracked organization](../concepts/organizations.md#tracked-and-excluded-organizations), off for an Excluded one. Every Organization but Home starts with its switch off, so its usage is not counted until you track it.
+With two or more, open Settings › [**Accounts**](settings.md#accounts) after the first run. Each Account's card lists its Organizations, each with a switch: Home's is marked **⌂ Home** and stays on, and each other one's is on for a [Tracked organization](../concepts/organizations.md#tracked-and-excluded-organizations), off for an Excluded one. Every Organization but Home starts with its switch off, so its usage is not counted until you track it.
+
+MaxPrice also counts only one [Account](../concepts/organizations.md#accounts), one claude.ai login, at first: the one that owns most of the sessions in Home's Organization, or, when you have already connected a session key that reads it, that key's Account. If Claude Code on this computer has run under another login too, that Account sits under **Not tracked** in Settings › Accounts. Turn its switch on, or connect its session key, to count its usage.
+
+If Claude Code here runs through a [Gateway](settings.md#gateways), such as CLIProxyAPI, rather than, or as well as, logging in directly, connect the Gateway in Settings › Accounts too: its records tell MaxPrice which Account and Organization each request used, since the session logs don't ([how](../concepts/organizations.md#how-maxprice-knows-the-organization)). An Account first seen through a Gateway also starts under **Not tracked**.
 
 ## After the first run
 
