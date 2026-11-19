@@ -12,7 +12,7 @@ A plan has up to three usage limits, each with how much of it you have used and 
 
 MaxPrice reads them from claude.ai about once a minute, for every [Tracked organization](organizations.md#tracked-and-excluded-organizations) whose limits can be read. With a [Hub](hubs.md), the Hub reads them for every machine.
 
-They show as **5-hour limit used** on Live's Active block tile, **weekly limit used** on This week's tile, the **5-hour limit** and **Weekly limit** rows of the Popout, and the **5h limit** column of Blocks. With two or more Accounts tracked and a Scope of two or more Memberships, each Membership's show on its own card on Live, its own row of the Popout and its own tab of Blocks. In the Desktop client the model-scoped weekly limit shows only in the Popout, once you turn on **Show model limit in tray popout** in Settings › Accounts, under the Claude section; the switch is there only when your plan has such a limit.
+They show as **5-hour limit used** on Live's Active block tile, **weekly limit used** on This week's tile, the **5-hour limit** and **Weekly limit** rows of the Popout, and the **5h limit** column of Blocks. With two or more Accounts tracked and a Scope of two or more Memberships, each Membership's show on its own card on Live, its own row of the Popout and its own tab of Blocks. In the Desktop client the model-scoped weekly limit shows only in the Popout, once you turn on **Show model limit in tray popout** in Settings › Claude, under the Account cards; the switch is there only when your plan has such a limit.
 
 ### The claude.ai session key
 
@@ -20,7 +20,7 @@ Reading your limits takes a claude.ai session key: your own, or your Hub's while
 
 The key is the `sessionKey` cookie of a browser signed in to claude.ai, a value starting `sk-ant-sid01-`. To copy it, sign in at claude.ai, open the browser's developer tools, then Application (Chrome, Edge) or Storage (Firefox), Cookies, `https://claude.ai`, and copy the value of `sessionKey`. It is not Claude Code's OAuth token, which starts `sk-ant-oat`.
 
-Each Account has its own key. In the Desktop client, choose **Connect** on the Account's card in [Settings › Accounts](../desktop-client/settings.md#connecting-an-account), or **+ Add account**, paste it and choose **Connect**. The Desktop client keeps each Account's key in the system keychain. The Headless client and the Headless Hub each have a `key set` command ([client](../../../cli/README.md#maxprice-key-setlistremove), [Hub](../../../hub/README.md#the-session-key)), and the Hub tray app's console has a Claude account card, or an Accounts card once it knows several Accounts.
+Each Account has its own key. In the Desktop client, choose **Connect** on the Account's card in [Settings › Claude](../desktop-client/settings.md#connecting-an-account), or **+ Add account**, paste it and choose **Connect**. The Desktop client keeps each Account's key in the system keychain. The Headless client and the Headless Hub each have a `key set` command ([client](../../../cli/README.md#maxprice-key-setlistremove), [Hub](../../../hub/README.md#the-session-key)), and the Hub tray app's console has a Claude account card, or an Accounts card once it knows several Accounts.
 
 > [!CAUTION]
 > The session key signs in to your whole claude.ai account. Don't share it, and paste it only into MaxPrice.

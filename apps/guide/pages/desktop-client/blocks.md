@@ -34,7 +34,7 @@ The dot after each window tells how MaxPrice found its edges. Hover it for its n
 
 With no row selected, the Detail strip above the table sums every Block in the Date range, gaps left out: **total spent**, **total tokens**, **entries** (the requests), **active burn** (the Active block's burn rate) and the **Models** used.
 
-Usage whose Account MaxPrice can't tell forms Blocks of its own, outside your Account's limits (see [Presumed organization](../concepts/organizations.md#presumed-organization)), so the table leaves it out. When the Date range holds some, the strip adds **account not known**: its cost and tokens. Hover it for what it counts. If your Account has no usage at all and such usage has some, the table shows that usage's Blocks instead, and the strip's line under **All blocks** ends in **account not known**.
+Usage whose Account MaxPrice can't tell forms Blocks of its own, outside your Account's limits (see [Presumed organization](../concepts/organizations.md#presumed-organization)), so the table leaves it out. When the Date range holds some, the strip adds **account not known**: its cost and tokens. Hover it for what it counts. If your Account has no usage at all and such usage has some, or such usage has an Active block and your Account has none, the table shows that usage's Blocks instead, and the strip's line under **All blocks** ends in **account not known**.
 
 Click a row for that Block's figures:
 
@@ -64,4 +64,4 @@ With one Account tracked, Blocks describe [one Organization](../concepts/organiz
 
 A [Usage limit](../concepts/blocks.md#usage-limits) covers all your work, so the Project filter does not apply to Blocks. The Model and Machine filters narrow each Block's tokens, cost and requests, but its window, status, Burn rate, Projection and 5-hour limit stay the whole Block's. The Date range keeps the Blocks that start inside it. See [Blocks and the filters](../concepts/blocks.md#blocks-and-the-filters).
 
-A window is exact only when MaxPrice recorded limit readings for it, which takes a claude.ai [session key](../concepts/blocks.md#the-claudeai-session-key), your own or your [Hub](../concepts/hubs.md)'s. A window it has no readings for, such as one before you connected a key or while the key had expired, is estimated, and its **5h limit** reads **—**. Windows already recorded stay exact. Connect a key in [Settings › Accounts](settings.md#connecting-an-account).
+A window is exact only when MaxPrice recorded limit readings for it, which takes a claude.ai [session key](../concepts/blocks.md#the-claudeai-session-key), your own or your [Hub](../concepts/hubs.md)'s. A window it has no readings for, such as one before you connected a key or while the key had expired, is estimated, and its **5h limit** reads **—**. Windows already recorded stay exact. Connect a key in [Settings › Claude](settings.md#connecting-an-account).

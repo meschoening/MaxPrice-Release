@@ -86,8 +86,14 @@ export type UsagePoller = {
   // One key refused outside a read (the Hub's listing): that key's reads stop
   // until a push carries it again; every other key keeps polling.
   expireKey: (account: string) => void;
-  // A key's connection: `disconnected` when it is not held.
+  // A key's connection: `disconnected` when it is not held. While a remote
+  // snapshot owns live state it is the Hub's connection, for every key.
   keyConnection: (account: string) => UsageConnection;
+  // A key's own connection, whoever owns polling: what this poller's own
+  // reads and `expireKey` left it (`disconnected` when it is not held or has
+  // no answer yet). The legacy key's report reads it (#702): its Account is
+  // not known, so no Hub connection is its.
+  ownKeyConnection: (account: string) => UsageConnection;
   // The Organizations a key's last listing named (null: no listing yet, or
   // forgotten). It chooses which keys read each polled Organization (below).
   setListing: (account: string, organizations: readonly string[] | null) => void;
@@ -735,6 +741,7 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
       expire(account);
     },
     keyConnection: (account) => (remote !== null ? remote.usageConnection : connectionOf(account)),
+    ownKeyConnection: connectionOf,
     setListing: (account, organizations) => {
       if (organizations === null) listings.delete(account);
       else listings.set(account, new Set(organizations));

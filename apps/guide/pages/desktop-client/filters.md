@@ -60,7 +60,7 @@ Each row is a tracked Account: a box to tick, its label (and its email, when Max
 - **Pending accounts.** An [Account](../concepts/organizations.md#accounts) MaxPrice knows only by an email has an **@** in place of its letter and reads **Known by email only**. It is ticked and counted like any other.
 - **Account not known.** When the Date range holds usage whose Account MaxPrice can't tell, or the Scope counts such usage, a last row, **Account not known**, holds it, with one Membership per Organization, at **$0.00** where the Date range has none. The default Scope ticks the one in Home's Organization, and **All accounts** every Organization's, so nothing counts without a ticked box. Tick it to count that usage too. An Account you tick never includes it, so ticking every row is exactly **All accounts**.
 
-The footer counts the Accounts MaxPrice has seen but doesn't track, which the menu leaves out, or reads **Every Account seen is tracked.** **Manage Accounts ›** opens [Settings › Accounts](settings.md#claude), where you track them.
+The footer counts the Accounts MaxPrice has seen but doesn't track, which the menu leaves out, or reads **Every Account seen is tracked.** **Manage Accounts ›** opens [Settings](settings.md#accounts), where you track them under **Claude**.
 
 The menu's costs follow the Date range and the other filters, never the Scope, so you can see what an Account would add before you tick it.
 

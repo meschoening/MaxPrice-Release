@@ -136,8 +136,8 @@ export async function blocks(parsed: Parsed, io: Io, env: Env = process.env): Pr
         rows: data.blocks,
         rangeLabel: request.rangeLabel,
         scopeLabel: request.scopeLabel,
-        // The Unknown Membership heading in place of an empty Home membership
-        // (#644) says so in the title.
+        // The Unknown Membership heading in place of an empty or idle Home
+        // membership (#644, #257) says so in the title.
         quotaLabel: withAccountNotKnown(
           request.quotaLabel,
           blocksHeadAccountNotKnown(data, request.scopeState.home),

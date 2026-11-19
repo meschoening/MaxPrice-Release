@@ -335,8 +335,8 @@ export function usePopoutData(now: number): PopoutData {
       inputs.todayYmd,
       quotaOrganization,
     ),
-    // The head Blocks are the Unknown Membership's in place of an empty Home
-    // membership (#644): the eyebrow says "account not known".
+    // The head Blocks are the Unknown Membership's in place of an empty or
+    // idle Home membership (#644, #257): the eyebrow says "account not known".
     quotaTag: withAccountNotKnown(
       popoutQuotaTag(multi, quotaOrganization, rosterQ.data?.organizations),
       blocksHeadAccountNotKnown(

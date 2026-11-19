@@ -40,7 +40,7 @@ The **Fleet replica** is a copy of every machine's usage, kept on this machine. 
 
 ### Send keys to the Hub
 
-**Send keys to the Hub**, also called auto-heal, sends this machine's claude.ai session keys to the Hub, each one when the Hub holds no working key for its Account. A Hub with no key at all gets one from the first client that joins with it on. On the Desktop client it is a switch in Settings › Usage hub and in the Hub notice at the top of [Settings › Accounts](../desktop-client/settings.md#notices); the Headless client turns it off with `--no-auto-heal`.
+**Send keys to the Hub**, also called auto-heal, sends this machine's claude.ai session keys to the Hub, each one when the Hub holds no working key for its Account. A Hub with no key at all gets one from the first client that joins with it on. On the Desktop client it is a switch in Settings › Usage hub and in the Hub notice at the top of [Settings](../desktop-client/settings.md#notices); the Headless client turns it off with `--no-auto-heal`.
 
 When you remove an Account's key at the Hub, the Hub records when. The client then sends this machine's key for that Account only if it was set after the removal, so a key you removed doesn't come straight back, while a fresh key pasted on any machine still does.
 

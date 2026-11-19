@@ -503,9 +503,11 @@ export function createBlockReports(deps: {
 
   // A Scope's Memberships, head first, each with the formation that forms its
   // Blocks. The Home membership heads whenever the Scope holds it, so
-  // `scopeHead`'s Home-in-scope rule names the same Organization; with its
-  // Account not known, the Home membership IS its Organization's Unknown
-  // Membership. After it, a Membership with rows in the Scope comes before
+  // `scopeHead`'s Home-in-scope rule names the same Organization, unless its
+  // Organization's Unknown Membership takes the lead (`headLead`: while the
+  // Home membership holds no rows, or no Active block at `now` while the
+  // Unknown one holds it, #644, #257); with its Account not known, the Home
+  // membership IS its Organization's Unknown Membership. After the lead, a Membership with rows in the Scope comes before
   // one without, which only the Organization's readings or the Home
   // membership minted, so a surface that shows one Membership's Blocks never
   // shows an empty one beside the Membership holding the usage. Ties fall to
@@ -521,6 +523,7 @@ export function createBlockReports(deps: {
   // Accounts explicitly.
   function scopeFormations(
     request: ScopeRequest,
+    now: number,
   ): Array<{ membership: MembershipKey; spec: BlockScope; rows: boolean }> {
     const current = bindStore();
     const p = current.presumption();
@@ -617,8 +620,22 @@ export function createBlockReports(deps: {
     // The shared head rule's order (`compareHeadCandidates`), so the first
     // is the Membership `scopeHeadOrganization` names; the lead is the Home
     // membership, or its Organization's Unknown one while only that holds
-    // rows (`headLead`, #644).
-    const lead = headLead(out, home);
+    // rows or only that holds the Active block (`headLead`, #644, #257). A
+    // Membership holds the Active block when its own formation's span at
+    // `now` resolves, the predicate `aggregateFormedBlocks` marks `isActive`
+    // by; the formation is the one its Blocks then form from, cached.
+    const holdsActiveBlock = (m: MembershipKey) => {
+      const f = out.find(
+        (x) =>
+          x.membership.organizationUuid === m.organizationUuid &&
+          x.membership.accountUuid === m.accountUuid,
+      );
+      return (
+        f !== undefined &&
+        resolveFormedBlockSpan(formation(slotFor(f.spec), samplesOf(f.spec)), now) !== null
+      );
+    };
+    const lead = headLead(out, home, holdsActiveBlock);
     return out.sort((a, b) => compareHeadCandidates(a, b, home, lead));
   }
 
@@ -641,17 +658,17 @@ export function createBlockReports(deps: {
       spanKey = slotKey(quota);
       return resolveFormedBlockSpan(formation(slot, samplesOf(quota)), now);
     },
-    // The formation of the Scope's head Membership, the one a surface that
-    // shows one Membership's Blocks reads (the span, the Active block tile).
-    // Null with no Membership in the Scope.
-    head(request: ScopeRequest): BlockScope | null {
-      return scopeFormations(request)[0]?.spec ?? null;
+    // The formation of the Scope's head Membership at `now`, the one a
+    // surface that shows one Membership's Blocks reads (the span, the Active
+    // block tile). Null with no Membership in the Scope.
+    head(request: ScopeRequest, now: number): BlockScope | null {
+      return scopeFormations(request, now)[0]?.spec ?? null;
     },
     // The Scope's candidate Memberships for the shared head rule
-    // (`scopeHeadOrganization`), head first, each with whether the store
-    // holds rows for it in the Scope.
-    candidates(request: ScopeRequest): HeadCandidate[] {
-      return scopeFormations(request).map(({ membership, rows }) => ({ membership, rows }));
+    // (`scopeHeadOrganization`), head first at `now`, each with whether the
+    // store holds rows for it in the Scope.
+    candidates(request: ScopeRequest, now: number): HeadCandidate[] {
+      return scopeFormations(request, now).map(({ membership, rows }) => ({ membership, rows }));
     },
     // A Scope's Blocks (`BlocksResponse`): the head Membership's as `blocks`,
     // and, while the Scope spans two or more, every Membership's as
@@ -662,12 +679,14 @@ export function createBlockReports(deps: {
       request: ScopeRequest | null,
     ): BlocksResponse {
       if (request === null) return blocks(mode, options, null);
-      const formations = scopeFormations(request);
+      // One `now` orders the Memberships and marks their Blocks active.
+      const now = options.now ?? Date.now();
+      const formations = scopeFormations(request, now);
       const keys = new Set(formations.map((f) => slotKey(f.spec)));
       const memberships = formations.map((f) => ({
         organizationUuid: f.membership.organizationUuid,
         accountUuid: f.membership.accountUuid,
-        blocks: formBlocks(f.spec, mode, options).blocks,
+        blocks: formBlocks(f.spec, mode, { ...options, now }).blocks,
       }));
       retain(keys);
       const first = memberships[0];

@@ -1,12 +1,12 @@
 # Settings
 
-Settings is the last page in the sidebar. It holds five groups, **Accounts**, **Data**, **Storage**, **Connections** and **Application**, one after another on one page. A change takes effect as you make it: there is no Save button, except for session keys, Gateways and the Hub, which you connect.
+Settings is the last page in the sidebar. It holds five groups, **Account** (**Accounts** once there are two or more), **Data**, **Storage**, **Connections** and **Application**, one after another on one page. A change takes effect as you make it: there is no Save button, except for session keys, Gateways and the Hub, which you connect.
 
 The settings are kept in `settings.json` in the Desktop client's folder ([where](../concepts/archive.md#desktop-client)). The claude.ai session keys, Gateway management keys and the [Hub](../concepts/hubs.md) password are kept in the system's keychain instead.
 
 ## Accounts
 
-![Settings › Accounts on a machine joined to a Hub: the Limits come from the Hub notice with its Send keys to the Hub switch, the Home membership menu, the Claude section with a card for each of two Accounts and their Organizations, and Gateways with none connected](../../screenshots/settings-accounts.light.png "Settings › Accounts")
+![The Accounts group of Settings on a machine joined to a Hub, with two Accounts: the Limits come from the Hub notice with its Send keys to the Hub switch, the Home membership menu, the Claude section with a card for each of two Accounts and their Organizations, and Gateways with none connected](../../screenshots/settings-accounts.light.png "The Accounts group, with two Accounts")
 
 The first group lists every claude.ai [Account](../concepts/organizations.md#accounts) this machine knows, each with its [Organizations](../concepts/organizations.md), and what reads their limits. Its heading reads **Account** while there is one and **Accounts** once there are more. From top to bottom it holds the notices that need you, the Home membership, a section per provider (only **Claude** today), **Gateways** and **Unattributed usage**.
 

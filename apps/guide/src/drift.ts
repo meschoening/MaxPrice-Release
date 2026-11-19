@@ -25,6 +25,12 @@
 //   (title too: a pointer shows it, and a screen reader reads it as the
 //   element's description). An id, a URL or a file name such as
 //   `organization-directory.json` is not read.
+// - The Account group (#621): no page's text, the Reference pages included,
+//   names the Desktop client's first Settings group in a path, as "Settings ›
+//   Account" or "Settings › Accounts". Its heading reads "Account" on a
+//   one-Account machine and "Accounts" past it, so a path through it is wrong
+//   on one of the two; a page names the section instead ("Settings ›
+//   Claude", "Settings › Gateways") or the group in words.
 //
 // Bun-only (HTMLRewriter): only the tests import it.
 import { readdirSync, readFileSync } from "node:fs";
@@ -98,6 +104,7 @@ export function checkBuild(build: Build): string[] {
 
     if (!scan.lang?.trim()) problem("its <html> has no lang");
     for (const term of retiredTerms(scan.text)) problem(term);
+    for (const path of accountGroupPaths(scan.text)) problem(path);
     const h1s = scan.headings.filter((h) => h.level === 1).length;
     if (h1s !== 1) problem(`has ${h1s} <h1> elements; a page has exactly one`);
     let level = 0;
@@ -462,6 +469,22 @@ function retiredTerms(text: string): string[] {
     }
   }
   return found;
+}
+
+// "Settings › Account" or "Settings › Accounts", across any whitespace (an
+// inline tag parts the words with a space), in any case. A word that only
+// starts with "Account", such as "Settings › Account cards", is the phrase
+// too: the group's name still leads the path.
+const ACCOUNT_GROUP_PATH = /\bSettings\s*›\s*(Accounts?)\b/gi;
+
+/** A problem for each path in `text` that runs through the Account group. */
+function accountGroupPaths(text: string): string[] {
+  return [...text.matchAll(ACCOUNT_GROUP_PATH)].map(
+    ([words]) =>
+      `names the Account group in a path: "${words.replace(/\s+/g, " ")}"; its heading reads ` +
+      `Account with one Account and Accounts with more (#621), so name the section, such as ` +
+      `Settings › Claude`,
+  );
 }
 
 // --- files ------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-import type { UsageConnection, UsageKeyset, UsageKeysResponse } from "@maxprice/shared";
+import type { UsageKeyset, UsageKeysResponse } from "@maxprice/shared";
 import {
   LEGACY_KEY,
   type FetchAccountResult,
@@ -18,6 +18,17 @@ import { emailHash } from "@maxprice/shared";
 // writes the Account's entry and deletes the legacy one (Tasks 4 and 5 of the
 // #633 plan). While the legacy key is expired or the network is down nothing
 // resolves, and it stays the one key, polled under LEGACY_KEY as before.
+//
+// The report gives the legacy key its own connection, never the Hub's
+// (#702): its Account is not known, so no Hub connection is its, and while a
+// Hub owns live state the poller's `keyConnection` answers the Hub's for
+// every key, which hid an expired legacy key's Reconnect (ADR-0138 §12). On a
+// hub-connected client nothing polls it here, so its `/api/account` read
+// answering expired expires it in the poller, as the Hub's listing expires a
+// key, and keeps it expired through every push that carries the same key: a
+// push re-arms the poller's keys, and under a Hub nothing would read it again.
+// Once its Account is known it reports that Account's connection, as each
+// pushed Account's key does: the Hub's, there (ADR-0138 §7's #639 residual).
 //
 // Also the one reading of which Accounts this machine holds a key for, and
 // what each key's listing named (`heldAccounts`): the held keys' roster
@@ -90,6 +101,8 @@ export function createUsageKeyset(opts: {
     | "rekey"
     | "setListing"
     | "keyConnection"
+    | "ownKeyConnection"
+    | "expireKey"
     | "memberships"
     | "staleOrganizations"
     | "expiredReaderOrganizations"
@@ -119,6 +132,9 @@ export function createUsageKeyset(opts: {
   // What the report says of it: set once the stamp has settled, so a host
   // never moves the key before its samples carry the Account.
   let legacyAnnounced: string | null = null;
+  // claude.ai refused the unresolved legacy key's `/api/account` read (#702):
+  // it stays expired in the poller until another legacy key is pushed.
+  let legacyRefused = false;
   const listings = new Map<string, readonly string[]>();
   let resolution: Promise<void> = Promise.resolve();
   // The legacy key's Account reads: how many are in flight, when the last one
@@ -164,22 +180,28 @@ export function createUsageKeyset(opts: {
   // The poller's keys and every held listing, as they stand.
   function install(): void {
     opts.poller.setKeys(pollerKeys());
+    if (legacyRefused && legacyAccount === null) opts.poller.expireKey(LEGACY_KEY);
     for (const k of pollerKeys()) {
       const listing = listings.get(k.sessionKey);
       if (listing !== undefined) opts.poller.setListing(k.account, listing);
     }
   }
   function report(): UsageKeysResponse {
-    const connection = (account: string): UsageConnection => opts.poller.keyConnection(account);
     return {
       keys: keys.map((k) => ({
         accountUuid: k.accountUuid,
-        connection: connection(k.accountUuid),
+        connection: opts.poller.keyConnection(k.accountUuid),
       })),
       legacy:
         legacy === null
           ? null
-          : { accountUuid: legacyAnnounced, connection: connection(legacyAccount ?? LEGACY_KEY) },
+          : {
+              accountUuid: legacyAnnounced,
+              connection:
+                legacyAccount === null
+                  ? opts.poller.ownKeyConnection(LEGACY_KEY)
+                  : opts.poller.keyConnection(legacyAccount),
+            },
     };
   }
   function announce(): void {
@@ -228,6 +250,7 @@ export function createUsageKeyset(opts: {
         legacyAnnounced = null;
         legacyFailedAt = null;
         retriedAfter = null;
+        legacyRefused = false;
       }
       keys = (next?.keys ?? []).map((k) => ({
         accountUuid: k.accountUuid,
@@ -255,7 +278,16 @@ export function createUsageKeyset(opts: {
         if (isLegacy()) legacyReads = Math.max(0, legacyReads - 1);
       }
       if (!result.ok) {
-        if (isLegacy()) legacyFailedAt = now();
+        if (isLegacy()) {
+          legacyFailedAt = now();
+          // claude.ai refused the unresolved legacy key: it is expired here,
+          // whoever owns polling (#702).
+          if (result.kind === "expired" && legacyAccount === null) {
+            legacyRefused = true;
+            opts.poller.expireKey(LEGACY_KEY);
+            announce();
+          }
+        }
         return result;
       }
       if (result.email !== null && result.email.trim() !== "") {

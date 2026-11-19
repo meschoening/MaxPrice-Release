@@ -28,8 +28,8 @@ export type ActiveBlockTileProps = {
   // The "typical" block — median tokens across the range's completed blocks
   // (see typicalBlockTokens). Shown in the tile's foot as the reference.
   typicalBlockTokens: number;
-  // The block is the Unknown Membership's, heading in place of an empty Home
-  // membership (#644): the eyebrow says "account not known".
+  // The block is the Unknown Membership's, heading in place of an empty or
+  // idle Home membership (#644, #257): the eyebrow says "account not known".
   accountNotKnown?: boolean;
 };
 

@@ -1163,7 +1163,7 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
         const quota =
           home === null
             ? noHomeFormation(blockScope)
-            : blockReports.head({ scope: blockScope, home });
+            : blockReports.head({ scope: blockScope, home }, now);
         const resolved = home !== null && quota === null ? null : blockReports.span(now, quota);
         if (resolved === null) {
           const body: IntradayResponse = {
@@ -1505,7 +1505,7 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
   // The head of a Scope that does not hold the Home membership, over the
   // store's candidates.
   function candidateHeadOf(scope: ResolvedScope, home: HomeMembership): ScopeHeadResponse {
-    const candidates = blockReports.candidates({ scope, home });
+    const candidates = blockReports.candidates({ scope, home }, deps.now());
     const organizationUuid = headOrganizationWithoutHome(scope, home, candidates);
     const head = candidates[0]?.membership;
     return {

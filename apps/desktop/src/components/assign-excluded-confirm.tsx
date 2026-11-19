@@ -1,5 +1,6 @@
 import { useRef } from "react";
 import { countSessions } from "@/lib/assignment-writes";
+import { SETTINGS_SECTIONS } from "@/lib/settings-sections";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { CloseX, useDialogFocus, usePendingConfirm } from "@/components/settings/tracking-dialog";
 
@@ -11,6 +12,10 @@ import { CloseX, useDialogFocus, usePendingConfirm } from "@/components/settings
 // dismiss locks while the write is pending, a failed write keeps the dialog
 // open over an error line (the page has already toasted the error), and a
 // write that lands closes it.
+//
+// It names the Claude section, never the cluster: the cluster's eyebrow reads
+// "Account" on a one-Account machine and "Accounts" past it (#621), while the
+// section's title is the same on both.
 
 export interface AssignExcludedConfirmContentProps {
   count: number;
@@ -45,7 +50,7 @@ export function AssignExcludedConfirmContent({
         <h3>{`Assign ${countSessions(count)} to ${label}?`}</h3>
       </DialogTitle>
       <DialogDescription className="gate-desc">
-        {`${organization} is excluded on this machine, so this usage leaves every report here. Nothing is deleted: it stays in this machine's archive, and machines that track ${organization} still count it. To bring it back, track ${organization} again in Settings › Accounts.`}
+        {`${organization} is excluded on this machine, so this usage leaves every report here. Nothing is deleted: it stays in this machine's archive, and machines that track ${organization} still count it. To bring it back, track ${organization} again in Settings › ${SETTINGS_SECTIONS.claude}.`}
       </DialogDescription>
       {failed ? <p className="err">Couldn&apos;t assign sessions.</p> : null}
       <div className="btns">

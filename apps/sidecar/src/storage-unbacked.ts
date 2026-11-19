@@ -342,12 +342,12 @@ function evaluateGuards(args: {
     const parts: string[] = [];
     if (unreadable.length > 0) {
       parts.push(
-        `${unreadable.length === input.roots.length ? "Every" : "A"} configured Claude Code path is missing: ${unreadable.join(", ")}. Check Settings › Data › Claude paths.`,
+        `${unreadable.length === input.roots.length ? "Every" : "A"} configured Claude Code path is missing: ${unreadable.join(", ")}. Check Settings › Data › Claude data paths.`,
       );
     }
     if (emptied.length > 0) {
       parts.push(
-        `${emptied.join(", ")} ${emptied.length === 1 ? "exists but holds" : "exist but hold"} no transcripts — remove ${emptied.length === 1 ? "it" : "them"} in Settings › Data › Claude paths, or add the folder that does.`,
+        `${emptied.join(", ")} ${emptied.length === 1 ? "exists but holds" : "exist but hold"} no transcripts — remove ${emptied.length === 1 ? "it" : "them"} in Settings › Data › Claude data paths, or add the folder that does.`,
       );
     }
     return { reason: "roots-missing", detail: parts.join(" ") };
@@ -358,7 +358,7 @@ function evaluateGuards(args: {
   if (selfRows > 0 && unbackedRows / selfRows > ratioLimit) {
     return {
       reason: "ratio-tripwire",
-      detail: `${unbackedRows} of this machine's ${selfRows} stored rows look unbacked — more than ${Math.round(ratioLimit * 100)}%. That usually means a transcript folder moved rather than that the history is gone. Check Settings › Data › Claude paths.`,
+      detail: `${unbackedRows} of this machine's ${selfRows} stored rows look unbacked — more than ${Math.round(ratioLimit * 100)}%. That usually means a transcript folder moved rather than that the history is gone. Check Settings › Data › Claude data paths.`,
     };
   }
 

@@ -14,9 +14,10 @@ import {
   pushHubConfigToSidecar,
   disconnectHub,
 } from "@/lib/hub-config";
-import { applyHubAutoHeal } from "@/lib/hub-auto-heal";
+import { applyHubAutoHeal, SEND_KEYS_COPY } from "@/lib/hub-auto-heal";
 import { hubConnectionDot, hubConnectionTextClass } from "@/lib/hub-status";
 import { isStale, STALE_HUB_LINE } from "@/lib/stale-status";
+import { SETTINGS_SECTIONS } from "@/lib/settings-sections";
 import { insideTauri } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { dotVariant } from "@/lib/dot-variant";
@@ -94,6 +95,24 @@ export function SeedProgress({
         <i className="fill" style={{ width: `${pct}%` }} />
       </div>
     </div>
+  );
+}
+
+// The section's closing helper. It names the Claude section, never the
+// Accounts cluster: the cluster's eyebrow reads "Account" on a one-Account
+// machine and "Accounts" past it (#621), while the section's title is the same
+// on both.
+export function HubHelper(): React.ReactElement {
+  return (
+    <p className="helper">
+      The hub URL is stored in settings.json; the password (if the hub has one) is stored in the OS
+      keychain. Leave the password blank when re-saving to keep the stored one. Set or clear the
+      hub&apos;s password on the hub machine — from the MaxPrice Hub console, or{" "}
+      <code>maxprice-hub password set</code> on a headless hub. While connected, Settings ›{" "}
+      {SETTINGS_SECTIONS.claude} shows each Account&apos;s connection at the Hub. With Send keys to
+      the Hub on (the default), this machine sends the Hub its key for any Account the Hub holds no
+      working key for, or whose key there expired.
+    </p>
   );
 }
 
@@ -327,8 +346,7 @@ export function HubSection(): React.ReactElement {
         disabled={busy}
         onToggle={(next) => void applyAutoHeal(next)}
       >
-        Send keys to the Hub: when the Hub holds no working key for an Account, send it this
-        machine&apos;s
+        {SEND_KEYS_COPY.row}
       </SwitchRow>
 
       <SwitchRow
@@ -361,15 +379,7 @@ export function HubSection(): React.ReactElement {
         </div>
       ) : null}
 
-      <p className="helper">
-        The hub URL is stored in settings.json; the password (if the hub has one) is stored in the
-        OS keychain. Leave the password blank when re-saving to keep the stored one. Set or clear
-        the hub&apos;s password on the hub machine — from the MaxPrice Hub console, or{" "}
-        <code>maxprice-hub password set</code> on a headless hub. While connected, Settings ›
-        Accounts shows each Account&apos;s connection at the Hub. With Send keys to the Hub on (the
-        default), this machine sends the Hub its key for any Account the Hub holds no working key
-        for, or whose key there expired.
-      </p>
+      <HubHelper />
     </>
   );
 }

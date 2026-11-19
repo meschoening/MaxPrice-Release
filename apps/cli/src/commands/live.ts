@@ -126,8 +126,8 @@ export async function live(
     now: at,
     display,
     // More than one Organization tracked means the roster was read.
-    // The Unknown Membership heading in place of an empty Home membership
-    // (#644) says so in the eyebrow, as the popout does.
+    // The Unknown Membership heading in place of an empty or idle Home
+    // membership (#644, #257) says so in the eyebrow, as the popout does.
     quotaTag: withAccountNotKnown(
       popoutQuotaTag(scope.multi, scope.quotaOrganization, scope.roster),
       blocksHeadAccountNotKnown(blocks.data, scope.state.home),

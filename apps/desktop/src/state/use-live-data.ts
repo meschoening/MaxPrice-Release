@@ -50,8 +50,9 @@ export type LiveData = {
   rollingWeekStart: string;
   activeBlock: BlockRow | null;
   // The head Blocks are the Unknown Membership's, heading in place of an
-  // empty Home membership (#644, `blocksHeadAccountNotKnown`): the Active
-  // block tile says "account not known".
+  // empty or idle Home membership (`headLead`, #644, #257;
+  // `blocksHeadAccountNotKnown`): the Active block tile says "account not
+  // known".
   activeBlockAccountNotKnown: boolean;
   typicalBlockTokens: number;
   chartRows: DailyRow[];

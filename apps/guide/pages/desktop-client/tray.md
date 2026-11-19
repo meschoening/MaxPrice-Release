@@ -30,9 +30,9 @@ Click the tray icon, with either mouse button, to open the Popout beside it. Cli
 
 From the top:
 
-- **Active block:** a ring counting down to the [Active block](../concepts/blocks.md#active-block)'s reset, with its cost, its tokens and the time it resets. With no Active block it reads **No active block — start a Claude Code session to open one.** It shows the Active block of usage whose Account isn't known, marked **account not known**, when your Home membership's Account has no usage at all.
+- **Active block:** a ring counting down to the [Active block](../concepts/blocks.md#active-block)'s reset, with its cost, its tokens and the time it resets. With no Active block it reads **No active block — start a Claude Code session to open one.** It shows the Active block of usage whose Account isn't known, marked **account not known**, when your Home membership's Account has no Active block, or no usage at all.
 - **5-hour limit** and **Weekly limit:** how much of each you have used. They read **—** without a [session key](../concepts/blocks.md#the-claudeai-session-key).
-- A third limit row, such as **Fable limit**, when your plan limits one model for the week and you turn on **Show model limit in tray popout** in [Settings › Accounts](settings.md#claude).
+- A third limit row, such as **Fable limit**, when your plan limits one model for the week and you turn on **Show model limit in tray popout** in [Settings › Claude](settings.md#claude).
 - **Today:** today's cost and tokens.
 - **↑ Update available**, while a new version is waiting. Click it to open the update prompt (see [Update](update.md)).
 - **Open MaxPrice** brings the main window back, and **Quit MaxPrice** quits.

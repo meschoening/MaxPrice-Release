@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-11-16T03:51:47.322Z",
+  "capturedAt": "2026-11-18T06:41:06.073Z",
   "models": {
     "aihubmix/claude-fable-5": {
       "input_cost_per_token": 0.000011,
@@ -728,6 +728,76 @@
       "cache_creation_input_token_cost": 0.00000375,
       "cache_read_input_token_cost": 3e-7
     },
+    "bedrock/mantle/anthropic.claude-fable-5": {
+      "input_cost_per_token": 0.000011,
+      "output_cost_per_token": 0.000055,
+      "cache_creation_input_token_cost": 0.00001375,
+      "cache_read_input_token_cost": 0.0000011,
+      "cache_creation_input_token_cost_above_1hr": 0.000022
+    },
+    "bedrock/mantle/anthropic.claude-haiku-4-5": {
+      "input_cost_per_token": 0.0000011,
+      "output_cost_per_token": 0.0000055,
+      "cache_creation_input_token_cost": 0.000001375,
+      "cache_read_input_token_cost": 1.1e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.0000022
+    },
+    "bedrock/mantle/anthropic.claude-haiku-5-5": {
+      "input_cost_per_token": 1.1e-7,
+      "output_cost_per_token": 5.5e-7,
+      "cache_creation_input_token_cost": 1.375e-7,
+      "cache_read_input_token_cost": 1.1e-8,
+      "cache_creation_input_token_cost_above_1hr": 2.2e-7
+    },
+    "bedrock/mantle/anthropic.claude-mythos-5": {
+      "input_cost_per_token": 0.000011,
+      "output_cost_per_token": 0.000055,
+      "cache_creation_input_token_cost": 0.00001375,
+      "cache_read_input_token_cost": 0.0000011,
+      "cache_creation_input_token_cost_above_1hr": 0.000022
+    },
+    "bedrock/mantle/anthropic.claude-opus-4-7": {
+      "input_cost_per_token": 0.0000055,
+      "output_cost_per_token": 0.0000275,
+      "cache_creation_input_token_cost": 0.000006875,
+      "cache_read_input_token_cost": 5.5e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000011
+    },
+    "bedrock/mantle/anthropic.claude-opus-4-8": {
+      "input_cost_per_token": 0.0000055,
+      "output_cost_per_token": 0.0000275,
+      "cache_creation_input_token_cost": 0.000006875,
+      "cache_read_input_token_cost": 5.5e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000011
+    },
+    "bedrock/mantle/anthropic.claude-opus-5": {
+      "input_cost_per_token": 0.0000055,
+      "output_cost_per_token": 0.0000275,
+      "cache_creation_input_token_cost": 0.000006875,
+      "cache_read_input_token_cost": 5.5e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000011
+    },
+    "bedrock/mantle/anthropic.claude-opus-5-5": {
+      "input_cost_per_token": 0.0000044,
+      "output_cost_per_token": 0.000022,
+      "cache_creation_input_token_cost": 0.0000055,
+      "cache_read_input_token_cost": 2.2e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.0000088
+    },
+    "bedrock/mantle/anthropic.claude-sonnet-5": {
+      "input_cost_per_token": 0.0000022,
+      "output_cost_per_token": 0.000011,
+      "cache_creation_input_token_cost": 0.00000275,
+      "cache_read_input_token_cost": 2.2e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.0000044
+    },
+    "bedrock/mantle/anthropic.claude-sonnet-5-5": {
+      "input_cost_per_token": 0.0000022,
+      "output_cost_per_token": 0.000011,
+      "cache_creation_input_token_cost": 0.00000275,
+      "cache_read_input_token_cost": 1.1e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.0000044
+    },
     "bedrock/us-east-1/anthropic.claude-instant-v1": {
       "input_cost_per_token": 8e-7,
       "output_cost_per_token": 0.0000024
@@ -954,12 +1024,19 @@
       "cache_creation_input_token_cost": 0.000001,
       "cache_read_input_token_cost": 8e-8
     },
+    "bedrock_mantle/anthropic.claude-fable-5": {
+      "input_cost_per_token": 0.000011,
+      "output_cost_per_token": 0.000055,
+      "cache_creation_input_token_cost": 0.00001375,
+      "cache_read_input_token_cost": 0.0000011,
+      "cache_creation_input_token_cost_above_1hr": 0.000022
+    },
     "bedrock_mantle/anthropic.claude-haiku-4-5": {
-      "input_cost_per_token": 0.000001,
-      "output_cost_per_token": 0.000005,
-      "cache_creation_input_token_cost": 0.00000125,
-      "cache_read_input_token_cost": 1e-7,
-      "cache_creation_input_token_cost_above_1hr": 0.000002
+      "input_cost_per_token": 0.0000011,
+      "output_cost_per_token": 0.0000055,
+      "cache_creation_input_token_cost": 0.000001375,
+      "cache_read_input_token_cost": 1.1e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.0000022
     },
     "bedrock_mantle/anthropic.claude-haiku-5-5": {
       "input_cost_per_token": 1.1e-7,
@@ -968,12 +1045,47 @@
       "cache_read_input_token_cost": 1.1e-8,
       "cache_creation_input_token_cost_above_1hr": 2.2e-7
     },
+    "bedrock_mantle/anthropic.claude-mythos-5": {
+      "input_cost_per_token": 0.000011,
+      "output_cost_per_token": 0.000055,
+      "cache_creation_input_token_cost": 0.00001375,
+      "cache_read_input_token_cost": 0.0000011,
+      "cache_creation_input_token_cost_above_1hr": 0.000022
+    },
+    "bedrock_mantle/anthropic.claude-opus-4-7": {
+      "input_cost_per_token": 0.0000055,
+      "output_cost_per_token": 0.0000275,
+      "cache_creation_input_token_cost": 0.000006875,
+      "cache_read_input_token_cost": 5.5e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000011
+    },
+    "bedrock_mantle/anthropic.claude-opus-4-8": {
+      "input_cost_per_token": 0.0000055,
+      "output_cost_per_token": 0.0000275,
+      "cache_creation_input_token_cost": 0.000006875,
+      "cache_read_input_token_cost": 5.5e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000011
+    },
+    "bedrock_mantle/anthropic.claude-opus-5": {
+      "input_cost_per_token": 0.0000055,
+      "output_cost_per_token": 0.0000275,
+      "cache_creation_input_token_cost": 0.000006875,
+      "cache_read_input_token_cost": 5.5e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.000011
+    },
     "bedrock_mantle/anthropic.claude-opus-5-5": {
       "input_cost_per_token": 0.0000044,
       "output_cost_per_token": 0.000022,
       "cache_creation_input_token_cost": 0.0000055,
       "cache_read_input_token_cost": 2.2e-7,
       "cache_creation_input_token_cost_above_1hr": 0.0000088
+    },
+    "bedrock_mantle/anthropic.claude-sonnet-5": {
+      "input_cost_per_token": 0.0000022,
+      "output_cost_per_token": 0.000011,
+      "cache_creation_input_token_cost": 0.00000275,
+      "cache_read_input_token_cost": 2.2e-7,
+      "cache_creation_input_token_cost_above_1hr": 0.0000044
     },
     "bedrock_mantle/anthropic.claude-sonnet-5-5": {
       "input_cost_per_token": 0.0000022,
@@ -2359,21 +2471,25 @@
     "snowflake/claude-4-sonnet": {
       "input_cost_per_token": 0.000003,
       "output_cost_per_token": 0.000015,
+      "cache_creation_input_token_cost": 0.00000375,
       "cache_read_input_token_cost": 3e-7
     },
     "snowflake/claude-haiku-4-5": {
       "input_cost_per_token": 0.000001,
       "output_cost_per_token": 0.000005,
+      "cache_creation_input_token_cost": 0.00000125,
       "cache_read_input_token_cost": 1e-7
     },
     "snowflake/claude-sonnet-4-5": {
       "input_cost_per_token": 0.000003,
       "output_cost_per_token": 0.000015,
+      "cache_creation_input_token_cost": 0.00000375,
       "cache_read_input_token_cost": 3e-7
     },
     "snowflake/claude-sonnet-4-6": {
       "input_cost_per_token": 0.000003,
       "output_cost_per_token": 0.000015,
+      "cache_creation_input_token_cost": 0.00000375,
       "cache_read_input_token_cost": 3e-7
     },
     "us-gov.anthropic.claude-3-haiku-20240307-v1:0": {

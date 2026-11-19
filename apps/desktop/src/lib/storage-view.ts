@@ -315,9 +315,12 @@ export const STORAGE_COPY = {
         lead: "A Claude data path is missing.",
         tail: "Reconnect it, or remove it in Claude data paths above.",
       },
+      // No tail: the sidecar's detail already says what it usually means and
+      // names Claude data paths, and a second "That usually means…" read as
+      // the same sentence twice (#648's installed-build smoke).
       "ratio-tripwire": {
         lead: "This doesn't look right.",
-        tail: "That usually means a data path is missing rather than that your history is old. Check Claude data paths before forgetting anything.",
+        tail: null,
       },
     },
 

@@ -11,6 +11,18 @@ import type { Settings } from "@maxprice/shared";
 // "unreachable" (F18). With no Hub it persists only: the sidecar reads the
 // value with the next hub config it is pushed.
 
+// The switch's words, one source for both surfaces (#648: the Usage hub row
+// once ended at "send it this machine's", with its noun lost). The strip's
+// switch shows the label with the rule as its tooltip; the Usage hub row
+// reads "‹label›: ‹rule›".
+const SEND_KEYS_LABEL = "Send keys to the Hub";
+const SEND_KEYS_RULE = "the Hub holds no working key for an Account, send it this machine's key";
+export const SEND_KEYS_COPY = {
+  label: SEND_KEYS_LABEL,
+  title: `When ${SEND_KEYS_RULE}`,
+  row: `${SEND_KEYS_LABEL}: when ${SEND_KEYS_RULE}`,
+} as const;
+
 export interface HubAutoHealDeps {
   // The persisted Hub URL (`settings.hubUrl`); empty with no Hub.
   hubUrl: string;

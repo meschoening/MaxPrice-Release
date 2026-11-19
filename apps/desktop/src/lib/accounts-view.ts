@@ -37,6 +37,7 @@ import {
   type ProviderId,
 } from "./account-menu";
 import type { DisconnectTarget } from "./credential-ops";
+import { SEND_KEYS_COPY } from "./hub-auto-heal";
 import { isNewOrganization } from "./organization-new";
 
 // Settings › Accounts (#639; layout, states and copy from #621's resolution;
@@ -73,8 +74,8 @@ export const RECONNECT_STRIP_TAIL = "Their limits show the last reading until th
 export const HUB_STRIP = {
   lead: "Limits come from the Hub, ",
   tail: ". Keys you connect here stay on this machine too, for when the Hub can't read.",
-  sendKeysLabel: "Send keys to the Hub",
-  sendKeysTitle: "When the Hub holds no working key for an Account, send it this machine's",
+  sendKeysLabel: SEND_KEYS_COPY.label,
+  sendKeysTitle: SEND_KEYS_COPY.title,
 } as const;
 
 export const HOME_SECTION = {
@@ -128,10 +129,11 @@ export const HUB_CONNECTION_WORDS = {
   error: "Can't reach claude.ai",
 } as const satisfies Record<UsageConnection, string>;
 // Hub-connected, the local key's fact is only whether one is held: there GET
-// /api/usage/keys answers the Hub's connection for every key held here, so
-// this machine's own key's health is not known (residual: #621's "This
-// machine's key expired too" is not shown until the sidecar reports the local
-// key's own health beside the Hub's).
+// /api/usage/keys answers the Hub's connection for every Account's key held
+// here, so this machine's own key's health is not known (residual: #621's
+// "This machine's key expired too" is not shown until the sidecar reports the
+// local key's own health beside the Hub's). The unresolved legacy key alone
+// reports its own (#702), which the legacy strip reads.
 export const LOCAL_KEY_WORDS = {
   held: "This machine also holds a key",
   none: "No key on this machine",

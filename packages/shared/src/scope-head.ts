@@ -44,22 +44,30 @@ import type { HomeMembership } from "./settings";
 // it in the Scope.
 export type HeadCandidate = { membership: MembershipKey; rows: boolean };
 
-// The Membership that leads the candidates: the Home membership, unless it
-// holds no rows in the Scope while its Organization's Membership with an
-// Account not known does, which then leads in its place (#644, the owner's
-// decision: "show unknown"). So a single-Account install whose usage carries
-// no Account evidence shows that usage's Active block, labelled "account not
-// known" (`blocksHeadAccountNotKnown`), rather than an empty Home's. With the
-// Home membership's Account not known the two are one Membership.
+// The Membership that leads the candidates: the Home membership, unless its
+// Organization's Membership with an Account not known holds rows in the Scope
+// and either the Home membership holds none (#644, the owner's decision:
+// "show unknown") or the Home membership holds no Active block while the
+// Unknown one holds it (#257). So the Active block of usage that carries no
+// Account evidence shows, labelled "account not known"
+// (`blocksHeadAccountNotKnown`), rather than an idle Home's "No active
+// block". `holdsActiveBlock` answers whether a Membership's own Blocks hold
+// the Active block now; it is asked only of these two, and only while both
+// hold rows. With the Home membership's Account not known the two are one
+// Membership. No other Membership's Active block takes the lead: a known
+// Account's would need a label naming it, and another Organization's would
+// move the head Organization off the one settings settle.
 export function headLead(
   candidates: readonly HeadCandidate[],
   home: HomeMembership,
+  holdsActiveBlock: (membership: MembershipKey) => boolean,
 ): MembershipKey {
   const homeKey: MembershipKey = {
     organizationUuid: home.organizationUuid,
     accountUuid: home.accountUuid,
   };
   if (home.accountUuid === null) return homeKey;
+  const unknownKey: MembershipKey = { organizationUuid: home.organizationUuid, accountUuid: null };
   const rowsOf = (account: string | null) =>
     candidates.some(
       (c) =>
@@ -67,9 +75,9 @@ export function headLead(
         c.membership.organizationUuid === home.organizationUuid &&
         c.membership.accountUuid === account,
     );
-  return !rowsOf(home.accountUuid) && rowsOf(null)
-    ? { organizationUuid: home.organizationUuid, accountUuid: null }
-    : homeKey;
+  if (!rowsOf(null)) return homeKey;
+  if (!rowsOf(home.accountUuid)) return unknownKey;
+  return !holdsActiveBlock(homeKey) && holdsActiveBlock(unknownKey) ? unknownKey : homeKey;
 }
 
 // The candidates' order, head first: the lead (`headLead`: the Home
@@ -171,7 +179,9 @@ export function headOrganizationWithoutHome(
 ): string {
   const named = oneOrganizationHead(scope);
   if (named !== undefined) return named;
-  const lead = headLead(candidates, home);
+  // The Scope does not hold the Home membership, so it is no candidate with
+  // rows, and `headLead` never asks for an Active block.
+  const lead = headLead(candidates, home, () => false);
   let head: HeadCandidate | undefined;
   for (const c of candidates) {
     if (head === undefined || compareHeadCandidates(c, head, home, lead) < 0) head = c;

@@ -140,7 +140,8 @@ export function BlocksPage(): React.ReactElement {
   // Usage whose Account is not known, outside the head's Blocks (#635).
   const unknown = useMemo(() => unknownAccountUsage(query.data), [query.data]);
   // The head Blocks are the Unknown Membership's, heading in place of an
-  // empty Home membership (#644): the strip says "account not known".
+  // empty or idle Home membership (#644, #257): the strip says "account not
+  // known".
   const headAccountNotKnown = blocksHeadAccountNotKnown(
     query.data,
     settings === undefined ? null : homeMembershipOf(settings),

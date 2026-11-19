@@ -99,24 +99,24 @@
     },
     "hub-page": {
       "light": {
-        "sha256": "fc8a347133716fea3a9283a829372d3094bea18fec80440758cf414443791da7",
+        "sha256": "479261f374599d40deeab7818336b764edb19b6bdf8cd38755f1155b59a6f081",
         "width": 1024,
         "height": 664
       },
       "dark": {
-        "sha256": "5ae4bcb69aff7da9972048274a4f7f4f74be28fb1c082d36b5ee52347801d058",
+        "sha256": "a26beb3fb6516be76f7b5aa2ef537598e7036be2529fd7261ad2935e2aa5e0cd",
         "width": 1024,
         "height": 664
       }
     },
     "hub-tray-console": {
       "light": {
-        "sha256": "f155658b42700a215e5a3168f0318488482df50c63ff8a8b209301498ff74fc9",
+        "sha256": "f120aee96c02657445fbd77a5e8f262c779ed823516b771aacda54b2b5354ac3",
         "width": 840,
         "height": 3178
       },
       "dark": {
-        "sha256": "91655d2160114315021c94548d5a89e4ba3c6e56bdabbe1ac3949b1cf4fbc73d",
+        "sha256": "fd50bd22447ba9be3a780e345a488abf82eecc3dfd3cd78173845c5eb9947102",
         "width": 840,
         "height": 3178
       }
@@ -147,12 +147,12 @@
     },
     "join-a-hub-connected": {
       "light": {
-        "sha256": "5e32bac0169e06a37a124b95efff0406cec62080db2029c539a038a90ae7a00d",
+        "sha256": "47ed61d0181d96a25553e505b7ada6c4bc83ff2e0cf62aed778c72a6acef62b3",
         "width": 1356,
         "height": 790
       },
       "dark": {
-        "sha256": "cc0bd94fb0d5a09ba6d87fde48fa9cfddf487a78944c0ad7d9a227dee35e0771",
+        "sha256": "a9879996dd3c583a2360610dd28b7de1e55722ec833d62ed08d8a3061a35939c",
         "width": 1356,
         "height": 790
       }
@@ -291,12 +291,12 @@
     },
     "settings-application": {
       "light": {
-        "sha256": "2e6720589ff690c092464cde87c391a5cf00f424b54b61bbc75210e4201fcdbf",
+        "sha256": "00362e3da8abcf988328004db16cf2953c8bb64fe6e7d87586e693c344bea536",
         "width": 1392,
         "height": 1770
       },
       "dark": {
-        "sha256": "b66040150333123d7aea7413d37ab3857815d97e9ad805b6305e998e704a3bd4",
+        "sha256": "12ae22f4f43c8580d724fb427aa85691235111a05fb21ea853eac30cf284e853",
         "width": 1392,
         "height": 1770
       }
@@ -315,12 +315,12 @@
     },
     "settings-connections": {
       "light": {
-        "sha256": "3473bf207bdecd50e94279b19e1d64c708b9a6675c3016f2d03dd288a5708d9f",
+        "sha256": "f95ad72082834389ce4ca61339758fed14907883078e2cc5754c64b8030c79ab",
         "width": 1392,
         "height": 900
       },
       "dark": {
-        "sha256": "83200783f6977cf61a36bcfb2938d29a214f005def553c4c7fbcd65fe93baa83",
+        "sha256": "181b4584d6d1efece8d4861c2c925903d5211e2592553a26cf10af1fb7db1095",
         "width": 1392,
         "height": 900
       }
