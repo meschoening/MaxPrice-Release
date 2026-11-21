@@ -119,11 +119,11 @@ export type ServiceContext = {
 };
 
 const VERBS = ["install", "uninstall", "status", "logs"] as const;
-type Verb = (typeof VERBS)[number];
+export type ServiceVerb = (typeof VERBS)[number];
 
 // The compiled binary carries its entry inside it, under `/$bunfs/`, so the
 // binary alone starts it; from source it is bun and the entry script.
-function selfCommand(): string[] {
+export function selfCommand(): string[] {
   return Bun.main.startsWith("/$bunfs/") ? [process.execPath] : [process.execPath, Bun.main];
 }
 
@@ -142,7 +142,7 @@ function usage(message: string): ServiceError {
   return new ServiceError("usage", message);
 }
 
-function isVerb(word: string): word is Verb {
+function isVerb(word: string): word is ServiceVerb {
   return (VERBS as readonly string[]).includes(word);
 }
 
@@ -578,11 +578,9 @@ export function dataDirOnInstall(
   );
 }
 
-export async function runService(
-  product: HeadlessService,
-  args: ServiceArgs,
-  context: ServiceContext,
-): Promise<ServiceResult> {
+// The verb `args` name, once its arguments and flags are checked; a usage
+// refusal otherwise. The launchd verbs (./launchd-service) take the same.
+export function serviceVerb(args: ServiceArgs): ServiceVerb {
   const [verb, ...extra] = args.positionals;
   if (verb === undefined) throw usage("service needs a verb: install, uninstall, status or logs");
   if (!isVerb(verb)) throw usage(`unknown service verb '${verb}'`);
@@ -594,6 +592,16 @@ export async function runService(
   if (lines !== undefined && !/^\d+$/.test(lines)) {
     throw usage(`-n takes a whole number of lines, not '${lines}'`);
   }
+  return verb;
+}
+
+export async function runService(
+  product: HeadlessService,
+  args: ServiceArgs,
+  context: ServiceContext,
+): Promise<ServiceResult> {
+  const verb = serviceVerb(args);
+  const { follow, lines } = args;
 
   const ctx: Context = {
     product,

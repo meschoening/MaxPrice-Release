@@ -1,6 +1,6 @@
 {
   "name": "@maxprice/usage-core",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "private": true,
   "type": "module",
   "main": "./src/index.ts",
@@ -18,8 +18,13 @@
     "./systemd-unit": "./src/systemd-unit.ts",
     "./systemctl": "./src/systemctl.ts",
     "./systemd-service": "./src/systemd-service.ts",
+    "./launchd-agent": "./src/launchd-agent.ts",
+    "./launchctl": "./src/launchctl.ts",
+    "./launchd-service": "./src/launchd-service.ts",
+    "./relaunch-ledger": "./src/relaunch-ledger.ts",
     "./terminal-text": "./src/terminal-text.ts",
     "./test-systemd": "./src/test-systemd.ts",
+    "./test-launchd": "./src/test-launchd.ts",
     "./test-channel": "./src/test-channel.ts",
     "./test-loopback": "./src/test-loopback.ts",
     "./update-check": "./src/update-check.ts"

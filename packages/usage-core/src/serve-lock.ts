@@ -31,7 +31,8 @@ export type ServeLockTake =
   // flock failed for any other reason, with its errno.
   | { kind: "failed"; errno: number };
 
-// What a process's cgroup file says, or null; `/proc` by default.
+// What a process's cgroup file says, or null when no process has that pid;
+// `defaultReadCgroup` unless a caller passes its own.
 export type ReadCgroup = (pid: number) => string | null;
 
 function readProcCgroup(pid: number): string | null {
@@ -41,6 +42,21 @@ function readProcCgroup(pid: number): string | null {
     return null;
   }
 }
+
+// macOS has neither `/proc` nor cgroups (ADR-0143 §8): a live pid reads as an
+// empty cgroup file, so the holder is running and in no unit. Signal 0 checks
+// only that the pid exists; EPERM means it does, under another user.
+function readLiveness(pid: number): string | null {
+  try {
+    process.kill(pid, 0);
+    return "";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM" ? "" : null;
+  }
+}
+
+export const defaultReadCgroup: ReadCgroup =
+  process.platform === "darwin" ? readLiveness : readProcCgroup;
 
 export type ServeLockHolder = {
   // The pid the holder wrote, or null when the file names none yet.
@@ -57,7 +73,7 @@ export type ServeLockHolder = {
 export function readServeLockHolder(
   path: string,
   unit: string,
-  readCgroup: ReadCgroup = readProcCgroup,
+  readCgroup: ReadCgroup = defaultReadCgroup,
 ): ServeLockHolder {
   let text = "";
   try {
@@ -84,7 +100,7 @@ export function describeHolder(holder: ServeLockHolder, unit: string): string {
 export function takeServeLock(
   path: string,
   unit: string,
-  readCgroup: ReadCgroup = readProcCgroup,
+  readCgroup: ReadCgroup = defaultReadCgroup,
   inspect?: (fd: number) => void,
 ): ServeLockTake {
   // O_RDWR | O_CREAT, never "w": truncating before the lock is taken would

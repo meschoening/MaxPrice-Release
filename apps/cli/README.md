@@ -1,6 +1,6 @@
 # The MaxPrice Headless client
 
-`maxprice` is the Headless client: MaxPrice with no window, for a Linux server. It tracks this machine's Claude Code usage from its session logs, prints the Desktop client's reports in a terminal, and can join a Hub as a Connected client. Its commands also do what the Desktop client's Settings do: choose the Accounts, Organizations and Home membership it counts, and connect session keys and Gateways. It is one binary, for Linux x64 with glibc.
+`maxprice` is the Headless client: MaxPrice with no window, for a Linux server or a Mac that nobody sits at. It tracks this machine's Claude Code usage from its session logs, prints the Desktop client's reports in a terminal, and can join a Hub as a Connected client. Its commands also do what the Desktop client's Settings do: choose the Accounts, Organizations and Home membership it counts, and connect session keys and Gateways. It is one binary, built for Linux x64 with glibc and for macOS on Apple Silicon.
 
 ## Contents
 
@@ -19,7 +19,11 @@
 
 ## Install
 
-The Headless client ships as `maxprice_<version>_linux-x64.tar.gz` on the [releases page](https://github.com/meschoening/MaxPrice-Release/releases), starting with the first release that ships it. The tarball holds one file, `maxprice`, with mode 0755. Download it, then, in the directory that holds it and no other `maxprice_` tarball:
+The Headless client ships as two tarballs on the [releases page](https://github.com/meschoening/MaxPrice-Release/releases), each starting with the first release that ships it: `maxprice_<version>_linux-x64.tar.gz` for Linux and `maxprice_<version>_darwin-arm64.tar.gz` for macOS. Each holds one file, `maxprice`, with mode 0755.
+
+### Linux
+
+Download the Linux tarball, then, in the directory that holds it and no other `maxprice_` tarball:
 
 ```sh
 mkdir -p ~/.local/bin && tar -xzf maxprice_*_linux-x64.tar.gz -C ~/.local/bin
@@ -30,6 +34,36 @@ The same line replaces an older `maxprice` there and leaves the rest of `~/.loca
 On Ubuntu and Debian, the default `~/.profile` adds `~/.local/bin` to `PATH` at your next login once the directory exists. Until then, or in a shell that does not, add it yourself:
 
 ```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then check that it runs:
+
+```sh
+maxprice --version
+```
+
+### macOS
+
+The macOS tarball is for Apple Silicon. Its `maxprice` is signed with MaxPrice's Developer ID. Fetch it with `curl`:
+
+```sh
+v=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/meschoening/MaxPrice-Release/releases/latest) && v=${v##*/v}
+mkdir -p ~/.local/bin && curl -fsSL "https://github.com/meschoening/MaxPrice-Release/releases/download/v$v/maxprice_${v}_darwin-arm64.tar.gz" | tar -xz -C ~/.local/bin
+```
+
+The first line sets `v` to the newest release's version, such as `0.9.4`; set it by hand for another release. If the download stops partway, `tar` may leave a half-written `maxprice`, which does not start; run the two lines again. The second line replaces an older `maxprice` there and leaves the rest of `~/.local/bin` alone. It needs no root. A daemon already running keeps the old version, and the other commands exit 4 until it restarts, so restart it: `launchctl kickstart -k gui/$(id -u)/com.maxprice.headless-client` for the LaunchAgent. [`maxprice update`](#updating) replaces the binary and restarts the agent in one step.
+
+A tarball downloaded in a browser carries macOS's quarantine attribute, and `tar` gives it to the `maxprice` it unpacks; `curl` sets none. Unless Apple has notarized the release, a quarantined `maxprice` never starts: over SSH macOS kills it at once (the shell prints `killed`, and the exit is 137), and in a session at the Mac's own screen it waits on Gatekeeper and prints nothing. Remove the attribute, then run it again:
+
+```sh
+xattr -d com.apple.quarantine ~/.local/bin/maxprice
+```
+
+macOS's shells do not put `~/.local/bin` on `PATH`. Add it for zsh, macOS's default shell, at every login, and in this shell:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zprofile
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -64,6 +98,10 @@ By default the daemon reads `~/.config/claude/projects` and `~/.claude/projects`
 Ctrl-C stops `serve` with exit 0, and so does closing its terminal. To keep it running, run it [as a service](#run-it-as-a-service).
 
 ## Run it as a service
+
+`maxprice service install` runs the daemon as a service: a systemd user unit on Linux, a LaunchAgent on macOS.
+
+### A systemd user unit
 
 ```sh
 maxprice service install
@@ -108,6 +146,60 @@ Day to day, `systemctl --user start|stop|restart maxprice` drives the unit, `max
 
 The unit needs a systemd user manager, which `systemctl --user` reaches. With none, as in a container or an SSH session with no `XDG_RUNTIME_DIR` or user bus, every `service` verb exits 1 and says so. Run `serve` under another init instead.
 
+### A LaunchAgent on macOS
+
+```sh
+maxprice service install
+```
+
+This writes a LaunchAgent, `~/Library/LaunchAgents/com.maxprice.headless-client.plist`, then loads it into your login session and starts it, with no root. Its `ProgramArguments` is the `maxprice` that ran `install`, so run it from the binary the agent should run. Run it again after moving the binary.
+
+A LaunchAgent runs while you are logged in to the Mac, at its screen or through Screen Sharing, and starts again at your next login. An SSH session is not a login: over SSH the `service` verbs work only while you are also logged in that way, and with no login every verb exits 1 and says so. On a Mac with FileVault, which offers no automatic login, the agent comes back after a restart once you unlock the disk and log in. For a Mac that nobody logs in to, run [a LaunchDaemon](#a-launchdaemon-on-macos) instead.
+
+The agent `install` writes, for a user `dev`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Generated by `maxprice service install`, which rewrites this file. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.maxprice.headless-client</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/dev/.local/bin/maxprice</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MAXPRICE_SUPERVISOR</key>
+    <string>launchd</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/dev/.local/share/maxprice/serve.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/dev/.local/share/maxprice/serve.log</string>
+</dict>
+</plist>
+```
+
+- **Restarts.** launchd starts the daemon again after a crash (exit 1) or a signal it does not catch, such as `kill -9`, at most once every 10 s. SIGTERM, SIGINT and SIGHUP stop it cleanly with exit 0, and launchd leaves it stopped until the next `launchctl kickstart` or login. launchd cannot bound those relaunches, so the daemon bounds its own, in `relaunch.json` in its data dir. It counts every start, hand restarts and `maxprice update`'s included. The sixth start within 15 minutes, another `maxprice serve` holding the data dir, and a refused `settings.json` are each recorded there as the reason it stopped, and the daemon exits 0, which launchd never relaunches. launchd then reports a last exit of 0, whatever stopped it, so `maxprice service status` reads the reason from `relaunch.json`. `maxprice service install` clears the count.
+- **Your shell's variables.** launchd never sees them. When the installing shell sets `CLAUDE_CONFIG_DIR` or `XDG_DATA_HOME`, `install` adds each to `EnvironmentVariables` and prints it. As on Linux, a relative `CLAUDE_CONFIG_DIR` entry is made absolute against the current directory, and a relative `XDG_DATA_HOME`, which `serve` ignores, is kept as it is. `MAXPRICE_SUPERVISOR=launchd` is what tells `serve` that launchd runs it.
+- **Its log.** launchd writes the daemon's stdout and stderr to `serve.log` in the data dir, creating the file; `install` makes the data dir first, since launchd cannot open a log in a directory that does not exist. At each start the daemon moves a `serve.log` past 10 MB to `serve.log.1`, replacing the older one.
+- **Customizing.** There are no drop-ins. `install` puts the generated text back whenever the file differs from it, so a hand edit is lost; when the file changed, it reloads the agent, which restarts a running daemon. For another shape, run [a LaunchDaemon](#a-launchdaemon-on-macos), or your own plist under another label.
+
+Day to day, `launchctl kickstart gui/$(id -u)/com.maxprice.headless-client` starts the agent and `launchctl kickstart -k …` restarts it; `maxprice service status` describes it, and `maxprice service logs -f` follows `serve.log`. `maxprice service uninstall` stops and removes it.
+
 ## Other inits
 
 `maxprice serve` runs under any supervisor that keeps a process in the foreground.
@@ -151,6 +243,69 @@ It differs from the user unit in four ways:
 - Linger is not needed.
 
 On a host where SELinux is enforcing, as RHEL and Rocky Linux ship, the system manager may be refused a binary under `/home` (`status=203/EXEC` in `systemctl status`). Then install the binary outside `/home`, such as `/usr/local/bin`, and point `ExecStart` there, or use the user unit, which is not affected.
+
+### A LaunchDaemon on macOS
+
+The LaunchAgent runs only while you are logged in. On a Mac that nobody logs in to, a LaunchDaemon runs the daemon for one user from boot, with no login. On a Mac with FileVault it still waits for the disk to be unlocked. Installing it needs root, and nothing in `maxprice` installs it. Write `com.maxprice.headless-client.dev.plist`, with `dev` replaced by that user's name and `/Users/dev` by their home:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.maxprice.headless-client.dev</string>
+  <key>UserName</key>
+  <string>dev</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/dev/.local/bin/maxprice</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/dev</string>
+    <key>MAXPRICE_SUPERVISOR</key>
+    <string>launchd</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/dev/.local/share/maxprice/serve.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/dev/.local/share/maxprice/serve.log</string>
+</dict>
+</plist>
+```
+
+- **Its label** is `com.maxprice.headless-client.<user>`, never the agent's `com.maxprice.headless-client`, which `maxprice service status` and `maxprice update` take for theirs. The name also lets several users run one each.
+- **`UserName`** runs it as that user, and **`HOME`** points it at their home, so the daemon reads that user's `~/.claude` and keeps its files in their `~/.local/share/maxprice`, the data dir their own commands reach. When their logs or data dir are elsewhere, add `CLAUDE_CONFIG_DIR` or `XDG_DATA_HOME` to `EnvironmentVariables`, with absolute paths, and point both log paths at `serve.log` in that data dir.
+- **`MAXPRICE_SUPERVISOR=launchd`** gives it the agent's bound on relaunches and its log rotation. The rest is the agent's plist.
+
+Create the data dir and the log as that user, so the log is theirs; then install the plist, owned by root, and load it:
+
+```sh
+sudo -u dev mkdir -p /Users/dev/.local/share/maxprice
+sudo -u dev touch /Users/dev/.local/share/maxprice/serve.log
+sudo install -m 644 -o root -g wheel com.maxprice.headless-client.dev.plist /Library/LaunchDaemons/
+sudo launchctl enable system/com.maxprice.headless-client.dev
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.maxprice.headless-client.dev.plist
+```
+
+It differs from the agent in four ways:
+
+- `maxprice service …` manages only the agent. Use `sudo launchctl print system/com.maxprice.headless-client.dev` for its state, `sudo launchctl kickstart -k system/com.maxprice.headless-client.dev` to restart it, and `tail -f /Users/dev/.local/share/maxprice/serve.log` for its log. Why it last stopped is in `relaunch.json`; after repeated crashes, delete that file to clear the count, as `service install` does for the agent, then start it.
+- The hints a command prints when the daemon is down or runs another version name the agent or a foreground `serve`. Read them as `sudo launchctl … system/com.maxprice.headless-client.dev`, and never also run `maxprice service install`: the two would contend for one data dir, and the one that starts second stops.
+- `maxprice update`, run as that user from a shell whose data dir is the daemon's, swaps the binary and prints `A 'maxprice serve' (pid N) still runs <old version>: restart it to finish the update.` Restart it with `sudo launchctl kickstart -k system/com.maxprice.headless-client.dev`.
+- It needs no login.
 
 ### Any other supervisor
 
@@ -283,6 +438,7 @@ Options: `--account` and `--org` ([Report options](#report-options)), and `--jso
 - It reads `secrets.json` once, at start. It tightens one that group or others can reach to 0600, and skips one it cannot use with one log line; it never exits for that file. A change made by hand applies at the next start.
 - It checks the update channel at boot and every 6 hours, writes what it found to `update-check.json`, and never installs anything.
 - It logs to stderr, and its boot trace to stdout. SIGTERM, SIGINT and SIGHUP stop it cleanly, with exit 0.
+- On macOS, under launchd (`MAXPRICE_SUPERVISOR=launchd`, which its LaunchAgent sets), it bounds its own relaunches: a sixth start within 15 minutes, another `maxprice serve` holding the data dir, or a refused `settings.json` is recorded in `relaunch.json` in the data dir, and it exits 0, which launchd does not relaunch. It moves a `serve.log` past 10 MB to `serve.log.1` at boot.
 
 | Exit | Meaning                                                                                                               |
 | ---- | --------------------------------------------------------------------------------------------------------------------- |
@@ -305,6 +461,21 @@ Options: `--account` and `--org` ([Report options](#report-options)), and `--jso
 | 1    | No systemd user manager, a systemctl step failed, `journalctl` is not on `PATH`, or `uninstall` found the file gone while the manager still has the unit |
 | 2    | A bad verb or option, an argument after the verb, `-f` or `-n` with a verb other than `logs`, or a `-n` that is not a whole number                       |
 | 3    | `status`: the unit is inactive, failed or not installed; `logs`: the unit is not installed                                                               |
+
+#### On macOS
+
+`maxprice service <verb>`: the daemon as a LaunchAgent, `com.maxprice.headless-client`, in your login session (`~/Library/LaunchAgents/com.maxprice.headless-client.plist`). It runs while you are logged in to the Mac and starts again at your next login; on a Mac with FileVault, that is after you unlock the disk and log in. There is no start, stop or restart verb: `launchctl kickstart [-k] gui/$(id -u)/com.maxprice.headless-client` starts or restarts it.
+
+- `install` clears the relaunch count in `relaunch.json`, makes the data dir, writes the plist when it changed, loads it and starts the agent. It bakes in `CLAUDE_CONFIG_DIR` and `XDG_DATA_HOME` when the shell sets them.
+- `uninstall` unloads the agent, which stops it, and removes its plist. The data dir, its `secrets.json`, `serve.log` and `relaunch.json` stay.
+- `status` shows the agent's state, pid, runs and last exit; why it stopped, from `relaunch.json` (a stopped agent's own exit status reads 0 whatever stopped it), and its starts in the last 15 minutes; whether it runs this maxprice and serves this shell's data dir; and whether the daemon answers on its socket.
+- `logs` runs `tail` on `serve.log` in the agent's data dir, and exits with tail's own code. `-f` or `--follow` follows it, and `-n <N>` or `--lines <N>` shows the last N lines.
+
+| Exit | Meaning                                                                                                                            |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | No launchd GUI session for this user, a launchctl step failed, or `tail` is not on `PATH`                                          |
+| 2    | A bad verb or option, an argument after the verb, `-f` or `-n` with a verb other than `logs`, or a `-n` that is not a whole number |
+| 3    | `status`: the agent is not running or not installed; `logs`: the agent is not installed                                            |
 
 ### `maxprice status`
 
@@ -593,6 +764,7 @@ After the swap:
 - A unit that runs another binary is left running, and `update` says so.
 - A `maxprice serve` outside the user unit, in a terminal, a [system unit](#a-systemd-system-unit) or another init, is left running, and `update` says to restart it. Until you do, commands exit 4 and name the two versions.
 - Run as root, as for a shared `/usr/local/bin`, it restarts nothing: each user restarts their own unit with `systemctl --user restart maxprice`.
+- On macOS the same holds for the LaunchAgent: a running `com.maxprice.headless-client` whose program is this binary is restarted with `launchctl kickstart -k gui/$(id -u)/com.maxprice.headless-client`, and `update` waits on the agent's own data dir; one that runs another binary is left running; as root it restarts nothing, and each user runs that `launchctl kickstart -k` line.
 
 The daemon checks the channel at boot and every 6 hours, and never installs anything. `maxprice status`'s Update line shows what it found: `! Update` with `→ maxprice update` when a newer release is out, `✓ Update current`, `– Update check failed` with the reason, or `– Update not checked yet` just after a boot. A failed check is not `✗`, since a server with no route to GitHub is not broken.
 
@@ -600,11 +772,11 @@ The daemon checks the channel at boot and every 6 hours, and never installs anyt
 
 A Desktop client and a Headless client on one machine can both join a Hub. They do not double-count: the Hub keeps one copy of each usage event. But this machine's usage then splits between two Machine directory entries, so the Machine filter misleads. Join only one of them to a Hub.
 
-The Headless client cannot tell whether the Desktop client's Hub is its own, so it warns whenever the Desktop client's settings, `$XDG_DATA_HOME/com.maxprice.desktop/settings.json` (`~/.local/share/com.maxprice.desktop/settings.json` by default), name any Hub: at `maxprice hub join`, as a line in `maxprice status`, and once in the daemon's log at boot. It never blocks.
+The Headless client cannot tell whether the Desktop client's Hub is its own, so it warns whenever the Desktop client's settings name any Hub. On Linux they are `$XDG_DATA_HOME/com.maxprice.desktop/settings.json` (`~/.local/share/com.maxprice.desktop/settings.json` by default); on macOS, `~/Library/Application Support/com.maxprice.desktop/settings.json`, whatever `XDG_DATA_HOME` is. It warns at `maxprice hub join`, as a line in `maxprice status`, and once in the daemon's log at boot. It never blocks.
 
 ## The data dir
 
-The data dir is `$XDG_DATA_HOME/maxprice`, or `~/.local/share/maxprice` when `XDG_DATA_HOME` is unset or not absolute. The daemon and every command compute it the same way, so a shell with another `XDG_DATA_HOME` reaches another daemon; `maxprice service status` flags a unit whose data dir is not the shell's. `serve` creates it 0700 and tightens one that group or others can reach, so only this user can open the files in it. Keep it on a local filesystem: its locks, its socket and its SQLite files are unsupported on a network filesystem.
+The data dir is `$XDG_DATA_HOME/maxprice`, or `~/.local/share/maxprice` when `XDG_DATA_HOME` is unset or not absolute, on macOS as on Linux. The daemon and every command compute it the same way, so a shell with another `XDG_DATA_HOME` reaches another daemon; `maxprice service status` flags a unit or agent whose data dir is not the shell's. `serve` creates it 0700 and tightens one that group or others can reach, so only this user can open the files in it. Keep it on a local filesystem: its locks, its socket and its SQLite files are unsupported on a network filesystem.
 
 | File                                           | What it holds                                                                                                                                           | Mode                 |
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
@@ -614,6 +786,8 @@ The data dir is `$XDG_DATA_HOME/maxprice`, or `~/.local/share/maxprice` when `XD
 | `settings.lock`                                | The lock every settings write takes                                                                                                                     | 0600                 |
 | `secrets.json`                                 | The claude.ai session keys, the Hub password, and each Gateway's URL and management key; there is no file while none is stored                          | 0600                 |
 | `update-check.json`                            | The daemon's last check of the update channel, which `status` shows                                                                                     | 0600                 |
+| `relaunch.json`                                | macOS, under launchd: the daemon's starts in the last 15 minutes and why it last stopped, which `service status` shows                                  | 0600                 |
+| `serve.log`, and `serve.log.1` once rotated    | macOS, under launchd: the daemon's log, which `service logs` shows                                                                                      | 0644, from launchd   |
 | `machine-id`                                   | This machine's id, minted at its first boot; a Hub knows the machine by it                                                                              | umask                |
 | `local-archive.sqlite`, with `-wal` and `-shm` | The Local archive: this machine's own usage events, kept after Claude Code prunes their JSONL                                                           | 0644, less the umask |
 | `usage-history.jsonl`                          | The Usage history: the usage-limit samples the daemon took or received from a Hub                                                                       | umask                |
@@ -638,7 +812,7 @@ A file marked umask has the mode the umask gives a new file. A write to most of 
 
 A first boot over Claude Code logs, with no session key and no Hub, writes `daemon.sock`, `serve.lock`, `settings.json` (its Home membership and tracked Accounts), `settings.lock`, `update-check.json`, `machine-id`, the Local archive, `scan-cache.json`, `organizations.json`, `organization-repair.json` and `account-pairs.json`. The others appear with what they hold.
 
-Both the archive reset below and the data deletion in [Uninstalling](#uninstalling) require `realpath` with `-m -s` support (GNU coreutils or a compatible implementation). These options normalize `.` and `..` lexically without following symlinks, matching the client's path calculation even when a symlink precedes `..` or a component does not exist. Deletion runs only if normalization succeeds. If the tool is missing or rejects these options, install a compatible coreutils tool before retrying. This requirement applies to these shell cleanup recipes.
+On Linux, both the archive reset below and the data deletion in [Uninstalling](#uninstalling) require `realpath` with `-m -s` support (GNU coreutils or a compatible implementation). These options normalize `.` and `..` lexically without following symlinks, matching the client's path calculation even when a symlink precedes `..` or a component does not exist. Deletion runs only if normalization succeeds. If the tool is missing or rejects these options, install a compatible coreutils tool before retrying. This requirement applies to these shell cleanup recipes. macOS's `realpath` has neither option, so each recipe has a macOS form, which hands the same steps to zsh, present on every Mac, whose `:a` modifier normalizes a path the same way.
 
 Deleting the data dir resets the client. It loses the settings, the session key and the Hub password, and on a client with no Hub, what no other place holds: the Local archive's events whose JSONL Claude Code has since pruned, and the Usage history's samples. A Hub keeps its own copies of the events and samples it received. It also loses the machine id, so a Hub sees the next boot as a new machine, and this machine's past usage stays under the old Machine directory entry. To reset only the Local archive, stop the daemon and delete the archive with its `-wal` and `-shm` files. Like the client, this recipe ignores an unset, empty or relative `XDG_DATA_HOME`:
 
@@ -651,16 +825,32 @@ data_dir=$(realpath -m -s -- "$data_dir") &&
   rm -f -- "$data_dir/local-archive.sqlite" "$data_dir/local-archive.sqlite-wal" "$data_dir/local-archive.sqlite-shm"
 ```
 
+On macOS:
+
+```sh
+zsh -f <<'EOF'
+case "${XDG_DATA_HOME:-}" in
+  /*) data_dir="$XDG_DATA_HOME/maxprice" ;;
+  *) data_dir="$HOME/.local/share/maxprice" ;;
+esac
+data_dir=${data_dir:a} &&
+  rm -f -- "$data_dir/local-archive.sqlite" "$data_dir/local-archive.sqlite-wal" "$data_dir/local-archive.sqlite-shm"
+EOF
+```
+
 The next boot fills it again from the JSONL still on disk.
 
 ## Uninstalling
 
+On macOS, first note the `Data dir:` line that `maxprice service status` prints: it is the agent's data dir, which the cleanup below removes. If you cannot tell which data dir the agent served, skip that cleanup.
+
 ```sh
-maxprice service uninstall
-rm ~/.local/bin/maxprice
+maxprice service uninstall && rm ~/.local/bin/maxprice
 ```
 
-`service uninstall` stops and disables the unit and removes its file. It keeps the data dir with its secrets.json, the unit's drop-ins in the `maxprice.service.d` dir it names (`~/.config/systemd/user/maxprice.service.d` by default), and linger. Stop any `maxprice serve` running outside the unit, then remove those too if you want them gone: that `.d` dir, `loginctl disable-linger` when nothing else of yours needs it, and the data dir, which deletes everything [the data dir](#the-data-dir) lists, the Local archive included. This recipe also ignores an unset, empty or relative `XDG_DATA_HOME` and requires the `realpath -m -s` support described [above](#the-data-dir):
+The binary goes only once the service is gone, so a failed `uninstall` leaves the command that retries it. Run `rm ~/.local/bin/maxprice` alone only when you never installed the service on this machine, so there is no unit or agent left to start it, and `service uninstall` fails for want of a systemd user manager or a macOS login session.
+
+On Linux, `service uninstall` stops and disables the unit and removes its file. It keeps the data dir with its secrets.json, the unit's drop-ins in the `maxprice.service.d` dir it names (`~/.config/systemd/user/maxprice.service.d` by default), and linger. Stop any `maxprice serve` running outside the unit, then remove those too if you want them gone: that `.d` dir, `loginctl disable-linger` when nothing else of yours needs it, and the data dir, which deletes everything [the data dir](#the-data-dir) lists, the Local archive included. This recipe also ignores an unset, empty or relative `XDG_DATA_HOME` and requires the `realpath -m -s` support described [above](#the-data-dir):
 
 ```sh
 case "${XDG_DATA_HOME:-}" in
@@ -679,27 +869,50 @@ sudo rm /etc/systemd/system/maxprice-dev.service
 sudo systemctl daemon-reload
 ```
 
+On macOS, `service uninstall` unloads the agent, which stops it, and removes its plist. It keeps the data dir with its secrets.json, `serve.log` and `relaunch.json`. Stop any `maxprice serve` running outside the agent, then remove the data dir too if you want it gone, which deletes everything [the data dir](#the-data-dir) lists, the Local archive included. The recipe removes this shell's data dir: when the agent's `Data dir:` you noted is another, first export `XDG_DATA_HOME` as the directory that holds the agent's (the agent's data dir without its last `/maxprice`), as in `export XDG_DATA_HOME=/Users/dev/data`, or run `unset XDG_DATA_HOME` when the agent's is `~/.local/share/maxprice`; the recipe's `zsh` sees only exported variables. This recipe ignores an unset, empty or relative `XDG_DATA_HOME` too:
+
+```sh
+zsh -f <<'EOF'
+case "${XDG_DATA_HOME:-}" in
+  /*) data_dir="$XDG_DATA_HOME/maxprice" ;;
+  *) data_dir="$HOME/.local/share/maxprice" ;;
+esac
+data_dir=${data_dir:a} &&
+  rm -r -- "$data_dir"
+EOF
+```
+
+For a [LaunchDaemon](#a-launchdaemon-on-macos), in place of `service uninstall`:
+
+```sh
+sudo launchctl bootout system/com.maxprice.headless-client.dev
+sudo rm /Library/LaunchDaemons/com.maxprice.headless-client.dev.plist
+```
+
 ## Troubleshooting
 
 Start with `maxprice status`: each line that has a fix names the command for it.
 
-| What you see                                                       | What to do                                                                                                                                                                                              |
-| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `the daemon is not running.` (exit 3)                              | Run the hint it prints: `systemctl --user start maxprice` once the unit is installed, else `maxprice service install` or `maxprice serve`. A shell with another `XDG_DATA_HOME` reaches another daemon  |
-| `the daemon is X but this maxprice is Y.` (exit 4)                 | This binary and the daemon differ, as after an install over a running daemon: `systemctl --user restart maxprice`, or restart your `serve`                                                              |
-| `the daemon is already running for …`: `serve` exits 5             | Another `maxprice serve` already holds this data dir; use that one                                                                                                                                      |
-| `Fix the file, then start the daemon again.`: `serve` exits 6      | It refused `settings.json`, for the reason on the line above. Fix the file, then start it again                                                                                                         |
-| The unit failed, or stops when you log out                         | `maxprice service logs -n 100` says why; `maxprice service install` clears a failed state, and `loginctl enable-linger` keeps it running after logout                                                   |
-| Every `service` verb exits 1: `no systemd user manager here (…)`   | Run `maxprice serve` under another init; see [Other inits](#other-inits)                                                                                                                                |
-| Limits print `—`                                                   | No fresh reading: with no Hub, set the session key with `maxprice key set`, then check the Limits line of `maxprice status`                                                                             |
-| A report misses recent sessions                                    | Try `--account all --org all`, check `maxprice settings get claude-paths`, then `maxprice rescan`                                                                                                       |
-| A model shows no cost                                              | `maxprice pricing refresh`, then the Pricing line of `maxprice status`. Under `cost-mode display` a request counts only the cost its log recorded, and current Claude Code records none, so it reads $0 |
-| `'alpha' names 2 projects; give its path` (exit 2)                 | Pass the project's path, such as `--project ~/git/alpha`                                                                                                                                                |
-| `--machine needs the Fleet replica, which is off here: …` (exit 2) | Join a Hub, and leave `fleet-replica` on                                                                                                                                                                |
+| What you see                                                                                      | What to do                                                                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `the daemon is not running.` (exit 3)                                                             | Run the hint it prints: `systemctl --user start maxprice` once the unit is installed (on macOS `launchctl kickstart gui/$(id -u)/com.maxprice.headless-client` once the agent is), else `maxprice service install` or `maxprice serve`. A shell with another `XDG_DATA_HOME` reaches another daemon |
+| `the daemon is X but this maxprice is Y.` (exit 4)                                                | This binary and the daemon differ, as after an install over a running daemon: `systemctl --user restart maxprice` (on macOS `launchctl kickstart -k gui/$(id -u)/com.maxprice.headless-client`), or restart your `serve`                                                                            |
+| `the daemon is already running for …`: `serve` exits 5                                            | Another `maxprice serve` already holds this data dir; use that one                                                                                                                                                                                                                                  |
+| `Fix the file, then start the daemon again.`: `serve` exits 6                                     | It refused `settings.json`, for the reason on the line above. Fix the file, then start it again                                                                                                                                                                                                     |
+| The unit failed, or stops when you log out                                                        | `maxprice service logs -n 100` says why; `maxprice service install` clears a failed state, and `loginctl enable-linger` keeps it running after logout                                                                                                                                               |
+| Every `service` verb exits 1: `no systemd user manager here (…)`                                  | Run `maxprice serve` under another init; see [Other inits](#other-inits)                                                                                                                                                                                                                            |
+| The agent stopped (macOS)                                                                         | `maxprice service status` says why, from `relaunch.json`, and `maxprice service logs -n 100` shows what the daemon logged; `maxprice service install` clears the relaunch count and starts it again                                                                                                 |
+| Every `service` verb exits 1: `no launchd GUI session for this user here (…)`                     | Log in to the Mac, at its screen or through Screen Sharing, then run it again; for a Mac nobody logs in to, see [A LaunchDaemon on macOS](#a-launchdaemon-on-macos)                                                                                                                                 |
+| `maxprice` is killed as it starts (`killed`, exit 137), or hangs before printing anything (macOS) | A browser download left it quarantined: `xattr -d com.apple.quarantine ~/.local/bin/maxprice`. A binary copied over an older one in place is killed too; install it again with the [Install](#macos) line, which writes a new file                                                                  |
+| Limits print `—`                                                                                  | No fresh reading: with no Hub, set the session key with `maxprice key set`, then check the Limits line of `maxprice status`                                                                                                                                                                         |
+| A report misses recent sessions                                                                   | Try `--account all --org all`, check `maxprice settings get claude-paths`, then `maxprice rescan`                                                                                                                                                                                                   |
+| A model shows no cost                                                                             | `maxprice pricing refresh`, then the Pricing line of `maxprice status`. Under `cost-mode display` a request counts only the cost its log recorded, and current Claude Code records none, so it reads $0                                                                                             |
+| `'alpha' names 2 projects; give its path` (exit 2)                                                | Pass the project's path, such as `--project ~/git/alpha`                                                                                                                                                                                                                                            |
+| `--machine needs the Fleet replica, which is off here: …` (exit 2)                                | Join a Hub, and leave `fleet-replica` on                                                                                                                                                                                                                                                            |
 
 ## Platform floor
 
-`maxprice` is built by Bun for linux-x64 and links against glibc. In each image below, it ran as a new user other than root, with no network: `maxprice --version`, then `maxprice serve` over a small synthetic set of Claude Code logs, then `maxprice status` against that daemon, and `maxprice daily`, which answered the same totals in every image that ran it. The floor, the oldest glibc where all three pass, is **glibc 2.28** (Rocky Linux 8). No older glibc was tried.
+On Linux, `maxprice` is built by Bun for linux-x64 and links against glibc. In each image below, it ran as a new user other than root, with no network: `maxprice --version`, then `maxprice serve` over a small synthetic set of Claude Code logs, then `maxprice status` against that daemon, and `maxprice daily`, which answered the same totals in every image that ran it. The floor, the oldest glibc where all three pass, is **glibc 2.28** (Rocky Linux 8). No older glibc was tried.
 
 | Image          | glibc       | `--version`                       | `serve`                  | `status` |
 | -------------- | ----------- | --------------------------------- | ------------------------ | -------- |
@@ -713,7 +926,14 @@ Start with `maxprice status`: each line that has a fix names the command for it.
 | `alpine`       | none (musl) | exit 127: the shell's `not found` | not run                  | not run  |
 
 - **musl.** There is no musl build. On Alpine the glibc binary does not start: the kernel finds no glibc loader, and the shell reports `not found`.
-- **arm64.** There is no arm64 build: the tarball is x86-64 only.
+- **arm64.** There is no Linux arm64 build: the Linux tarball is x86-64 only.
 - **No runtime check.** On a host below the floor the loader fails before any of maxprice's code runs, so the first command fails with the loader's own message.
 - **The kernel.** The containers share the host's kernel, so the table says nothing about an older kernel.
 - **systemd.** `systemd-analyze verify` reports no problem with the generated unit or the system unit above under systemd 259, as user and system units, or under Rocky Linux 8's systemd 239. The 239 warning about an unknown service type came only from a separate deliberate `Type=bogus` control; neither MaxPrice unit emitted it. With no user manager in a container, 239 parsed the generated unit as a system unit. Neither ran under a manager for this table.
+
+### The macOS floor
+
+On macOS, `maxprice` is built by Bun for darwin-arm64: Apple Silicon only, with no Intel or universal build. Its binary names **macOS 13.0** as its minimum (`vtool -show-build` reads `minos 13.0`), which is Bun 1.3.14's own floor, so an older macOS refuses to start it.
+
+- **Where it ran.** On macOS 27.2.1, on an Apple Silicon Mac mini: `--version`, `serve` in a terminal and as the LaunchAgent, `status`, the reports, and `maxprice update` from one build to the next. No macOS between 13 and 27 was tried.
+- **launchd.** `plutil -lint` accepts the generated LaunchAgent and the [LaunchDaemon](#a-launchdaemon-on-macos) above. The LaunchDaemon was not run.

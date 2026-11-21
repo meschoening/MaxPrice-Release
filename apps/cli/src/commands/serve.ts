@@ -6,11 +6,28 @@ import {
   type Settings,
   type UsageKeyset,
 } from "@maxprice/shared";
+import { SUPERVISOR } from "@maxprice/usage-core/launchd-agent";
+import {
+  clearCause,
+  recordCause,
+  recordStart,
+  rotateLog,
+  START_LIMIT,
+  WINDOW_MS,
+} from "@maxprice/usage-core/relaunch-ledger";
 import { startUpdateChecks } from "@maxprice/usage-core/update-check";
 import { desktopHubUrl, doubleJoinWarning } from "../double-join";
 import { displayHubUrl } from "../hub-url";
-import { EXIT } from "../exit";
-import { dataDir, type Env, settingsPath, socketPath } from "../paths";
+import { CliError, EXIT } from "../exit";
+import {
+  dataDir,
+  type Env,
+  relaunchLedgerPath,
+  serveLogPath,
+  settingsPath,
+  socketPath,
+} from "../paths";
+import { renderError } from "../render/error";
 import {
   bootSecrets,
   editSecrets,
@@ -20,7 +37,7 @@ import {
   sessionKeyCount,
   withLegacyMoved,
 } from "../secrets";
-import { type ServeLock, takeServeLock } from "../serve-lock";
+import { readServeLockHolder, type ServeLock, takeServeLock } from "../serve-lock";
 import {
   checkSettingsForServe,
   joinedHubUrl,
@@ -47,6 +64,13 @@ import { VERSION } from "../version";
 //
 // Every `[serve]` line goes to stderr, which systemd hands to the journal.
 // Secret facts omit values, and displayed Hub URLs omit userinfo (ADR-0121).
+//
+// Under launchd (`MAXPRICE_SUPERVISOR=launchd`, ADR-0143 §5–§6), which has no
+// start limit and relaunches every nonzero exit, it bounds its own relaunches
+// through its ledger, relaunch.json: a sixth start within 15 minutes, and
+// what would be exit 5 or 6, record their cause and exit 0, the one exit
+// launchd does not relaunch. It also rotates serve.log, where launchd sends
+// its stderr, at boot. Without the marker its exits are ADR-0120 §2's.
 
 // The lock's descriptor, held for the process's whole life (ADR-0120 §3).
 let serveLock: ServeLock | null = null;
@@ -232,12 +256,78 @@ export function moveLegacyKey(
   return keysetOf(next);
 }
 
+// A stop the ledger declines (ADR-0143 §5): the refusal as `serve` would
+// have printed it, then why it exits 0.
+function decline(error: CliError, why: string): { kind: "declined" } {
+  process.stderr.write(renderError(error));
+  console.error(`[serve] ${why}; exiting 0 so launchd does not relaunch it`);
+  return { kind: "declined" };
+}
+
+// A step's value, or the stop the ledger declined in its place.
+type Stepped<T> = { kind: "done"; value: T } | { kind: "declined" };
+
+// Under launchd (`supervised`), the lock and the settings check, whose exits
+// 5 and 6 a relaunch cannot fix, record their cause and are declined, which
+// serve turns into exit 0; elsewhere they throw as they always have.
+function underLedger<T>(dir: string, supervised: boolean, step: () => T): Stepped<T> {
+  try {
+    return { kind: "done", value: step() };
+  } catch (error) {
+    if (!supervised || !(error instanceof CliError)) throw error;
+    const ledger = relaunchLedgerPath(dir);
+    const at = new Date().toISOString();
+    if (error.code === EXIT.ALREADY_RUNNING) {
+      const { pid } = readServeLockHolder(dir);
+      recordCause(ledger, { kind: "locked", at, pid });
+      return decline(error, "recorded another serve's hold in relaunch.json");
+    }
+    if (error.code === EXIT.SETTINGS_REFUSED) {
+      recordCause(ledger, { kind: "refused", at, exit: error.code });
+      return decline(error, "recorded the refused settings.json in relaunch.json");
+    }
+    throw error;
+  }
+}
+
+const WINDOW_MINUTES = WINDOW_MS / 60_000;
+
 export async function serve(env: Env = process.env, deps: ServeDeps = {}): Promise<number> {
   const chmod = deps.chmod ?? chmodSync;
   const loadBoot = deps.loadBoot ?? importBoot;
   const dir = dataDir(env);
+  const supervised = env[SUPERVISOR.name] === SUPERVISOR.value;
+  // ADR-0143 §6: before anything is logged, so this boot's lines start the
+  // fresh file. A rotation that fails is logged and the start still counts:
+  // exiting here would put launchd's relaunches past the ledger's bound.
+  let rotated: boolean | Error = false;
+  try {
+    rotated = supervised && rotateLog(serveLogPath(dir));
+  } catch (error) {
+    rotated = error instanceof Error ? error : new Error(String(error));
+  }
   prepareDataDir(dir);
-  serveLock = takeServeLock(dir, env);
+  if (supervised) {
+    if (rotated === true) console.error(`[serve] rotated ${serveLogPath(dir)} to serve.log.1`);
+    if (rotated instanceof Error) {
+      console.error(`[serve] could not rotate ${serveLogPath(dir)}: ${rotated.message}`);
+    }
+    const start = recordStart(relaunchLedgerPath(dir), new Date());
+    console.error(
+      `[serve] under launchd: start ${start.starts} in the last ${WINDOW_MINUTES} minutes`,
+    );
+    if (start.declined) {
+      console.error(
+        `[serve] stopped after repeated crashes: more than ${START_LIMIT} starts in ` +
+          `${WINDOW_MINUTES} minutes, recorded in relaunch.json; ` +
+          "'maxprice service install' clears the count. Exiting 0 so launchd does not relaunch it",
+      );
+      return EXIT.OK;
+    }
+  }
+  const lock = underLedger(dir, supervised, () => takeServeLock(dir, env));
+  if (lock.kind === "declined") return EXIT.OK;
+  serveLock = lock.value;
   console.error(`[serve] holding ${serveLock.path} (pid ${process.pid})`);
   const socket = socketPath(dir);
   removeStaleSocket(socket);
@@ -245,7 +335,12 @@ export async function serve(env: Env = process.env, deps: ServeDeps = {}): Promi
   // no JSON object or whose Home or tracked list the schema rejects. Booting
   // on it would admit under a null or degraded tracked set. Under the lock,
   // so two `serve`s never both get this far.
-  const settings = checkSettingsForServe(env);
+  const checked = underLedger(dir, supervised, () => checkSettingsForServe(env));
+  if (checked.kind === "declined") return EXIT.OK;
+  const settings = checked.value;
+  // ADR-0143 §5: this start took the lock and accepted its settings, so the
+  // last stop's cause no longer holds; its start time stays.
+  if (supervised) clearCause(relaunchLedgerPath(dir));
   // ADR-0121 §3, §5: read once, under the lock too. A file it cannot use is
   // one line, and the boot goes on without its secrets: tracking needs none.
   const secrets = bootSecrets(env, (line) => console.error(`[serve] ${line}`));

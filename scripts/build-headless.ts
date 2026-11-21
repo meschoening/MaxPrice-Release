@@ -1,20 +1,33 @@
-// Build, pack and sign the two Headless release tarballs: the Headless
-// client's, maxprice_<v>_linux-x64.tar.gz (ADR-0123 §1, §2), then the Headless
-// Hub's, maxprice-hub_<v>_linux-x64.tar.gz (ADR-0129 §1).
+// Build, pack and sign the Headless release tarballs. For linux-x64, the
+// default target, two: the Headless client's, maxprice_<v>_linux-x64.tar.gz
+// (ADR-0123 §1, §2), then the Headless Hub's, maxprice-hub_<v>_linux-x64.tar.gz
+// (ADR-0129 §1). For darwin-arm64, one: the Headless client's,
+// maxprice_<v>_darwin-arm64.tar.gz (ADR-0144 §3), since the Headless Hub is
+// Linux-only.
 //
-//   bun scripts/build-headless.ts --tag vX.Y.Z [--out <dir>] [--unsigned] [--root <dir>]
+//   bun scripts/build-headless.ts --tag vX.Y.Z [--target linux-x64|darwin-arm64]
+//       [--codesign <identity>] [--out <dir>] [--unsigned] [--root <dir>]
 //
-// PUBLIC-ONLY FILE, with one private caller. It lives in the private repo under
+// PUBLIC-ONLY FILE, with private callers. It lives in the private repo under
 // release/overlay/ and reaches the public build repo through the overlay pass
 // (ADR-0070 §5), where CI's `build-headless` job runs it as
-// scripts/build-headless.ts and signs with the TAURI_SIGNING_* secrets. The
-// local fallback pipeline (ADR-0052) runs the same file at its private path,
+// scripts/build-headless.ts for linux-x64, and its `build-headless-macos` job
+// for darwin-arm64 with `--codesign` and the Developer ID identity, both
+// signing with the TAURI_SIGNING_* secrets. The local fallback pipeline
+// (ADR-0052) runs the same file at its private path,
 // release/overlay/scripts/build-headless.ts, inside release_linux.sh's
-// container, with --unsigned: no signing key ever reaches a build machine
-// (ADR-0071 §3), so a hand-built release advances no channel,
-// headless-latest.json and headless-hub-latest.json included (ADR-0123 §10,
-// ADR-0129 §8). Uploading is the workflow's own step, not this script's, so
-// both callers run the same file to the same end.
+// container and in release_macos.sh's arm64 leg (with `--codesign -`, ad-hoc),
+// with --unsigned: no signing key ever reaches a build machine (ADR-0071 §3),
+// so a hand-built release advances no channel, headless-latest.json and
+// headless-hub-latest.json included (ADR-0123 §10, ADR-0129 §8, ADR-0144 §7).
+// Uploading is the workflow's own step, not this script's, so every caller
+// runs the same file to the same end.
+//
+// THE TARGET is also the host's. Step 3 runs the binary it packs, so a target
+// builds only on its own platform and architecture: linux-x64 on CI's
+// `ubuntu-latest` and in the fallback's container, darwin-arm64 on
+// `macos-latest` and on the fallback's Mac. Any other host is refused before
+// the first compile.
 //
 // THE ROOT is --root, or else the working directory, and never this file's own
 // location: the file sits at scripts/ in one repo and at
@@ -24,17 +37,20 @@
 // the path it writes are spelled here, in PRODUCTS.
 //
 // compose-updater-manifest.ts, its sibling at both paths, imports the asset
-// names (`headlessAssetName`, `headlessHubAssetName`) and `signedFileOf` from
-// it, so the composer and this script agree on each asset's name and on what a
-// `.sig` names. Importing it has no side effects: the CLI runs only under
-// `import.meta.main`.
+// names (`headlessAssetName`, `headlessHubAssetName`), the targets' platform
+// keys (`HEADLESS_TARGETS`) and `signedFileOf` from it, so the composer and
+// this script agree on each asset's name and on what a `.sig` names.
+// Importing it has no side effects: the CLI runs only under `import.meta.main`.
 //
-// TWO PRODUCTS, in turn: the client whole, then the Hub, so a client that
-// refuses costs no Hub build. Each goes through the same steps, every one of
-// which refuses (exit 1) rather than carry on:
+// THE PRODUCTS, in turn: for linux-x64 the client whole, then the Hub, so a
+// client that refuses costs no Hub build; for darwin-arm64 the client alone.
+// Each goes through the same steps, every one of which refuses (exit 1)
+// rather than carry on:
 //
 //   1. compile   in the root. The client's is `bun run build:cli`, which
-//                writes apps/cli/binaries/maxprice. The Hub's is
+//                writes apps/cli/binaries/maxprice, or
+//                `bun run build:cli darwin-arm64`, which writes
+//                apps/cli/binaries/darwin-arm64/maxprice. The Hub's is
 //                `bun apps/hub/scripts/build-binaries.ts linux-x64`, which
 //                builds apps/hub-desktop's dist-page, writes the page manifest
 //                and compiles
@@ -51,16 +67,29 @@
 //                os.tmpdir(), which is removed again on every path. The
 //                client's `maxprice` is packed where the compile wrote it.
 //                Either way the file packed is made 0755 here, whatever mode
-//                the compile left, and steps 3 and 4 run on it: for the Hub,
-//                the copy, the bytes that ship. (A host whose tmpdir is
+//                the compile left, and the steps after run on it: for the
+//                Hub, the copy, the bytes that ship. (A host whose tmpdir is
 //                mounted noexec refuses at step 3; point TMPDIR elsewhere.)
+//   2a. codesign darwin-arm64 only, and required there (ADR-0144 §2, §3):
+//                `codesign --force --options runtime --timestamp
+//                --entitlements apps/desktop/src-tauri/entitlements.plist
+//                --sign <identity>`, the hardened runtime with the
+//                desktop's two JIT entitlements, which Bun's JavaScriptCore
+//                needs under it, then `codesign --verify --strict`. CI's
+//                identity is the Developer ID; `-` signs ad-hoc, as the
+//                fallback and the rehearsal do. A darwin binary as Bun
+//                compiles it fails the strict check, so it runs only once
+//                re-signed; and the signature goes on before step 4 packs
+//                it and step 5 minisigns the tarball, so notarizing that
+//                binary later (ADR-0144 §4) changes no byte step 5 covers.
 //   3. version   `<binary> --version` exits 0 and prints the tag minus its v,
 //                exactly. Each binary prints its bare version (ADR-0123 §4's
 //                amendment, ADR-0129 §2), and each one's `update`, as ADR-0123
 //                §4 and ADR-0129 §4 specify it, runs this same check on the
 //                binary it extracts (check 5), so a binary that failed it here
 //                would fail every install's update.
-//   4. pack      GNU tar, then the archive is read back. The update's reader
+//   4. pack      GNU tar, or on a Mac its bsdtar in GNU's format (`tarArgv`),
+//                then the archive is read back. The update's reader
 //                (packages/usage-core/src/self-update.ts) takes one regular
 //                file named exactly for its product, `maxprice` or
 //                `maxprice-hub`, and refuses anything else (ADR-0123 §2's
@@ -73,7 +102,11 @@
 //                extraction, as into a shared /usr/local/bin, keeps the
 //                archive's owner: without them the binary would belong to
 //                whatever uid the CI runner had, and the archive would carry
-//                that runner's user names.
+//                that runner's user names. bsdtar spells those three
+//                `--uid 0 --gid 0 --numeric-owner`, and is told to leave out
+//                the Mac's metadata, extended attributes, ACLs and flags,
+//                each of which it would otherwise write as a header or an
+//                AppleDouble entry of its own.
 //   5. sign      `tauri signer sign`, run as the desktop workspace's tauri-cli
 //                (ADR-0123 §1), writes <asset>.sig. Its trusted comment's
 //                `file:` must name the asset exactly: each `update`, as ADR-0123
@@ -83,17 +116,17 @@
 //                version's or the other product's, ships a manifest every
 //                install refuses. Skipped under --unsigned.
 //
-// --out holds both tarballs and their .sigs; without it each goes to its own
-// workspace's binaries/, beside its compiled binary, where the fallback stages
-// it from. Both products' previous <asset> and <asset>.sig are removed before
-// the client's compile, and a refusal anywhere removes every tarball and .sig
-// the run wrote, both products', so the only tarballs left are from a run that
-// passed every step for both. A stale .sig matters most: left beside a new
-// tarball, it would sign other bytes, and it would stand in for a signer that
-// wrote nothing.
+// --out holds the target's tarballs and their .sigs; without it each goes to
+// its own workspace's binaries/, where the fallback stages it from. Every
+// product's previous <asset> and <asset>.sig are removed before the first
+// compile, and a refusal anywhere removes every tarball and .sig the run
+// wrote, so the only tarballs left are from a run that passed every step for
+// every product. A stale .sig matters most: left beside a new tarball, it
+// would sign other bytes, and it would stand in for a signer that wrote
+// nothing.
 //
-// Exit 0 when every step passed for both, 1 when one refused, 2 on a usage
-// error.
+// Exit 0 when every step passed for every product, 1 when one refused, 2 on
+// a usage error.
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -113,20 +146,44 @@ export type Env = Record<string, string | undefined>;
 /** The two binaries this script ships, each alone in a tarball of its own. */
 export type Binary = "maxprice" | "maxprice-hub";
 
-/** Compiles `binary` in `root`, resolving to the exit code. */
-export type Compile = (root: string, binary: Binary) => Promise<number>;
+/**
+ * The targets this script packs, each a target of the Headless client's
+ * build (apps/cli/scripts/build-binary.ts), and the updater platform key each
+ * one's tarball serves in headless-latest.json (ADR-0144 §5).
+ */
+export const HEADLESS_TARGETS = {
+  "linux-x64": "linux-x86_64",
+  "darwin-arm64": "darwin-aarch64",
+} as const;
+
+export type Target = keyof typeof HEADLESS_TARGETS;
+
+export const DEFAULT_TARGET: Target = "linux-x64";
+
+/** Compiles `binary` for `target` in `root`, resolving to the exit code. */
+export type Compile = (root: string, binary: Binary, target: Target) => Promise<number>;
 
 /** Signs `asset` (an absolute path) into `<asset>.sig`, resolving to the exit code. */
 export type Sign = (asset: string, ctx: { root: string; env: Env }) => Promise<number>;
 
+/** Code-signs the darwin binary `file` (step 2a) and verifies it, resolving to the exit code. */
+export type Codesign = (file: string, ctx: { root: string; identity: string }) => Promise<number>;
+
 export type BuildOptions = {
   root: string;
   tag: string;
-  /** Where both tarballs go; each defaults to defaultOutDir(root, binary). */
+  /** DEFAULT_TARGET when absent. */
+  target?: Target;
+  /** The codesign identity, `-` for ad-hoc: required for darwin-arm64, refused for linux-x64. */
+  identity?: string;
+  /** Where the tarballs go; each defaults to defaultOutDir(root, binary). */
   out?: string;
   unsigned?: boolean;
   compile?: Compile;
+  codesign?: Codesign;
   sign?: Sign;
+  /** `<process.platform>-<process.arch>` when absent; must be the target. */
+  host?: string;
   env?: Env;
   log?: (line: string) => void;
 };
@@ -143,9 +200,13 @@ const TAG = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/;
 // fail every install's update anyway.
 const VERSION_TIMEOUT_MS = 15_000;
 
-/** The client's tarball's published name, which CI signs it under and `maxprice update` computes. */
-export function headlessAssetName(version: string): string {
-  return `maxprice_${version}_linux-x64.tar.gz`;
+/**
+ * The client's tarball's published name for `target`, which CI signs it
+ * under and `maxprice update` computes (apps/cli/src/update-channel.ts's
+ * `channelEntry`).
+ */
+export function headlessAssetName(version: string, target: Target = DEFAULT_TARGET): string {
+  return `maxprice_${version}_${target}.tar.gz`;
 }
 
 /** The Hub's tarball's published name, which CI signs it under and ADR-0129 §4's `maxprice-hub update` computes. */
@@ -156,6 +217,7 @@ export function headlessHubAssetName(version: string): string {
 type Product = {
   /** The tarball's one entry, and the command its install runs. */
   binary: Binary;
+  target: Target;
   /** Its GLOSSARY.md headword, for the log. */
   label: string;
   assetName: (version: string) => string;
@@ -163,22 +225,24 @@ type Product = {
   compile: readonly string[];
   /** Its workspace's binaries/, from the root: where the compile writes, and the default --out. */
   binaries: string;
-  /** The file the compile writes there. */
+  /** The file the compile writes there, relative to it. */
   compiled: string;
 };
 
-// In build order.
+// Each target's products, in build order.
 const PRODUCTS: readonly Product[] = [
   {
     binary: "maxprice",
+    target: "linux-x64",
     label: "the Headless client",
-    assetName: headlessAssetName,
+    assetName: (version) => headlessAssetName(version, "linux-x64"),
     compile: ["bun", "run", "build:cli"],
     binaries: "apps/cli/binaries",
     compiled: "maxprice",
   },
   {
     binary: "maxprice-hub",
+    target: "linux-x64",
     label: "the Headless Hub",
     assetName: headlessHubAssetName,
     // linux-x64 is the one target that embeds the Hub page, which this
@@ -187,19 +251,86 @@ const PRODUCTS: readonly Product[] = [
     binaries: "apps/hub/binaries",
     compiled: "maxprice-hub-x86_64-unknown-linux-gnu",
   },
+  {
+    binary: "maxprice",
+    target: "darwin-arm64",
+    label: "the Headless client",
+    assetName: (version) => headlessAssetName(version, "darwin-arm64"),
+    compile: ["bun", "run", "build:cli", "darwin-arm64"],
+    binaries: "apps/cli/binaries",
+    // build-binary.ts's outfileFor: any target but linux-x64 under a
+    // directory of its own, so the two never take each other's place.
+    compiled: "darwin-arm64/maxprice",
+  },
 ];
 
-function productOf(binary: Binary): Product {
-  return PRODUCTS.find((p) => p.binary === binary)!;
+/** The products a target builds, in build order. */
+export function productsOf(target: Target): Binary[] {
+  return PRODUCTS.filter((p) => p.target === target).map((p) => p.binary);
+}
+
+function productOf(binary: Binary, target: Target = DEFAULT_TARGET): Product {
+  return PRODUCTS.find((p) => p.binary === binary && p.target === target)!;
+}
+
+export function isTarget(value: string): value is Target {
+  return Object.hasOwn(HEADLESS_TARGETS, value);
 }
 
 /**
- * Where `binary`'s compile writes it, its workspace's binaries/, and so its
- * tarball's default --out. The fallback stages each tarball from here:
- * release-assets.ts lists it under that workspace, at `binaries/<asset>`.
+ * `binary`'s workspace's binaries/, where its compile writes, and so its
+ * tarball's default --out for every target. The fallback stages each tarball
+ * from here: release-assets.ts lists it under that workspace, at
+ * `binaries/<asset>`.
  */
 export function defaultOutDir(root: string, binary: Binary): string {
   return join(root, productOf(binary).binaries);
+}
+
+/** The desktop's entitlements, under the root: the two JIT keys Bun needs under the hardened runtime. */
+export const ENTITLEMENTS = "apps/desktop/src-tauri/entitlements.plist";
+
+/** Step 2a's signing command, then its check (ADR-0144 §3). */
+export function codesignArgv(file: string, identity: string, entitlements: string): string[][] {
+  return [
+    [
+      "codesign",
+      "--force",
+      "--options",
+      "runtime",
+      "--timestamp",
+      "--entitlements",
+      entitlements,
+      "--sign",
+      identity,
+      file,
+    ],
+    ["codesign", "--verify", "--strict", "--verbose=2", file],
+  ];
+}
+
+/**
+ * Step 4's command on a host whose `process.platform` is `os`: GNU tar on
+ * Linux; on a Mac, bsdtar writing GNU's format, with none of the Mac's
+ * metadata. Packs `dir/binary` alone, under the name `binary`.
+ */
+export function tarArgv(os: string, tarball: string, dir: string, binary: Binary): string[] {
+  const owner =
+    os === "darwin"
+      ? [
+          "--format=gnutar",
+          "--uid",
+          "0",
+          "--gid",
+          "0",
+          "--numeric-owner",
+          "--no-mac-metadata",
+          "--no-xattrs",
+          "--no-acls",
+          "--no-fflags",
+        ]
+      : ["--format=gnu", "--owner=0", "--group=0", "--numeric-owner"];
+  return ["tar", ...owner, "-czf", tarball, "-C", dir, binary];
 }
 
 /** The version a `vX.Y.Z` tag names, or null for anything else. */
@@ -312,12 +443,20 @@ function octal(buf: Buffer, offset: number, width: number): number | null {
   return /^[0-7]+$/.test(text) ? parseInt(text, 8) : null;
 }
 
-const realCompile: Compile = (root, binary) =>
-  Bun.spawn([...productOf(binary).compile], {
+const realCompile: Compile = (root, binary, target) =>
+  Bun.spawn([...productOf(binary, target).compile], {
     cwd: root,
     stdout: "inherit",
     stderr: "inherit",
   }).exited;
+
+const realCodesign: Codesign = async (file, { root, identity }) => {
+  for (const argv of codesignArgv(file, identity, join(root, ENTITLEMENTS))) {
+    const code = await Bun.spawn(argv, { stdout: "inherit", stderr: "inherit" }).exited;
+    if (code !== 0) return code;
+  }
+  return 0;
+};
 
 // The signer runs in the env whose key buildHeadless checked, passed
 // explicitly: Bun's spawn would otherwise hand it the environment this process
@@ -331,13 +470,32 @@ const realSign: Sign = (asset, { root, env }) =>
   }).exited;
 
 export async function buildHeadless(options: BuildOptions): Promise<BuildResult[]> {
-  const { root, tag, unsigned = false, env = process.env } = options;
+  const { root, tag, unsigned = false, env = process.env, identity } = options;
+  const target = options.target ?? DEFAULT_TARGET;
+  const host = options.host ?? `${process.platform}-${process.arch}`;
   const compile = options.compile ?? realCompile;
+  const codesign = options.codesign ?? realCodesign;
   const sign = options.sign ?? realSign;
   const log = options.log ?? ((line: string) => console.log(line));
 
   const version = versionOfTag(tag);
   if (version === null) throw new BuildRefused(`the tag ${JSON.stringify(tag)} is not vX.Y.Z`);
+  if (host !== target) {
+    throw new BuildRefused(
+      `this host is ${host}, and step 3 runs each binary it packs, ` +
+        `so ${target} builds only on a ${target} host`,
+    );
+  }
+  const darwin = target === "darwin-arm64";
+  if (darwin && identity === undefined) {
+    throw new BuildRefused(
+      `${target} needs --codesign <identity>: a darwin binary runs only validly signed ` +
+        `(ADR-0144 §2), and \`-\` signs ad-hoc`,
+    );
+  }
+  if (!darwin && identity !== undefined) {
+    throw new BuildRefused(`--codesign signs a darwin binary, and ${target} is not one`);
+  }
   // Before the first compile, so a run that cannot sign costs nothing.
   if (!unsigned && !env[KEY_VAR]) {
     throw new BuildRefused(
@@ -346,7 +504,7 @@ export async function buildHeadless(options: BuildOptions): Promise<BuildResult[
     );
   }
 
-  const outputs = PRODUCTS.map((product) => {
+  const outputs = PRODUCTS.filter((product) => product.target === target).map((product) => {
     const out = options.out ?? defaultOutDir(root, product.binary);
     const tarball = join(out, product.assetName(version));
     return { product, tarball, signature: `${tarball}.sig` };
@@ -363,7 +521,19 @@ export async function buildHeadless(options: BuildOptions): Promise<BuildResult[
     const results: BuildResult[] = [];
     for (const output of outputs) {
       results.push(
-        await buildProduct({ ...output, root, tag, version, unsigned, compile, sign, env, log }),
+        await buildProduct({
+          ...output,
+          root,
+          tag,
+          version,
+          unsigned,
+          compile,
+          identity: identity ?? null,
+          codesign,
+          sign,
+          env,
+          log,
+        }),
       );
     }
     return results;
@@ -382,21 +552,24 @@ type ProductRun = {
   version: string;
   unsigned: boolean;
   compile: Compile;
+  /** Step 2a's identity, or null for a target that is not darwin. */
+  identity: string | null;
+  codesign: Codesign;
   sign: Sign;
   env: Env;
   log: (line: string) => void;
 };
 
-/** One product's steps; the caller removes both products' outputs when any refuses. */
+/** One product's steps; the caller removes every product's outputs when any refuses. */
 async function buildProduct(run: ProductRun): Promise<BuildResult> {
   const { product, tarball, signature, root, tag, version, log } = run;
   const { binary } = product;
   const asset = basename(tarball);
   const command = product.compile.join(" ");
-  const compiled = join(defaultOutDir(root, binary), product.compiled);
+  const compiled = join(root, product.binaries, product.compiled);
 
-  log(`[build-headless] compiling ${product.label} in ${root}`);
-  const code = await run.compile(root, binary);
+  log(`[build-headless] compiling ${product.label} for ${product.target} in ${root}`);
+  const code = await run.compile(root, binary, product.target);
   if (code !== 0) throw new BuildRefused(`\`${command}\` exited ${code}`);
   if (!existsSync(compiled)) {
     throw new BuildRefused(`\`${command}\` exited 0 but wrote no ${compiled}`);
@@ -414,6 +587,17 @@ async function buildProduct(run: ProductRun): Promise<BuildResult> {
       copyFileSync(compiled, packed);
     }
     chmodSync(packed, 0o755);
+
+    if (run.identity !== null) {
+      const how = run.identity === "-" ? "ad-hoc" : "with the given identity";
+      log(`[build-headless] code-signing ${binary} ${how}, hardened runtime`);
+      const signed = await run.codesign(packed, { root, identity: run.identity });
+      if (signed !== 0) {
+        throw new BuildRefused(
+          `codesign of ${probed} exited ${signed}: it would not run as shipped`,
+        );
+      }
+    }
 
     log(`[build-headless] checking ${binary} --version prints ${version}`);
     const probe = spawnSync(packed, ["--version"], {
@@ -439,21 +623,13 @@ async function buildProduct(run: ProductRun): Promise<BuildResult> {
 
     log(`[build-headless] packing ${tarball}`);
     mkdirSync(dirname(tarball), { recursive: true });
-    const tar = spawnSync(
-      "tar",
-      [
-        "--format=gnu",
-        "--owner=0",
-        "--group=0",
-        "--numeric-owner",
-        "-czf",
-        tarball,
-        "-C",
-        dirname(packed),
-        binary,
-      ],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-    );
+    const [tarCommand, ...tarArgs] = tarArgv(process.platform, tarball, dirname(packed), binary);
+    const tar = spawnSync(tarCommand!, tarArgs, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      // bsdtar's own switch for AppleDouble entries, beside its flags.
+      env: { ...process.env, COPYFILE_DISABLE: "1" },
+    });
     if (tar.status !== 0) {
       throw new BuildRefused(`tar exited ${tar.status ?? tar.signal}: ${tar.stderr.trim()}`);
     }
@@ -497,22 +673,27 @@ async function buildProduct(run: ProductRun): Promise<BuildResult> {
 
 function usage(why: string): number {
   console.error(
-    `${why}\n\nusage: build-headless.ts --tag vX.Y.Z [--out <dir>] [--unsigned] [--root <dir>]`,
+    `${why}\n\nusage: build-headless.ts --tag vX.Y.Z [--target linux-x64|darwin-arm64]\n` +
+      `    [--codesign <identity>] [--out <dir>] [--unsigned] [--root <dir>]`,
   );
   return 2;
 }
 
+const VALUED = ["--tag", "--target", "--codesign", "--out", "--root"] as const;
+type Valued = (typeof VALUED)[number];
+
 async function main(argv: string[]): Promise<number> {
-  const values: Partial<Record<"--tag" | "--out" | "--root", string>> = {};
+  const values: Partial<Record<Valued, string>> = {};
   let unsigned = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === "--unsigned") {
       unsigned = true;
-    } else if (arg === "--tag" || arg === "--out" || arg === "--root") {
+    } else if ((VALUED as readonly string[]).includes(arg)) {
       const value = argv[++i];
+      // `-` is a value: --codesign's ad-hoc identity.
       if (value === undefined || value.startsWith("--")) return usage(`${arg} needs a value`);
-      values[arg] = value;
+      values[arg as Valued] = value;
     } else {
       return usage(`unknown argument ${JSON.stringify(arg)}`);
     }
@@ -520,11 +701,26 @@ async function main(argv: string[]): Promise<number> {
   const tag = values["--tag"];
   if (tag === undefined) return usage("missing --tag");
   if (versionOfTag(tag) === null) return usage(`--tag ${JSON.stringify(tag)} is not vX.Y.Z`);
+  const target = values["--target"] ?? DEFAULT_TARGET;
+  if (!isTarget(target)) {
+    return usage(
+      `--target ${JSON.stringify(target)} is not one of ${Object.keys(HEADLESS_TARGETS).join(", ")}`,
+    );
+  }
+  const identity = values["--codesign"];
+  if (target === "darwin-arm64" && identity === undefined) {
+    return usage(`--target ${target} needs --codesign <identity> (\`-\` for ad-hoc)`);
+  }
+  if (target !== "darwin-arm64" && identity !== undefined) {
+    return usage(`--codesign signs a darwin binary, and --target ${target} is not one`);
+  }
 
   try {
     const results = await buildHeadless({
       root: resolve(values["--root"] ?? process.cwd()),
       tag,
+      target,
+      identity,
       out: values["--out"] === undefined ? undefined : resolve(values["--out"]),
       unsigned,
     });

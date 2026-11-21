@@ -1,4 +1,5 @@
 import { errnoName } from "@maxprice/usage-core/flock";
+import { printAgentSync } from "@maxprice/usage-core/launchctl";
 import {
   describeHolder,
   type ReadCgroup,
@@ -8,6 +9,7 @@ import {
 } from "@maxprice/usage-core/serve-lock";
 import { CliError, EXIT } from "./exit";
 import { displayPath, type Env, serveLockPath } from "./paths";
+import { LABEL, MAXPRICE_AGENT } from "./service/agent";
 import { UNIT } from "./service/unit";
 
 // One daemon per data dir (ADR-0120 §3): a non-blocking exclusive flock on
@@ -31,15 +33,38 @@ export function readServeLockHolder(
   return { pid, running, service };
 }
 
+// On macOS the holder belongs to the LaunchAgent when its pid is the one
+// `launchctl print` reports for it (ADR-0143 §8), the form there of the
+// cgroup check, which reads every darwin pid as in no unit.
+export function agentHolds(
+  holder: { pid: number | null; running: boolean },
+  agentPid: number | null,
+): boolean {
+  return holder.running && holder.pid !== null && holder.pid === agentPid;
+}
+
+// The holder as a lock loser names it: `pid 4182, maxprice.service`, or on
+// macOS `pid 4182, com.maxprice.headless-client`.
+function holderText(holder: ServeLockHolder, env: Env, platform: NodeJS.Platform): string {
+  if (platform !== "darwin") return describeHolder(holder, UNIT);
+  const agentPid = printAgentSync(MAXPRICE_AGENT, process.getuid?.() ?? 0, env)?.pid ?? null;
+  return describeHolder({ ...holder, service: agentHolds(holder, agentPid) }, LABEL);
+}
+
 // Takes the lock or throws: exit 5 naming the holder when another process
 // holds it, exit 1 for any other failure.
-export function takeServeLock(dir: string, env: Env, readCgroup?: ReadCgroup): ServeLock {
+export function takeServeLock(
+  dir: string,
+  env: Env,
+  readCgroup?: ReadCgroup,
+  platform: NodeJS.Platform = process.platform,
+): ServeLock {
   const path = serveLockPath(dir);
   const taken = takeLock(path, UNIT, readCgroup);
   if (taken.kind === "held") {
     throw new CliError(
       EXIT.ALREADY_RUNNING,
-      `the daemon is already running for ${displayPath(dir, env)} (${describeHolder(taken.holder, UNIT)})`,
+      `the daemon is already running for ${displayPath(dir, env)} (${holderText(taken.holder, env, platform)})`,
     );
   }
   if (taken.kind === "failed") {

@@ -1,4 +1,6 @@
 import { realpathSync } from "node:fs";
+import { printAgent } from "@maxprice/usage-core/launchctl";
+import { agentTarget, shellTarget } from "@maxprice/usage-core/launchd-agent";
 import {
   checkForUpdate,
   installUpdate,
@@ -10,8 +12,9 @@ import { terminalText } from "@maxprice/usage-core/terminal-text";
 import { engineVersionSchema, PROBE_TIMEOUT_MS } from "../daemon-client";
 import { CliError, EXIT, type Hint, usageError } from "../exit";
 import type { Io, Parsed } from "../main";
-import { dataDir, displayPath, type Env, socketPath } from "../paths";
-import { type ReadCgroup, readServeLockHolder } from "../serve-lock";
+import { dataDir, displayPath, type Env, home, socketPath } from "../paths";
+import { agentHolds, type ReadCgroup, readServeLockHolder } from "../serve-lock";
+import { LABEL, MAXPRICE_AGENT } from "../service/agent";
 import {
   parseExecStart,
   parseProperties,
@@ -40,6 +43,8 @@ export type UpdateDeps = {
   product?: SelfUpdateProduct;
   // The binary to replace: process.execPath, read before anything else.
   execPath?: string;
+  // Which service restarts: the LaunchAgent on macOS, the systemd unit elsewhere.
+  platform?: NodeJS.Platform;
   // Whether this maxprice is the compiled binary, not bun running main.ts.
   compiled?: boolean;
   uid?: number;
@@ -71,6 +76,7 @@ type Context = {
   io: Io;
   env: Env;
   execPath: string;
+  platform: NodeJS.Platform;
   uid: number;
   readCgroup: ReadCgroup | undefined;
   waitMs: number;
@@ -157,11 +163,83 @@ async function reportsVersion(ctx: Context, socket: string, version: string): Pr
   }
 }
 
+// The line for a `serve` outside the service that still runs `from`, found
+// through serve.lock as `service status` finds it (ADR-0120 §1).
+function outsideLine(ctx: Context, holder: { pid: number | null }, from: string): void {
+  say(
+    ctx.io,
+    `A 'maxprice serve' (pid ${holder.pid}) still runs ${from}: restart it to finish the update.`,
+  );
+}
+
+// ADR-0143 §8, after a swap from `from` to `to` on macOS: restart the
+// LaunchAgent that runs this binary with `launchctl kickstart -k`, or say
+// what still runs `from`. `update` runs outside the agent, so restarting it
+// never kills this process.
+async function restartAgent(ctx: Context, from: string, to: string): Promise<number> {
+  const { io, env, execPath } = ctx;
+  const kickstart = `launchctl kickstart -k ${shellTarget(MAXPRICE_AGENT)}`;
+  // Root's GUI domain does not run the users' agents, so a shared install's
+  // swap restarts nothing, as on Linux (ADR-0123 §6).
+  if (ctx.uid === 0) {
+    say(
+      io,
+      `Running as root, so nothing was restarted: each user who runs ${LABEL} restarts their own with '${kickstart}'.`,
+    );
+    return EXIT.OK;
+  }
+
+  // No agent loaded, or no launchctl: nothing to restart, which is no
+  // failure, since the swap is done.
+  const agent = await printAgent(MAXPRICE_AGENT, ctx.uid, env);
+  if (agent !== null && agent.state === "running") {
+    const program = agent.arguments[0];
+    if (program === undefined || !sameFile(program, execPath)) {
+      const other =
+        program === undefined ? "a program this maxprice cannot read" : displayPath(program, env);
+      say(
+        io,
+        `${LABEL} runs ${other}, not this maxprice, so it was not restarted; 'maxprice service install' points it here.`,
+      );
+      return EXIT.OK;
+    }
+    const ran = await runTool(
+      "launchctl",
+      ["kickstart", "-k", agentTarget(MAXPRICE_AGENT, ctx.uid)],
+      env,
+    );
+    if (ran.code !== 0) {
+      throw new CliError(
+        EXIT.FAILURE,
+        `maxprice is ${to} now, but '${kickstart}' failed: ${reason(ran)}`,
+        WHY,
+      );
+    }
+    // The agent's own data dir, which its XDG_DATA_HOME may set apart from
+    // this shell's (ADR-0143 §4).
+    const socket = socketPath(dataDir({ ...agent.environment, HOME: home(env) }));
+    if (!(await reportsVersion(ctx, socket, to))) {
+      throw new CliError(
+        EXIT.FAILURE,
+        `${LABEL} did not report ${to} within ${ctx.waitMs / 1000} s`,
+        WHY,
+      );
+    }
+    say(io, `Restarted ${LABEL}, which now runs ${to}.`);
+    return EXIT.OK;
+  }
+
+  const holder = readServeLockHolder(dataDir(env), ctx.readCgroup);
+  if (holder.running && !agentHolds(holder, agent?.pid ?? null)) outsideLine(ctx, holder, from);
+  return EXIT.OK;
+}
+
 // ADR-0120 §7, after a swap from `from` to `to`: restart the unit that runs
 // this binary, or say what still runs `from`. Run from a shell, `update` is
 // outside the unit's cgroup, so restarting the unit never kills it.
 async function restart(ctx: Context, from: string, to: string): Promise<number> {
   const { io, env, execPath } = ctx;
+  if (ctx.platform === "darwin") return await restartAgent(ctx, from, to);
   // ADR-0123 §6: root's user manager does not run the users' units, so a
   // shared install's swap restarts nothing. Until each user restarts their
   // own, their commands exit 4 and say how.
@@ -222,12 +300,7 @@ async function restart(ctx: Context, from: string, to: string): Promise<number> 
   // print this line spuriously, and a `serve` that has taken the lock but not
   // yet written its pid is missed (ADR-0120 §7's note).
   const holder = readServeLockHolder(dataDir(env), ctx.readCgroup);
-  if (holder.running && !holder.service) {
-    say(
-      io,
-      `A 'maxprice serve' (pid ${holder.pid}) still runs ${from}: restart it to finish the update.`,
-    );
-  }
+  if (holder.running && !holder.service) outsideLine(ctx, holder, from);
   return EXIT.OK;
 }
 
@@ -288,6 +361,7 @@ export async function update(
       io,
       env,
       execPath,
+      platform: deps.platform ?? process.platform,
       uid: deps.uid ?? process.getuid?.() ?? 0,
       readCgroup: deps.readCgroup,
       waitMs: deps.waitMs ?? WAIT_MS,

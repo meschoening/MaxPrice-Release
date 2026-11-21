@@ -581,6 +581,14 @@ function octal(buf: Buffer, offset: number, width: number): number | null {
 
 // --- version probes and the swap --------------------------------------------------
 
+// The wrapper's own process group ID: field 5 of `/proc/$$/stat` on Linux;
+// macOS has no `/proc` and asks ps(1) by absolute path, since the caller's
+// PATH may hold nothing (ADR-0143 §1).
+const GROUP_ID =
+  process.platform === "darwin"
+    ? String.raw`$(/bin/ps -o pgid= -p $$ | /usr/bin/tr -d ' ')`
+    : String.raw`$(cut -d' ' -f5 /proc/$$/stat)`;
+
 /**
  * Both version probes' wrapper, run by expectVersion as
  * `/bin/sh -c VERSION_CHECK_SCRIPT sh <binary> <nonce>` in a session and
@@ -604,7 +612,7 @@ function octal(buf: Buffer, offset: number, width: number): number | null {
  * Exported for its guard's test.
  */
 export const VERSION_CHECK_SCRIPT = String.raw`n=$2
-if [ "$(cut -d' ' -f5 /proc/$$/stat)" != "$$" ]; then
+if [ "${GROUP_ID}" != "$$" ]; then
   printf '\n%s not-a-group-leader\n' "$n" >&2
   exit 1
 fi
@@ -641,8 +649,8 @@ kill -s KILL 0`;
  * after its bound, so the update fails and the old binary stays, and nothing
  * else is killed. Cleanup resumes if the binary ever exits (the wrapper's
  * `wait` returns and its own `kill 0` runs); otherwise they need killing from
- * outside. All of this is Linux's: win32 never gets here, because the lock
- * fails first.
+ * outside. All of this is Linux's and macOS's: win32 never gets here,
+ * because the lock fails first.
  */
 async function expectVersion(
   binary: string,

@@ -1,13 +1,49 @@
-// Compiles the Headless client into one Bun binary for Linux x64
-// (ADR-0118 §6): apps/cli/binaries/maxprice, git-ignored. Bun cross-compiles,
-// so any host builds it. `bun run build:cli` runs this; it stays out of
+// Compiles the Headless client into one Bun binary (ADR-0118 §6, ADR-0144
+// §1): for linux-x64 by default, apps/cli/binaries/maxprice; for another
+// target, apps/cli/binaries/<target>/maxprice, so a cross-compile never takes
+// the Linux binary's place. All git-ignored. Bun cross-compiles, so any host
+// builds either. `bun run build:cli [target]` runs this; it stays out of
 // `build:binaries`, so `bun run dev` does not wait for it.
+//
+// A darwin binary Bun compiles, on a Mac or off one, carries an ad-hoc
+// signature `codesign --verify --strict` calls invalid: re-sign it on the Mac
+// with `codesign --force --sign -` before it runs (ADR-0144 §2; mac-leg.ts
+// smoke).
 import { mkdir, readdir, rm } from "node:fs/promises";
-import { join, resolve } from "node:path";
-import { TARGETS } from "../../sidecar/scripts/build-binaries";
+import { dirname, join, resolve } from "node:path";
+import { TARGETS, type TargetSpec } from "../../sidecar/scripts/build-binaries";
 
 const CLI_DIR = resolve(import.meta.dir, "..");
-const TARGET = TARGETS["linux-x64"]!;
+
+// The platforms the Headless client ships for (ADR-0143 §1, ADR-0144 §1),
+// each a key of the sidecar's TARGETS.
+export const CLI_TARGETS = ["linux-x64", "darwin-arm64"] as const;
+export type CliTarget = (typeof CLI_TARGETS)[number];
+export const DEFAULT_TARGET: CliTarget = "linux-x64";
+
+// The target an argv names, the default when it names none; a usage error
+// for any other, or for more than one.
+export function parseTarget(argv: readonly string[]): CliTarget {
+  if (argv.length > 1) throw new Error(`build-binary takes one target, not ${argv.join(" ")}`);
+  const name = argv[0] ?? DEFAULT_TARGET;
+  if (!(CLI_TARGETS as readonly string[]).includes(name)) {
+    throw new Error(`unknown target ${name}; one of ${CLI_TARGETS.join(", ")}`);
+  }
+  return name as CliTarget;
+}
+
+// Where a target's binary lands: the Linux one where the release and the
+// rigs have always found it, any other under a directory of its own.
+export function outfileFor(cliDir: string, target: CliTarget): string {
+  const binaries = join(cliDir, "binaries");
+  return target === DEFAULT_TARGET
+    ? join(binaries, "maxprice")
+    : join(binaries, target, "maxprice");
+}
+
+export function targetSpec(target: CliTarget): TargetSpec {
+  return TARGETS[target]!;
+}
 
 // The compile's command line. `--define` folds the update channel's test seam
 // away (src/update-channel.ts, ADR-0123 §9 as amended by #472): defined as
@@ -18,7 +54,7 @@ const TARGET = TARGETS["linux-x64"]!;
 export function compileArgv(
   entry: string,
   outfile: string,
-  bunTarget: string = TARGET.bunTarget,
+  bunTarget: string = targetSpec(DEFAULT_TARGET).bunTarget,
 ): string[] {
   return [
     "bun",
@@ -53,14 +89,18 @@ async function sweepBuildTemps(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const target = parseTarget(process.argv.slice(2));
+  const { bunTarget } = targetSpec(target);
+  const outfile = outfileFor(CLI_DIR, target);
   await sweepBuildTemps();
-  const outDir = join(CLI_DIR, "binaries");
-  await mkdir(outDir, { recursive: true });
+  await mkdir(dirname(outfile), { recursive: true });
   const entry = join(CLI_DIR, "src", "main.ts");
-  const outfile = join(outDir, "maxprice");
-  console.log(`[build] ${entry} → ${outfile} (${TARGET.bunTarget})`);
+  console.log(`[build] ${entry} → ${outfile} (${bunTarget})`);
   try {
-    const proc = Bun.spawn(compileArgv(entry, outfile), { stdout: "inherit", stderr: "inherit" });
+    const proc = Bun.spawn(compileArgv(entry, outfile, bunTarget), {
+      stdout: "inherit",
+      stderr: "inherit",
+    });
     const code = await proc.exited;
     if (code !== 0) throw new Error(`bun build failed (exit ${code})`);
   } finally {

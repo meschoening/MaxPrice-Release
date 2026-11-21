@@ -2,7 +2,9 @@ import { existsSync } from "node:fs";
 import { errorResponseSchema, statusSnapshotSchema, type StatusSnapshot } from "@maxprice/shared";
 import type { ZodType, ZodTypeDef } from "zod";
 import { CliError, EXIT, type Hint } from "./exit";
-import { dataDir, type Env, socketPath, unitPath } from "./paths";
+import { shellTarget } from "@maxprice/usage-core/launchd-agent";
+import { agentPlistPath, dataDir, type Env, socketPath, unitPath } from "./paths";
+import { MAXPRICE_AGENT } from "./service/agent";
 import { VERSION } from "./version";
 
 // The Headless client's only loopback client (ADR-0118 §1): it reaches the
@@ -27,6 +29,8 @@ export type ConnectOptions = {
   // the scan's end, and Ctrl-C ends the wait.
   report?: boolean;
   stderr?: Stderr;
+  // Which service the hints name: the LaunchAgent on macOS, else the unit.
+  platform?: NodeJS.Platform;
 };
 
 export type RequestOptions = {
@@ -54,16 +58,26 @@ export type Daemon = {
 // ADR-0119 §7's hints use only the default unit path: no subprocess on a
 // daemon request's error path. A manager with a custom config home can get
 // terminal/install hints instead; `maxprice service status` resolves its
-// actual UnitPath (ADR-0120 §4's named residual).
-function notRunning(env: Env): CliError {
+// actual UnitPath (ADR-0120 §4's named residual). On macOS they check the
+// LaunchAgent's plist instead, and name launchctl (ADR-0143 §8).
+function notRunning(env: Env, platform: NodeJS.Platform): CliError {
+  const installed =
+    platform === "darwin" ? existsSync(agentPlistPath(env)) : existsSync(unitPath(env));
+  const service =
+    platform === "darwin"
+      ? [
+          { label: "Start it:", command: `launchctl kickstart ${shellTarget(MAXPRICE_AGENT)}` },
+          { label: "Why it stopped:", command: "maxprice service logs" },
+        ]
+      : [
+          { label: "Start it:", command: "systemctl --user start maxprice" },
+          { label: "Why it stopped:", command: "journalctl --user --user-unit=maxprice -n 50" },
+        ];
   return new CliError(
     EXIT.NOT_RUNNING,
     "the daemon is not running.",
-    existsSync(unitPath(env))
-      ? [
-          { label: "Start it:", command: "systemctl --user start maxprice" },
-          { label: "Why it stopped:", command: "journalctl --user --user-unit=maxprice -n 50" },
-        ]
+    installed
+      ? service
       : [
           { label: "Install it as a service:", command: "maxprice service install" },
           { label: "Or run it in a terminal:", command: "maxprice serve" },
@@ -71,8 +85,14 @@ function notRunning(env: Env): CliError {
   );
 }
 
-// How to restart the daemon: through its unit, when the default one exists.
-export function restartHints(env: Env): Hint[] {
+// How to restart the daemon: through its unit, when the default one exists,
+// or on macOS through its LaunchAgent, when its plist exists.
+export function restartHints(env: Env, platform: NodeJS.Platform = process.platform): Hint[] {
+  if (platform === "darwin") {
+    return existsSync(agentPlistPath(env))
+      ? [{ label: "Restart it:", command: `launchctl kickstart -k ${shellTarget(MAXPRICE_AGENT)}` }]
+      : ["Stop the running 'maxprice serve' and start it again."];
+  }
   return existsSync(unitPath(env))
     ? [{ label: "Restart it:", command: "systemctl --user restart maxprice" }]
     : ["Stop the running 'maxprice serve' and start it again."];
@@ -94,11 +114,11 @@ export async function pushSaved(env: Env, push: () => Promise<unknown>): Promise
   }
 }
 
-function skew(theirs: string, env: Env): CliError {
+function skew(theirs: string, env: Env, platform: NodeJS.Platform): CliError {
   return new CliError(
     EXIT.SKEW,
     `the daemon is ${theirs} but this maxprice is ${VERSION}.`,
-    restartHints(env),
+    restartHints(env, platform),
   );
 }
 
@@ -124,6 +144,7 @@ async function exchange(
   socket: string,
   path: string,
   env: Env,
+  platform: NodeJS.Platform,
   init: RequestOptions,
   timeoutMs: number | null,
 ): Promise<Exchange> {
@@ -142,7 +163,7 @@ async function exchange(
     if (signal?.aborted && timeoutMs !== null) {
       throw new CliError(EXIT.FAILURE, `the daemon did not answer within ${timeoutMs / 1000} s`);
     }
-    if (isConnectFailure(error)) throw notRunning(env);
+    if (isConnectFailure(error)) throw notRunning(env, platform);
     throw new CliError(EXIT.FAILURE, `cannot reach the daemon: ${messageOf(error)}`);
   }
 }
@@ -178,8 +199,9 @@ export async function connect(options: ConnectOptions = {}): Promise<Daemon> {
   const env = options.env ?? process.env;
   const socket = options.socket ?? socketPath(dataDir(env));
   const timeoutMs = options.timeoutMs ?? PROBE_TIMEOUT_MS;
+  const platform = options.platform ?? process.platform;
 
-  const probe = await exchange(socket, "/api/status", env, {}, timeoutMs);
+  const probe = await exchange(socket, "/api/status", env, platform, {}, timeoutMs);
   if (!probe.ok) throw refused("/api/status", probe);
   const body = json("/api/status", probe.text);
   // The version alone first (ADR-0119 §5): a skewed daemon's status may no
@@ -188,7 +210,7 @@ export async function connect(options: ConnectOptions = {}): Promise<Daemon> {
   if (!version.success) {
     throw new CliError(EXIT.FAILURE, "the daemon's /api/status names no engineVersion");
   }
-  if (version.data.engineVersion !== VERSION) throw skew(version.data.engineVersion, env);
+  if (version.data.engineVersion !== VERSION) throw skew(version.data.engineVersion, env, platform);
   const status = statusSnapshotSchema.safeParse(body);
   if (!status.success) {
     throw new CliError(EXIT.FAILURE, "the daemon's /api/status does not match this maxprice");
@@ -203,7 +225,7 @@ export async function connect(options: ConnectOptions = {}): Promise<Daemon> {
     status: status.data,
     statusText: probe.text,
     async request(path, schema, init = {}) {
-      const answer = await exchange(socket, path, env, init, init.timeoutMs ?? null);
+      const answer = await exchange(socket, path, env, platform, init, init.timeoutMs ?? null);
       if (!answer.ok) throw refused(path, answer);
       const parsed = schema.safeParse(json(path, answer.text));
       if (!parsed.success) {

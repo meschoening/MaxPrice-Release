@@ -287,6 +287,29 @@ Accounts, Total tokens, Last activity. Piped output keeps every column.
 
 ${reportFlagsHelp({ project: true })}`;
 
+// The help that differs by platform: on macOS the service is a LaunchAgent
+// (ADR-0143), elsewhere a systemd user unit. Linux's text is as it was.
+const ON_MAC = process.platform === "darwin";
+
+const SERVE_LOGS = ON_MAC
+  ? `It logs to stderr, and its boot trace to stdout; under its LaunchAgent both
+go to serve.log in the data dir.
+`
+  : `It logs to stderr, and its boot trace to stdout; under systemd both go to the
+journal.
+`;
+
+const SERVE_LEDGER = ON_MAC
+  ? `
+Under launchd, with MAXPRICE_SUPERVISOR=launchd as its LaunchAgent sets it,
+it bounds its own relaunches: a sixth start within 15 minutes, another
+'maxprice serve' holding the data dir, or a refused settings.json is
+recorded in relaunch.json in the data dir, and it exits 0, which launchd
+does not relaunch. It also moves a serve.log past 10 MB to serve.log.1 at
+boot.
+`
+  : "";
+
 const SERVE_HELP = `Usage: maxprice serve
 
 Run the daemon in the foreground: the usage engine over this machine's Claude
@@ -297,9 +320,7 @@ It keeps its files in the data dir, $XDG_DATA_HOME/maxprice, or
 tightens that dir to 0700, listens on daemon.sock in it (0600), and holds a
 lock on serve.lock there, so one daemon runs per data dir.
 
-It logs to stderr, and its boot trace to stdout; under systemd both go to the
-journal.
-
+${SERVE_LOGS}
 It reads its settings from settings.json in the data dir, and refuses to
 start on a file it cannot read as a JSON object, or one whose Home
 membership or tracked list is a value the setting does not take. On a
@@ -320,7 +341,7 @@ found to update-check.json in the data dir, which 'maxprice status' shows;
 it never installs anything.
 
 SIGTERM, SIGINT and SIGHUP stop it cleanly, with exit 0.
-
+${SERVE_LEDGER}
 Exit codes:
   1  A crash or a failed bind
   2  An option or an argument: serve takes none
@@ -329,7 +350,7 @@ Exit codes:
      list is rejected; fix the file, then start it again
 `;
 
-const SERVICE_HELP = `Usage: maxprice service <install|uninstall|status|logs> [options]
+export const SERVICE_HELP_LINUX = `Usage: maxprice service <install|uninstall|status|logs> [options]
 
 Run the daemon as a systemd user unit in the manager's config home
 (~/.config/systemd/user/maxprice.service by default).
@@ -367,6 +388,65 @@ Exit codes:
      logs: the unit is not installed
 `;
 
+export const SERVICE_HELP_MACOS = `Usage: maxprice service <install|uninstall|status|logs> [options]
+
+Run the daemon as a LaunchAgent in your login session
+(~/Library/LaunchAgents/com.maxprice.headless-client.plist). It runs while
+you are logged in to this Mac, and starts again at your next login. Start it,
+or with -k restart it, with launchctl:
+  launchctl kickstart [-k] gui/$(id -u)/com.maxprice.headless-client
+
+Verbs:
+  install    Write the plist when it changed, load it and start the agent.
+             It clears the relaunch count in relaunch.json, makes the data
+             dir, bakes in CLAUDE_CONFIG_DIR and XDG_DATA_HOME when this
+             shell sets them, and restarts a running daemon when the file
+             changed.
+  uninstall  Unload the agent, which stops it, and remove its plist. The data
+             dir, its secrets.json, serve.log and relaunch.json stay.
+  status     The agent's state, pid, runs and last exit; why it stopped, from
+             relaunch.json, and its starts in the last 15 minutes; whether it
+             runs this maxprice and serves this shell's data dir; whether the
+             daemon answers on its socket.
+  logs       The agent's log: tail on serve.log in its data dir. It exits
+             with tail's own code.
+
+Options for logs:
+  -f, --follow     Follow the log
+  -n, --lines <N>  Show the last N lines
+
+With no launchd GUI session for this user, every verb fails; log in to this
+Mac, or run 'maxprice serve' under a LaunchDaemon instead.
+
+Exit codes:
+  1  No launchd GUI session for this user, a launchctl step failed, or tail
+     is not on PATH
+  2  A bad verb or option, an argument after the verb, -f or -n with a verb
+     other than logs, or a -n that is not a whole number
+  3  status: the agent is not running or not installed;
+     logs: the agent is not installed
+`;
+
+const SERVICE_HELP = ON_MAC ? SERVICE_HELP_MACOS : SERVICE_HELP_LINUX;
+
+const UPDATE_RESTART = ON_MAC
+  ? `After the swap, a running com.maxprice.headless-client agent whose program
+is this binary is restarted with
+'launchctl kickstart -k gui/$(id -u)/com.maxprice.headless-client', and
+update waits up to 30 s for it to report the new version; one that runs
+another binary is left running, and update says so. A 'maxprice serve' run
+outside the agent is left running, and update says to restart it. Run as
+root, as for a shared /usr/local/bin, it restarts nothing: each user
+restarts their own agent.
+`
+  : `After the swap, a running maxprice.service whose ExecStart is this binary is
+restarted with 'systemctl --user restart maxprice.service', and update waits
+up to 30 s for it to report the new version; one that runs another binary is
+left running, and update says so. A 'maxprice serve' run outside the unit is
+left running, and update says to restart it. Run as root, as for a shared
+/usr/local/bin, it restarts nothing: each user restarts their own unit.
+`;
+
 const UPDATE_HELP = `Usage: maxprice update [--check [--json]]
 
 Install the newest maxprice from the update channel over this binary. It
@@ -378,13 +458,7 @@ no rollback: the previous release stays on its release page.
 It never runs sudo: this user must be able to read, write and search the
 binary's directory.
 
-After the swap, a running maxprice.service whose ExecStart is this binary is
-restarted with 'systemctl --user restart maxprice.service', and update waits
-up to 30 s for it to report the new version; one that runs another binary is
-left running, and update says so. A 'maxprice serve' run outside the unit is
-left running, and update says to restart it. Run as root, as for a shared
-/usr/local/bin, it restarts nothing: each user restarts their own unit.
-
+${UPDATE_RESTART}
 The daemon checks the channel at boot and every 6 hours, and never installs
 anything; 'maxprice status' shows what it found on its Update line.
 
@@ -417,7 +491,7 @@ cannot be used (the next serve starts without it), and the double-join
 warning when the Desktop client on this machine is joined to a Hub. Each line
 is marked ✓ ok, ! warn, ✗ bad or – off, and one with a fix names the command
 for it. The checklist shows no part of a session key, a Gateway's management
-key or the Hub password. Hub URLs hide userinfo. The systemd unit's state is
+key or the Hub password. Hub URLs hide userinfo. ${ON_MAC ? "The LaunchAgent's" : "The systemd unit's"} state is
 'maxprice service status'.
 
 With one session key stored, or none, Limits is one line: the limits'
@@ -981,7 +1055,9 @@ export const COMMANDS: Record<string, Command> = {
     run: async () => (await import("./commands/serve")).serve(),
   },
   service: {
-    summary: "Install, remove or inspect the daemon's systemd user unit",
+    summary: ON_MAC
+      ? "Install, remove or inspect the daemon's LaunchAgent"
+      : "Install, remove or inspect the daemon's systemd user unit",
     help: SERVICE_HELP,
     options: {
       follow: { type: "boolean", short: "f" },

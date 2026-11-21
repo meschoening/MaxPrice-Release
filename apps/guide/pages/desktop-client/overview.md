@@ -10,7 +10,7 @@ The Desktop client is the MaxPrice app. It reads the session logs Claude Code wr
 | Windows | An `.exe` installer for x64, not code-signed                 | Yes             | Yes            |
 | Linux   | A `.deb` for x64, for Debian, Ubuntu and their derivatives   | No              | No             |
 
-On a Linux server with no desktop, use the [Headless client](../headless-client/overview.md) instead.
+On a Linux server with no desktop, or a Mac that nobody sits at, use the [Headless client](../headless-client/overview.md) instead.
 
 ## What it shows
 

@@ -19,7 +19,7 @@ Your usage stays on your machine unless you join it to a Hub. Apart from a Hub a
 | If you want to …                                                     | Use                                                                              |
 | -------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | See your usage and cost on your own Mac, Windows PC or Linux desktop | The [Desktop client](desktop-client/overview.md)                                 |
-| Track Claude Code on a Linux server, with no desktop                 | The [Headless client](headless-client/overview.md)                               |
+| Track Claude Code on a Linux server or a Mac that nobody sits at     | The [Headless client](headless-client/overview.md)                               |
 | See several machines' usage in one place, from any of them           | A Hub, plus a client on each machine. See [Hubs and the fleet](concepts/hubs.md) |
 | Run that Hub on an always-on Windows PC                              | The [Hub tray app](hub-tray-app/overview.md)                                     |
 | Run that Hub on a Linux server, and publish its read-only Hub page   | The [Headless Hub](headless-hub/overview.md)                                     |
@@ -32,7 +32,7 @@ A Hub is optional. One machine with the Desktop client or the Headless client ne
 | ---------------------------------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | [Desktop client](desktop-client/overview.md)   | macOS (Apple Silicon and Intel), Windows x64, Linux x64 (`.deb`) | The MaxPrice app: its reports, charts and Settings in a window, and on macOS and Windows a tray icon and Popout |
 | [Hub tray app](hub-tray-app/overview.md)       | Windows x64                                                      | A Hub that runs in the Windows tray, with a Popout and an operator console. Its download is "MaxPrice Hub"      |
-| [Headless client](headless-client/overview.md) | Linux x64, glibc 2.28 or later                                   | A client with no window: the `maxprice` terminal command, with a daemon that runs as a service                  |
+| [Headless client](headless-client/overview.md) | Linux x64, glibc 2.28 or later; macOS 13 or later, Apple Silicon | A client with no window: the `maxprice` terminal command, with a daemon that runs as a service                  |
 | [Headless Hub](headless-hub/overview.md)       | Linux x64, glibc 2.28 or later                                   | A Hub with no window: the `maxprice-hub` terminal command, run as a service, with a read-only Hub page          |
 
 Every product is on the [releases page](https://github.com/meschoening/MaxPrice-Release/releases). The Desktop client and the Hub tray app update themselves on macOS and Windows; on Linux, install a new `.deb` to update the Desktop client, and the two terminal binaries update only when you ask them to. This guide describes the version named at the foot of every page.

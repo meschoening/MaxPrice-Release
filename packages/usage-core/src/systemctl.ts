@@ -2,6 +2,8 @@
 // read from their output (ADR-0120 §5, ADR-0127 §6, §11). Each tool is found
 // on the PATH of the environment the caller passes and runs with that
 // environment alone, so a test's fake tools are the only ones it can reach.
+// The launchd verbs (`./launchctl`, ADR-0143 §10) run `launchctl` and `tail`
+// through the same runners.
 //
 // Reachable only via the "./systemctl" subpath, never index.ts.
 
@@ -10,7 +12,7 @@ import { dirname, isAbsolute, join } from "node:path";
 
 import { type Env, home } from "./home-path";
 
-export type Tool = "systemctl" | "journalctl" | "loginctl";
+export type Tool = "systemctl" | "journalctl" | "loginctl" | "launchctl" | "tail";
 
 export type Ran = { code: number; stdout: string; stderr: string };
 

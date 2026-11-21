@@ -1,7 +1,9 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { displayPath, home } from "@maxprice/usage-core/home-path";
+import { agentPlistPath as agentPlistPathOf } from "@maxprice/usage-core/launchd-agent";
 import { defaultUnitPath } from "@maxprice/usage-core/systemd-unit";
+import { MAXPRICE_AGENT } from "./service/agent";
 import { UNIT } from "./service/unit";
 
 // Where the Headless client keeps its files, and the one maker of its data
@@ -61,11 +63,27 @@ export function settingsLockPath(dir: string): string {
   return join(dir, "settings.lock");
 }
 
+// The LaunchAgent's log, its stdout and stderr both, on macOS (ADR-0143 §6).
+export function serveLogPath(dir: string): string {
+  return join(dir, "serve.log");
+}
+
+// The relaunch ledger `serve` keeps under launchd (ADR-0143 §5).
+export function relaunchLedgerPath(dir: string): string {
+  return join(dir, "relaunch.json");
+}
+
 // The Desktop client's settings.json: Tauri's app_data_dir for the identifier
-// `com.maxprice.desktop`, which follows XDG_DATA_HOME the same way. Read only
-// for the double-join warning (ADR-0120 §6).
-export function desktopSettingsPath(env: Env): string {
-  return join(xdgDataHome(env), "com.maxprice.desktop", "settings.json");
+// `com.maxprice.desktop`. On Linux it follows XDG_DATA_HOME the same way; on
+// macOS it is ~/Library/Application Support, which ignores XDG_DATA_HOME
+// (ADR-0143 §3). Read only for the double-join warning (ADR-0120 §6).
+export function desktopSettingsPath(
+  env: Env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const appData =
+    platform === "darwin" ? join(home(env), "Library", "Application Support") : xdgDataHome(env);
+  return join(appData, "com.maxprice.desktop", "settings.json");
 }
 
 // The default systemd user unit path (ADR-0120 §4), the shared module's for
@@ -75,4 +93,11 @@ export function desktopSettingsPath(env: Env): string {
 // only this cheap default-path check for its hints.
 export function unitPath(env: Env): string {
   return defaultUnitPath(UNIT, env);
+}
+
+// The LaunchAgent's plist on macOS (ADR-0143 §4):
+// ~/Library/LaunchAgents/com.maxprice.headless-client.plist. daemon-client
+// checks it for its hints as it checks the unit's default path on Linux.
+export function agentPlistPath(env: Env): string {
+  return agentPlistPathOf(MAXPRICE_AGENT, env);
 }

@@ -22,7 +22,7 @@ Release code and binaries for MaxPrice, a Claude Code cost/token tracker.
 - macOS (Universal .dmg, Intel or Apple Silicon): [install](https://meschoening.github.io/MaxPrice-Release/desktop-client/install.html#macos)
 - Windows (Installer, portable coming soon): [install](https://meschoening.github.io/MaxPrice-Release/desktop-client/install.html#windows)
 - Linux (.deb Installer): [install](https://meschoening.github.io/MaxPrice-Release/desktop-client/install.html#linux)
-- Linux servers (Headless client: the `maxprice` terminal binary, x64): [install](https://meschoening.github.io/MaxPrice-Release/headless-client/overview.html#get-started), [manual](apps/cli/README.md)
+- Linux servers and Macs nobody sits at (Headless client: the `maxprice` terminal binary, Linux x64 or macOS on Apple Silicon): [install](https://meschoening.github.io/MaxPrice-Release/headless-client/overview.html#get-started), [manual](apps/cli/README.md)
 
 ### Hub:
 
@@ -37,6 +37,6 @@ Requires [Bun](https://bun.sh) >= 1.3.14 and a stable Rust toolchain.
 bun install --frozen-lockfile
 bun run build        # desktop app -> apps/desktop/src-tauri/target/release/bundle/
 bun run build:hub    # hub tray app -> apps/hub-desktop/src-tauri/target/release/bundle/
-bun run build:cli    # Headless client -> apps/cli/binaries/maxprice
+bun run build:cli    # Headless client -> apps/cli/binaries/maxprice (linux-x64; `darwin-arm64` -> apps/cli/binaries/darwin-arm64/maxprice)
 bun apps/hub/scripts/build-binaries.ts linux-x64   # Headless Hub -> apps/hub/binaries/maxprice-hub-x86_64-unknown-linux-gnu
 ```

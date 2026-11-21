@@ -81,9 +81,10 @@ export function defaultUnitPath(unit: string, env: Env): string {
 // path list entry by entry, the list staying comma-separated. An absolute
 // path, and any other value, is baked as it is. The unit is a systemd
 // artifact, so its paths are POSIX ones on any host, the Windows VM that
-// runs these tests included.
+// runs these tests included. The LaunchAgent bakes by the same rule
+// (./launchd-agent, ADR-0143 §4).
 export function bakedEnvironment(
-  unit: UserUnit,
+  unit: Pick<UserUnit, "baked">,
   env: Env,
   cwd: string,
 ): [name: string, value: string][] {

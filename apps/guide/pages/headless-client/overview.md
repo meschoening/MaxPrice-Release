@@ -1,13 +1,13 @@
 # Overview
 
-The Headless client is MaxPrice with no window, for a Linux server you reach over SSH. It is one terminal command, `maxprice`. Its daemon reads the session logs Claude Code writes on that machine and keeps their usage in the [Local archive](../concepts/archive.md#the-local-archive). Its commands print the Desktop client's reports as tables in your terminal, and it can join a [Hub](../concepts/hubs.md) as one of the fleet's machines.
+The Headless client is MaxPrice with no window, for a Linux server, or a Mac that nobody sits at, that you reach over SSH. It is one terminal command, `maxprice`. Its daemon reads the session logs Claude Code writes on that machine and keeps their usage in the [Local archive](../concepts/archive.md#the-local-archive). Its commands print the Desktop client's reports as tables in your terminal, and it can join a [Hub](../concepts/hubs.md) as one of the fleet's machines.
 
-Use it where Claude Code runs on a machine with no desktop. On a Mac, a Windows PC or a Linux desktop, the [Desktop client](../desktop-client/overview.md) does the same job in a window.
+Use it where Claude Code runs on a machine nobody sits at, such as a server or a Mac mini on a shelf. On a Mac, a Windows PC or a Linux desktop that you work at, the [Desktop client](../desktop-client/overview.md) does the same job in a window.
 
 ## What it is
 
-- **One binary for Linux x64**, with glibc 2.28 or later. There is no musl build, so it does not run on Alpine, and no arm64 build. The [Platform floor](../../../cli/README.md#platform-floor) lists the systems it was tried on.
-- **A daemon and its commands.** The daemon, `maxprice serve`, does the work and runs all the time, as a systemd user unit or under another init. The reports, and most other commands, ask it and print its answer. The daemon listens on a socket in its data dir, never on a network port, so only your own user can reach it.
+- **One binary for each platform:** Linux x64, with glibc 2.28 or later, and macOS 13 or later on Apple Silicon. There is no musl build, so it does not run on Alpine, and no build for Linux on arm64 or for Intel Macs. The [Platform floor](../../../cli/README.md#platform-floor) lists the systems it was tried on.
+- **A daemon and its commands.** The daemon, `maxprice serve`, does the work and runs all the time: as a systemd user unit on Linux, as a LaunchAgent on macOS, or under another init. The reports, and most other commands, ask it and print its answer. The daemon listens on a socket in its data dir, never on a network port, so only your own user can reach it.
 - **The same reports as the Desktop client:** per day, per session, per project, the 5-hour [blocks](../concepts/blocks.md), and a snapshot of the Active block, the [usage limits](../concepts/blocks.md#usage-limits) and today. They take the Desktop client's filters as options, and `--json` gives the daemon's answer for a script.
 - **No root.** It installs into your home directory and runs as you.
 - **It updates only when you ask it to**, from its own signed channel.
@@ -16,9 +16,12 @@ Use it where Claude Code runs on a machine with no desktop. On a Mac, a Windows 
 
 Each step links the Reference section that holds its commands.
 
-1. **Install it.** Download the tarball from the releases page and unpack it into `~/.local/bin` ([Install](../../../cli/README.md#install)).
+1. **Install it.** Download your platform's tarball from the releases page and unpack it into `~/.local/bin` ([Linux](../../../cli/README.md#linux), [macOS](../../../cli/README.md#macos)). On a Mac, fetch it with `curl` as shown there: a copy downloaded in a browser is quarantined, and macOS may stop it from starting.
 2. **Start the daemon and read a report.** Run it in a terminal first, then check it with `maxprice status` and try `maxprice daily` ([First run](../../../cli/README.md#first-run)).
-3. **Run it as a service**, so it keeps running after you log out ([Run it as a service](../../../cli/README.md#run-it-as-a-service)). With no systemd user manager, as in a container, run it under another init ([Other inits](../../../cli/README.md#other-inits)).
+3. **Run it as a service**, so it keeps running when you close the terminal ([Run it as a service](../../../cli/README.md#run-it-as-a-service)). On Linux it is a systemd user unit, which can keep running after you log out. With no systemd user manager, as in a container, run it under another init ([Other inits](../../../cli/README.md#other-inits)).
+
+   On macOS it is a LaunchAgent, which runs while you are logged in to the Mac and starts again at each login ([A LaunchAgent on macOS](../../../cli/README.md#a-launchagent-on-macos)). On a Mac with FileVault, that means after a restart it waits until you unlock the disk and log in. For a Mac that nobody logs in to, the Reference shows a LaunchDaemon that runs it from boot ([A LaunchDaemon on macOS](../../../cli/README.md#a-launchdaemon-on-macos)).
+
 4. **Set the timezone.** Servers often run in UTC, and the reports count days in the `timezone` setting, which follows the shell's `TZ` until you set it. Set yours so that today and this week fall where you expect, and choose how a week is counted ([`maxprice settings`](../../../cli/README.md#maxprice-settings-getsetunset)).
 5. **Give it your claude.ai session key**, to see your real usage limits ([`maxprice key`](../../../cli/README.md#maxprice-key-setlistremove)). [Blocks and usage limits](../concepts/blocks.md#the-claudeai-session-key) explains what the key reads. A key for another Account is kept beside the first, and storing one tracks its Account. Joined to a Hub, the Hub reads the limits for you, and these keys are only the fallback. If Claude Code reaches claude.ai through a Gateway, such as CLIProxyAPI, connect it too ([`maxprice gateway`](../../../cli/README.md#maxprice-gateway-connectlistremove)), so the usage it routes is counted under its Account.
 6. **Read your usage.** The [Report options](../../../cli/README.md#report-options) choose the range, the models, the projects, the machines and the [Scope](../concepts/organizations.md#the-scope), and each report's section lists its columns: [`daily`](../../../cli/README.md#maxprice-daily), [`sessions`](../../../cli/README.md#maxprice-sessions), [`projects`](../../../cli/README.md#maxprice-projects), [`blocks`](../../../cli/README.md#maxprice-blocks) and [`live`](../../../cli/README.md#maxprice-live).

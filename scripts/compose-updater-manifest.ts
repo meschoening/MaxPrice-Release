@@ -50,17 +50,20 @@
 //
 //   desktop        latest.json                darwin-aarch64, darwin-x86_64, windows-x86_64
 //   hub            hub-latest.json            windows-x86_64
-//   headless       headless-latest.json       linux-x86_64
+//   headless       headless-latest.json       linux-x86_64, darwin-aarch64
 //   headless-hub   headless-hub-latest.json   linux-x86_64
 //
 // Linux is deliberately absent from the two Tauri manifests. Tauri v2 can only
 // update an AppImage, and this release ships a .deb (release-assets.ts records
 // why no AppImage is built: linuxdeploy runs ldd over the Bun-compiled sidecar
 // and the dynamic loader segfaults). A .deb updates through the distro, or by
-// re-downloading. Each Headless tarball is its own manifest's only entry
-// (ADR-0123 §3, ADR-0129 §3), so a Desktop updater on Linux never finds a
-// tarball, the Windows tray app's hub-latest.json never carries the Headless
-// Hub's, and a bad Headless entry never fails another product's parse.
+// re-downloading. Each Headless product's tarballs are its own manifest's only
+// entries (ADR-0123 §3, ADR-0129 §3, ADR-0144 §5), so a Desktop updater on
+// Linux never finds a tarball, the Windows tray app's hub-latest.json never
+// carries the Headless Hub's, and a bad Headless entry never fails another
+// product's parse. The Headless client's darwin-aarch64 entry shares its key
+// with the Desktop app's in latest.json, which is why the two never share a
+// manifest.
 //
 // STAGING goes by asset name. `stage` routes each .sig off the draft release to
 // its channel's directory by the prefix of the asset it signs (ADR-0129 §3):
@@ -72,10 +75,10 @@
 //
 // THE SIGNED NAME is checked where a channel's clients check it. Each headless
 // product's update, `maxprice update` and ADR-0129 §4's `maxprice-hub update`,
-// computes its asset name from the manifest's version and refuses a signature whose trusted
-// comment names any other file (ADR-0123 §4 check 3, ADR-0129 §4), so the
-// composer refuses that manifest first, rather than publish one every install
-// on the channel refuses. It reads `file:` with build-headless's
+// computes its asset name from the manifest's version and its own platform,
+// and refuses a signature whose trusted comment names any other file
+// (ADR-0123 §4 check 3, ADR-0129 §4), so the composer refuses that manifest
+// first, rather than publish one every install on that platform refuses. It reads `file:` with build-headless's
 // `signedFileOf`, which finds the trusted comment by the update's own rules.
 //
 // BOTH darwin keys point at ONE universal bundle, which is correct here and was
@@ -89,7 +92,14 @@ import { mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { headlessAssetName, headlessHubAssetName, signedFileOf } from "./build-headless";
+import {
+  DEFAULT_TARGET,
+  HEADLESS_TARGETS,
+  headlessAssetName,
+  headlessHubAssetName,
+  signedFileOf,
+  type Target,
+} from "./build-headless";
 
 export type Channel = "desktop" | "hub" | "headless" | "headless-hub";
 
@@ -118,7 +128,7 @@ export type StagedArtifact = { name: string; signature: string };
 export const EXPECTED_PLATFORMS: Record<Channel, readonly UpdaterPlatform[]> = {
   desktop: ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"],
   hub: ["windows-x86_64"],
-  headless: ["linux-x86_64"],
+  headless: ["linux-x86_64", "darwin-aarch64"],
   "headless-hub": ["linux-x86_64"],
 };
 
@@ -152,23 +162,30 @@ export function pubkeySourceOf(channel: Channel): string {
   return PUBKEY_SOURCES[channel];
 }
 
+/** The build target whose tarball serves a headless platform key: HEADLESS_TARGETS read backwards. */
+function targetOf(platform: UpdaterPlatform): Target | null {
+  const found = Object.entries(HEADLESS_TARGETS).find(([, key]) => key === platform);
+  return found === undefined ? null : (found[0] as Target);
+}
+
 /**
  * The channels whose clients check the name a signature binds, and the asset
- * name each computes from a manifest's version. Only the headless products
- * read the trusted comment: Tauri's updater does not, and the rename step
- * changes a Windows installer's published name after tauri-action signed it,
- * so its `file:` names the pre-rename bundle and must not be checked.
+ * name each computes from a manifest's version on a platform. Only the
+ * headless products read the trusted comment: Tauri's updater does not, and
+ * the rename step changes a Windows installer's published name after
+ * tauri-action signed it, so its `file:` names the pre-rename bundle and must
+ * not be checked.
  */
 export const SIGNED_ASSETS: Partial<
-  Record<Channel, { client: string; assetName(version: string): string }>
+  Record<Channel, { client: string; assetName(version: string, platform: UpdaterPlatform): string }>
 > = {
   headless: {
     client: "maxprice update",
-    assetName: headlessAssetName,
+    assetName: (version, platform) => headlessAssetName(version, targetOf(platform) ?? undefined),
   },
   "headless-hub": {
     client: "maxprice-hub update",
-    assetName: headlessHubAssetName,
+    assetName: (version) => headlessHubAssetName(version),
   },
 };
 
@@ -179,16 +196,23 @@ export const SIGNED_ASSETS: Partial<
  * `createUpdaterArtifacts`, the NSIS installer IS the Windows updater bundle
  * (there is no separate .nsis.zip — mapping one was the second bug in the
  * Actions-era predecessor), while macOS gets a purpose-built .app.tar.gz. Any
- * other .tar.gz is a Linux tarball, which the Headless client or the Headless
- * Hub downloads straight from MaxPrice-Release. Returns null for anything else
- * so an unrecognised artifact is REPORTED rather than quietly left out of the
- * manifest.
+ * other .tar.gz is a Headless tarball, which the Headless client or the
+ * Headless Hub downloads straight from MaxPrice-Release, and which serves the
+ * platform its name ends in: `_darwin-arm64.tar.gz` darwin-aarch64 (ADR-0144
+ * §5), and any other, `_linux-x64.tar.gz` among them, linux-x86_64, as every
+ * tarball did before it. Returns null for anything else so an unrecognised
+ * artifact is REPORTED rather than quietly left out of the manifest.
  */
 export function classifyArtifact(
   name: string,
 ): { platforms: UpdaterPlatform[]; host: Host } | null {
   if (name.endsWith(".app.tar.gz")) {
     return { platforms: ["darwin-aarch64", "darwin-x86_64"], host: "updates" };
+  }
+  for (const [target, platform] of Object.entries(HEADLESS_TARGETS)) {
+    if (target !== DEFAULT_TARGET && name.endsWith(`_${target}.tar.gz`)) {
+      return { platforms: [platform], host: "installers" };
+    }
   }
   if (name.endsWith(".tar.gz")) {
     return { platforms: ["linux-x86_64"], host: "installers" };
@@ -281,7 +305,6 @@ export function composeManifest(input: ComposeInput): ComposeResult {
   const manifestName = manifestNameOf(input.channel);
   const expectedPlatforms = EXPECTED_PLATFORMS[input.channel];
   const signedAsset = SIGNED_ASSETS[input.channel];
-  const expectedName = signedAsset?.assetName(input.version) ?? null;
 
   let darwinSeen: string | null = null;
 
@@ -309,6 +332,8 @@ export function composeManifest(input: ComposeInput): ComposeResult {
       continue;
     }
 
+    // One platform per headless tarball, so its expected name is one name.
+    const expectedName = signedAsset?.assetName(input.version, kind.platforms[0]!) ?? null;
     if (signedAsset !== undefined && artifact.name !== expectedName) {
       errors.push(
         `${artifact.name} is not ${expectedName}, the name ${signedAsset.client} computes from ` +
@@ -499,6 +524,27 @@ export function manifestUrls(manifest: Manifest): string[] {
   return [...new Set(Object.values(manifest.platforms).map((p) => p.url))];
 }
 
+/** The channel a manifest file is, by its name, or null for a name no channel writes. */
+export function channelOfManifest(fileName: string): Channel | null {
+  return CHANNELS.find((channel) => manifestNameOf(channel) === fileName) ?? null;
+}
+
+/**
+ * What is wrong with a downloaded manifest's platform set, or null when it is
+ * exactly its channel's EXPECTED_PLATFORMS: compose asserts the set when it
+ * writes a manifest, and `verify` again on the bytes actually attached, so a
+ * manifest that lost or gained an entry on its way up fails before the
+ * channel switches.
+ */
+export function platformSetProblem(fileName: string, manifest: Manifest): string | null {
+  const channel = channelOfManifest(fileName);
+  if (channel === null) return `${fileName} is not a manifest any channel writes`;
+  const expected = [...EXPECTED_PLATFORMS[channel]].sort();
+  const got = Object.keys(manifest.platforms ?? {}).sort();
+  if (got.length === expected.length && got.every((key, i) => key === expected[i])) return null;
+  return `${fileName} carries ${got.join(", ") || "no platform"}, not ${expected.join(", ")}`;
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -657,6 +703,13 @@ async function cmdVerify(argv: string[]): Promise<number> {
       manifest = JSON.parse(readFileSync(file, "utf8")) as Manifest;
     } catch (err) {
       console.error(`✗ ${file} — unreadable: ${err instanceof Error ? err.message : err}`);
+      failed++;
+      continue;
+    }
+
+    const problem = platformSetProblem(basename(file), manifest);
+    if (problem !== null) {
+      console.error(`✗ ${problem}`);
       failed++;
       continue;
     }
