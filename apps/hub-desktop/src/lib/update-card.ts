@@ -81,7 +81,8 @@ const RESTART_BODY =
 /**
  * State 5's second sentence is the one string that was conditional on #144, and
  * #144 settled it: Tauri's NSIS updater passes `/P /R`, and `.onInstSuccess`
- * relaunches on `/R`. So the hub does come back on its own.
+ * relaunches on `/R`. So the hub does come back on its own. On macOS
+ * `applyUpdate` relaunches it once the new .app is in place.
  */
 const INSTALLING_LEAD = "Downloading and installing.";
 const INSTALLING_BODY =
@@ -108,14 +109,16 @@ const INSTALL_FAILED_BODY =
   "Couldn’t install the update. Try again — if it keeps failing, the reason is in hub.log.";
 
 /**
- * Off Windows. The version row still renders — it is the half of the card that
- * has nothing to do with the platform — and the copy names the ONLY real route,
- * because no macOS hub download exists to point at. Only macOS ever sees this:
- * Linux hub hosts run headless `maxprice-hub serve` and have no console.
+ * Off Windows and macOS. The version row still renders — it is the half of the
+ * card that has nothing to do with the platform — and the copy names the ONLY
+ * real route, because no hub tray app download exists for this host to point
+ * at. Only a tray app run from source on Linux ever sees this: Linux hub hosts
+ * run headless `maxprice-hub serve` and have no console.
  */
 const UNSUPPORTED_HINT: UpdateBelowHint = {
   kind: "hint",
-  before: "Automatic updates are built for Windows. On macOS, update by rebuilding from source: ",
+  before:
+    "Automatic updates are built for Windows and macOS. Here, update by rebuilding from source: ",
   code: "bun run build:hub",
   after: ".",
 };
@@ -181,6 +184,6 @@ export function updateCardView(state: UpdateCardState, now: number): UpdateCardV
       };
 
     case "unsupported":
-      return { value: "Windows only", below: UNSUPPORTED_HINT };
+      return { value: "Windows and macOS", below: UNSUPPORTED_HINT };
   }
 }

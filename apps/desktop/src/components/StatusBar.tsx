@@ -43,7 +43,8 @@ import { cn } from "@/lib/utils";
 export function StatusBar() {
   const connectionState = useLiveStatus((s) => s.connectionState);
   const usageConnection = useLiveStatus((s) => s.usageConnection);
-  const usageLastSampleAt = useLiveStatus((s) => s.usageLastSampleAt);
+  // The last read of the limits `usageConnection` describes (ADR-0145 §6).
+  const usageLastReadAt = useLiveStatus((s) => s.usageLastReadAt);
   const hubConnection = useLiveStatus((s) => s.hubConnection);
   // The last SETTLED hub state, feeding the sticky-connecting rule. Store-derived
   // rather than tracked here, so it carries the history from before this
@@ -58,12 +59,12 @@ export function StatusBar() {
   // surface, and the complementary one: saturation is an engine too busy to keep
   // up, this is an engine that may not be being told anything has changed.
   const watcherDegraded = useLiveStatus((s) => s.watcherDegraded);
-  // Coarse tick — the usage tooltip's "sampled Nm ago" only needs
+  // Coarse tick — the usage tooltip's "read Nm ago" only needs
   // minute-grained freshness.
   const now = useNowTick(60_000);
 
   const stale = isStale(connectionState);
-  const usage = usageFootLine(usageConnection, usageLastSampleAt, now, stale);
+  const usage = usageFootLine(usageConnection, usageLastReadAt, now, stale);
   const hub = hubFootLine(hubConnection, lastSettledHub, stale);
   const showSaturation = saturationFootLine(saturated, stale);
   const showWatcher = watcherFootLine(watcherDegraded, stale);

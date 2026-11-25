@@ -12,8 +12,7 @@ import { slugFromPath, ymdShift, zonedInstant } from "@maxprice/shared";
 //   theirs at every hour of the Chicago day it is written on. Its wall-clock
 //   times are New York's, which is an hour ahead: counted there, from
 //   midnight to 01:00 the corpus's today was Chicago's tomorrow, and every
-//   this-week and popout answer lost its active block, and every this-week
-//   answer its sessions last active today. The corpus alone still ages at
+//   this-week answer lost its sessions last active today. The corpus alone still ages at
 //   Chicago midnight. Amended 2026-10-20 (PR #522): the headless rig and the
 //   report tests use test-clock.ts's advancing Chicago-noon origin in
 //   their own process and every sandboxed child, with a ten-minute budget.

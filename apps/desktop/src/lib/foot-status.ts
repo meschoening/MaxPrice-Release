@@ -101,9 +101,11 @@ export type UsageFootLine =
   | { kind: "expired"; variant: DotVariant; title: string }
   | { kind: "state"; variant: DotVariant; title: string };
 
+// `lastReadAt` is the Head membership's last successful read (ADR-0145 §6,
+// `headLastReadAt`), absent until one succeeds.
 export function usageFootLine(
   connection: UsageConnection,
-  lastSampleAt: string | null,
+  lastReadAt: string | null,
   now: number,
   stale: boolean,
 ): UsageFootLine {
@@ -128,14 +130,14 @@ export function usageFootLine(
       title: "claude.ai limits: Session expired — click to reconnect",
     };
   }
-  const sampled =
-    connection === "connected" && lastSampleAt !== null
-      ? ` · sampled ${formatRelativeTime(lastSampleAt, now)}`
+  const read =
+    connection === "connected" && lastReadAt !== null
+      ? ` · read ${formatRelativeTime(lastReadAt, now)}`
       : "";
   return {
     kind: "state",
     variant: dotVariant(dot),
-    title: `claude.ai limits: ${usageConnectionLabel(connection)}${sampled}`,
+    title: `claude.ai limits: ${usageConnectionLabel(connection)}${read}`,
   };
 }
 

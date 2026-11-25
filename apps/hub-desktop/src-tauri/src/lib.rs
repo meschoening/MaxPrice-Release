@@ -10,6 +10,8 @@ use parking_lot::Mutex;
 #[cfg(windows)]
 mod job_object;
 #[cfg(any(target_os = "macos", test))]
+mod macos_menubar_icon;
+#[cfg(any(target_os = "macos", test))]
 mod macos_popout;
 mod popout;
 mod sidecar_log;
@@ -1189,6 +1191,65 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
     let _ = window.set_focus();
 }
 
+// The popout's round corners on macOS (ADR-0148 §2), the client's technique
+// (ADR-0050's 2026-08-25 amendment) in this app's copy. AppKit rounds nothing
+// for an undecorated window, so mask the content view's layer to a rounded
+// rect and stop the window painting its own ground behind it: the webview is a
+// layer-backed subview, so the mask clips it too, and the window stays opaque
+// everywhere the mask keeps.
+//
+// Called once, at setup, on a window that is only ever hidden and shown,
+// neither of which disturbs a layer mask, so nothing is re-asserted per open.
+//
+// Every failure here is cosmetic by construction: a popout with square
+// corners is what the app had before. So each step degrades in place with a
+// log rather than unwinding, and none can leave the window half-styled in a
+// way that hides content.
+#[cfg(target_os = "macos")]
+fn round_popout_corners(window: &tauri::WebviewWindow, radius: f64) {
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSColor, NSView, NSWindow};
+
+    let ptr = match window.ns_window() {
+        Ok(ptr) => ptr,
+        Err(e) => {
+            eprintln!("[popout] no NSWindow — corners stay square: {e}");
+            return;
+        }
+    };
+    // SAFETY: `ns_window()` returns this window's live NSWindow, retained by
+    // the window itself for as long as it exists; we borrow it for this call
+    // only. Setup runs on the main thread, where every AppKit call below must
+    // happen.
+    let ns_window: &NSWindow = unsafe { &*(ptr as *const NSWindow) };
+
+    let Some(content) = ns_window.contentView() else {
+        eprintln!("[popout] NSWindow has no content view — corners stay square");
+        return;
+    };
+    let content: Retained<NSView> = content;
+
+    // The mask alone would cut the corners out of an OPAQUE window, and macOS
+    // would keep painting the window's own background in the gap. Clearing
+    // both makes the cut-away transparent, and it is not the
+    // `transparent: true` ADR-0050 declined: the webview still paints an
+    // opaque ground over every pixel the mask keeps.
+    ns_window.setOpaque(false);
+    ns_window.setBackgroundColor(Some(&NSColor::clearColor()));
+
+    content.setWantsLayer(true);
+    match content.layer() {
+        Some(layer) => {
+            layer.setCornerRadius(radius);
+            layer.setMasksToBounds(true);
+        }
+        None => eprintln!("[popout] content view has no layer — corners stay square"),
+    }
+    // The system shadow is traced from the window's opaque shape, which just
+    // changed; without this it keeps the square outline cached at creation.
+    ns_window.invalidateShadow();
+}
+
 // Windows retains physical pixels and the two passes required by WM_DPICHANGED.
 fn place_popout_physical(
     app: &AppHandle,
@@ -1311,6 +1372,14 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
 
+    // macOS draws its own icon from the first frame (ADR-0148 §3): Starting's,
+    // until the popout's renderer reports the first status. Setup runs on the
+    // main thread, so this applies at once.
+    #[cfg(target_os = "macos")]
+    if let Err(e) = apply_tray_tone(app, TrayTone::Soft) {
+        eprintln!("[hub] menu-bar icon not set: {e}");
+    }
+
     Ok(())
 }
 
@@ -1389,9 +1458,8 @@ fn hide_popout(app: AppHandle) {
     }
 }
 
-// Reflect the hub's live status in the tray tooltip. The operator window
-// invokes this as status arrives. The status-tinted icon *variants* ship with
-// the Phase 4 icon set; today the tooltip text carries the status.
+// Reflect the hub's live status in the tray tooltip. The popout's renderer
+// invokes this as status arrives, beside `set_tray_tone` for the icon.
 //
 // The tooltip arrives COMPOSED (ADR-0049). This used to match on a state token
 // and build the words here, which meant the console's status vocabulary lived
@@ -1406,10 +1474,50 @@ fn hide_popout(app: AppHandle) {
 // ran — and the caller logs that rather than freezing the tooltip in silence.
 #[tauri::command]
 fn set_tray_tooltip(app: AppHandle, tooltip: String) -> Result<(), String> {
-    match app.tray_by_id("hub-tray") {
-        Some(tray) => tray.set_tooltip(Some(tooltip)).map_err(|e| e.to_string()),
-        None => Err("tray icon 'hub-tray' not found".into()),
-    }
+    hub_tray(&app)?
+        .set_tooltip(Some(tooltip))
+        .map_err(|e| e.to_string())
+}
+
+/// The hub's tray icon, or the error its two commands return without one.
+fn hub_tray(app: &AppHandle) -> Result<tauri::tray::TrayIcon, String> {
+    app.tray_by_id("hub-tray")
+        .ok_or_else(|| "tray icon 'hub-tray' not found".into())
+}
+
+/// The Hub row's dot tone, which the tray icon carries on macOS (ADR-0148
+/// §3): the popout's renderer derives it with the row's own words
+/// (`trayTone`), so the icon and the row never disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TrayTone {
+    Good,
+    Warn,
+    Bad,
+    Soft,
+}
+
+/// Set the tray icon for the Hub's tone. On macOS it draws the menu-bar icon
+/// ADR-0148 §3 chose (`macos_menubar_icon`); elsewhere the icon stays the colour orb
+/// and the tooltip alone carries the status, so this only checks for the
+/// tray, as `set_tray_tooltip` does.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+#[tauri::command]
+fn set_tray_tone(app: AppHandle, tone: TrayTone) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return apply_tray_tone(&app, tone);
+    #[cfg(not(target_os = "macos"))]
+    hub_tray(&app).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn apply_tray_tone(app: &AppHandle, tone: TrayTone) -> Result<(), String> {
+    hub_tray(app)?
+        .with_inner_tray_icon(move |inner| match inner.ns_status_item() {
+            Some(item) => macos_menubar_icon::apply(&item, tone),
+            None => Err("the tray has no status item".into()),
+        })
+        .map_err(|e| e.to_string())?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1437,6 +1545,7 @@ pub fn run() {
             get_hub_url,
             get_operator_token,
             set_tray_tooltip,
+            set_tray_tone,
             check_firewall,
             fix_firewall,
             autostart_status,
@@ -1460,6 +1569,17 @@ pub fn run() {
                 eprintln!("[hub] startup failed: {e}");
                 let state = app.state::<SidecarState>();
                 *state.status.lock() = SidecarStatus::Failed(e);
+            }
+
+            // macOS rounds no undecorated window for us; do it ourselves
+            // before the popout is ever shown (it is pre-created hidden, so
+            // this lands well ahead of the first tray click).
+            #[cfg(target_os = "macos")]
+            match app.get_webview_window(popout::POPOUT_LABEL) {
+                Some(popout_window) => {
+                    round_popout_corners(&popout_window, popout::POPOUT_CORNER_RADIUS)
+                }
+                None => eprintln!("[popout] popout window missing — corners stay square"),
             }
 
             create_tray(handle)?;
@@ -1527,6 +1647,20 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- set_tray_tone's argument: the renderer's `TrayTone` words ---
+    // The wire half of the contract `lib/tauri.test.ts` pins on the TS side.
+
+    #[test]
+    fn tray_tone_reads_the_renderers_four_words_and_nothing_else() {
+        let read = |word: &str| serde_json::from_str::<TrayTone>(&format!("\"{word}\""));
+        assert_eq!(read("good").unwrap(), TrayTone::Good);
+        assert_eq!(read("warn").unwrap(), TrayTone::Warn);
+        assert_eq!(read("bad").unwrap(), TrayTone::Bad);
+        assert_eq!(read("soft").unwrap(), TrayTone::Soft);
+        assert!(read("Good").is_err());
+        assert!(read("online").is_err());
+    }
 
     // --- relaunch_args: a relaunch the user asked for drops --hidden ---
     // ADR-0112 §5-6, the client shell's rule kept alike.
@@ -2089,6 +2223,28 @@ mod tests {
         assert!(
             w.is_finite() && w > 0.0 && h.is_finite() && h > 0.0,
             "the popout's configured size must be a real window, got {w}x{h}"
+        );
+    }
+
+    #[test]
+    fn the_macos_corner_radius_matches_the_stylesheet() {
+        // The corner is drawn twice: the layer mask `round_popout_corners`
+        // applies, and the CSS border-radius that curves the frame running
+        // along it. Only one of the two is visible to the compiler. Two radii
+        // that disagree fail nowhere: they render as a hairline that drifts off
+        // the corner it is meant to trace. The client's copy pins the same
+        // pair (ADR-0077: a per-app copy).
+        let css = include_str!("../../src/styles/globals.css");
+        let rule = css
+            .split(".popout-window.popout-rounded .popout-frame {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("globals.css must carry a `.popout-window.popout-rounded .popout-frame` rule");
+        let expected = format!("border-radius: {}px;", popout::POPOUT_CORNER_RADIUS as u32);
+        assert!(
+            rule.contains(&expected),
+            "globals.css's rounded-popout rule must set `{expected}` \
+             (popout::POPOUT_CORNER_RADIUS), got:{rule}"
         );
     }
 

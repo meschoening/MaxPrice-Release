@@ -435,9 +435,10 @@ button:disabled {
    never the translucent panel recipe. The WINDOW is opaque (T2: transparent
    + undecorated disables the Windows system shadow and flashes on first
    paint), so the frame fills the viewport edge-to-edge: Win11's DWM rounds
-   and shadows the undecorated window itself (`shadow: true`), macOS stays
-   square in v1 — the mock's radius 14 returns only if a transparent-window
-   revisit ever lands. Scoped under the body class main.tsx stamps.
+   and shadows the undecorated window itself (`shadow: true`), and on macOS
+   Rust masks the window's content layer to the radius the rounded rule below
+   carries (ADR-0148 §2, the client's technique from ADR-0050's 2026-08-25
+   amendment). Scoped under the body class main.tsx stamps.
    ============================================================ */
 /* --panel-opaque is glass's always-defined opaque composite and flips with the
    theme on its own, so the base needs no dark override. The wash's hues track
@@ -473,6 +474,20 @@ body.popout-window {
   padding: 6px;
   border: 1px solid var(--panel-border);
   box-shadow: var(--panel-inner);
+}
+/* macOS gets the radius-14 corners the client's popout wears (ADR-0148 §2).
+   The curve is TWO halves that must agree: Rust masks the NSWindow's content
+   layer to the same radius (lib.rs `round_popout_corners`, which owns the
+   number, POPOUT_CORNER_RADIUS, and a test binds it to this rule), and this
+   curves the frame that runs along it, so the hairline follows the corner
+   instead of being cut square by the mask.
+
+   Class-gated rather than platform-queried because the OTHER platform is
+   already rounded by someone else: Win11's DWM curves the undecorated window
+   at its own radius, so drawing ours inside it would show the body's ground
+   in the gap between the two curves. main.tsx stamps the class on macOS. */
+.popout-window.popout-rounded .popout-frame {
+  border-radius: 14px;
 }
 /* The Popout's rows recipe, which the Hub page shares (ADR-0124 §7), inlined
    in place by Tailwind like hub-header.css above. */

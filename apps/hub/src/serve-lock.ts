@@ -3,6 +3,7 @@ import { constants as os } from "node:os";
 import { join } from "node:path";
 import { errnoName, tryLockShared } from "@maxprice/usage-core/flock";
 import { displayPath, type Env } from "@maxprice/usage-core/home-path";
+import { printAgentSync } from "@maxprice/usage-core/launchctl";
 import {
   describeHolder,
   readServeLockHolder,
@@ -31,6 +32,44 @@ import { SERVE_LOCK_POLL_MS, SERVE_LOCK_RETRY_MS } from "./serve-lock-bound";
 export type { ServeLock };
 
 export const UNIT = "maxprice-hub.service";
+
+// The LaunchAgent that runs a Headless Hub on macOS (ADR-0146 §5), the
+// label `update`'s restart names too (§8).
+export const LABEL = "com.maxprice.headless-hub";
+
+// The service a holder's pid runs in, as the Hub's lines name it: the user
+// unit on Linux, the LaunchAgent on macOS.
+export function serviceName(platform: NodeJS.Platform = process.platform): string {
+  return platform === "darwin" ? LABEL : UNIT;
+}
+
+// The holder with `service` read for this platform. On Linux the shared
+// reader's cgroup check says whether the pid runs in the unit. On macOS,
+// which has no /proc, that check reads every pid as in none (a test's
+// cgroup reader aside), and the holder is the agent's when its pid is the
+// one `launchctl print` reports for it (ADR-0146 §7, ADR-0143 §8). Asked
+// only where a line or a choice reads it, so a poll of the lock never runs
+// launchctl.
+export function withService(
+  holder: ServeLockHolder,
+  env: Env = process.env,
+  platform: NodeJS.Platform = process.platform,
+): ServeLockHolder {
+  if (platform !== "darwin" || holder.service) return holder;
+  if (!holder.running || holder.pid === null) return holder;
+  const agentPid = printAgentSync({ label: LABEL }, process.getuid?.() ?? 0, env)?.pid ?? null;
+  return { ...holder, service: holder.pid === agentPid };
+}
+
+// The holder as a line names it: `pid 4182, maxprice-hub.service`, or on
+// macOS `pid 4182, com.maxprice.headless-hub`.
+export function describeHubHolder(
+  holder: ServeLockHolder,
+  env: Env = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return describeHolder(withService(holder, env, platform), serviceName(platform));
+}
 
 export function serveLockPath(dataDir: string): string {
   return join(dataDir, "serve.lock");
@@ -114,7 +153,7 @@ export async function takeServeLock(
     if (left <= 0) {
       throw new CliError(
         EXIT.ALREADY_RUNNING,
-        `maxprice-hub is already running for ${displayPath(dataDir, env)} (${describeHolder(taken.holder, UNIT)})`,
+        `maxprice-hub is already running for ${displayPath(dataDir, env)} (${describeHubHolder(taken.holder, env)})`,
       );
     }
     // Never past the bound: the last wait ends on it, for the last attempt.
@@ -136,7 +175,7 @@ export function takeVerbLock(
   if (taken.kind === "held") {
     throw new CliError(
       EXIT.FAILURE,
-      `maxprice-hub is running for ${displayPath(dataDir, env)} (${describeHolder(taken.holder, UNIT)}); stop it first: ${verb} edits the data files directly`,
+      `maxprice-hub is running for ${displayPath(dataDir, env)} (${describeHubHolder(taken.holder, env)}); stop it first: ${verb} edits the data files directly`,
     );
   }
   return taken.lock;
@@ -170,6 +209,7 @@ export function readOnlyLockHolder(dir: string, readCgroup?: ReadCgroup): ServeL
     closeSync(fd);
   }
   if (errno === 0) return null;
-  if (errno === os.errno.EWOULDBLOCK) return readServeLockHolder(path, UNIT, readCgroup);
+  if (errno === os.errno.EWOULDBLOCK)
+    return withService(readServeLockHolder(path, UNIT, readCgroup));
   throw flockFailed(path, errno);
 }

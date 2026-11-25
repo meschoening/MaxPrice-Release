@@ -26,12 +26,12 @@ import { liveStatus } from "./hub-names";
 import { reachHub, type ReachOptions, refusal, unreadable } from "./operator-client";
 import { type SecretDeps, secretReader } from "./operator";
 import { createFileGatewayKeyStore, secretsPath } from "./secrets";
-import { DASH, linuxOnly, say, terminalJson, terminalTable } from "./terminal-output";
+import { DASH, headlessOnly, say, terminalJson, terminalTable } from "./terminal-output";
 
 // `maxprice-hub gateway connect|list|remove` (ADR-0141 §7, §8): the Gateways
 // the Hub drains, each keyed by its URL, its management key in secrets.json's
-// `gateways` (0600) and its URL in gateways.json, both in the data dir. Linux
-// only, as `key` is: elsewhere the hub tray app keeps each key in the
+// `gateways` (0600) and its URL in gateways.json, both in the data dir. A
+// Headless Hub's, on Linux and macOS, as `key` is: elsewhere the hub tray app keeps each key in the
 // keychain and its console connects them. Each reaches the Hub as the
 // operator commands do (ADR-0127 §7): a running Hub through its own routes,
 // `POST /api/gateways` and `DELETE /api/gateways/<id>`, which apply at once;
@@ -52,7 +52,7 @@ export type GatewayDeps = SecretDeps & {
   reach?: ReachOptions;
 };
 
-// ADR-0141 §7: the Headless Hub keeps the keys in secrets.json, Linux's;
+// ADR-0141 §7, ADR-0146 §4: the Headless Hub keeps the keys in secrets.json;
 // elsewhere the hub tray app keeps them in the keychain.
 const ELSEWHERE = "connect Gateways from the console";
 
@@ -95,7 +95,7 @@ export async function gatewayConnect(
   platform: NodeJS.Platform = process.platform,
   deps: GatewayDeps = {},
 ): Promise<number> {
-  linuxOnly(platform, ELSEWHERE);
+  headlessOnly(platform, ELSEWHERE);
   const dataDir = requireHub(env, platform);
   const normalized = gatewayUrl(url);
   const host = gatewayUrlHost(normalized);
@@ -219,7 +219,7 @@ export async function gatewayList(
   platform: NodeJS.Platform = process.platform,
   deps: Pick<GatewayDeps, "reach" | "now"> = {},
 ): Promise<number> {
-  linuxOnly(platform, ELSEWHERE);
+  headlessOnly(platform, ELSEWHERE);
   const dataDir = requireHub(env, platform);
   const reached = await reachHub(dataDir, env, deps.reach);
   let rows: GatewayListRow[];
@@ -281,7 +281,7 @@ export async function gatewayRemove(
   platform: NodeJS.Platform = process.platform,
   deps: Pick<GatewayDeps, "reach"> = {},
 ): Promise<number> {
-  linuxOnly(platform, ELSEWHERE);
+  headlessOnly(platform, ELSEWHERE);
   const dataDir = requireHub(env, platform);
   let id: string;
   // The host when the URL names it; for an Id, the Hub's own entry gives it.

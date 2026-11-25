@@ -17,11 +17,6 @@ import { resolveModelKey, activePricingSnapshot } from "./resolve";
 // straight through. The folds do exactly that with each stored event, rather
 // than copying its four counts into a literal per event (#416).
 //
-// This intentionally does NOT reuse `blocks.ts`'s `TokenCounts`: that type
-// carries the blocks-wire field names (`cacheCreationInputTokens` /
-// `cacheReadInputTokens`), whereas `CostTokenCounts` matches `UsageRecord`'s
-// names (`cacheCreationTokens` / `cacheReadTokens`). The two are deliberately
-// distinct shapes for distinct boundaries — don't "DRY them up".
 export type CostTokenCounts = {
   inputTokens: number;
   outputTokens: number;

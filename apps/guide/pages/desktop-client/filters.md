@@ -71,9 +71,9 @@ A **Provider** switch, **All** or **Claude** or another, sits above the Account 
 While one Account is tracked and it is in two or more [Organizations](../concepts/organizations.md), the Organization chip, beside **Find** in the topbar, chooses the Scope by Organization, as it always has. It reads the chosen Organization's label; click it to choose another.
 
 - **[Home](../concepts/organizations.md#home)**, marked **(home)**, which the chip starts on, and each other [Tracked organization](../concepts/organizations.md#tracked-and-excluded-organizations): every report, its cost, its tokens and its limits, is about that Organization.
-- **All organizations**, marked **money only**: cost and tokens add up across every Tracked organization, while [Usage limits](../concepts/blocks.md#usage-limits) and [Blocks](../concepts/blocks.md#blocks) stay Home's. The chip then reads **All organizations** with **quota · Northwind Labs** beside it.
+- **All organizations**, marked **money only**: cost and tokens add up across every Tracked organization, while [Usage limits](../concepts/usage-limits.md) stay Home's. The chip then reads **All organizations** with **limits · Northwind Labs** beside it.
 
-An Organization marked **no limits** has no limits MaxPrice can read, so its Blocks are estimated. [Whose limits a page shows](../concepts/organizations.md#whose-limits-a-page-shows) explains the split.
+An Organization marked **no limits** has no limits MaxPrice can read. [Whose limits a page shows](../concepts/organizations.md#whose-limits-a-page-shows) explains the split.
 
 Once you track a second Account the chip goes, and the Account filter takes its place.
 
@@ -86,7 +86,7 @@ If you go back to one Account after choosing Accounts or Memberships in the Acco
 The Scope applies to every page at once, and to the Popout the next time it opens. Whenever it holds more than one Membership:
 
 - while it spans two or more Organizations, Projects gains an **Organizations** column;
-- with two or more Accounts tracked, Live splits its Today and This week tiles by Account or by Organization, and shows a card per Membership in place of the Active block tile ([Live](live.md#several-memberships)), with a picker for whose Block the chart's **Block** span frames; Blocks shows a tab per Membership ([Blocks](blocks.md#a-tab-per-membership)); and the Popout a row per Membership, and the tray icon the most used one's limit ([Tray](tray.md#the-figure-with-several-memberships)). With one Account, Live's tiles, Blocks, the Popout and the tray icon's figure stay as they are;
+- with two or more Accounts tracked, Live splits its Today and This week tiles by Account or by Organization, and shows a limit card per Membership on a row of their own ([Live](live.md#several-memberships)); and the Popout a row per Membership, and the tray icon the most used one's limit ([Tray](tray.md#the-figure-with-several-memberships)). With one Account, Live's tiles, the Popout and the tray icon's figure stay as they are;
 - on Windows, the tray icon's tooltip says what today's cost adds up: **(all accounts)**, **(all organizations)** or, for any other set, **(3 memberships)** ([Tray](tray.md#the-tray-icon)).
 
 ## Which filter applies where
@@ -96,18 +96,17 @@ Not every filter narrows every part of every page. A Usage limit covers all your
 | Where                                       | Date range                          | Project | Model                 | Machine               | Scope                                                                      |
 | ------------------------------------------- | ----------------------------------- | ------- | --------------------- | --------------------- | -------------------------------------------------------------------------- |
 | Live: **Today**                             | No: always today                    | Yes     | Yes                   | Yes                   | Yes                                                                        |
-| Live: **This week**                         | No: always this week                | Yes     | Yes                   | Yes                   | Yes; its weekly meter is one Organization's                                |
-| Live: **Active block**                      | Only its **typical**                | No      | Cost and tokens only  | Cost and tokens only  | One Organization; with two or more Accounts tracked, a card per Membership |
-| Live: the cost chart                        | No: it follows its span             | Yes     | Yes                   | Yes                   | Yes; its **Block** span is one Organization's, or the picked Membership's  |
+| Live: **This week**                         | No: always this week                | Yes     | Yes                   | Yes                   | Yes                                                                        |
+| Live: the limit card                        | No                                  | No      | No                    | No                    | One Organization; with two or more Accounts tracked, a card per Membership |
+| Live: the cost chart                        | No: it follows its span             | Yes     | Yes                   | Yes                   | Yes                                                                        |
 | Live: **Top sessions** and **Top projects** | Yes                                 | Yes     | Yes                   | Yes                   | Yes                                                                        |
 | Session detail                              | No                                  | No      | Yes, except from Find | Yes, except from Find | Yes, except from Find                                                      |
 | Projects                                    | Yes                                 | Yes     | Yes                   | Yes                   | Yes                                                                        |
 | Projects: **Cost · last 30 days**           | No: always the last 30 days         | Yes     | Yes                   | No                    | Yes                                                                        |
 | Projects: a project's sessions              | Yes, by each session's last request | Yes     | Yes                   | Yes                   | Yes                                                                        |
-| Blocks                                      | Yes, by each Block's start          | No      | Cost and tokens only  | Cost and tokens only  | One Organization; with two or more Accounts tracked, a tab per Membership  |
 | The Popout                                  | No                                  | No      | No                    | No                    | Yes; its limits are one Organization's, or a row per Membership            |
 | Find                                        | Yes                                 | No      | No                    | No                    | No: every tracked Membership                                               |
 
-In the Scope column, "one Organization" is the Organization whose limits and Blocks a surface shows with one Account tracked: the Scope's, or Home's when the Scope spans two or more ([whose limits](../concepts/organizations.md#whose-limits-a-page-shows)); "a card", "a tab" and "a row per Membership" apply with two or more tracked and a Scope of two or more Memberships. "Cost and tokens only" means the filter narrows a Block's cost, tokens and requests, but not its window, its Burn rate, its Projection or its share of the 5-hour limit ([why](../concepts/blocks.md#blocks-and-the-filters)). The Machine column applies only where the Machine filter shows.
+In the Scope column, "one Organization" is the Organization whose limits a surface shows with one Account tracked: the Scope's, or Home's when the Scope spans two or more ([whose limits](../concepts/organizations.md#whose-limits-a-page-shows)); "a card" and "a row per Membership" apply with two or more tracked and a Scope of two or more Memberships. The limit card shows what claude.ai reports, so no filter narrows it. The Machine column applies only where the Machine filter shows.
 
 Muting a series in the [cost chart's legend](live.md#the-legend) is not a filter: it changes that chart alone.

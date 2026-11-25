@@ -24,15 +24,15 @@
 //
 // WHERE THE PIECES LIVE, and why it is split across two repos at all:
 //
-//   MaxPrice-Release   the four installers and the two Headless tarballs, the
-//                      Headless client's and the Headless Hub's. This is what
-//                      a human downloads, and keeping its asset list to those
-//                      is the entire point of the split — updater freight used
-//                      to double it.
-//   MP-Updates         the four manifests, plus the one artifact that has
-//                      nowhere else to go: macOS updates in-place from a
-//                      .app.tar.gz, which is not an installer anybody would
-//                      download.
+//   MaxPrice-Release   the five installers and the four Headless tarballs,
+//                      the Headless client's and the Headless Hub's. This is
+//                      what a human downloads, and keeping its asset list to
+//                      those is the entire point of the split — updater
+//                      freight used to double it.
+//   MP-Updates         the four manifests, plus the artifacts that have
+//                      nowhere else to go: each Tauri app on macOS updates
+//                      in-place from a .app.tar.gz, which is not an installer
+//                      anybody would download.
 //
 // A manifest is just URLs, so the Windows entries point straight back at the
 // .exe, and each headless product's at its tarball, already sitting in
@@ -49,21 +49,22 @@
 // of that manifest.
 //
 //   desktop        latest.json                darwin-aarch64, darwin-x86_64, windows-x86_64
-//   hub            hub-latest.json            windows-x86_64
+//   hub            hub-latest.json            darwin-aarch64, windows-x86_64
 //   headless       headless-latest.json       linux-x86_64, darwin-aarch64
-//   headless-hub   headless-hub-latest.json   linux-x86_64
+//   headless-hub   headless-hub-latest.json   linux-x86_64, darwin-aarch64
 //
 // Linux is deliberately absent from the two Tauri manifests. Tauri v2 can only
 // update an AppImage, and this release ships a .deb (release-assets.ts records
 // why no AppImage is built: linuxdeploy runs ldd over the Bun-compiled sidecar
 // and the dynamic loader segfaults). A .deb updates through the distro, or by
 // re-downloading. Each Headless product's tarballs are its own manifest's only
-// entries (ADR-0123 §3, ADR-0129 §3, ADR-0144 §5), so a Desktop updater on
-// Linux never finds a tarball, the Windows tray app's hub-latest.json never
+// entries (ADR-0123 §3, ADR-0129 §3, ADR-0144 §5, ADR-0147 §6), so a Desktop updater on
+// Linux never finds a tarball, the hub tray app's hub-latest.json never
 // carries the Headless Hub's, and a bad Headless entry never fails another
-// product's parse. The Headless client's darwin-aarch64 entry shares its key
-// with the Desktop app's in latest.json, which is why the two never share a
-// manifest.
+// product's parse. Every darwin-aarch64 entry, the Desktop app's in latest.json,
+// the hub tray app's in hub-latest.json (ADR-0148 §7) and each Headless
+// product's, shares its key with the others, which is why no two of them
+// share a manifest.
 //
 // STAGING goes by asset name. `stage` routes each .sig off the draft release to
 // its channel's directory by the prefix of the asset it signs (ADR-0129 §3):
@@ -81,13 +82,18 @@
 // first, rather than publish one every install on that platform refuses. It reads `file:` with build-headless's
 // `signedFileOf`, which finds the trusted comment by the update's own rules.
 //
-// BOTH darwin keys point at ONE universal bundle, which is correct here and was
-// a bug in the Actions-era predecessor this replaces: CI builds macOS with
-// `--target universal-apple-darwin`, so a single .app.tar.gz genuinely serves
-// both architectures. The rule is wrong for a two-leg arch-specific build like
-// the local fallback pipeline's, where each arch would overwrite the other —
-// so `classifyArtifact` keys off the fact that ONE darwin artifact is staged,
-// and refuses outright if it is ever handed two.
+// A MACOS BUNDLE serves the architectures tauri-action's upload names it for:
+// `<product>_<arch>.app.tar.gz`, where <arch> is `universal`, `aarch64` or
+// `x64` by the leg's `--target`. The Desktop app builds
+// `--target universal-apple-darwin`, so its one bundle serves both darwin keys,
+// which was a bug in the Actions-era predecessor this replaces and is correct
+// here. The hub tray app builds `--target aarch64-apple-darwin` (ADR-0148 §1),
+// so its bundle serves darwin-aarch64 alone, and hub-latest.json carries no
+// darwin-x86_64. No leg builds an x86_64-only bundle, so a bundle named for
+// neither arch is refused rather than guessed at.
+// One channel takes ONE macOS bundle, published under one --darwin-asset
+// name, so `composeManifest` refuses a channel handed two rather than map
+// both onto that one URL.
 import { mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -127,9 +133,9 @@ export type StagedArtifact = { name: string; signature: string };
 /** Each channel's manifest carries exactly these platforms, no fewer and no more. */
 export const EXPECTED_PLATFORMS: Record<Channel, readonly UpdaterPlatform[]> = {
   desktop: ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"],
-  hub: ["windows-x86_64"],
+  hub: ["darwin-aarch64", "windows-x86_64"],
   headless: ["linux-x86_64", "darwin-aarch64"],
-  "headless-hub": ["linux-x86_64"],
+  "headless-hub": ["linux-x86_64", "darwin-aarch64"],
 };
 
 export const CHANNELS = Object.keys(EXPECTED_PLATFORMS) as Channel[];
@@ -185,9 +191,22 @@ export const SIGNED_ASSETS: Partial<
   },
   "headless-hub": {
     client: "maxprice-hub update",
-    assetName: (version) => headlessHubAssetName(version),
+    assetName: (version, platform) =>
+      headlessHubAssetName(version, targetOf(platform) ?? undefined),
   },
 };
+
+/**
+ * The macOS bundles the release's legs upload, by the arch tauri-action's
+ * upload appends: the Desktop client's `universal-apple-darwin` build serves
+ * both darwin keys, and the hub tray app's `aarch64-apple-darwin` one
+ * darwin-aarch64. tauri-action always appends an arch, so a bundle with
+ * neither is one no leg uploads.
+ */
+const MAC_BUNDLE_ARCHES: readonly (readonly [suffix: string, platforms: UpdaterPlatform[]])[] = [
+  ["_universal.app.tar.gz", ["darwin-aarch64", "darwin-x86_64"]],
+  ["_aarch64.app.tar.gz", ["darwin-aarch64"]],
+];
 
 /**
  * Which platforms an artifact serves, and which repo hosts it.
@@ -195,7 +214,8 @@ export const SIGNED_ASSETS: Partial<
  * Extension-driven because that is genuinely what decides it: under Tauri v2's
  * `createUpdaterArtifacts`, the NSIS installer IS the Windows updater bundle
  * (there is no separate .nsis.zip — mapping one was the second bug in the
- * Actions-era predecessor), while macOS gets a purpose-built .app.tar.gz. Any
+ * Actions-era predecessor), while macOS gets a purpose-built .app.tar.gz,
+ * whose name says its architecture (MAC_BUNDLE_ARCHES and the header). Any
  * other .tar.gz is a Headless tarball, which the Headless client or the
  * Headless Hub downloads straight from MaxPrice-Release, and which serves the
  * platform its name ends in: `_darwin-arm64.tar.gz` darwin-aarch64 (ADR-0144
@@ -207,7 +227,8 @@ export function classifyArtifact(
   name: string,
 ): { platforms: UpdaterPlatform[]; host: Host } | null {
   if (name.endsWith(".app.tar.gz")) {
-    return { platforms: ["darwin-aarch64", "darwin-x86_64"], host: "updates" };
+    const arch = MAC_BUNDLE_ARCHES.find(([suffix]) => name.endsWith(suffix));
+    return arch === undefined ? null : { platforms: [...arch[1]], host: "updates" };
   }
   for (const [target, platform] of Object.entries(HEADLESS_TARGETS)) {
     if (target !== DEFAULT_TARGET && name.endsWith(`_${target}.tar.gz`)) {
@@ -313,7 +334,8 @@ export function composeManifest(input: ComposeInput): ComposeResult {
     if (kind === null) {
       errors.push(
         `${artifact.name} is not a recognised updater bundle ` +
-          `(expected *.app.tar.gz, *.tar.gz or *.exe) — refusing to guess its platform`,
+          `(expected *_<universal|aarch64>.app.tar.gz, *.tar.gz or *.exe) — ` +
+          `refusing to guess its platform`,
       );
       continue;
     }
@@ -343,12 +365,12 @@ export function composeManifest(input: ComposeInput): ComposeResult {
 
     if (kind.host === "updates") {
       if (darwinSeen !== null) {
-        // See the header: one universal bundle serving both darwin keys is
-        // only correct while there is exactly one.
+        // See the header: a channel's macOS bundle is published under the one
+        // --darwin-asset name, so a second would share its URL.
         errors.push(
           `two macOS bundles were staged (${darwinSeen} and ${artifact.name}) — ` +
-            `this composer maps ONE universal bundle onto both darwin keys, so a ` +
-            `per-arch build needs the arch carried explicitly, not inferred`,
+            `a channel publishes ONE macOS bundle, under its one --darwin-asset name, ` +
+            `so a second would point its darwin keys at the first one's URL`,
         );
         continue;
       }

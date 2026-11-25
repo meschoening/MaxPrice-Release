@@ -19,14 +19,14 @@ If those folders hold no usage, every report shows **No Claude usage data yet**:
 
 ## Connect your claude.ai account
 
-Cost and tokens need nothing more. To see your real 5-hour and weekly [usage limits](../concepts/blocks.md#usage-limits), give MaxPrice your [claude.ai session key](../concepts/blocks.md#the-claudeai-session-key):
+Cost and tokens need nothing more. To see your real 5-hour and weekly [usage limits](../concepts/usage-limits.md), give MaxPrice your [claude.ai session key](../concepts/usage-limits.md#the-claudeai-session-key):
 
 1. Copy the key from your browser, as that page describes.
 2. Open Settings › [**Claude**](settings.md#claude). Choose **Connect** on your Account's card, or **+ Add account** beside **Claude** if it has none, paste the key and choose **Connect**.
 
 ![Connect open under + Add account in Settings › Claude: the session key field with Connect and Cancel, and how to copy the key](../../screenshots/settings-connect.light.png "Connect, in Settings › Claude")
 
-The card then reads **Connected**, the step lists the key's Organizations, and Live's tiles show how much of each limit you have used. Without a key, the limit meters don't show and every [Block](../concepts/blocks.md#blocks) is estimated. A computer [joined to a Hub](join-a-hub.md) reads the Hub's limits instead, but it still needs a key of its own to read them whenever it [can't reach the Hub](../concepts/hubs.md#fallback-polling).
+The card then reads **Connected**, the step lists the key's Organizations, and Live's [limit card](live.md#the-limit-card) shows how much of each limit you have used. Without a key, the card reads **not connected**. A computer [joined to a Hub](join-a-hub.md) reads the Hub's limits instead, but it still needs a key of its own to read them whenever it [can't reach the Hub](../concepts/hubs.md#fallback-polling).
 
 ## Check your Organization
 

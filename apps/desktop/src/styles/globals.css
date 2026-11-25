@@ -168,26 +168,21 @@ body {
      1280->976 medium   1512->1208 medium  1728->1424 medium
      1920->1616 wide    2560->2256 wide
 
-   Three COMPONENT thresholds exist beside the two boundaries:
+   One COMPONENT threshold exists beside the two boundaries:
 
-     845      idle `.tiles` can draw 3-up (no active-window rows).
-     1013     active `.tiles` without an unpriced block cost chip.
-     1093     `.tiles` breaks from 3-up to `duo` below this content
-              width. It is the SUM OF THE THREE TILES' MEASURED
-              FLOORS plus the gaps plus margin (T2 #153) — see the
-              derivation at `.tiles` itself. It is a component's
-              floor, so it moves when the tiles' copy moves — and
-              when the worst case those floors are priced against
-              moves, which is what took it from #161's 1056 — and
-              the arrangement boundaries do not move with it.
+     845      `.tiles` breaks from 3-up to `duo` below this content
+              width. It is the SUM OF THE THREE TILES' FLOORS plus the
+              gaps plus margin (T2 #153) — see the derivation at
+              `.tiles` itself. It is a component's floor, so it moves
+              when the tiles' copy moves, and the arrangement
+              boundaries do not move with it.
 
-   ACCEPTANCE (T1's, as amended by what T2 measured): at viewport
-   1280 (content 976) `.tiles` must NOT draw 3-up. T1 wrote that as
-   "a SINGLE track"; the shipped answer is two — Today | This week
-   over a spanning Active block — which breaks the letter of the
-   condition and keeps its intent. 3-up at a cramped 1280 is the
-   reported "hierarchy doesn't hold" bug, and that is what the
-   check exists to forbid.
+   ACCEPTANCE (T1's, as amended by what T2 measured, then by #720):
+   3-up must not squeeze the middle tile below its floor. T1 wrote it
+   for the tile the one limit card replaced (ADR-0142 §2), whose 446px
+   value row kept `.tiles` out of 3-up at viewport 1280 (content 976);
+   the card needs 270px, so 1280 draws 3-up with room to spare. That
+   tile's 1013 and 1093 thresholds went with it.
 
    Above 2560 is UNBENCHED, not designed-against: wide is unbounded
    on purpose (a ceiling would re-litigate the frame cap this map
@@ -1174,30 +1169,21 @@ em.finder-end {
 }
 /* --- floating stat tiles ---
 
-   TWO arrangements (map #151 / T2 #153, ADR-0073):
+   TWO arrangements (map #151 / T2 #153, ADR-0073; the middle tile since
+   ADR-0142 §2 is the limit area):
 
-     duo    Today | This week on row 1, Active block spanning row 2
-     3-up   Today | Active block | This week, at 1 : 1.62 : 1
+     duo    Today | This week on row 1, the limit area spanning row 2
+     3-up   Today | the one limit card | This week, at 1 : 1.62 : 1
 
    The stat tiles get NO new state for this. The row simply stops handing
-   a tile more width than its column composition wants — the shipped tile
-   was already correct at every width, and 3-up at 1280 was the row's
-   fault, not the tile's.
+   a tile more width than its column composition wants.
 
-   The Active block's cost and elapsed/reset text must share one line.
-   Reserve 446px for that tile, including its ring, gap and card padding;
-   an actual unpriced chip needs another 80px (526px total).
-   This restores 54f7efe's realistic $999.99 bound while retaining PR #199's
-   no-wrap value row. Measured with the current font and a full AM/PM reset:
-   288.14px value row + 90.625px visible ring + 25px gap + 42px chrome
-   = 445.765px. The projection foot may wrap independently.
-   The other floors remain 236px (Today) and 285px (This week).
-
-   236 + 446 + 285 + two 18px gaps = 1003px. The 1013px content
-   threshold adds 10px for the main scrollbar; the old 8px cushion bought
-   no content room beyond these floors. A block cost chip raises it to
-   1093px; absent chips consume no reserve. Below it the Active block
-   spans the duo layout instead of squeezing its value row.
+   The floors: 236px (Today), 285px (This week) and 270px for the one limit
+   card, whose widest line that cannot wrap is a meter row (an 82px label, a
+   60px bar floor and a 34px percent) or the head's name beside its 44px
+   ring, inside the 20px card padding. 236 + 270 + 285 + two 18px gaps =
+   827px, plus 10px for the main scrollbar and an 8px cushion: 845px. Below
+   it the card spans the duo row instead of squeezing its meters.
 
    NOT taken, on purpose: `.tile`'s 20px side padding. Trimming it to 14
    would buy another 36px of threshold, but 20 is the shared card padding
@@ -1206,11 +1192,9 @@ em.finder-end {
 
    The floors are what make the tracks a shrink-priority engine with no
    logic written anywhere: grid freezes a track whose proportional share
-   would fall under its base and re-splits the rest, so the Active block
-   freezes first, then This week, and Today absorbs the whole remaining
-   shortfall alone. The 1 : 1.62 : 1 ratio therefore governs only the
-   SLACK above the floors — it is a taste decision again, not the thing
-   that sets the threshold. */
+   would fall under its base and re-splits the rest. The 1 : 1.62 : 1 ratio
+   therefore governs only the SLACK above the floors — a taste decision,
+   not the thing that sets the threshold. */
 .tiles {
   display: grid;
   /* duo. `minmax(0, 1fr)` rather than a bare `1fr` (= minmax(auto, 1fr)):
@@ -1221,59 +1205,36 @@ em.finder-end {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   grid-template-areas:
     "today week"
-    "block block";
+    "limits limits";
   gap: 18px;
 }
-/* Placed by position, which is the same authority the areas below rely on.
-   NOT `.block-tile`: the Active block drops that class in its empty-inset
-   state and would fall out of its own cell. */
+/* Placed by position, which is the same authority the areas below rely on:
+   the limit area is a card, a no-limits tile or a section of cards. */
 .tiles > :nth-child(1) {
   grid-area: today;
 }
 .tiles > :nth-child(2) {
-  grid-area: block;
+  grid-area: limits;
 }
 .tiles > :nth-child(3) {
   grid-area: week;
 }
-/* 3-up. See "responsive thresholds" and the derivation above for 1093. */
-@container content (min-width: 1093px) {
-  .tiles {
-    grid-template-columns: minmax(236px, 1fr) minmax(526px, 1.62fr) minmax(285px, 1fr);
-    grid-template-areas: "today block week";
-  }
-}
-/* Use the measured priced floor when the block cost has no unpriced chip.
-   Chips in Today/This week do not enlarge the block. Keep this selector's
-   specificity at `.tiles` so the idle composition below still wins.
-   The DOM is the authority: a pricing refresh can remove a chip in place. */
-@container content (min-width: 1013px) {
-  .tiles:where(:not(:has(> .block-tile .unpriced-chip))) {
-    grid-template-columns: minmax(236px, 1fr) minmax(446px, 1.62fr) minmax(285px, 1fr);
-    grid-template-areas: "today block week";
-  }
-}
-/* Idle has no window chip, reset meta, projection, or unpriced cost to fit.
-   Its ring + label fit in 270px including card chrome. With the stat floors:
-   236 + 270 + 285 + two 18px gaps + 10px scrollbar + 8px margin = 845px.
-   Use the explicit state, including the disconnected inset; a future 0%
-   account window is active and keeps the full reserve above. */
+/* 3-up. See the floors above for 845. */
 @container content (min-width: 845px) {
-  .tiles:has(> [data-block-state="idle"]) {
-    grid-template-columns: minmax(236px, 1fr) minmax(270px, 1fr) minmax(285px, 1fr);
-    grid-template-areas: "today block week";
+  .tiles {
+    grid-template-columns: minmax(236px, 1fr) minmax(270px, 1.62fr) minmax(285px, 1fr);
+    grid-template-areas: "today limits week";
   }
 }
 /* Two or more Memberships in the Scope (#613 §4–§5, #637): the limit area
-   takes the Active block's place and always spans the row under Today and
-   This week, whatever the width, since its cards need the whole row. Placed
-   after the 3-up rules and at their specificity or above, so it wins them. */
-.tiles.tiles-many,
-.tiles.tiles-many:has(> [data-block-state="idle"]) {
+   always spans the row under Today and This week, whatever the width, since
+   its cards need the whole row. Placed after the 3-up rule and at its
+   specificity or above, so it wins it. */
+.tiles.tiles-many {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   grid-template-areas:
     "today week"
-    "block block";
+    "limits limits";
 }
 
 /* --- split money tiles (#637 D6) -------------------------------------------
@@ -1422,6 +1383,16 @@ em.finder-end {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* The one card's eyebrow (ADR-0142 §2): "LIMITS ·" before the name, on its
+   baseline, never cut while the name ellipsizes. */
+.limit-card-eyebrow {
+  flex-shrink: 0;
+  white-space: pre;
+}
+/* A plan with no 5-hour limit says so under its meters (ADR-0142 §2). */
+.limit-card-none {
+  margin-top: 8px;
 }
 .limit-home {
   color: var(--accent);
@@ -1709,11 +1680,9 @@ em.finder-end {
    height) would resolve auto to 0 and pull its chip 10px tighter than it
    ships. Carried by the sibling it survives as a floor in both tiles.
 
-   Selected by position rather than `:not(.block-tile)` for the reason
-   given at `.tiles` — the Active block's empty-inset state drops the
-   class. Neither rule can match it anyway (it has no `.delta`); the
-   positional form is used throughout so "the two stat tiles" reads the
-   same everywhere. */
+   Selected by position, as at `.tiles`: the limit area has no `.delta`,
+   so neither rule can match it, and the positional form is used
+   throughout so "the two stat tiles" reads the same everywhere. */
 .tiles > :nth-child(1) > .delta,
 .tiles > :nth-child(3) > .delta {
   margin-top: auto;
@@ -1727,26 +1696,6 @@ em.finder-end {
    The cards expand; their contents do not switch to horizontal wrapping.
    See ADR-0073's stable tile lines amendment. */
 
-/* active block tile — ONE state at every width (map #151 / T2 #153):
-   the ring is attached to the left of the text and the pair centres as
-   one lockup. Nothing centred before this; the ring sat flush left with
-   `.block-body { flex: 1 }` filling the rest, which is the complaint the
-   map was opened with. The alternative reading — the body centred in the
-   whole tile with the ring hanging into the empty half on a `cqw` ramp —
-   is built and measured (commit 9bbd7f6) and left explicitly open in
-   ADR-0073: the tile is centred to 0.1px and STILL reads ~60px
-   off-centre, because the ring is a hollow 100px box and the eye weighs
-   ink, not boxes. Taking it is a choice, not a fix. */
-.block-tile {
-  flex-direction: row;
-  align-items: center;
-  justify-content: center;
-  /* 25, not the 20 this shipped with: 4.6875px of the old gap was the
-     ring's own dead inset (see `.ring-wrap`), which the negative margin
-     below hands back. 25 keeps the VISIBLE ring-to-text distance where
-     it was. */
-  gap: 25px;
-}
 /* The box is 100px; the ring inside it is 90.625px. `viewBox="0 0 96 96"`
    with r=40 and a 7 stroke puts the outer edge at 43.5 of a 48 half-view,
    which scales to 45.3125 in the 100px box — so 4.6875px of every side is
@@ -1794,7 +1743,7 @@ em.finder-end {
   stroke: url(#ringGrad);
   stroke-width: 7;
   stroke-linecap: round;
-  /* earned: the live block's trackers glow; 1Hz advance crawls (900ms linear) */
+  /* earned: a live window's tracker glows; 1Hz advance crawls (900ms linear) */
   filter: drop-shadow(0 0 6px var(--accent-glow));
   transition: stroke-dasharray 0.9s linear;
 }
@@ -1823,46 +1772,6 @@ em.finder-end {
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
-/* `flex: 0 1 auto`, not `flex: 1`: the body must be its own width for the
-   lockup to have a width to centre. `min-width: 0` keeps it shrinkable
-   below its content rather than pushing the ring out of the tile. */
-.block-body {
-  min-width: 0;
-  flex: 0 1 auto;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-}
-.block-head {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  flex-wrap: wrap;
-}
-.window-chip {
-  font-size: 10.5px;
-  font-weight: 500;
-  color: var(--soft);
-  padding: 1.5px 9px;
-  border-radius: 999px;
-  border: 1px solid var(--panel-border);
-  background: color-mix(in oklch, var(--text) 4%, transparent);
-}
-.block-value-row {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  /* This is one readout; the tile grid reserves room for both labels. */
-  flex-wrap: nowrap;
-  white-space: nowrap;
-}
-.block-value-row .value {
-  font-size: 25px;
-}
-.block-meta {
-  font-size: 11.5px;
-  color: var(--soft);
-}
 .limit-row {
   display: flex;
   align-items: center;
@@ -1884,7 +1793,7 @@ em.finder-end {
 
    110 is the narrowest bar that still reads as a proportion, and it is
    the ceiling as well as the floor so both bars are the same length
-   wherever they appear — the block's row lives in a shrink-to-fit column
+   wherever they appear — the retired 5-hour tile's row lived in a shrink-to-fit column
    and always resolved to 110, while This week's grew to the old 170,
    putting two readings of the same kind side by side at visibly
    different lengths. Measured: the floor buys no width either way (a
@@ -1921,31 +1830,6 @@ em.finder-end {
   font-size: 11px;
   font-weight: 800;
 }
-/* In a limit row's place when the Quota organization reports no limit or its
-   limits can't be read: the row's top margin and label size, in the soft
-   ink, with the Organization's label in full ink. */
-.no-limits-note {
-  margin-top: 8px;
-  font-size: 11px;
-  line-height: 1.35;
-  color: var(--soft);
-}
-.no-limits-note b {
-  color: var(--text);
-  font-weight: 600;
-}
-.block-foot {
-  margin-top: 6px;
-  font-size: 11.5px;
-  color: var(--soft);
-  text-align: center;
-}
-.block-foot b {
-  font-weight: 800;
-  color: var(--text);
-  font-size: 11px;
-}
-
 /* --- chart panel --- */
 .chart-card {
   padding: 16px 20px 13px;
@@ -1964,30 +1848,11 @@ em.finder-end {
   gap: 8px;
   flex-wrap: wrap;
 }
-/* Whose block the block span frames, under All organizations. A long label
-   ellipsizes rather than wrapping the head: the head breaks its line on the
-   controls' max-content, so the note's text is contained out of it, and the
-   controls grow into whatever room the span tabs leave for the note to fill. */
-.chart-controls:has(> .chart-span-note) {
-  flex-grow: 1;
-}
-.chart-span-note {
-  font-size: 11px;
-  color: var(--soft);
-  margin-left: 8px;
-  white-space: nowrap;
-  flex: 1 1 0;
-  min-width: 0;
-  contain: inline-size;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 /* A Membership's name in its two parts (`MembershipNameView`, #638): the
-   Organization part ellipsizes first, so the Account half, which tells two
-   Memberships of one Organization apart (#619), stays whole. That half
-   ellipsizes too, from its start, only when it alone outgrows the room,
-   always leaving the Organization a stub. Every surface that lists Memberships draws it: the
-   Popout's rows and head, the Blocks tabs, the Block span's picker. */
+   Organization's label, then the Account half, which tells two Memberships
+   of one Organization apart (#619). The Popout's rows and head draw both
+   halves; Live's limit cards and board draw the label's parts alone
+   (`OrganizationLabelParts`). */
 .mname {
   display: inline-flex;
   min-width: 0;
@@ -2005,10 +1870,9 @@ em.finder-end {
 }
 /* An Organization label's collision suffix (` · 1a2b3c4d`), the part that
    tells two Organizations on one plan word apart (#647): never cut while the
-   label ellipsizes. With an Account half after it, which is whole up to its
-   own cap, it yields once the label is gone, clipped rather than ellipsized
-   (a fraction of a px given up must not draw "…"), so the Account half is
-   never pushed out of `.mname`. */
+   label ellipsizes. With an Account half after it (`.mname-label`), it
+   yields once the label is gone, clipped rather than ellipsized (a fraction
+   of a px given up must not draw "…"). */
 .mname-suffix {
   flex-shrink: 0;
   white-space: pre;
@@ -2023,66 +1887,35 @@ em.finder-end {
   /* A flex item's leading space: kept, not collapsed. */
   white-space: pre;
 }
-/* The Account half: whole while it fits beside an Organization stub; past
-   that it ellipsizes from its start (right-to-left overflow over an isolated
-   left-to-right label), keeping the end that differs. */
-.mname-acct {
+/* Beside an Account half the label is one part, its collision suffix inside
+   it, and keeps its plan word ahead of the Account half (#746): at the
+   Popout's width, ellipsizing the label first left `· 06· …6cccc`, a row
+   that named neither its Organization nor its plan. The Account half yields
+   first, down to the floor the label's cap leaves it, 3.25em: the separator
+   and about five characters, which holds `Work` whole. Only the cap narrows
+   the label, never a shrink: a label that shrank too gave up a fraction of a
+   px beside a long Account half, which drew its "…". The cap is taken from
+   the room the name may take, its query container's (`.pname`, the head's
+   eyebrow) less what else sits in it (`--mname-beside`), never from the
+   name's own width, which is its content's: a cap taken from that cut names
+   that fit. */
+.mname-label {
+  display: inline-flex;
   flex: 0 0 auto;
-  max-width: calc(100% - 2.2em);
+  min-width: 0;
+  max-width: calc(100cqw - var(--mname-beside, 0px) - 3.25em);
+  overflow: hidden;
+}
+/* The Account half: whole while it fits; past that it ellipsizes from its
+   start (right-to-left overflow over an isolated left-to-right label),
+   keeping the end that differs. */
+.mname-acct {
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   direction: rtl;
   text-align: left;
-}
-/* The Block span's Membership picker (#619 variant 1, #638): the note's slot,
-   holding a trigger that shrinks to it. The Membership's name ellipsizes,
-   never "'s block" or the caret, so the head never wraps for it. */
-.chart-span-picker {
-  margin-left: 4px;
-  overflow: visible;
-}
-.chart-span-pick {
-  display: inline-flex;
-  align-items: center;
-  max-width: 100%;
-  padding: 3px 6px;
-  border-radius: 8px;
-  font-size: 11px;
-  color: var(--soft);
-  cursor: pointer;
-}
-.chart-span-pick:hover,
-.chart-span-pick[data-state="open"] {
-  color: var(--text);
-  background: color-mix(in oklch, var(--text) 6%, transparent);
-}
-.chart-span-pick-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 700;
-  color: var(--text);
-}
-.chart-span-pick-rest {
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-.chart-span-pick svg {
-  width: 12px;
-  height: 12px;
-  margin-left: 3px;
-  flex-shrink: 0;
-}
-.chart-span-opt em {
-  margin-left: auto;
-  padding-left: 12px;
-}
-.chart-span-opt em.tone-warn {
-  color: var(--warn);
-}
-.chart-span-opt em.tone-bad {
-  color: var(--bad);
 }
 .legend-row {
   display: flex;
@@ -2913,9 +2746,8 @@ em.finder-end {
 /* The sticky header block — the panel's frost, relocated here (see
    `.table-panel`: the two cannot both sample content, and this is the one
    whose backdrop is not the wash). Rows visibly blur as they slide beneath
-   it: the material demo of the page. Carries the column-header row AND the
-   Blocks page's pinned active row so both stay put over the scrolling body
-   without a second frost surface. */
+   it: the material demo of the page. Carries the column-header row, which
+   stays put over the scrolling body without a second frost surface. */
 .sticky-head {
   position: sticky;
   top: 0;
@@ -2991,17 +2823,6 @@ em.finder-end {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
   border-radius: 8px;
-}
-/* Blocks: the pinned active row — accent underline + tint + inset bar. Lives
-   inside .sticky-head, so its translucent tint composites over the shared
-   frost, not over the rows sliding beneath. */
-.row.pinned {
-  background: color-mix(in oklch, var(--accent) 8%, transparent);
-  border-bottom: 2px solid color-mix(in oklch, var(--accent) 55%, transparent);
-  box-shadow: inset 3px 0 0 var(--accent);
-}
-.row.pinned[aria-selected="true"] {
-  background: color-mix(in oklch, var(--accent) 14%, transparent);
 }
 /* Projects: a repository's worktrees, disclosed beneath it (ADR-0061). A child
    is subordinate, not lesser — it keeps full text contrast and only loses the
@@ -3111,10 +2932,6 @@ em.finder-end {
   align-items: center;
   gap: 7px;
   min-width: 0;
-}
-/* The pinned row's window label reads bold (the mock's <b>). */
-.row.pinned .trunc {
-  font-weight: 600;
 }
 /* A sessions list's Organization attribution (#312, past one tracked
    Organization): the `presumed` / `assigned` pill beside an owner-less
@@ -3287,14 +3104,15 @@ em.finder-end {
 
      narrow   there is LESS space than the data wants. Every row
               here is 54-152px too wide for the 604-748 band, and
-              two fail worse than "a column is off-screen": Blocks
-              hands WINDOW 113px for a 166px label and ellipsises
-              16 of 16 rows INSIDE the scroller, where panning can
-              never reach it, and the timeline pushes COST — the
-              page's whole subject — past the right edge.
+              two fail worse than "a column is off-screen": the
+              retired windows table handed its label column 113px for
+              a 166px label and ellipsised 16 of 16 rows INSIDE the
+              scroller, where panning can never reach it, and the
+              timeline pushed COST — the page's whole subject — past
+              the right edge.
               The row takes a second line. Nothing is dropped and
-              nothing scrolls; the price is height (Blocks 91px,
-              the retired Sessions page 118px, Projects 160px per row).
+              nothing scrolls; the price is height (the retired
+              Sessions page 118px, Projects 160px per row).
 
      wide     there is MORE. At content 2256 the sessions table was
               578px of ink in 2245, and a row whose label and value
@@ -3376,9 +3194,9 @@ em.finder-end {
   .row > .cell:has(> .row-action) {
     align-self: center;
   }
-  /* An absent value is not worth a labelled slot: without this a done Blocks
-     row spends three of its six on "BURN RATE —" and runs a line longer than
-     the active row's. The fact comes from `Column.isEmpty` — CSS cannot select
+  /* An absent value is not worth a labelled slot: without this a row with
+     an empty column spends a labelled slot on "—" and runs a line longer than
+     its neighbours'. The fact comes from `Column.isEmpty` — CSS cannot select
      on text. It is written AFTER the cell rules on purpose: it ties with
      `.row > .cell:not(:first-child)` on specificity, so source order is what
      decides whether the suppressed cell stays hidden. */
@@ -3562,100 +3380,6 @@ em.finder-end {
   color: var(--soft);
 }
 
-/* --- Blocks: a tab per Membership (#619 A, #638) ---
-   The row is the `.seg` recipe; a tab is its button with the Membership's
-   name and a `.pill` badge. The "‹N› more" menu is `.menu`/`.opt`. */
-.blocks-tabs {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-.blocks-tablist {
-  min-width: 0;
-  max-width: 100%;
-  overflow-x: auto;
-}
-.blocks-tablist button {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  min-width: 0;
-  /* A tab grows to its name, so a row with room never ellipsizes one. */
-  max-width: 360px;
-}
-.blocks-tab-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.blocks-tab-badge {
-  padding: 0 7px;
-  flex-shrink: 0;
-}
-.blocks-tab-badge.tone-warn {
-  color: var(--warn);
-}
-.blocks-tab-badge.tone-bad {
-  color: var(--bad);
-}
-.blocks-tab-badge[data-stale] {
-  opacity: 0.7;
-}
-.blocks-tabs-more {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-  padding: 6.5px 12px;
-  font-size: 12px;
-  color: var(--soft);
-}
-.blocks-tabs-more svg {
-  width: 12px;
-  height: 12px;
-}
-.blocks-tabs-opt {
-  justify-content: space-between;
-}
-/* What the row's fit measures (#645, `MembershipTabs`): each tab, each name in
-   readable form and the "more" button at their natural widths. Out of flow,
-   unseen, and clipped to nothing, so it never adds to a scroll area. */
-.blocks-tabs-measure {
-  position: absolute;
-  width: 0;
-  height: 0;
-  overflow: hidden;
-  visibility: hidden;
-  white-space: nowrap;
-  pointer-events: none;
-}
-.blocks-tabs-measure > * {
-  width: max-content;
-  max-width: none;
-}
-/* The Membership strip's Limits: a meter per window, stacked. */
-.blocks-limits {
-  display: flex;
-  flex-direction: column;
-  min-width: 240px;
-}
-.blocks-limits .limit-row {
-  margin-top: 2px;
-}
-.blocks-limits .limit-row label {
-  flex: 0 0 96px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.blocks-limits .limit-row.idle b {
-  color: var(--soft);
-}
-.blocks-limits[data-stale] .limit-row {
-  opacity: 0.7;
-}
-
 /* --- status pills (active / gap / done / stale) --- */
 .pill {
   display: inline-flex;
@@ -3725,8 +3449,8 @@ em.finder-end {
   border-color: color-mix(in oklch, var(--accent) 45%, var(--panel-border));
 }
 
-/* the 5h limit meter: flat accent for settled blocks; the gradient+glow is
-   earned by liveness only (the active block's tracker, per the glass canon) */
+/* the limit meter: flat accent when settled; the gradient+glow is earned by
+   liveness only (a live window's tracker, per the glass canon) */
 .meter {
   width: 100%;
   max-width: 190px;
@@ -5812,7 +5536,7 @@ body.popout-window {
   justify-content: center;
 }
 
-/* --- the live head: 54px ring + cost + meta --- */
+/* --- the head: 54px ring on the most used window + percent + reset --- */
 .popout-root .a-head {
   display: flex;
   align-items: center;
@@ -5840,17 +5564,24 @@ body.popout-window {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* The ranked head's eyebrow (#638): its words, then the Membership's name,
-   whose Organization part yields first (`.mname`); still one 14.25px line. */
+/* The head's eyebrow (ADR-0142 §2): `Most used`, then the Membership's name
+   (`.mname`) or the window, which never yields; still one 14.25px line. A
+   name with an Account half stands alone, in the lead's place (#746). */
 .popout-root .a-head .eyebrow-named {
   display: flex;
+  /* The name's room, for `.mname-label`'s cap (#746). */
+  container-type: inline-size;
 }
 .popout-root .a-head .eyebrow-named .eyebrow-lead,
-.popout-root .a-head .eyebrow-named .eyebrow-sep {
+.popout-root .a-head .eyebrow-named .eyebrow-sep,
+.popout-root .a-head .eyebrow-named .eyebrow-window {
   flex-shrink: 0;
   white-space: pre;
 }
 .popout-root .a-head .hd {
+  /* Fills the head, so the eyebrow's query container has the room the name
+     may take, not none (#746). */
+  flex: 1 1 auto;
   min-width: 0;
 }
 .popout-root .a-head .hd .value {
@@ -5858,20 +5589,13 @@ body.popout-window {
   font-weight: 800;
   letter-spacing: -0.01em;
   line-height: 1.2;
-  /* Equal air above and below the cost (the generic .value's 3px/1px read
+  /* Equal air above and below the percent (the generic .value's 3px/1px read
      lopsided at this size); 4.5px keeps the head's measured height, which
      popout_content_height's 260px base was taken from. */
   margin: 4.5px 0;
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis; /* the tokens run yields before the cost ever can */
-}
-.popout-root .a-head .hd .value .tokens {
-  margin-left: 5px;
-  font-size: 10.5px;
-  font-weight: 500;
-  letter-spacing: 0;
-  color: var(--soft);
+  text-overflow: ellipsis;
 }
 .popout-root .a-head .hd .meta {
   font-size: 10.5px;
@@ -5879,6 +5603,17 @@ body.popout-window {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis; /* never poke the gutter */
+}
+/* `Ultra: no 5-hour limit` (ADR-0142 §2), a meta line of its own. The
+   percent's air and the two meta lines tighten to make room, so the head
+   keeps the measured height popout_content_height's base was taken from
+   (the guide's `tray-popout-ranked` frame shows it). */
+.popout-root .a-head .hd:has(> .note) .value {
+  margin: 0 0 1px;
+  line-height: 1.1;
+}
+.popout-root .a-head .hd:has(> .note) .meta {
+  line-height: 12.5px;
 }
 
 /* --- quiet label/value rows --- */
@@ -5948,6 +5683,12 @@ body.popout-window {
   gap: 4px;
   flex: 1 1 auto;
   min-width: 0;
+  /* The name's room, for `.mname-label`'s cap (#746); `wk` and its 4px gap
+     take about 20px of it. */
+  container-type: inline-size;
+}
+.popout-root .prow .pname:has(> .pwtag) {
+  --mname-beside: 20px;
 }
 .popout-root .prow .pname-text {
   overflow: hidden;
@@ -5962,6 +5703,14 @@ body.popout-window {
 }
 .popout-root .prow .pname + .state {
   flex-shrink: 0;
+}
+/* A Membership row's meter is shorter than a one-Membership row's 64px: the
+   name beside it carries a plan word and an Account half, and at 64px it had
+   88px for both, `wk` included (#746). At 32px it has 120px, which holds
+   `Max plan · 1a2b3c4d` whole in Windows' wider text too. */
+.popout-root .prow .pname + .state .limit-meter {
+  flex-basis: 32px;
+  width: 32px;
 }
 .popout-root .prow .pnote {
   font-size: 10.5px;
@@ -5984,8 +5733,8 @@ body.popout-window {
   color: var(--bad);
   font-weight: 700;
 }
-/* The `Most used:` Membership drawn idle (#622 item 6): the head's words in
-   place of its numbers, quieter than a cost. */
+/* The head with no window in flight: `Nothing used` in place of its percent,
+   quieter than a number. */
 .popout-root .a-head .hd .idle-value {
   font-size: 13px;
   font-weight: 600;

@@ -15,9 +15,9 @@ export type LiveUsagePoller = UsagePoller & {
 // The poller as the sidecar's live channel carries it (ADR-0104). Every polled
 // Organization's reading goes out as it lands, stamped with that Organization
 // even when it is null, so the renderer can key each one. Status's
-// `usageConnection`, and `getCurrent()` with no Organization, describe the
-// Quota organization of the persisted scope — Home until a scope names another
-// — while the rest of the status stays the key's.
+// `usageConnection` and `usageLastReadAt`, and `getCurrent()` with no
+// Organization, describe the Quota organization of the persisted scope — Home
+// until a scope names another — while the rest of the status stays the key's.
 //
 // A Home change emits no reading. The renderer keys each Organization's reading
 // on its own entry and derives the one it displays from the scope and Home, so
@@ -33,9 +33,11 @@ export function createLiveUsagePoller(
   },
 ): LiveUsagePoller {
   function publish(status: Partial<PollerStatus>): void {
+    const head = opts.getQuotaOrganization();
     opts.liveHub.patchStatus({
       ...status,
-      usageConnection: poller.getCurrent(opts.getQuotaOrganization()).connection,
+      usageConnection: poller.getCurrent(head).connection,
+      usageLastReadAt: poller.lastReadAt(head),
     });
     opts.onPublish?.();
   }
@@ -49,6 +51,9 @@ export function createLiveUsagePoller(
           weeklyResetAt: poller.getCurrent(organizationUuid).weeklyResetAt,
         });
       },
+      // The sidecar's reports read history from its store in process; its
+      // live channel carries readings only.
+      emitHistory: () => {},
       patchStatus: publish,
     },
   });

@@ -1,8 +1,8 @@
 // The acceptance harness's shared clock origin (#296).
 //
 // Two sidecars started seconds apart must agree on "now", or every response that
-// reads the wall clock (`span=today`, the 30-day intraday span, the active block)
-// differs by luck rather than by code (review focus 2). So a harness run mints ONE
+// reads the wall clock (`span=today`, the 30-day intraday span) differs by luck
+// rather than by code (review focus 2). So a harness run mints ONE
 // origin — a real instant paired with the fake instant it stands for — and hands
 // the same env value to every process it spawns. `clock-preload.ts` turns that
 // value into one fixed offset applied to every `Date` reading, so time still

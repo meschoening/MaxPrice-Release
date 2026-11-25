@@ -1,4 +1,4 @@
-import { Database, SQLiteError } from "bun:sqlite";
+import { constants, Database, SQLiteError } from "bun:sqlite";
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { setImmediate as yieldToLoop } from "node:timers/promises";
@@ -245,7 +245,12 @@ function openFleetDatabase<T extends { readonly seq: number }>(
     try {
       db = new Database(opts.path, { create: true, strict: true });
       openings++;
-      if (opts.mode === "hub") db.exec("PRAGMA locking_mode=EXCLUSIVE;");
+      if (opts.mode === "hub") {
+        db.exec("PRAGMA locking_mode=EXCLUSIVE;");
+        // A Hub's clean stop leaves no WAL beside the archive (ADR-0127 §2,
+        // a backup's contract in ADR-0130).
+        dropWalOnClose(db);
+      }
       const busyTimeoutMs = Math.trunc(opts.busyTimeoutMs ?? 5000);
       db.exec(
         `PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=${busyTimeoutMs};`,
@@ -1026,6 +1031,14 @@ export type FleetEventStore = ReturnType<typeof hubStore>;
 export type FleetReplicaStore = ReturnType<typeof replicaStore>;
 export type LocalArchiveStore = ReturnType<typeof archiveStore>;
 
+// Deletes the WAL and its -shm when the last connection closes, or when the
+// journal leaves WAL mode. macOS's SQLite, which bun:sqlite uses there, keeps
+// them unless told not to (persistent WAL is Apple's default); elsewhere this
+// is the default already (ADR-0146 §1, §14).
+function dropWalOnClose(db: Database): void {
+  db.fileControl(constants.SQLITE_FCNTL_PERSIST_WAL, 0);
+}
+
 export function createFleetEventStore(opts: FleetStoreOptions & { mode: "hub" }): FleetEventStore;
 export function createFleetEventStore(
   opts: FleetStoreOptions & { mode: "replica" },
@@ -1177,6 +1190,7 @@ async function restoreCopy(path: string): Promise<RestoredHubArchive> {
     //    above reads.
     const { changes } = db.query("UPDATE meta SET value=? WHERE name='epoch'").run(epoch);
     if (changes !== 1) throw new Error(`restore's epoch update changed ${changes} rows`);
+    dropWalOnClose(db);
     const mode = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode=DELETE").get();
     if (mode?.journal_mode !== "delete")
       throw new Error(`the restored archive stayed in journal_mode ${mode?.journal_mode}`);

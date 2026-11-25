@@ -1,5 +1,4 @@
 import type {
-  BlockSpanWindow,
   DailyByMachineResponse,
   DailyByProjectResponse,
   DailyRow,
@@ -24,7 +23,6 @@ import type { ChartStyle, Span } from "@/state/filters";
 import type { GroupByAxis } from "@/lib/group-by";
 import { densifyDays } from "./daily-rows";
 import { isLineStyle, lineRequestFor, type TodayClock } from "./line-style";
-import { blockSpanState } from "./block-span-state";
 import {
   bucketRowsToDailyRows,
   intradayByMachineToMachineData,
@@ -47,7 +45,7 @@ import {
 // chart to the intraday data source; `week` / `30d` keep the daily path —
 // except an ANCHORED week (`weekIsAnchored` below), which is a growing
 // `[weekStart → now]` frame the daily endpoint cannot serve (ADR-0083).
-const INTRADAY_SPAN_SET = new Set<Span>(["15m", "1h", "block", "today"]);
+const INTRADAY_SPAN_SET = new Set<Span>(["15m", "1h", "today"]);
 
 export function isIntradaySpan(span: Span): span is IntradaySpan {
   return INTRADAY_SPAN_SET.has(span);
@@ -135,9 +133,7 @@ export type ChartSourceRequest = {
   // disabled then).
   intraday: {
     // ADR-0018/0022: the line bucket (span floor, or today's adaptive rung);
-    // bars omit it (native per-span bucket). `block` always omits it — the
-    // sidecar supplies the constant `BLOCK_BUCKET_MS` (ADR-0046, pinning
-    // ADR-0031's adaptive rung).
+    // bars omit it (native per-span bucket).
     bucketMs: number | undefined;
     withDate: boolean;
     // ADR-0083: the `span=week` anchor (see `weekStartFor`); absent otherwise.
@@ -250,8 +246,7 @@ export type MachineContext = {
 
 // Everything the compose→render tail needs, resolved from the active source:
 // the composeSeries inputs (prev* already ghost-gated — null/absent while the
-// ghost is off), the block span's frame + empty flag (ADR-0031), and the
-// active source's query status.
+// ghost is off) and the active source's query status.
 export type ChartSource = {
   rows: DailyRow[];
   prevRows: DailyRow[] | null;
@@ -261,8 +256,6 @@ export type ChartSource = {
   prevMachineData?: Record<string, MachineSeriesEntry>;
   machineOrder?: FoldedMachine[];
   labels: string[];
-  blockWindow: BlockSpanWindow | null;
-  isEmpty: boolean;
   isLoading: boolean;
   isError: boolean;
   errorMessage: string | undefined;
@@ -281,7 +274,6 @@ function queryStatus(q: {
 }
 
 export function resolveChartSource(input: {
-  span: Span;
   ghostOverlay: boolean;
   // How the intraday bucket labels render (ADR-0060) — zone AND 24h/AM-PM.
   // This is a PRESENTATION input, distinct from `TodayClock` above, which is
@@ -303,7 +295,7 @@ export function resolveChartSource(input: {
   // pre-ADR-0062 stage-1 fold.
   identityCtx: IdentityIndex | undefined;
 }): ChartSource {
-  const { span, ghostOverlay, display, request, machineCtx, identityCtx } = input;
+  const { ghostOverlay, display, request, machineCtx, identityCtx } = input;
   switch (request.kind) {
     case "daily-flat": {
       // The established Part 2–4 path: useLiveData's densified chart window.
@@ -312,8 +304,6 @@ export function resolveChartSource(input: {
         rows: live.chartRows,
         prevRows: ghostOverlay ? live.prevChartRows : null,
         labels: live.chartRows.map((r) => r.date),
-        blockWindow: null,
-        isEmpty: false,
         isLoading: live.chartIsPending,
         isError: live.chartIsError,
         errorMessage: (live.chartError as Error | undefined)?.message,
@@ -338,8 +328,6 @@ export function resolveChartSource(input: {
         // picks out the prev-window dates.
         prevProjectData: ghostOverlay ? projects : undefined,
         labels: rows.map((r) => r.date),
-        blockWindow: null,
-        isEmpty: false,
         ...queryStatus(q),
       };
     }
@@ -363,8 +351,6 @@ export function resolveChartSource(input: {
         prevMachineData: ghostOverlay ? machineData : undefined,
         machineOrder: machineCtx.folded,
         labels: rows.map((r) => r.date),
-        blockWindow: null,
-        isEmpty: false,
         ...queryStatus(q),
       };
     }
@@ -430,10 +416,6 @@ export function resolveChartSource(input: {
               identityCtx,
             )
           : undefined;
-      // ADR-0031: a null blockWindow on an arrived block-span response means
-      // no active block — the tail renders the empty state in place of the
-      // chart + foot.
-      const { blockWindow, isEmpty } = blockSpanState(span, q.data);
       return {
         rows,
         prevRows,
@@ -443,8 +425,6 @@ export function resolveChartSource(input: {
         prevMachineData,
         machineOrder: request.machineOn ? machineCtx.folded : undefined,
         labels: rows.map((r) => r.date),
-        blockWindow,
-        isEmpty,
         ...queryStatus(q),
       };
     }

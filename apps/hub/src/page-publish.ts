@@ -3,7 +3,13 @@ import { displayPath } from "@maxprice/usage-core/home-path";
 import { readServeLockHolder, type ServeLockHolder } from "@maxprice/usage-core/serve-lock";
 import { terminalText } from "@maxprice/usage-core/terminal-text";
 import { CliError, EXIT, type Io } from "./cli";
-import { type HubFileConfig, readHubConfig, requireHub, saveHubPageUrl } from "./config";
+import {
+  type HubFileConfig,
+  readHubConfig,
+  requireHub,
+  runsHeadlessHub,
+  saveHubPageUrl,
+} from "./config";
 import { type DirectGet, directGet } from "./direct-http";
 import { loopbackRequest } from "./loopback-http";
 import { checkHubPageUrl } from "./page-url";
@@ -20,7 +26,7 @@ import { VERSION } from "./version";
 //
 // Setup (ADR-0128) takes three pieces from here. Its step 3 is `page set`'s
 // effect without the snippet, setHubPageUrl (§3); its ending prints
-// probePage's reading (§5) and the Apache lines, PAGE_APACHE_LINES, but not
+// probePage's reading (§5) and the Apache lines, pageApacheLines, but not
 // the `maxprice-hub page` check, PAGE_CHECK_LINE, which its Enter replaces.
 
 // The snippet (ADR-0125 §6) for a URL checkHubPageUrl accepted. Its path
@@ -70,7 +76,7 @@ export function pageContract(url: string, port: number): string {
 // applies to every vhost; the binary assumes no host-specific layout. One
 // line each, unindented, comments aligned: the Apache lines, then the check
 // that the page is published. `page` prints them all, indented two spaces
-// (PAGE_INSTALL_STEPS). Setup's ending lists the Apache lines alone among
+// (pageInstallSteps). Setup's ending lists the Apache lines alone among
 // its sudo steps, since its Enter makes the check (ADR-0128 §5).
 export const PAGE_APACHE_LINES: readonly string[] = [
   "sudo a2enmod proxy_http                      # pulls in proxy; first time only",
@@ -80,12 +86,32 @@ export const PAGE_APACHE_LINES: readonly string[] = [
   "sudo systemctl restart apache2               # after a2enmod; a reload for later snippet changes",
 ];
 
+// ADR-0146 §11: Apple's Apache on macOS, which has no a2enmod and whose
+// httpd.conf ships the two proxy LoadModule lines commented out and
+// includes /etc/apache2/other/*.conf. The sed uncomments exactly those two
+// lines, and again changes nothing; `apachectl restart` unloads and loads
+// its LaunchDaemon with -w, so it starts Apache when it is stopped and at
+// every boot after. Run on the Mac mini against a copy of httpd.conf at
+// user level (#751); the sudo forms are not run.
+export const PAGE_APACHE_LINES_MACOS: readonly string[] = [
+  "sudo sed -i '' -E 's/^#(LoadModule proxy(_http)?_module )/\\1/' /etc/apache2/httpd.conf   # loads mod_proxy and mod_proxy_http",
+  "maxprice-hub page snippet | sudo tee /etc/apache2/other/maxprice-hub.conf",
+  "sudo apachectl configtest",
+  "sudo apachectl restart                       # starts Apache now and at every boot",
+];
+
+// The Apache lines for this platform: Apple's on macOS, Debian's elsewhere.
+export function pageApacheLines(platform: NodeJS.Platform): readonly string[] {
+  return platform === "darwin" ? PAGE_APACHE_LINES_MACOS : PAGE_APACHE_LINES;
+}
+
 export const PAGE_CHECK_LINE =
   'maxprice-hub page                            # should read "published"';
 
-export const PAGE_INSTALL_STEPS = lines(
-  [...PAGE_APACHE_LINES, PAGE_CHECK_LINE].map((line) => `  ${line}`),
-);
+// What `page` prints after its heading: the Apache lines, then the check.
+export function pageInstallSteps(platform: NodeJS.Platform): string {
+  return lines([...pageApacheLines(platform), PAGE_CHECK_LINE].map((line) => `  ${line}`));
+}
 
 // What `page`'s probe found (ADR-0125 §4).
 export type PageReading =
@@ -211,11 +237,11 @@ export type ProbeDeps = Omit<PageDeps, "io">;
 
 // `page`'s probe (ADR-0125 §4), whose reading setup's ending prints too
 // (ADR-0128 §5). First, whether the Hub runs, so a stopped one is not read
-// as a web-server fault: on Linux, serve.lock's record names the pid and its
+// as a web-server fault: on Linux and macOS, serve.lock's record names the pid and its
 // port. It is read, never taken, as `service status` and the Headless
 // client's `update` read theirs, so this check can never make a starting
 // serve lose the lock and exit 5. A pid the kernel reused reads as running;
-// /healthz then decides. Off Linux there is no lock, and hub.json's port is
+// /healthz then decides. On Windows there is no lock, and hub.json's port is
 // asked. Then `<url>view`, under one manual timer (not AbortSignal.timeout:
 // the bun/win32 parked-loop bug, index.ts's getHealthz) that covers the
 // body as well as the headers. Neither request goes through a proxy that
@@ -235,7 +261,7 @@ export async function probePage(
   const hubAnswers = deps.hubAnswers ?? answersHealthz;
   const ms = deps.viewTimeoutMs ?? 5_000;
   let hubPort = port;
-  if ((deps.platform ?? process.platform) === "linux") {
+  if (runsHeadlessHub(deps.platform ?? process.platform)) {
     const readLockHolder =
       deps.readLockHolder ?? ((dir: string) => readServeLockHolder(serveLockPath(dir), UNIT));
     const holder = readLockHolder(dataDir);
@@ -309,7 +335,8 @@ async function answersHealthz(port: number): Promise<boolean> {
 export async function cliPage(deps: PageDeps): Promise<number> {
   const env = deps.env ?? process.env;
   const version = deps.version ?? VERSION;
-  const dataDir = requireHub(env, deps.platform ?? process.platform);
+  const platform = deps.platform ?? process.platform;
+  const dataDir = requireHub(env, platform);
   const { config, stored } = readPageConfig(dataDir);
   const { port } = config;
   const loopback = `Loopback: http://127.0.0.1:${port}/page/ (loopback peers only)`;
@@ -350,8 +377,13 @@ export async function cliPage(deps: PageDeps): Promise<number> {
   deps.io.stdout.write(
     reading.kind === "hub-not-running"
       ? lines([...report, "", "Start the Hub, then run maxprice-hub page again."])
-      : lines([...report, "", "Install the snippet on Debian or Ubuntu's Apache:"]) +
-          PAGE_INSTALL_STEPS,
+      : lines([
+          ...report,
+          "",
+          platform === "darwin"
+            ? "Install the snippet on macOS's built-in Apache:"
+            : "Install the snippet on Debian or Ubuntu's Apache:",
+        ]) + pageInstallSteps(platform),
   );
   return EXIT.FAILURE;
 }

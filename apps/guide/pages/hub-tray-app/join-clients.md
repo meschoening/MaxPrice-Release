@@ -4,15 +4,15 @@ Each machine you run Claude Code on joins the Hub through its client: a [Desktop
 
 Before you start, check that:
 
-- the Hub's Popout reads **Online** on its Hub row, and the [firewall step](install.md#let-it-through-the-windows-firewall) is done;
-- the machine is on the same tailnet as the Hub's PC;
+- the Hub's Popout reads **Online** on its Hub row, and on Windows the [firewall step](install.md#let-it-through-the-windows-firewall) is done;
+- the machine is on the same tailnet as the Hub's computer;
 - the client runs the same release as the Hub ([why](../concepts/hubs.md#versions)).
 
 ## The Hub's address
 
-A client names the Hub by a URL: `http://`, the Hub PC's address on your tailnet, and the Hub's port, 47100 unless you [changed it](install.md#where-the-hub-listens). The console's Hub status card shows the address and the port as its **Listening** row, such as `100.101.102.103:47100`.
+A client names the Hub by a URL: `http://`, the Hub computer's address on your tailnet, and the Hub's port, 47100 unless you [changed it](install.md#where-the-hub-listens). The console's Hub status card shows the address and the port as its **Listening** row, such as `100.101.102.103:47100`.
 
-Either the PC's Tailscale address or its Tailscale name works. A name such as `http://my-desktop.tailnet.ts.net:47100` keeps working if the address changes. A client on the Hub's own PC can use `http://127.0.0.1:47100` too.
+Either the computer's Tailscale address or its Tailscale name works. A name such as `http://my-desktop.tailnet.ts.net:47100` keeps working if the address changes. A client on the Hub's own computer can use `http://127.0.0.1:47100` too.
 
 ## From a Desktop client
 
@@ -40,4 +40,4 @@ A Desktop client leaves the Hub with **Disconnect** in Settings › Usage hub, a
 
 ## Moving the fleet to another Hub
 
-To move the fleet from the Hub tray app to a [Headless Hub](../headless-hub/overview.md), quit the Hub tray app, copy its data dir, `%APPDATA%\maxprice-hub`, and restore the copy onto the Headless Hub before its first start. The [Headless Hub's manual](../../../hub/README.md#moving-a-fleet-to-another-hub) has the whole procedure, from the backup to pointing every client at the new address.
+To move the fleet from the Hub tray app to a [Headless Hub](../headless-hub/overview.md), quit the Hub tray app, copy its data dir, `%APPDATA%\maxprice-hub` on Windows or `~/Library/Application Support/maxprice-hub` on a Mac, and restore the copy onto the Headless Hub before its first start. The [Headless Hub's manual](../../../hub/README.md#moving-a-fleet-to-another-hub) has the whole procedure, from the backup to pointing every client at the new address.

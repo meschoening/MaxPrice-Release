@@ -19,7 +19,6 @@ import { hubConnectionSchema } from "./hub";
 // never listens for it by name.
 export const SSE_EVENT = {
   usageNew: "usage:new",
-  blockTick: "block:tick",
   statusChanged: "status:changed",
   heartbeat: "heartbeat",
   usageSample: "usage:sample",
@@ -59,12 +58,6 @@ export const usageEventSchema = z.object({
   sessionId: z.string(),
   timestamp: z.string(),
   count: z.number(),
-});
-
-// `block:tick` — emitted every 30s while a client is subscribed, so the active
-// block's burn rate / projection refresh even with no new file activity.
-export const blockTickEventSchema = z.object({
-  timestamp: z.string(),
 });
 
 // `usage:sample` — one Organization's authoritative live value AND its cadence
@@ -269,9 +262,14 @@ export const statusSnapshotSchema = z.object({
   // Usage-limits connection state for the subtle status indicator (ADR-0023).
   // `disconnected` until a credential is pushed and a poll succeeds.
   usageConnection: usageConnectionSchema,
-  // Cross-Organization complete-history cursor. Partial/none answers and
-  // failures do not advance it; per-Organization read times live below.
+  // The newest line of the Usage history: the sample sync's cursor, and no
+  // freshness copy reads it (ADR-0145 §6).
   usageLastSampleAt: z.string().nullable(),
+  // The last successful read of the limits `usageConnection` describes, the
+  // persisted Scope's head Organization's (with no Home, the newest of any):
+  // the freshness copy's "read 5m ago" (ADR-0145 §6). Null until a read
+  // succeeds in this process.
+  usageLastReadAt: z.string().nullable(),
   organizations: usageOrganizationsSchema,
   // Sidecar→hub connection state (ADR-0035). `off` whenever no hub is
   // configured — the strictly-optional default.
@@ -354,7 +352,6 @@ export const statusSnapshotSchema = z.object({
 });
 
 export type UsageEvent = z.infer<typeof usageEventSchema>;
-export type BlockTickEvent = z.infer<typeof blockTickEventSchema>;
 export type UsageSampleEvent = z.infer<typeof usageSampleEventSchema>;
 export type PricingFailureKind = z.infer<typeof pricingFailureKindSchema>;
 export type PricingStatus = z.infer<typeof pricingStatusSchema>;

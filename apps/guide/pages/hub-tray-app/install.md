@@ -1,24 +1,46 @@
 # Install
 
-The Hub tray app installs for your Windows user alone, so the installer asks for no administrator rights. The one step that needs them comes later, in the console: [letting the Hub through the Windows Firewall](#let-it-through-the-windows-firewall).
+The Hub tray app is one download for each system: a disk image for a Mac with Apple Silicon, and an installer for Windows. Neither asks for administrator rights. On Windows the one step that needs them comes later, in the console: [letting the Hub through the Windows Firewall](#let-it-through-the-windows-firewall).
 
-Install [Tailscale](https://tailscale.com) on the PC first, and sign in, so the Hub can listen on your [tailnet](../concepts/hubs.md#tailnet) from its first start.
+Install [Tailscale](https://tailscale.com) on the computer first, and sign in, so the Hub can listen on your [tailnet](../concepts/hubs.md#tailnet) from its first start.
 
-## Download and run the installer
+## Download and install it
 
-1. On the [releases page](https://github.com/meschoening/MaxPrice-Release/releases), download `MaxPrice.Hub_<version>_x64-setup-win.exe` from the latest release.
-2. Run it. The installer is not signed, so Windows SmartScreen says **Windows protected your PC**. Choose **More info**, then **Run anyway**.
-3. Follow the installer to the end. On its last page, leave **Run MaxPrice Hub** ticked, or start it later from the Start menu.
+On the [releases page](https://github.com/meschoening/MaxPrice-Release/releases), download the Hub tray app for your system from the latest release:
 
-It opens no window. Its icon appears in the tray, at the right of the taskbar. On Windows 11 a new tray icon often lands in the overflow, behind the **^** arrow; drag it onto the taskbar to keep it in sight.
+| System                    | File                                       |
+| ------------------------- | ------------------------------------------ |
+| macOS, Apple Silicon only | `MaxPrice.Hub_<version>_mac-aarch64.dmg`   |
+| Windows                   | `MaxPrice.Hub_<version>_x64-setup-win.exe` |
+
+<!-- platforms -->
+
+### macOS
+
+1. Open the `.dmg`.
+2. Drag **MaxPrice Hub** to **Applications**.
+3. Open MaxPrice Hub from Applications.
+
+It is signed with a Developer ID and notarized by Apple, so it opens with a normal double-click. It opens no window and no Dock icon: its icon appears in the menu bar, at the top right of the screen ([the menu-bar icon](popout-and-console.md#the-menu-bar-icon)). macOS tells you that it can run in the background, since it [starts at login](#starts-at-login).
+
+### Windows
+
+1. Run the `.exe` installer. It is not signed, so Windows SmartScreen says **Windows protected your PC**. Choose **More info**, then **Run anyway**.
+2. Follow the installer to the end. On its last page, leave **Run MaxPrice Hub** ticked, or start it later from the Start menu.
+
+It installs for your Windows user alone. It opens no window. Its icon appears in the tray, at the right of the taskbar. On Windows 11 a new tray icon often lands in the overflow, behind the **^** arrow; drag it onto the taskbar to keep it in sight.
+
+<!-- /platforms -->
 
 Click the icon, with either button, to open the [Popout](popout-and-console.md#the-popout), then **Open window** for the console.
 
 ## Starts at login
 
-The Hub is meant to be always on, so it registers itself to start at login the first time it runs, with no setting to turn on. Each later start checks the registration and repairs one that names another copy of the app. A start at login opens no window, only the tray icon.
+The Hub is meant to be always on, so it registers itself to start at login the first time it runs, with no setting to turn on. A start at login opens no window, only the icon.
 
-The console's Hub status card shows the registration as **Starts at login**:
+On a Mac it registers a login item, and the console shows no row for it. To stop it starting at login, turn off **maxprice-hub-desktop** in System Settings › General › Login Items & Extensions. [Update and quit](update-and-quit.md#quit) says what quitting does meanwhile.
+
+On Windows, each later start checks the registration and repairs one that names another copy of the app. The console's Hub status card shows the registration as **Starts at login**:
 
 | Row reads                         | What it means                                                                                                   |
 | --------------------------------- | --------------------------------------------------------------------------------------------------------------- |
@@ -29,6 +51,8 @@ The console's Hub status card shows the registration as **Starts at login**:
 To stop it starting at login, disable **MaxPrice Hub** in Task Manager's **Startup apps**. [Update and quit](update-and-quit.md#quit) says what quitting does meanwhile.
 
 ## Let it through the Windows Firewall
+
+This step is for Windows alone. On a Mac the console checks no firewall: if you have turned on the macOS firewall, in System Settings › Network › Firewall, check that its options allow incoming connections to MaxPrice Hub.
 
 Windows Firewall blocks connections to a new program from other machines until a rule allows them, and the per-user installer cannot add one. So on a fresh install the Hub runs, but nothing on your tailnet can reach it. The console says so in its Hub status card:
 
@@ -44,11 +68,11 @@ If you choose **No** at the Windows prompt, nothing changes and the warning stay
 
 ## Give it a session key
 
-The Hub reads your [usage limits](../concepts/blocks.md#usage-limits) from claude.ai with a session key, for every machine in the fleet. Until it has one, the Popout's claude.ai row reads **No key**.
+The Hub reads your [usage limits](../concepts/usage-limits.md) from claude.ai with a session key, for every machine in the fleet. Until it has one, the Popout's claude.ai row reads **No key**.
 
 Either paste one into the console: in the Claude account card, choose **Replace key…**, paste the value of your browser's `sessionKey` cookie for claude.ai ([how to copy it](../../../hub/README.md#the-session-key)), and choose **Save key**. Or skip this step: the first client that joins the Hub with [Send keys to the Hub](../concepts/hubs.md#send-keys-to-the-hub) on sends it its own key.
 
-The Hub keeps the key in the Windows Credential Manager, and never shows it again: the console shows only when it was set, and by whom.
+The Hub keeps the key in the Windows Credential Manager, or in the macOS Keychain, and never shows it again: the console shows only when it was set, and by whom.
 
 ## Optional: a Gateway
 
@@ -60,8 +84,12 @@ With no [Hub password](../concepts/hubs.md#hub-password), any device on your tai
 
 ## Where the Hub listens
 
-The Hub listens on port 47100, on this PC's Tailscale addresses and on the PC itself. If Tailscale isn't connected when the Hub starts, it serves the PC alone, and binds the tailnet on its own within about 10 seconds of Tailscale connecting.
+The Hub listens on port 47100, on this computer's Tailscale addresses and on the computer itself. If Tailscale isn't connected when the Hub starts, it serves the computer alone, and binds the tailnet on its own within about 10 seconds of Tailscale connecting.
 
-To change the port or the addresses, quit the Hub tray app, edit the `hub.json` in its data dir, `%APPDATA%\maxprice-hub`, as the [Headless Hub's manual](../../../hub/README.md#bind-and-port) describes, and start it again. Then point every client at the new address.
+To change the port or the addresses, quit the Hub tray app, edit the `hub.json` in its data dir, as the [Headless Hub's manual](../../../hub/README.md#bind-and-port) describes, and start it again. Then point every client at the new address. The data dir is `%APPDATA%\maxprice-hub` on Windows, and `~/Library/Application Support/maxprice-hub` on a Mac.
+
+## One Hub per Mac
+
+A Mac can hold both the Hub tray app and a [Headless Hub](../headless-hub/overview.md), but run only one of them. Each keeps its own data dir, so nothing stops both starting, but only one can serve on port 47100: whichever starts second can't listen. When that is the tray app, its Hub row reads **Not responding** ([Troubleshooting](troubleshooting.md#the-hub-row-reads-not-responding)). To move the tray app's Hub to a Headless Hub, quit the tray app, stop it starting at login, and move its data as [Join clients](join-clients.md#moving-the-fleet-to-another-hub) describes.
 
 Next: [Join clients](join-clients.md).

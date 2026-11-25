@@ -37,8 +37,7 @@ export const cacheCreationSplitSchema = z
 // Required vs optional mirrors the golden oracle's usage schema exactly (the
 // package + pinned version are named in CONTRIBUTING.md, "Tests and the
 // golden oracle"). Read from the Valibot record schema in its bundled
-// `data-loader` dist module — `engine/blocks.ts`'s header cites that file by
-// its full path:
+// `data-loader` dist module:
 //   input_tokens: number                    (required)
 //   output_tokens: number                   (required)
 //   cache_creation_input_tokens: optional(number)

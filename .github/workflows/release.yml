@@ -14,21 +14,26 @@ name: release
 #                         Bun sidecar binary per target, then `tauri build`,
 #                         uploads bundles to the draft release, and renames them
 #                         to carry their platform (see below).
-#   4. build-hub        — the MaxPrice Hub tray app, Windows only; uploads to the
-#                         same draft release, and renames the same way.
+#   4. build-hub        — the MaxPrice Hub tray app, Windows x64 and macOS arm64
+#                         (ADR-0148 §6); uploads to the same draft release, and
+#                         renames the same way.
 #   5. build-headless   — the two Linux x64 Headless tarballs, the Headless
 #                         client's and then the Headless Hub's, with Bun and
 #                         no Rust; compiles, checks, packs and signs each, and
 #                         uploads both and their .sigs to the same draft release
 #                         (ADR-0123 §1, ADR-0129 §1). Each name already carries
 #                         its platform.
-#  5b. build-headless-macos — the Headless client's darwin-arm64 tarball, on a
-#                         Mac: compiles, signs the binary with Developer ID,
-#                         checks and smokes it, packs and minisigns the tarball,
-#                         and uploads both to the same draft (ADR-0144 §3).
+#  5b. build-headless-macos — the two darwin-arm64 Headless tarballs, the
+#                         Headless client's and then the Headless Hub's, on a
+#                         Mac: compiles, signs each binary with Developer ID,
+#                         checks and smokes it, packs and minisigns each
+#                         tarball, and uploads them and their .sigs to the same
+#                         draft (ADR-0144 §3, ADR-0147 §4).
 #   6. notarize-macos   — separate, slow (10+ min) Apple notarization step that
-#                         cannot fail the build jobs above: the .dmg, and the
-#                         darwin tarball's `maxprice` (ADR-0144 §4).
+#                         cannot fail the build jobs above: both .dmgs, the
+#                         Desktop client's and the hub tray app's (ADR-0148
+#                         §6), and the darwin tarballs' `maxprice` and
+#                         `maxprice-hub` (ADR-0144 §4, ADR-0147 §5).
 #   7. compose-updater  — moves the updater freight OFF this release and onto the
 #                         MP-Updates repo, as a PRERELEASE.
 #   8. publish          — un-drafts the release.
@@ -37,12 +42,12 @@ name: release
 #
 # THE UPDATE CHANNEL LIVES IN A SEPARATE REPO (ADR-0071).
 #
-# This release's asset list is seven: four installers and the three Headless
-# tarballs, the Headless client's two, Linux x64 and darwin-arm64, and the
-# Headless Hub's, and stays that. The
-# updater freight — the macOS .app.tar.gz and the four manifests — goes to
-# MP-Updates instead, so what a human sees when they open the releases page is
-# only the things a human downloads. Detached .sig files are published nowhere
+# This release's asset list is nine: five installers, the hub tray app's
+# macOS DMG among them (ADR-0148 §6), and the four Headless tarballs, each
+# Headless product's two, Linux x64 and darwin-arm64, and stays that. The
+# updater freight — both Tauri apps' macOS .app.tar.gz and the four manifests —
+# goes to MP-Updates instead, so what a human sees when they open the releases
+# page is only the things a human downloads. Detached .sig files are published nowhere
 # at all: a signature travels INSIDE the manifest, which is the only place an
 # updater reads one from.
 #
@@ -50,6 +55,8 @@ name: release
 # Windows entries point straight back at the .exe on THIS release, and each
 # headless product's entry at its tarball (ADR-0123 §3, ADR-0129 §3). Only
 # macOS needs a home in MP-Updates, because a .app.tar.gz is not an installer.
+# Each Tauri app has one there, the Desktop client's universal bundle and the
+# hub tray app's arm64 one (ADR-0148 §7).
 #
 # ASSET NAMES SAY THE PLATFORM. Tauri names its bundles after the ARCHITECTURE
 # ("_universal.dmg", "_amd64.deb", "_x64-setup.exe"), which on a release page
@@ -59,15 +66,22 @@ name: release
 #
 #   MaxPrice_<v>_mac.dmg              MaxPrice_<v>_x64-setup-win.exe
 #   MaxPrice_<v>_linux.deb            MaxPrice.Hub_<v>_x64-setup-win.exe
+#   MaxPrice.Hub_<v>_mac-aarch64.dmg
+#
+# The hub's DMG says its architecture, where the Desktop client's universal
+# one says only "mac": it is arm64 alone (ADR-0148 §1), and an Intel Mac
+# cannot run it.
 #
 # The rules live in each job's matrix. Two things they must not break: a
 # renamed bundle keeps its EXTENSION (compose-updater classifies platforms by
 # it), and each product keeps its prefix (compose-updater stages a .sig by it:
 # the dot in "MaxPrice.Hub_" is the hub, "maxprice-hub_" the Headless Hub,
-# "maxprice_" the Headless client, and anything else the desktop app). The
-# macOS .app.tar.gz is untouched — it never appears on this release at all.
-# Neither are the three Headless tarballs, maxprice_<v>_linux-x64.tar.gz,
-# maxprice_<v>_darwin-arm64.tar.gz and maxprice-hub_<v>_linux-x64.tar.gz,
+# "maxprice_" the Headless client, and anything else the desktop app). Both
+# macOS .app.tar.gz bundles are untouched — neither appears on this release at
+# all.
+# Neither are the four Headless tarballs, maxprice_<v>_linux-x64.tar.gz,
+# maxprice_<v>_darwin-arm64.tar.gz, maxprice-hub_<v>_linux-x64.tar.gz and
+# maxprice-hub_<v>_darwin-arm64.tar.gz,
 # which build-headless and build-headless-macos name for their platform and
 # sign under those names; the "MaxPrice_*" and "MaxPrice.Hub_*" globs are
 # case-sensitive, so no rule reaches any of them.
@@ -77,9 +91,9 @@ name: release
 # `--config`, which makes updater artifacts a property of the CI release path
 # rather than of the product — so the local hand-built fallback pipeline
 # (ADR-0052) is untouched and needs no signing key on any machine. The same
-# holds for the three Headless tarballs: the two headless jobs sign them here,
+# holds for the four Headless tarballs: the two headless jobs sign them here,
 # and the fallback packs them unsigned (ADR-0123 §10, ADR-0129 §8, ADR-0144
-# §7). The tradeoff is
+# §7, ADR-0147 §8). The tradeoff is
 # recorded in ADR-0071: a fallback release serves no update, and the channel
 # resumes at the next CI release.
 #
@@ -95,13 +109,13 @@ name: release
 #
 # Four products ship from one tag and their platform sets DIFFER: the desktop
 # app (`build`, step 3) targets macOS / Windows / Linux, while the MaxPrice Hub
-# tray app (`build-hub`, step 4) is Windows only — no macOS and no Linux leg, by
-# decision (ADR-0050). See that job's header for what restoring either takes.
+# tray app (`build-hub`, step 4) targets Windows and macOS on Apple silicon
+# (ADR-0148), with no Linux leg, by decision (ADR-0050). See that job's header
+# for what a Linux leg would take.
 # The Headless client and the Headless Hub (`build-headless`, step 5) are
 # terminal binaries for Linux x64 servers, with no Tauri bundle at all
-# (ADR-0118, ADR-0127); the Headless client also runs on Apple silicon Macs,
-# built by `build-headless-macos` (step 5b, ADR-0144), and the Headless Hub
-# does not.
+# (ADR-0118, ADR-0127); both also run on Apple silicon Macs, built by
+# `build-headless-macos` (step 5b, ADR-0144, ADR-0147).
 #
 # Third-party actions are pinned to full commit SHAs (with a trailing `# vN`
 # comment) so a moved tag can't change what runs in this `contents: write`
@@ -109,9 +123,9 @@ name: release
 #
 # Owner-provisioned GitHub Actions secrets (all optional — the build degrades
 # to an UNSIGNED build when an Apple signing secret is absent):
-#   Signing (build and build-headless-macos jobs) — absent ⇒ an unsigned
-#   build, not a failed one; build-headless-macos signs its binary ad-hoc then,
-#   and refuses a partial set:
+#   Signing (build, build-hub and build-headless-macos jobs) — absent ⇒ an
+#   unsigned build, not a failed one; build-headless-macos signs its binaries
+#   ad-hoc then, and refuses a partial set:
 #   - APPLE_CERTIFICATE              base64 of the .p12 signing certificate
 #   - APPLE_CERTIFICATE_PASSWORD     password for that .p12
 #   - APPLE_SIGNING_IDENTITY         e.g. "Developer ID Application: Name (TEAMID)"
@@ -561,21 +575,20 @@ jobs:
   #     "MaxPrice" is the discriminator; they never collide with the desktop's
   #     "MaxPrice_…". Co-released from the same v* tag (version-locked monorepo).
   #
-  #     WINDOWS ONLY — neither a macOS nor a Linux leg, both deliberately
-  #     (ADR-0050). Windows is the supported hub host and the only platform the
-  #     packaged tray app has been smoked on end to end.
-  #
-  #     No macOS leg: the packaged tray app has never been built or run on a
-  #     Mac, and shipping a bundle nobody has opened is worse than shipping
-  #     none. The macOS SOURCE paths stay in the repo (unit-tested,
-  #     unexercised) — restoring this leg takes six things: (1) re-add the
-  #     `macos-latest` include with `args: --target universal-apple-darwin`,
-  #     (2) `hub-targets: "darwin-arm64 darwin-x64"`, (3) the x86_64 credstore
-  #     cross-build for the universal lipo, (4) the APPLE_* signing env on
-  #     tauri-action, (5) the toolchain's darwin `targets:`, and (6) add
-  #     `build-hub` to `notarize-macos`'s `needs:` — that job downloads `*.dmg`
-  #     as soon as `build` finishes, so a hub `.dmg` still in flight would ship
-  #     un-notarized (see that job's header).
+  #     Two legs, Windows x64 and macOS arm64 (ADR-0148 §6). The macOS leg
+  #     targets `aarch64-apple-darwin` alone: no x86_64 half and no universal
+  #     lipo, because macOS 27 runs on Apple silicon only and a universal
+  #     build would ship a darwin-x64 daemon and keychain helper nobody runs
+  #     (ADR-0148 §1). The leg is the runner's own arch, so build:credstore's
+  #     host build is the arm64 `maxprice-credstore` the bundle needs, and
+  #     build:binaries' darwin-arm64 key is the tray app's daemon, which embeds
+  #     no Hub page (ADR-0147 §2). It signs with the Developer ID through the
+  #     same APPLE_* secrets the Desktop client's macOS leg uses, the hardened
+  #     runtime and apps/hub-desktop/src-tauri/entitlements.plist applied to
+  #     the app and to both sidecars; notarize-macos `needs:` this job, so the
+  #     hub's DMG is notarized and stapled with the Desktop client's. Its
+  #     updater bundle, `MaxPrice Hub_aarch64.app.tar.gz`, is the hub's
+  #     darwin-aarch64 entry in hub-latest.json (ADR-0148 §7).
   #
   #     No Linux leg: tao emits no tray-click events on Linux (tray-icon 0.24.1
   #     — "**Linux**: Unsupported. The event is not emmited even though the icon
@@ -603,12 +616,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # See the desktop matrix for what `args` and the `rename-*` keys
+          # mean. `app` is bundled beside `dmg` because the .app.tar.gz updater
+          # bundle is derived from it; like the desktop's, it is not renamed:
+          # compose-updater rehomes it to MP-Updates under a name of its own.
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin --bundles app,dmg --config src-tauri/tauri.updater.conf.json -- --locked"
+            hub-targets: "darwin-arm64"
+            rename-glob: "MaxPrice.Hub_*"
+            rename-from: "_aarch64.dmg"
+            rename-to: "_mac-aarch64.dmg"
+            rename-expect: 1
           - platform: windows-latest
+            args: "--bundles nsis --config src-tauri/tauri.updater.conf.json -- --locked"
             hub-targets: "windows-x64"
-            # See the desktop matrix for what these mean. The glob is the hub's
-            # own prefix: GitHub rewrites the space in "MaxPrice Hub_…" to a dot
-            # on upload, and that dot is the same discriminator compose-updater
-            # splits the two products on. Renaming must preserve it.
+            # The glob is the hub's own prefix: GitHub rewrites the space in
+            # "MaxPrice Hub_…" to a dot on upload, and that dot is the same
+            # discriminator compose-updater splits the two products on.
+            # Renaming must preserve it.
             rename-glob: "MaxPrice.Hub_*"
             rename-from: "-setup.exe"
             rename-to: "-setup-win.exe"
@@ -620,10 +645,11 @@ jobs:
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-03-27
-        # No extra `targets:` — the sole leg builds host-native. The darwin pair
-        # goes back when the macOS leg does (see the job header).
         with:
           toolchain: stable
+          # The macOS leg names its one target for `--target`; it is the
+          # runner's own arch. Windows builds host-native.
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -645,12 +671,13 @@ jobs:
       - name: Build credstore helper (host arch)
         # The keyring helper is a bundled externalBin (Contract §10) so the
         # packaged app keeps at-rest claude.ai key custody. Built per-OS — the
-        # windows-native keyring backend on this leg; a restored Linux leg would
-        # use sync-secret-service and need the libdbus-1-dev + pkg-config deps
-        # step named in the job header. The next step's build:binaries copies
-        # this host-arch binary into the tray app's binaries dir,
-        # triple-suffixed. Host arch is enough for the Windows leg; the macOS
-        # universal build's second-arch cross-compile went with its leg.
+        # windows-native keyring backend on the Windows leg, apple-native (the
+        # macOS Keychain, ADR-0148 §4) on the macOS one; a restored Linux leg
+        # would use sync-secret-service and need the libdbus-1-dev + pkg-config
+        # deps step named in the job header. The next step's build:binaries
+        # copies this host-arch binary into the tray app's binaries dir,
+        # triple-suffixed. Host arch is each leg's whole target: neither builds
+        # a second arch (ADR-0148 §1).
         run: bun --filter @maxprice/hub build:credstore
 
       - name: Compile hub binaries
@@ -670,13 +697,17 @@ jobs:
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # No APPLE_* here: the only leg is Windows, so signing has nothing to
-          # sign. They return with the macOS leg (job header).
-          #
+          # macOS code signing, as the desktop job's macOS leg does it: only the
+          # certificate-import vars, so the build SIGNS but does not notarize
+          # (notarize-macos does), and an absent secret builds unsigned rather
+          # than failing.
+          APPLE_CERTIFICATE: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_SIGNING_IDENTITY || '' }}
           # The minisign key is NOT Apple signing and is needed on every leg that
-          # builds an updater bundle, this one included — the hub has its own
-          # channel (hub-latest.json) and its own pubkey, though both products
-          # are signed by the one keypair.
+          # builds an updater bundle, both of these included — the hub has its
+          # own channel (hub-latest.json) and its own pubkey, though both
+          # products are signed by the one keypair.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
@@ -684,13 +715,14 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseId: ${{ needs.create-release.outputs.release_id }}
           includeUpdaterJson: false
-          # `--bundles nsis` for the reason the desktop matrix records: "all"
-          # would add an .msi this release does not ship. `--config` merges the
-          # CI-only updater overlay (ADR-0071). Everything after the `--` is
-          # passed through by `tauri build` to the runner (cargo): enforces the
-          # committed apps/hub-desktop/src-tauri/Cargo.lock instead of letting
-          # the release build silently re-resolve it.
-          args: "--bundles nsis --config src-tauri/tauri.updater.conf.json -- --locked"
+          # Each leg pins `--bundles` for the reason the desktop matrix records:
+          # "all" would add an .msi this release does not ship. `--config`
+          # merges the CI-only updater overlay (ADR-0071) on both legs, since
+          # both update themselves. Everything after the `--` is passed through
+          # by `tauri build` to the runner (cargo): enforces the committed
+          # apps/hub-desktop/src-tauri/Cargo.lock instead of letting the release
+          # build silently re-resolve it.
+          args: ${{ matrix.args }}
 
       - name: Rename release assets to carry their platform
         # Verbatim twin of the desktop job's step (that one carries the
@@ -746,7 +778,7 @@ jobs:
   #    runs the same script unsigned, which is why the upload is a step of its
   #    own here.
   #
-  #    Both tarballs stay on the release, beside build-headless-macos's: they
+  #    Both tarballs stay on the release, beside build-headless-macos's two: they
   #    are what a human downloads to install, and what headless-latest.json and
   #    headless-hub-latest.json point at. Their .sigs are read and stripped by
   #    compose-updater like every other; that job's `*.sig | *.app.tar.gz`
@@ -803,23 +835,27 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
 
   # --------------------------------------------------------------------------
-  # 5b. Build the Headless client's darwin-arm64 tarball (ADR-0144 §3) and
-  #     upload it, with its signature, to the same draft release.
+  # 5b. Build the two darwin-arm64 Headless tarballs, the Headless client's
+  #     (ADR-0144 §3) and then the Headless Hub's (ADR-0147 §4), and upload
+  #     them, with their signatures, to the same draft release.
   #
   #     A job of its own on a Mac, beside build-headless rather than a matrix
-  #     leg of it: that job also builds the Headless Hub, which is Linux-only,
-  #     and the darwin binary must be code-signed, and run, on macOS.
-  #     scripts/build-headless.ts --target darwin-arm64 compiles `maxprice`
-  #     (`bun run build:cli darwin-arm64`), signs it with
-  #     `codesign --force --options runtime --timestamp --entitlements
+  #     leg of it: each darwin binary must be code-signed, and run, on macOS.
+  #     One run of scripts/build-headless.ts --target darwin-arm64 builds both,
+  #     the client first, as build-headless does on Linux. It compiles
+  #     `maxprice` (`bun run build:cli darwin-arm64`) and then `maxprice-hub`
+  #     with its Hub page embedded (`bun apps/hub/scripts/build-binaries.ts
+  #     --headless darwin-arm64`, ADR-0147 §2). For each it signs the binary
+  #     with `codesign --force --options runtime --timestamp --entitlements
   #     apps/desktop/src-tauri/entitlements.plist` under the Developer ID
   #     identity and checks it with `codesign --verify --strict`, refuses a
   #     binary whose --version is not the tag minus its `v`, packs
-  #     maxprice_<v>_darwin-arm64.tar.gz (one entry, `maxprice`, 0755, 0:0)
-  #     and signs it with `tauri signer sign` under that published name. The
-  #     Developer ID signature goes on before the tarball is packed and
-  #     minisigned, so notarize-macos, which notarizes that binary, changes no
-  #     byte the minisign signature covers.
+  #     maxprice_<v>_darwin-arm64.tar.gz or maxprice-hub_<v>_darwin-arm64.tar.gz
+  #     (one entry, `maxprice` or `maxprice-hub`, 0755, 0:0) and signs it with
+  #     `tauri signer sign` under that published name. The Developer ID
+  #     signature goes on before the tarball is packed and minisigned, so
+  #     notarize-macos, which notarizes each binary, changes no byte the
+  #     minisign signature covers.
   #
   #     The certificate is imported from the same three APPLE_* secrets the
   #     `build` job's macOS leg signs the DMG with, into a keychain of this
@@ -827,11 +863,14 @@ jobs:
   #     signed ad-hoc and the job says so, as the DMG then builds unsigned;
   #     with only some set, the job fails, since that is a misconfiguration
   #     rather than "signing is off". An ad-hoc tarball still installs and
-  #     updates through curl and `maxprice update`, neither of which sets
-  #     quarantine; only a browser download of it is blocked.
+  #     updates through curl and `maxprice update` or `maxprice-hub update`,
+  #     none of which sets quarantine; only a browser download of it is
+  #     blocked.
   #
   #     ADR-0123 §11's smoke (scripts/acceptance/headless/smoke.ts) then runs
-  #     the signed binary in a throwaway sandbox before anything is uploaded.
+  #     the signed `maxprice`, and ADR-0129 §9's
+  #     (scripts/acceptance/headless-hub/smoke.ts) the signed `maxprice-hub`,
+  #     each in a throwaway sandbox, before anything is uploaded.
   # --------------------------------------------------------------------------
   build-headless-macos:
     needs: [preflight, create-release]
@@ -848,7 +887,7 @@ jobs:
           # One of FOUR load-bearing bun-version pins in this file (`build`,
           # `build-hub`, `build-headless`, `build-headless-macos`) — bump all
           # four together; `build`'s pin carries the rationale (the darwin
-          # `maxprice` embeds this Bun).
+          # `maxprice` and `maxprice-hub` both embed this Bun).
           bun-version: "1.3.14"
 
       - name: Install dependencies
@@ -866,12 +905,12 @@ jobs:
           [ -n "$APPLE_CERTIFICATE_PASSWORD" ] || missing="$missing APPLE_CERTIFICATE_PASSWORD"
           [ -n "$APPLE_SIGNING_IDENTITY" ]     || missing="$missing APPLE_SIGNING_IDENTITY"
           if [ "$missing" = " APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY" ]; then
-            echo "::notice::Apple signing secrets absent — signing the darwin maxprice ad-hoc."
+            echo "::notice::Apple signing secrets absent — signing the darwin maxprice and maxprice-hub ad-hoc."
             echo "SIGNING=ad-hoc" >> "$GITHUB_ENV"
             exit 0
           fi
           if [ -n "$missing" ]; then
-            echo "::error::Apple signing secrets partly set (missing:$missing). Set all three, or none for an ad-hoc darwin maxprice."
+            echo "::error::Apple signing secrets partly set (missing:$missing). Set all three, or none for an ad-hoc darwin maxprice and maxprice-hub."
             exit 1
           fi
           keychain="$RUNNER_TEMP/build-headless-macos.keychain-db"
@@ -906,9 +945,10 @@ jobs:
           fi
           echo "SIGNING=developer-id" >> "$GITHUB_ENV"
 
-      - name: Build, sign, check, pack and minisign the darwin tarball
-        # With no --out, the tarball and its .sig are written beside the
-        # Linux one, in apps/cli/binaries/, where the upload reads them.
+      - name: Build, sign, check, pack and minisign both darwin tarballs
+        # With no --out, each tarball and its .sig are written beside its
+        # product's Linux one, in apps/cli/binaries/ and apps/hub/binaries/,
+        # where the upload reads them.
         env:
           TAG: ${{ github.ref_name }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -925,18 +965,25 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: bun scripts/acceptance/headless/smoke.ts --version "$TAG" --binary apps/cli/binaries/darwin-arm64/maxprice
 
-      - name: Upload the darwin tarball and its signature
-        # No --clobber, as build-headless's upload: a re-run that finds either
-        # already on the draft fails rather than pair a new tarball with an
-        # older signature.
+      - name: Smoke the darwin Headless Hub (ADR-0129 §9)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bun scripts/acceptance/headless-hub/smoke.ts --version "$TAG" --binary apps/hub/binaries/darwin-arm64/maxprice-hub
+
+      - name: Upload both darwin tarballs and their signatures
+        # No --clobber, as build-headless's upload: a re-run that finds any of
+        # the four already on the draft fails rather than pair a new tarball
+        # with an older signature.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           client="apps/cli/binaries/maxprice_${TAG#v}_darwin-arm64.tar.gz"
+          hub="apps/hub/binaries/maxprice-hub_${TAG#v}_darwin-arm64.tar.gz"
           gh release upload "$TAG" \
             "$client" "$client.sig" \
+            "$hub" "$hub.sig" \
             --repo "$GITHUB_REPOSITORY"
 
       - name: Delete the signing keychain
@@ -946,20 +993,19 @@ jobs:
 
   # --------------------------------------------------------------------------
   # 6. Notarize macOS bundles — separate job so a slow (10+ min) notarization
-  #    can never fail the build jobs. Covers the DESKTOP .dmg, and the
-  #    Headless client's darwin `maxprice` (ADR-0144 §4): the hub tray app has
-  #    no macOS leg (ADR-0050 — Windows-only for now), so no hub .dmg exists
-  #    to notarize.
+  #    can never fail the build jobs. Covers both .dmgs, the Desktop client's
+  #    and the hub tray app's (ADR-0148 §6), and the darwin `maxprice` and
+  #    `maxprice-hub` (ADR-0144 §4, ADR-0147 §5).
   #
-  #    The darwin `maxprice` is submitted as a zip of the binary the tarball
+  #    Each darwin binary is submitted as a zip of the binary its tarball
   #    holds (`ditto -c -k`), and nothing is stapled or re-uploaded: a bare
   #    Mach-O cannot hold a ticket, and Gatekeeper finds it online for a
-  #    quarantined copy. The tarball and its minisign signature stay exactly
-  #    as build-headless-macos uploaded them. An un-notarized one still
-  #    installs through curl and updates through `maxprice update`, neither
-  #    of which sets quarantine. Restoring the hub's macOS leg requires adding
-  #    `build-hub` to this job's `needs:` — the `*.dmg` glob below is a
-  #    `gh release download` that fires the moment `build` finishes, so a hub
+  #    quarantined copy. The tarballs and their minisign signatures stay
+  #    exactly as build-headless-macos uploaded them. An un-notarized one
+  #    still installs through curl and updates through its own `update`,
+  #    neither of which sets quarantine. The job `needs:` every producer of a
+  #    macOS asset, build-hub included: the `*.dmg` glob below is a
+  #    `gh release download` that fires the moment its needs finish, so a hub
   #    `.dmg` uploaded after that point would never be picked up and would ship
   #    un-notarized. Skipped entirely when the notarization secrets are absent;
   #    failures here are non-blocking for the release.
@@ -970,18 +1016,20 @@ jobs:
   #    credential rather than the Apple ID behind every app on the account.
   # --------------------------------------------------------------------------
   notarize-macos:
-    needs: [build, build-headless-macos]
-    # `build` and `build-headless-macos` are the only producers of macOS
-    # binaries, so this does not wait on build-hub at all.
+    needs: [build, build-hub, build-headless-macos]
+    # The three producers of macOS assets: the Desktop client's .dmg, the hub
+    # tray app's .dmg and the two darwin binaries.
     if: >-
       !cancelled()
       && needs.build.result == 'success'
+      && needs.build-hub.result == 'success'
       && needs.build-headless-macos.result == 'success'
     runs-on: macos-latest
     # Cap the job — `notarytool submit --wait` can hang on Apple's service;
     # without this it could burn to the 6h runner ceiling and stall `publish`.
-    # Two submissions in series now, the .dmg's and the darwin maxprice's.
-    timeout-minutes: 45
+    # Four submissions in series now, the two .dmgs' and the two darwin
+    # binaries'.
+    timeout-minutes: 75
     # Don't gate the release on notarization succeeding.
     continue-on-error: true
     steps:
@@ -1017,6 +1065,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pattern "*.dmg" \
             --pattern "maxprice_*_darwin-arm64.tar.gz" \
+            --pattern "maxprice-hub_*_darwin-arm64.tar.gz" \
             --dir notarize
 
       - name: Notarize and staple
@@ -1037,16 +1086,27 @@ jobs:
           # (/usr/bin/openssl) and OpenSSL 3, and -A tolerates the single
           # unwrapped line `gh secret set` stores.
           printf '%s' "$APPLE_API_KEY" | openssl base64 -d -A > "$key_file"
+          # Each .dmg on its own: one that fails is reported and dropped from
+          # the re-upload, and never costs the other its submission (the
+          # hub's, "MaxPrice.Hub_…", sorts first). A rejected submission fails
+          # at the staple, which finds no ticket.
+          failed=""
           for dmg in notarize/*.dmg; do
             echo "Submitting $dmg for notarization…"
-            xcrun notarytool submit "$dmg" \
-              --key "$key_file" \
-              --key-id "$APPLE_API_KEY_ID" \
-              --issuer "$APPLE_API_ISSUER" \
-              --wait
-            echo "Stapling $dmg…"
-            xcrun stapler staple "$dmg"
+            if xcrun notarytool submit "$dmg" \
+                 --key "$key_file" \
+                 --key-id "$APPLE_API_KEY_ID" \
+                 --issuer "$APPLE_API_ISSUER" \
+                 --wait \
+               && echo "Stapling $dmg…" \
+               && xcrun stapler staple "$dmg"; then
+              continue
+            fi
+            echo "::error::Notarizing or stapling $dmg failed; it stays on the release un-notarized."
+            failed="$failed $(basename "$dmg")"
+            rm -f "$dmg"
           done
+          echo "DMG_NOTARIZE_FAILED=$failed" >> "$GITHUB_ENV"
 
       - name: Re-upload notarized assets
         if: steps.gate.outputs.enabled == 'true'
@@ -1060,8 +1120,14 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --clobber
           done
+          # The job goes red for a .dmg that failed above, once the others
+          # are back on the release; the darwin binaries still get theirs.
+          if [ -n "${DMG_NOTARIZE_FAILED:-}" ]; then
+            echo "::error::Not notarized:$DMG_NOTARIZE_FAILED"
+            echo "NOTARIZE_RED=1" >> "$GITHUB_ENV"
+          fi
 
-      - name: Notarize the darwin maxprice
+      - name: Notarize the darwin maxprice and maxprice-hub
         # After the .dmg's re-upload, and a step of its own, so a rejected or
         # slow submission here never costs the stapled .dmg its upload.
         if: steps.gate.outputs.enabled == 'true'
@@ -1076,26 +1142,34 @@ jobs:
           umask 077
           trap 'rm -f "$key_file"' EXIT
           printf '%s' "$APPLE_API_KEY" | openssl base64 -d -A > "$key_file"
-          # The darwin maxprice: the bytes the tarball holds, zipped, because
+          # Each darwin binary: the bytes its tarball holds, zipped, because
           # notarytool takes no bare Mach-O. `--wait` exits 0 on a finished
-          # submission whatever its verdict, so the verdict is read.
-          for tarball in notarize/maxprice_*_darwin-arm64.tar.gz; do
-            unpacked="$RUNNER_TEMP/headless-notarize"
-            rm -rf "$unpacked"; mkdir -p "$unpacked"
-            tar -xzf "$tarball" -C "$unpacked"
-            ditto -c -k "$unpacked/maxprice" "$unpacked/maxprice.zip"
-            echo "Submitting the maxprice in $tarball for notarization…"
-            xcrun notarytool submit "$unpacked/maxprice.zip" \
-              --key "$key_file" \
-              --key-id "$APPLE_API_KEY_ID" \
-              --issuer "$APPLE_API_ISSUER" \
-              --wait --output-format json | tee "$unpacked/result.json"
-            status="$(jq -r .status "$unpacked/result.json")"
-            if [ "$status" != Accepted ]; then
-              echo "::error::Notarization of the darwin maxprice ended $status."
-              exit 1
-            fi
+          # submission whatever its verdict, so the verdict is read. Every
+          # binary is submitted, and the step fails after, if any was not
+          # Accepted, so one rejection never costs the other its submission.
+          failed=""
+          for pair in "maxprice:notarize/maxprice_*_darwin-arm64.tar.gz" \
+                      "maxprice-hub:notarize/maxprice-hub_*_darwin-arm64.tar.gz"; do
+            binary="${pair%%:*}"
+            for tarball in ${pair#*:}; do
+              unpacked="$RUNNER_TEMP/headless-notarize-$binary"
+              rm -rf "$unpacked"; mkdir -p "$unpacked"
+              tar -xzf "$tarball" -C "$unpacked"
+              ditto -c -k "$unpacked/$binary" "$unpacked/$binary.zip"
+              echo "Submitting the $binary in $tarball for notarization…"
+              xcrun notarytool submit "$unpacked/$binary.zip" \
+                --key "$key_file" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER" \
+                --wait --output-format json | tee "$unpacked/result.json"
+              status="$(jq -r .status "$unpacked/result.json")"
+              if [ "$status" != Accepted ]; then
+                echo "::error::Notarization of the darwin $binary ended $status."
+                failed="$failed $binary"
+              fi
+            done
           done
+          if [ -n "$failed" ] || [ -n "${NOTARIZE_RED:-}" ]; then exit 1; fi
 
   # --------------------------------------------------------------------------
   # 7. Move the updater freight off this release and onto MP-Updates (ADR-0071).
@@ -1165,38 +1239,49 @@ jobs:
           # build's bundle directory is what keeps the manifest's URLs and the
           # release's asset names the same strings.
           bun scripts/compose-updater-manifest.ts stage --dir staged
-          echo "macOS bundle:"; ls -1 staged/mac
+          echo "macOS bundles:"; ls -1 staged/mac
 
-      - name: Rehome the macOS bundle to MP-Updates
+      - name: Rehome the macOS bundles to MP-Updates
         env:
           GH_TOKEN: ${{ secrets.UPDATES_REPO_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
-          darwin_src="$(find staged/mac -name '*.app.tar.gz' -print -quit)"
-          if [ -z "$darwin_src" ]; then
-            echo "::error::The macOS leg produced no .app.tar.gz. Either --config stopped merging the updater overlay, or --bundles no longer includes 'app'."
+          # One bundle per Tauri app, told apart by the prefix `stage` reads:
+          # the Desktop client's universal "MaxPrice_universal.app.tar.gz" and
+          # the hub tray app's arm64 "MaxPrice.Hub_aarch64.app.tar.gz" (the dot
+          # is GitHub's for the space in "MaxPrice Hub"). The case-sensitive
+          # "MaxPrice_*" never matches the hub's.
+          shopt -s nullglob
+          desktop=(staged/mac/MaxPrice_*.app.tar.gz)
+          hub=(staged/mac/MaxPrice.Hub_*.app.tar.gz)
+          if [ "${#desktop[@]}" -ne 1 ] || [ "${#hub[@]}" -ne 1 ]; then
+            echo "::error::Expected one Desktop and one hub .app.tar.gz, found ${#desktop[@]} and ${#hub[@]}. Either --config stopped merging the updater overlay, or a macOS leg's --bundles no longer includes 'app'."
             exit 1
           fi
-          # Tauri names this ONE artifact with no version in it at all
-          # ("MaxPrice.app.tar.gz"). Give it one here — it is about to sit in a
-          # repo whose entire content is one of these per release.
+          # Tauri names these with no version in them at all. Give each one
+          # here — they are about to sit in a repo whose entire content is a
+          # pair of these per release.
           darwin_asset="MaxPrice_${version}_universal.app.tar.gz"
-          mv "$darwin_src" "staged/mac/$darwin_asset"
+          hub_darwin_asset="MaxPrice.Hub_${version}_aarch64.app.tar.gz"
+          mv "${desktop[0]}" "staged/mac/$darwin_asset"
+          mv "${hub[0]}" "staged/mac/$hub_darwin_asset"
           echo "DARWIN_ASSET=$darwin_asset" >> "$GITHUB_ENV"
+          echo "HUB_DARWIN_ASSET=$hub_darwin_asset" >> "$GITHUB_ENV"
           if ! gh release view "$TAG" --repo "$UPDATES_REPO" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$UPDATES_REPO" --prerelease \
               --title "MaxPrice $TAG" \
               --notes "Update-channel metadata for MaxPrice $TAG. Installers are at https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
           fi
-          gh release upload "$TAG" "staged/mac/$darwin_asset" --repo "$UPDATES_REPO" --clobber
+          gh release upload "$TAG" "staged/mac/$darwin_asset" "staged/mac/$hub_darwin_asset" \
+            --repo "$UPDATES_REPO" --clobber
 
       - name: Compose a manifest per channel
         # One compose per entry of UPDATE_MANIFESTS. The two headless ones read
         # their trusted key from packages/shared/src/update-channel.ts in this
         # checkout, where the two Tauri ones read their tauri.conf.json, and
-        # have no macOS bundle to name.
+        # have no macOS bundle to name; each Tauri one names its own.
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -1214,6 +1299,7 @@ jobs:
             --dir staged/hub \
             --installers-repo "$GITHUB_REPOSITORY" \
             --updates-repo "$UPDATES_REPO" \
+            --darwin-asset "$HUB_DARWIN_ASSET" \
             --out hub-latest.json
           bun scripts/compose-updater-manifest.ts compose \
             --channel headless --version "$version" --tag "$TAG" \
@@ -1244,9 +1330,9 @@ jobs:
           # Last, deliberately — every step above reads these assets. Detached
           # .sig files are published nowhere at all: the signature travels
           # inside the manifest, which is the only place an updater reads one
-          # from. The three Headless tarballs, maxprice_<v>_linux-x64.tar.gz,
-          # maxprice_<v>_darwin-arm64.tar.gz and maxprice-hub_<v>_linux-x64.tar.gz,
-          # match neither pattern and stay: each is an installer on this
+          # from. The four Headless tarballs, maxprice_<v>_linux-x64.tar.gz,
+          # maxprice_<v>_darwin-arm64.tar.gz, maxprice-hub_<v>_linux-x64.tar.gz
+          # and maxprice-hub_<v>_darwin-arm64.tar.gz, match neither pattern and stay: each is an installer on this
           # release, and what headless-latest.json or headless-hub-latest.json
           # points at. Only their .sigs go.
           # `while read` rather than `for name in $(...)`: GitHub rewrites a

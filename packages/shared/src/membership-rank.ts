@@ -1,3 +1,4 @@
+import { minuteParts } from "./figure-format";
 import {
   membershipReadability,
   type OrgLimitsAnswer,
@@ -7,9 +8,8 @@ import {
 } from "./usage-limits";
 
 // The one "most used" ordering (ADR-0136 §6 as amended by #610/#622, ADR-0138
-// §8, #633): Live's limit area, the Readout, the Popout head, the Blocks tabs,
-// the Hub console and the Headless views all rank Memberships by it, and the
-// poller's per-Organization projection breaks a tie between two Memberships of
+// §8, #633): Live's limit area, the Readout, the Popout head, the Hub console
+// and the Headless views all rank Memberships by it, and the poller's per-Organization projection breaks a tie between two Memberships of
 // one Organization with it. Pure: each surface maps its own rows onto
 // `RankableMembership` and keeps whatever else it carries (the generic `T`).
 //
@@ -90,7 +90,7 @@ export function rankMemberships<T extends RankableMembership>(
 // --- What a Membership's limits show ------------------------------------------
 
 // A Membership's state on a surface that lists Memberships (Live's limit
-// area, the Blocks tabs, the ranked Popout): what its Account's key and its
+// area, the ranked Popout): what its Account's key and its
 // Organization's last Limits answer let it show (ADR-0138 §8, #610's states).
 //   readable      — windows to draw;
 //   no-limits     — read, and the Organization reports no supported limit;
@@ -118,15 +118,36 @@ export function membershipLimitState(
 }
 
 // What a Membership with no percent to draw says in its place, in each state
-// but `readable` (#610/#619's words): the ranked Popout's rows, the Blocks
-// tabs' badges and, capitalised, the Membership strip's Limits note all read
-// this one map.
+// but `readable` (#610/#619's words): the ranked Popout's rows read this one
+// map.
 export const LIMIT_STATE_WORDS: Record<Exclude<MembershipLimitState, "readable">, string> = {
   "no-limits": "no limits",
   stale: "key expired",
   "not-connected": "not connected",
   unreadable: "not readable now",
 };
+
+// The words a 5-hour row wears where the plan has no 5-hour limit (ADR-0142
+// §2): `none on Ultra`, the plan word without its "plan". `maxprice live`
+// prints it, and the Popout's row is to share it. A plan not known reads
+// `none on this plan`.
+export function noFiveHourLimitWords(plan: string | null): string {
+  return `none on ${planWord(plan) ?? "this plan"}`;
+}
+
+// A plan label without its "plan" (`Ultra plan` → `Ultra`), null when the
+// plan is not known.
+export function planWord(plan: string | null): string | null {
+  const name = plan?.replace(/ plan$/, "") ?? "";
+  return name === "" ? null : name;
+}
+
+// A window as a limit surface names it: `5-hour`, `weekly` or
+// `weekly · Fable`. Live's card meters and the Popout's head share it.
+export function limitWindowWords(kind: LiveWindowKind, model: string | null): string {
+  if (kind === "fiveHour") return "5-hour";
+  return model === null ? "weekly" : `weekly · ${model}`;
+}
 
 // --- A Membership's windows ---------------------------------------------------
 
@@ -160,8 +181,8 @@ function liveWindow(
   return { pct: window.utilizationPct, resetAtMs: reset };
 }
 
-// Every window of a Membership's reading, as Live's cards, the Blocks strip's
-// Limits and the Headless client's Limits lines list them: 5-hour and weekly
+// Every window of a Membership's reading, as Live's cards and the Headless
+// client's Limits lines list them: 5-hour and weekly
 // (none for one whose Organization has no such limit), then the Model-scoped
 // weekly one while the reading holds it. Each surface names them its own way.
 export function membershipWindows(
@@ -190,6 +211,15 @@ export function membershipWindows(
   return out;
 }
 
+// A countdown to a window's reset: "23m", "2h 14m", "3d 4h". Live's Resets
+// line and the Popout head's `resets in` read it.
+export function resetIn(ms: number): string {
+  const { days, hours, mins } = minuteParts(Math.max(0, ms));
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${String(mins).padStart(2, "0")}m`;
+  return `${mins}m`;
+}
+
 // The tag a most used window wears beside its percent: `wk` for a weekly one
 // (the model's weekly included), none for the 5-hour one (#610).
 export function windowTag(kind: LiveWindowKind): "wk" | null {
@@ -198,7 +228,7 @@ export function windowTag(kind: LiveWindowKind): "wk" | null {
 
 // A use percent reads warning-coloured from 75% used and bad, "hot", from
 // 90% (#620 item 4): the Account menu's rows, the limit area's cards and
-// windows, the Blocks tabs and the ranked Popout colour and count by this one
+// windows and the ranked Popout colour and count by this one
 // rule.
 export const USE_WARN_PCT = 75;
 export const USE_BAD_PCT = 90;

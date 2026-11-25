@@ -1,6 +1,6 @@
 [package]
 name = "maxprice-hub-desktop"
-version = "0.9.5"
+version = "0.10.0"
 description = "MaxPrice Hub"
 authors = ["Max Schoening"]
 license = "MIT"
@@ -59,6 +59,45 @@ windows-sys = { version = "0.61", features = [
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
+# The popout adapter (ADR-0084, ADR-0097), its rounded corners (ADR-0148
+# §2) and the menu-bar icon (§3): AppKit rounds a window through public API,
+# masking the content view's layer, so this needs no `macos-private-api`. The
+# crates are tao/tauri transitives at these versions, taken with `default-features = false` so they
+# add no package to the graph (the client's Cargo.toml says why). Add a feature
+# when the code needs the class.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSEvent", "NSScreen", "NSRunningApplication", "NSWindow"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "block2",
+  "NSBezierPath",
+  "NSButton",
+  "NSColor",
+  "NSControl",
+  "NSEvent",
+  "NSGraphics",
+  "NSGraphicsContext",
+  "NSImage",
+  "NSResponder",
+  "NSScreen",
+  "NSRunningApplication",
+  "NSStatusBarButton",
+  "NSStatusItem",
+  "NSView",
+  "NSWindow",
+  "objc2-core-foundation",
+  "objc2-quartz-core",
+] }
+# The menu-bar icon's drawing handler (ADR-0148 §3) and its geometry types.
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSArray",
+  "NSEnumerator",
+  "NSGeometry",
+] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+  "std",
+  "CALayer",
+  "objc2-core-foundation",
+] }

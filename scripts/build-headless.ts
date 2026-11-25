@@ -1,9 +1,9 @@
 // Build, pack and sign the Headless release tarballs. For linux-x64, the
 // default target, two: the Headless client's, maxprice_<v>_linux-x64.tar.gz
 // (ADR-0123 §1, §2), then the Headless Hub's, maxprice-hub_<v>_linux-x64.tar.gz
-// (ADR-0129 §1). For darwin-arm64, one: the Headless client's,
-// maxprice_<v>_darwin-arm64.tar.gz (ADR-0144 §3), since the Headless Hub is
-// Linux-only.
+// (ADR-0129 §1). For darwin-arm64 the same two: the Headless client's,
+// maxprice_<v>_darwin-arm64.tar.gz (ADR-0144 §3), then the Headless Hub's,
+// maxprice-hub_<v>_darwin-arm64.tar.gz (ADR-0147 §4).
 //
 //   bun scripts/build-headless.ts --tag vX.Y.Z [--target linux-x64|darwin-arm64]
 //       [--codesign <identity>] [--out <dir>] [--unsigned] [--root <dir>]
@@ -42,10 +42,9 @@
 // this script agree on each asset's name and on what a `.sig` names.
 // Importing it has no side effects: the CLI runs only under `import.meta.main`.
 //
-// THE PRODUCTS, in turn: for linux-x64 the client whole, then the Hub, so a
-// client that refuses costs no Hub build; for darwin-arm64 the client alone.
-// Each goes through the same steps, every one of which refuses (exit 1)
-// rather than carry on:
+// THE PRODUCTS, in turn, on either target: the client whole, then the Hub, so
+// a client that refuses costs no Hub build. Each goes through the same steps,
+// every one of which refuses (exit 1) rather than carry on:
 //
 //   1. compile   in the root. The client's is `bun run build:cli`, which
 //                writes apps/cli/binaries/maxprice, or
@@ -55,17 +54,22 @@
 //                builds apps/hub-desktop's dist-page, writes the page manifest
 //                and compiles
 //                apps/hub/binaries/maxprice-hub-x86_64-unknown-linux-gnu with
-//                the page embedded, in ADR-0124's order.
+//                the page embedded, in ADR-0124's order, or
+//                `bun apps/hub/scripts/build-binaries.ts --headless
+//                darwin-arm64`, which does the same into
+//                apps/hub/binaries/darwin-arm64/maxprice-hub, apart from the
+//                tray app's pageless sidecar of that triple (ADR-0147 §2).
 //   2. stage     only where the compile's file is not already named for the
-//                tarball's one entry, which is the Hub's: build-binaries.ts
+//                tarball's one entry, which is the Linux Hub's: build-binaries.ts
 //                names it for its target triple, the form Tauri's externalBin
 //                wants and the path the acceptance rigs run it from, so it is
 //                left there under that name; and it copies a credstore helper
-//                beside it whenever one has been built, while the Linux Hub
-//                ships no helper (ADR-0126 §1). So a copy named
+//                beside it whenever one has been built, while the Headless
+//                Hub ships no helper (ADR-0126 §1, ADR-0146 §4). So a copy named
 //                `maxprice-hub` goes alone into a fresh directory under
 //                os.tmpdir(), which is removed again on every path. The
-//                client's `maxprice` is packed where the compile wrote it.
+//                client's `maxprice` and the darwin `maxprice-hub`, alone in
+//                its own directory, are packed where the compile wrote them.
 //                Either way the file packed is made 0755 here, whatever mode
 //                the compile left, and the steps after run on it: for the
 //                Hub, the copy, the bytes that ship. (A host whose tmpdir is
@@ -209,9 +213,13 @@ export function headlessAssetName(version: string, target: Target = DEFAULT_TARG
   return `maxprice_${version}_${target}.tar.gz`;
 }
 
-/** The Hub's tarball's published name, which CI signs it under and ADR-0129 §4's `maxprice-hub update` computes. */
-export function headlessHubAssetName(version: string): string {
-  return `maxprice-hub_${version}_linux-x64.tar.gz`;
+/**
+ * The Hub's tarball's published name for `target`, which CI signs it under
+ * and ADR-0129 §4's `maxprice-hub update` computes (usage-core's
+ * `channelEntry`, ADR-0147 §6).
+ */
+export function headlessHubAssetName(version: string, target: Target = DEFAULT_TARGET): string {
+  return `maxprice-hub_${version}_${target}.tar.gz`;
 }
 
 type Product = {
@@ -244,9 +252,9 @@ const PRODUCTS: readonly Product[] = [
     binary: "maxprice-hub",
     target: "linux-x64",
     label: "the Headless Hub",
-    assetName: headlessHubAssetName,
-    // linux-x64 is the one target that embeds the Hub page, which this
-    // command builds first (ADR-0124 §1).
+    assetName: (version) => headlessHubAssetName(version, "linux-x64"),
+    // A Headless target, which embeds the Hub page and builds it first
+    // (ADR-0124 §1).
     compile: ["bun", "apps/hub/scripts/build-binaries.ts", "linux-x64"],
     binaries: "apps/hub/binaries",
     compiled: "maxprice-hub-x86_64-unknown-linux-gnu",
@@ -261,6 +269,19 @@ const PRODUCTS: readonly Product[] = [
     // build-binary.ts's outfileFor: any target but linux-x64 under a
     // directory of its own, so the two never take each other's place.
     compiled: "darwin-arm64/maxprice",
+  },
+  {
+    binary: "maxprice-hub",
+    target: "darwin-arm64",
+    label: "the Headless Hub",
+    assetName: (version) => headlessHubAssetName(version, "darwin-arm64"),
+    // The Headless darwin-arm64 build, page and all (ADR-0147 §2), never the
+    // tray app's sidecar of the same triple.
+    compile: ["bun", "apps/hub/scripts/build-binaries.ts", "--headless", "darwin-arm64"],
+    binaries: "apps/hub/binaries",
+    // build-binaries.ts's outDir: plain `maxprice-hub`, alone in its own
+    // directory, with no credstore helper copied beside it.
+    compiled: "darwin-arm64/maxprice-hub",
   },
 ];
 

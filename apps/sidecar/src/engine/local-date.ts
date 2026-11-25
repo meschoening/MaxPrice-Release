@@ -82,7 +82,7 @@ export function isParseableTimestamp(timestamp: string): boolean {
 //
 // THE RULE that unboundedness rests on: **every caller of the memoized
 // `localDate` must pass an immutable corpus timestamp** — a stored
-// `UsageRecord.timestamp` or a derived block boundary — never a wall-clock
+// `UsageRecord.timestamp` or a boundary derived from one — never a wall-clock
 // reading. A caller passing `Date.now()` mints one distinct key per call, and
 // against a long-lived poller (the ADR-0079 tray's 60s `/api/readout` poll)
 // that grows an inner map forever: ≥1440 permanently-retained entries a day for

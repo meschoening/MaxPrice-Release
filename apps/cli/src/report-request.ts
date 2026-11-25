@@ -137,8 +137,8 @@ export type ScopeRequest = {
   memberships: TrackedMembership[];
   // The Account labels by key; empty when /api/accounts was not read.
   accountLabels: ReadonlyMap<string, string>;
-  // The Scope's head Organization (`scope-head.ts`): whose usage current
-  // and Blocks a one-Membership surface reads. Undefined with no Home.
+  // The Scope's head Organization (`scope-head.ts`): whose usage current a
+  // one-Membership surface reads. Undefined with no Home.
   quotaOrganization: string | undefined;
   // The Scope holds every tracked Membership, and more than one.
   isAll: boolean;
@@ -163,11 +163,6 @@ export type ReportRequest = {
   // The Scope spans two or more Organizations: the Organization(s) column
   // shows (ADR-0140 §3).
   spansOrganizations: boolean;
-  // Under All, the label of the Home membership's Organization, which a
-  // quota-shaped report's header names (ADR-0108: its Blocks are Home's).
-  // Null otherwise: a scoped Organization's quota is its own, and the scope
-  // label already names it.
-  quotaLabel: string | null;
   // The roster's Organization labels by uuid; empty when no roster was read.
   labels: ReadonlyMap<string, string>;
   // The daemon's Organization roster (plans and Window states), or empty
@@ -686,7 +681,7 @@ export async function resolveReportRequest(
   options: ReportRequestOptions = {},
 ): Promise<ReportRequest> {
   const scope = await resolveScopeRequest(flags, daemon, settings);
-  const { multi, quotaOrganization, isAll } = scope;
+  const { quotaOrganization, isAll } = scope;
   const labels = organizationLabelMap(scope.roster);
 
   const range = flags.range ?? (await thisWeek(daemon, settings, quotaOrganization, now, stderr));
@@ -718,9 +713,6 @@ export async function resolveReportRequest(
     scopeLabel: scope.scopeLabel,
     isAll,
     spansOrganizations: scope.spansOrganizations,
-    // More than one Organization tracked means a Home, so under All the Home
-    // membership's Organization, the head, is known.
-    quotaLabel: multi && isAll ? organizationLabel(labels, quotaOrganization!) : null,
     labels,
     roster: scope.roster,
     scope: scope.scope,

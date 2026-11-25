@@ -75,10 +75,6 @@ export function projectsKey(input: QueryInput): ["projects", QueryInput] {
   return ["projects", normalize(input)];
 }
 
-export function blocksKey(input: QueryInput): ["blocks", QueryInput] {
-  return ["blocks", normalize(input)];
-}
-
 // The /api/membership-totals key (#637): the common report query, like daily.
 export function membershipTotalsKey(input: QueryInput): ["membership-totals", QueryInput] {
   return ["membership-totals", normalize(input)];
@@ -101,7 +97,7 @@ export function dailyByMachineKey(
 
 // The `/api/intraday` query input. Unlike the daily-family keys it is NOT keyed
 // on a `since`/`until` date window — the intraday endpoint windows itself on a
-// fixed `span` (any of the six, ADR-0018), so `span` replaces `since`/`until`
+// fixed `span` (any of the five, ADR-0018), so `span` replaces `since`/`until`
 // here. `mode` + the project/model multi-selects are carried the same way as
 // the daily keys so a cost-mode change or a filter edit re-keys and refetches.
 export type IntradayQueryInput = {
@@ -109,8 +105,7 @@ export type IntradayQueryInput = {
   mode: CostMode;
   // `tz` (Part 6, ADR-0015) — the `today` span buckets by the local calendar
   // day in this zone (ADR-0020), so `tz` is load-bearing there; the now-relative
-  // spans (`15m`/`1h`/`30d`), the anchored `week`, and the server-resolved
-  // `block` window ignore it. Kept in the key for every span so a
+  // spans (`15m`/`1h`/`30d`) and the anchored `week` ignore it. Kept in the key for every span so a
   // Timezone-setting change re-keys.
   tz?: string;
   // ADR-0083 — required by `span=week`; re-keys because the anchor changes the
@@ -165,24 +160,6 @@ export function intradayKey(input: IntradayQueryInput): ["intraday", IntradayQue
   return ["intraday", normalizeIntraday(input)];
 }
 
-// Predicate matching an intraday query key whose `span` is `block` — the one
-// intraday family `block:tick` invalidates (the block frame is block-shaped
-// data; every other span is now-relative, ADR-0031). Owns the key-shape
-// knowledge so `live-stream.ts` invalidates through this helper instead of
-// re-inlining the tuple positions + cast, mirroring how the blocks invalidation
-// reaches for `BLOCKS_KEY_ROOT` rather than rebuilding the prefix.
-export function isBlockSpanIntradayKey(queryKey: readonly unknown[]): boolean {
-  return (
-    queryKey[0] === "intraday" &&
-    (queryKey[1] as Partial<IntradayQueryInput> | undefined)?.span === "block"
-  );
-}
-
-// Family-root key for the blocks report. `block:tick` events invalidate the
-// whole blocks family regardless of filters, so they target this root rather
-// than a fully-built `blocksKey` — it prefix-matches every ["blocks", input].
-export const BLOCKS_KEY_ROOT = ["blocks"] as const;
-
 // Per-session detail key — keyed by session id alone, not the report filters.
 // Part 3 creates the stub so the SSE channel can invalidate ['session', id]
 // on a `usage:new` event; Part 5 adds the hook and the data behind it.
@@ -197,7 +174,7 @@ export function sessionKey(id: string): ["session", string] {
   return ["session", id];
 }
 
-// Family-root key for the per-session detail report — mirrors BLOCKS_KEY_ROOT.
+// Family-root key for the per-session detail report.
 // A manual rescan (ADR-0019) doesn't know which session ids changed, so it
 // invalidates the whole session family by this prefix rather than per-id;
 // it prefix-matches every ["session", id] and ["session", id, mode].
@@ -216,7 +193,6 @@ export const DATA_QUERY_KEYS = new Set<string>([
   "intraday",
   "sessions",
   "projects",
-  "blocks",
   "membership-totals",
   // The Scope's head (`scopeHeadKey`): no money, but its candidates gain rows
   // as usage lands, so it refreshes with the reports.

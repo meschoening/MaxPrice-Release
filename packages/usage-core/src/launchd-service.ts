@@ -54,6 +54,7 @@ import {
   ServiceError,
   type ServiceResult,
   serviceVerb,
+  type UnitReading,
 } from "./systemd-service";
 
 /** One headless product's agent, and what its `service` verbs read. */
@@ -79,6 +80,12 @@ export interface HeadlessAgent extends LaunchAgent {
    * its exit, a refused settings.json for maxprice.
    */
   refusedExits: readonly { exit: number; note: string }[];
+  /**
+   * The line `service status` prints for an agent stopped on the lock, when
+   * more than another `serve` can hold it: the Headless Hub's commands that
+   * edit its files hold it too. By default it names another `serve`.
+   */
+  lockedNote?: string;
 }
 
 export type AgentServiceContext = {
@@ -110,11 +117,21 @@ function say(ctx: Context, ...lines: string[]): void {
 }
 
 // ADR-0143 §7: one line, and no fallback to sudo or a system domain.
+function noSessionLine(product: LaunchAgent, uid: number, ran: Ran): string {
+  return (
+    `no launchd GUI session for this user here (launchctl print ${guiDomain(uid)} failed: ${reason(ran)}); ` +
+    `log in to this Mac, or run '${agentServeCommand(product)}' under a LaunchDaemon (the README shows one)`
+  );
+}
+
 function noSession(ctx: Context, ran: Ran): ServiceError {
+  return new ServiceError("failure", noSessionLine(ctx.product, ctx.uid, ran));
+}
+
+function unreadable(product: LaunchAgent, uid: number, ran: Ran): ServiceError {
   return new ServiceError(
     "failure",
-    `no launchd GUI session for this user here (launchctl print ${guiDomain(ctx.uid)} failed: ${reason(ran)}); ` +
-      `log in to this Mac, or run '${agentServeCommand(ctx.product)}' under a LaunchDaemon (the README shows one)`,
+    `launchctl print ${agentTarget(product, uid)} failed: ${reason(ran)}`,
   );
 }
 
@@ -123,12 +140,7 @@ function noSession(ctx: Context, ran: Ran): ServiceError {
 async function inspect(ctx: Context): Promise<{ print: AgentPrint | null; file: string }> {
   const reading = await readAgent(ctx.product, ctx.uid, ctx.env);
   if (reading.kind === "no-session") throw noSession(ctx, reading.ran);
-  if (reading.kind === "unreadable") {
-    throw new ServiceError(
-      "failure",
-      `launchctl print ${agentTarget(ctx.product, ctx.uid)} failed: ${reason(reading.ran)}`,
-    );
-  }
+  if (reading.kind === "unreadable") throw unreadable(ctx.product, ctx.uid, reading.ran);
   return {
     print: reading.kind === "loaded" ? reading.print : null,
     file: agentPlistPath(ctx.product, ctx.env),
@@ -324,7 +336,10 @@ function causeNote(ctx: Context, cause: StopCause): string {
         `see '${product.name} service logs', and '${product.name} service install' clears the count`
       );
     case "locked":
-      return `another '${agentServeCommand(product)}' held the data dir, so the agent stopped without a retry`;
+      return (
+        product.lockedNote ??
+        `another '${agentServeCommand(product)}' held the data dir, so the agent stopped without a retry`
+      );
     case "refused":
       return (
         product.refusedExits.find(({ exit }) => exit === cause.exit)?.note ??
@@ -433,6 +448,36 @@ async function logs(
   const code = await execTool("tail", args, env);
   if (code === null) throw new ServiceError("failure", "tail is not on PATH");
   return { kind: "exited", code };
+}
+
+// The agent as the Headless Hub's setup reads it (ADR-0146 §10), in
+// ./systemd-service's UnitReading shape, so setup reads the agent on macOS
+// as it reads the unit on Linux: no GUI session, with the line every verb
+// refuses with then, which setup prints in place of installing; or whether
+// the agent is installed, by status's rule (its plist, or a job launchd still
+// has), its state ("running", …; "" while not loaded), its pid (0 for none)
+// and the data dir it serves, from launchd's environment for it, else its
+// plist's. A print that fails for another reason refuses, as every verb does.
+export async function readAgentService(
+  product: HeadlessAgent,
+  context: { env: Env; uid?: number },
+): Promise<UnitReading> {
+  const { env } = context;
+  const uid = context.uid ?? process.getuid?.() ?? 0;
+  const reading = await readAgent(product, uid, env);
+  if (reading.kind === "no-session") {
+    return { kind: "no-manager", message: noSessionLine(product, uid, reading.ran) };
+  }
+  if (reading.kind === "unreadable") throw unreadable(product, uid, reading.ran);
+  const print = reading.kind === "loaded" ? reading.print : null;
+  const file = agentPlistPath(product, env);
+  return {
+    kind: "unit",
+    installed: print !== null || existsSync(file),
+    activeState: print?.state ?? "",
+    mainPid: print?.pid ?? 0,
+    dataDir: agentDataDir(product, environmentOf(print, file), env),
+  };
 }
 
 export async function runAgentService(

@@ -4,8 +4,11 @@
 // tray app (ADR-0036) can bundle the daemon as its externalBin sidecar
 // (mirrors apps/sidecar/scripts/build-binaries.ts).
 //
-// linux-x64 is the Headless Hub's target, and it alone embeds the Hub page
-// (ADR-0124 §1, §7). Its build orders itself: the page build
+// The Headless Hub's builds alone embed the Hub page (ADR-0124 §1, §7,
+// ADR-0147 §2): linux-x64, always, and darwin-arm64 under `--headless`,
+// written to binaries/darwin-arm64/maxprice-hub and never copied for the tray
+// app, whose darwin-arm64 sidecar is the same triple without the page. Their
+// build orders itself: the page build
 // (`bun run build:page` in apps/hub-desktop, into dist-page/), then the page
 // manifest (page-manifest.ts, into the git-ignored apps/hub/generated/), then
 // the compile under `--conditions=maxprice-hub-page`, which resolves
@@ -46,13 +49,19 @@ async function sweepBuildTemps() {
   }
 }
 
-export type TargetSpec = { bunTarget: string; triple: string };
+// `headless` marks a Headless Hub build, which embeds the page. `outDir`, a
+// dir under binaries/, marks one that is not the tray app's sidecar: written
+// there as plain `maxprice-hub`, and never copied into the tray's binaries.
+export type TargetSpec = { bunTarget: string; triple: string; headless?: true; outDir?: string };
 
 // Map Bun --target → Rust target triple.
 export const TARGETS: Record<string, TargetSpec> = {
   "darwin-arm64": { bunTarget: "bun-darwin-arm64", triple: "aarch64-apple-darwin" },
   "darwin-x64": { bunTarget: "bun-darwin-x64", triple: "x86_64-apple-darwin" },
-  "linux-x64": { bunTarget: "bun-linux-x64", triple: "x86_64-unknown-linux-gnu" },
+  // The tray app ships on Windows alone (ADR-0050). A Linux tray run from
+  // source (`bun run dev:hub`) bundles this same binary, page and all, but
+  // runs it embedded, and an embedded daemon mounts no `/page/`.
+  "linux-x64": { bunTarget: "bun-linux-x64", triple: "x86_64-unknown-linux-gnu", headless: true },
   "windows-x64": { bunTarget: "bun-windows-x64", triple: "x86_64-pc-windows-msvc" },
 };
 
@@ -73,14 +82,35 @@ function hostKey(): string {
 // generated manifest (apps/hub/package.json).
 export const PAGE_CONDITION = "maxprice-hub-page";
 
-// The Headless Hub's target. The tray app ships on Windows alone (ADR-0050). A
-// Linux tray run from source (`bun run dev:hub`) bundles this same binary, page
-// and all, but runs it embedded, and an embedded daemon mounts no `/page/`.
-const HEADLESS_HUB_TARGET = "linux-x64";
+// The Headless Hub's builds, by `--headless <key>` (ADR-0146 §1, ADR-0147
+// §1): linux-x64 is TARGETS' own, and darwin-arm64 the tray's triple with the
+// page, written apart.
+export const HEADLESS_TARGETS: Record<string, TargetSpec> = {
+  "linux-x64": TARGETS["linux-x64"]!,
+  "darwin-arm64": { ...TARGETS["darwin-arm64"]!, headless: true, outDir: "darwin-arm64" },
+};
 
-/** Whether a target's binary embeds the Hub page: the Headless Hub's alone. */
+/** Whether a build embeds the Hub page: the Headless Hub's alone. */
 export function embedsPage(target: TargetSpec): boolean {
-  return target.triple === TARGETS[HEADLESS_HUB_TARGET]!.triple;
+  return target.headless === true;
+}
+
+/** The targets a command line names: tray keys, then `--headless <key>`, or else the host's, asked only then. */
+export function requestedTargets(args: readonly string[], host: () => string): TargetSpec[] {
+  const targets: TargetSpec[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const headless = args[i] === "--headless";
+    const key = headless ? args[++i] : args[i];
+    const table = headless ? HEADLESS_TARGETS : TARGETS;
+    const target = key === undefined ? undefined : table[key];
+    if (target === undefined) {
+      throw new Error(
+        `Unknown ${headless ? "Headless target" : "target"}: ${key ?? "(none)"} (known: ${Object.keys(table).join(", ")})`,
+      );
+    }
+    targets.push(target);
+  }
+  return targets.length > 0 ? targets : [TARGETS[host()]!];
 }
 
 /**
@@ -144,15 +174,14 @@ function writeManifest() {
   console.log(`[build] page manifest: ${keys.length} files → ${PAGE_MANIFEST_FILE}`);
 }
 
-async function compile(
-  entry: string,
-  outName: string,
-  target: { bunTarget: string; triple: string },
-) {
-  const outDir = join(HUB_DIR, "binaries");
-  await mkdir(outDir, { recursive: true });
+async function compile(entry: string, outName: string, target: TargetSpec) {
   const ext = target.triple.includes("windows") ? ".exe" : "";
-  const outfile = join(outDir, `${outName}-${target.triple}${ext}`);
+  const outDir = join(HUB_DIR, "binaries", target.outDir ?? "");
+  await mkdir(outDir, { recursive: true });
+  const outfile = join(
+    outDir,
+    target.outDir === undefined ? `${outName}-${target.triple}${ext}` : `${outName}${ext}`,
+  );
   const entryPath = join(HUB_DIR, entry);
 
   console.log(`[build] ${entry} → ${outfile}`);
@@ -166,6 +195,7 @@ async function compile(
   } finally {
     await sweepBuildTemps();
   }
+  if (target.outDir !== undefined) return;
   // Copy the hub binary into the hub-desktop Tauri externalBin directory.
   await mkdir(TAURI_BIN_DIR, { recursive: true });
   const dest = join(TAURI_BIN_DIR, `${outName}-${target.triple}${ext}`);
@@ -175,16 +205,7 @@ async function compile(
 
 async function main() {
   await sweepBuildTemps();
-  const requested = process.argv.slice(2);
-  const targetsToBuild =
-    requested.length > 0
-      ? requested.map((k) => {
-          const t = TARGETS[k];
-          if (!t)
-            throw new Error(`Unknown target: ${k} (known: ${Object.keys(TARGETS).join(", ")})`);
-          return t;
-        })
-      : [TARGETS[hostKey()]!];
+  const targetsToBuild = requestedTargets(process.argv.slice(2), hostKey);
 
   const steps: BuildSteps = {
     buildPage,

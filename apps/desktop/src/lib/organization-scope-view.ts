@@ -11,14 +11,11 @@ import {
   type WindowState,
 } from "@maxprice/shared";
 
-// The quota surfaces' view (ADR-0106 §10): what the Active block and This week
-// tiles, the Live chart's block span and the Blocks page's subtitle say about
-// the Organization whose limits they read, and the topbar's Organization scope
-// chip. Pure, so their markup is testable without the query hooks.
-//
-// The Scope's head Organization (`useScope().quotaOrganization`) is what the
-// quota surfaces read under every Scope; while the Scope spans more than one
-// Organization (`spansOrganizations`) they name it (`tag`).
+// The quota surfaces' view (ADR-0106 §10): whether the Organization whose
+// limits Live reads has a weekly limit (the This week tile's fallback line),
+// and the topbar's Organization scope chip. Pure, so their markup is testable
+// without the query hooks. The Scope's head Organization
+// (`useScope().quotaOrganization`) is the one they read under every Scope.
 
 // --- The Organization scope chip (ADR-0106, kept by #637) --------------------
 //
@@ -166,22 +163,6 @@ export const HIDDEN_SELECTION_NOTE =
   "A saved Account selection is not applied while only one Account is tracked. Showing the Home membership.";
 export const HIDDEN_SELECTION_SHORT = "Saved selection not applied";
 
-// What the quota surfaces say about the Quota organization, whose reading they
-// show under every scope. A tile shows no meter for its window, and says why,
-// when the Quota organization has no such limit (`absent`, its Window state)
-// or its limits can't be read (`forbidden`).
-export type NoLimit = { reason: "absent" | "forbidden"; label: string };
-export interface QuotaSurface {
-  // The Quota organization's label while the Scope spans more than one
-  // Organization, else null: scoped to one Organization, there is no other
-  // it could be.
-  tag: string | null;
-  // The Active block tile's note and the This Week tile's, each set only
-  // when that tile's window has no limit to show (`quotaSurface`).
-  fiveHourNote: NoLimit | null;
-  weeklyNote: NoLimit | null;
-}
-
 // An Organization's Limits answer as the roster reports it: undefined for an
 // unread entry, a uuid the roster lacks, or a roster not yet loaded. A string,
 // so it keeps its value across the roster's per-read status churn and a memo
@@ -208,61 +189,21 @@ export function rosterWindowState(
   return roster?.find((entry) => entry.uuid === uuid)?.limits?.windowStates?.[window];
 }
 
-// The tag follows the Scope; each tile's note follows the Quota organization's
-// roster facts for its own window:
-//   - `forbidden` is unreadable on both: nothing about its limits can be read.
-//   - otherwise a window whose Window state is `absent` has no such limit: an
-//     Enterprise organization's weekly window, or a `five_hour` of null. The
-//     state is the last successful poll's, so a transient `error` keeps it.
-//   - an `active` or `idle` window says nothing: an idle limit renders idle on
-//     every Organization (#384). So does a window with no state yet, a
-//     Connect-seeded `none` included, so no note flashes before a poll.
-// The rule holds under every scope, so a single tracked Organization gains the
-// note too. No Quota organization (no Home) names nothing.
-export function quotaSurface(input: {
-  // The Scope spans more than one Organization (`ScopeView.spansOrganizations`).
-  isAll: boolean;
+// Whether the Quota organization has no weekly limit to read, so the This
+// week tile has no weekly reset to wait for (ADR-0106 §10, #384):
+//   - `forbidden` reads nothing about its limits;
+//   - otherwise an `absent` weekly Window state is no such limit (an
+//     Enterprise organization's). The state is the last successful poll's, so
+//     a transient `error` keeps it;
+//   - an `active` or `idle` window is a limit (#384), and so is a window with
+//     no state yet, a Connect-seeded `none` included, so the tile never drops
+//     its warning before a poll.
+// No Quota organization (no Home) has none to lack.
+export function noWeeklyLimit(input: {
   quotaOrganization: string | undefined;
-  labels: ReadonlyMap<string, string>;
   answer: OrganizationLimits["answer"] | undefined;
-  fiveHour: WindowState | undefined;
   weekly: WindowState | undefined;
-}): QuotaSurface {
-  const { isAll, quotaOrganization, labels, answer } = input;
-  if (quotaOrganization === undefined) return { tag: null, fiveHourNote: null, weeklyNote: null };
-  const label = organizationLabel(labels, quotaOrganization);
-  const noLimit = (state: WindowState | undefined): NoLimit | null =>
-    answer === "forbidden"
-      ? { reason: "forbidden", label }
-      : state === "absent"
-        ? { reason: "absent", label }
-        : null;
-  return {
-    tag: isAll ? label : null,
-    fiveHourNote: noLimit(input.fiveHour),
-    weeklyNote: noLimit(input.weekly),
-  };
-}
-
-// The Live chart's note beside its controls on the block span: the 5-hour
-// block it frames is the Quota organization's, so while the Scope spans
-// Organizations it says whose.
-export function blockSpanNote(span: string, tag: string | null): string | null {
-  return span === "block" && tag !== null ? `${tag}'s block` : null;
-}
-
-// The Blocks page's topbar subtitle suffix: every block there is the Quota
-// organization's, so while the Scope spans Organizations the subtitle says
-// whose. None while the page names its Membership in a tab or its strip
-// instead (#619 A, #638): whenever the Scope's Memberships
-// (`useScopeMemberships`, non-empty only with two or more tracked Accounts)
-// hold any, exactly when `blocksTabsView` is not `single`. A one-Account
-// install, whose list is always empty, keeps the suffix.
-export function blocksSubtitleSuffix(
-  pathname: string,
-  tag: string | null,
-  scopeMemberships: readonly unknown[] = [],
-): string {
-  if (pathname !== "/blocks" || tag === null || scopeMemberships.length > 0) return "";
-  return ` · ${tag}'s blocks`;
+}): boolean {
+  if (input.quotaOrganization === undefined) return false;
+  return input.answer === "forbidden" || input.weekly === "absent";
 }

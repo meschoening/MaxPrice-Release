@@ -28,6 +28,7 @@ import {
   type UsageConnection,
 } from "@maxprice/shared";
 import { displayPath, type Env } from "@maxprice/usage-core/home-path";
+import { agentPlistPath, shellTarget } from "@maxprice/usage-core/launchd-agent";
 import { describeHolder, type ServeLockHolder } from "@maxprice/usage-core/serve-lock";
 import { defaultUnitPath } from "@maxprice/usage-core/systemd-unit";
 import { terminalText } from "@maxprice/usage-core/terminal-text";
@@ -37,11 +38,18 @@ import {
   updateRow,
 } from "@maxprice/usage-core/update-check";
 import { CliError, EXIT, type Io } from "./cli";
-import { requireHub } from "./config";
+import { requireHub, runsHeadlessHub } from "./config";
 import { gatewayLastRecord } from "./gateway-words";
 import { labelledAccounts, liveAccountLabels } from "./hub-names";
 import { HubNoAnswer, reachHub, type ReachOptions, refusal, unreadable } from "./operator-client";
-import { readOnlyLockHolder, serveLockPath, UNIT } from "./serve-lock";
+import {
+  LABEL,
+  readOnlyLockHolder,
+  serveLockPath,
+  serviceName,
+  UNIT,
+  withService,
+} from "./serve-lock";
 import { terminalJson } from "./terminal-output";
 import { VERSION } from "./version";
 
@@ -52,8 +60,8 @@ import { VERSION } from "./version";
 // one per Account when the Hub knows several, #614 §13), one row per Gateway
 // it drains (ADR-0141 §8), the daemon's version, the Update row (ADR-0129
 // §6), the data dir and the pid. `service status` keeps describing the unit
-// (§6). Linux only, as serve.lock and the operator token are (§3, ADR-0126
-// §8).
+// (§6). Linux and macOS only, as serve.lock and the operator token are (§3,
+// ADR-0126 §8, ADR-0146 §3).
 //
 // Once the lock says a Hub runs (below), the daemon is read the way §7's
 // commands reach it, through reachHub (operator-client.ts): serve.lock's
@@ -78,7 +86,7 @@ import { VERSION } from "./version";
 // stderr, and with its line alone for a holder that recorded no port, a
 // page view that came back with an error, or any of reachHub's other
 // failures; 4 on skew; 2 for a data dir with no hub.json, as every command
-// that reads a Hub refuses it (§4), or off Linux.
+// that reads a Hub refuses it (§4), or on Windows.
 //
 // `status` changes no file, and reads the daemon through the lock (§3)
 // without writing it. With no serve.lock, no Hub has run here: exit 3, and
@@ -120,16 +128,25 @@ export type StatusOptions = {
 
 const PAGE_VIEW_PATH = "/page/view";
 
-// ADR-0119 §7's hints, by whether the default unit file exists: no
-// subprocess on this path, so a manager with its own config home gets the
-// hints for no unit (ADR-0120 §4's residual, the Headless client's too).
-function notRunning(env: Env, dataDir: string): CliError {
+// ADR-0119 §7's hints, by whether the default unit file exists, or on macOS
+// the LaunchAgent's plist (ADR-0146 §5): no subprocess on this path, so a
+// manager with its own config home gets the hints for no unit (ADR-0120 §4's
+// residual, the Headless client's too).
+function notRunning(env: Env, dataDir: string, platform: NodeJS.Platform): CliError {
+  const installed =
+    platform === "darwin"
+      ? existsSync(agentPlistPath({ label: LABEL }, env))
+      : existsSync(defaultUnitPath(UNIT, env));
+  const start =
+    platform === "darwin"
+      ? `launchctl kickstart ${shellTarget({ label: LABEL })}`
+      : "systemctl --user start maxprice-hub";
   return new CliError(
     EXIT.NOT_RUNNING,
     `maxprice-hub is not running for ${displayPath(dataDir, env)}`,
-    existsSync(defaultUnitPath(UNIT, env))
+    installed
       ? [
-          { label: "Start it:", command: "systemctl --user start maxprice-hub" },
+          { label: "Start it:", command: start },
           { label: "Why it stopped:", command: "maxprice-hub service logs" },
         ]
       : [
@@ -152,12 +169,19 @@ function corruptRecord(env: Env, dataDir: string, holder: ServeLockHolder): CliE
 // Where the daemon lives, as serve.lock says. The report's path is absolute
 // even for a relative MAXPRICE_HUB_DATA_DIR. The lookup and diagnostics keep
 // the configured spelling; only the reported fact needs the absolute path.
-function daemonFacts(dataDir: string, holder: ServeLockHolder) {
+// `inUnit` is whether the holder runs in the unit, or on macOS the
+// LaunchAgent (serve-lock.ts's withService).
+function daemonFacts(
+  dataDir: string,
+  holder: ServeLockHolder,
+  env: Env,
+  platform: NodeJS.Platform,
+) {
   return {
     dataDir: resolve(dataDir),
     pid: holder.pid,
     port: holder.port,
-    inUnit: holder.service,
+    inUnit: withService(holder, env, platform).service,
   };
 }
 
@@ -240,7 +264,11 @@ function updateCheckRow(answered: Answered | null, inUnit: boolean, update: Upda
           mark: "warn",
           label: "Update",
           detail,
-          remedy: "systemctl --user restart maxprice-hub",
+          // On macOS the holder runs in the LaunchAgent (ADR-0146 §5).
+          remedy:
+            process.platform === "darwin"
+              ? `launchctl kickstart -k ${shellTarget({ label: LABEL })}`
+              : "systemctl --user restart maxprice-hub",
         }
       : { mark: "warn", label: "Update", detail: `${detail}: restart serve to finish the update` };
   }
@@ -296,7 +324,7 @@ function rows(
       label: "Daemon",
       // describeHolder's words. A report names the lock's holder, which runs:
       // it answered, or the kernel holds the lock for it.
-      detail: `${describeHolder({ pid: report.pid, port: report.port, running: true, service: report.inUnit }, UNIT)} · 127.0.0.1:${report.port}`,
+      detail: `${describeHolder({ pid: report.pid, port: report.port, running: true, service: report.inUnit }, serviceName())} · 127.0.0.1:${report.port}`,
     },
   ];
 }
@@ -481,10 +509,12 @@ export async function hubStatus(
     reach = {},
   }: StatusOptions = {},
 ): Promise<number> {
-  if (platform !== "linux") throw new CliError(EXIT.USAGE, "maxprice-hub status is Linux only");
+  if (!runsHeadlessHub(platform)) {
+    throw new CliError(EXIT.USAGE, "maxprice-hub status is Linux only");
+  }
   const dataDir = requireHub(env, platform);
   const refuseFree = (): never => {
-    throw notRunning(env, dataDir);
+    throw notRunning(env, dataDir, platform);
   };
 
   // The lock, asked read-only (above): free, or no file at all, is no Hub.
@@ -518,7 +548,7 @@ export async function hubStatus(
       ...view.data,
       state: hubDaemonState(false, view.data, undefined, false),
       keys: reportKeys(status.data.accounts, labels),
-      ...daemonFacts(dataDir, hub.holder),
+      ...daemonFacts(dataDir, hub.holder, env, platform),
     });
     // The view parsed, so only the lock's record can fail here: digits that
     // name no pid or port a Hub writes, pid 0, say.
@@ -548,7 +578,7 @@ export async function hubStatus(
       const report = hubStatusReportSchema.safeParse({
         service: "maxprice-hub",
         state: "not-responding",
-        ...daemonFacts(dataDir, error.holder),
+        ...daemonFacts(dataDir, error.holder, env, platform),
       });
       if (report.success) print(io, json, report.data, env, now());
     }

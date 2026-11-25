@@ -4,27 +4,23 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { listen } from "@tauri-apps/api/event";
 import {
-  activeBlockOf,
-  blocksHeadAccountNotKnown,
-  homeMembershipOf,
   organizationLabelMap,
-  popoutHeadMembership,
+  type OrganizationEntry,
   popoutQueryInputs,
   popoutQuotaTag,
   popoutReadings,
-  rankedHeadBlocksInput,
   scopeMembershipReadings,
   type PopoutReadings,
   type RankedPopoutViewInput,
+  type ScopeMembershipReading,
   statusSnapshotSchema,
   type StatusSnapshot,
   type TrackedMembership,
-  withAccountNotKnown,
 } from "@maxprice/shared";
+import { rosterWindowState } from "@/lib/organization-scope-view";
 import { sidecarExited, sidecarFetch } from "@/lib/sidecar";
 import { insideTauri } from "@/lib/tauri";
 import { applyStoredTheme } from "@/lib/theme";
-import { blocksQueryKey, fetchBlocks } from "./use-blocks";
 import { dailyQueryKey, fetchDaily } from "./use-daily";
 import {
   accountsQueryKey,
@@ -45,7 +41,9 @@ import { useSettings } from "./use-settings";
 //
 // Those fetches follow the persisted Scope (ADR-0106 §11, #637) through the
 // same `useScope` as the main window: the money queries carry the Scope's
-// tokens, usage current reads the Quota organization's entry. The settings
+// tokens, and the limits read the head Organization's usage current, or the
+// Scope's Memberships off `/api/accounts` on an install tracking two or more
+// Accounts (`popoutSource`). The settings
 // query is one of the queries `popout:shown` invalidates, so a Scope flip
 // made in the main window lands on the popout's next open.
 //
@@ -63,12 +61,12 @@ import { useSettings } from "./use-settings";
 // `refetchInterval` is silently conditioned on `focusManager.isFocused()`,
 // which resolves to `document.visibilityState !== "hidden"`; WebView2 leaves
 // that "visible" through a hide, so nothing anywhere stopped the timer. The
-// popout window is created hidden at process start, so four sidecar fetches
+// popout window is created hidden at process start, so its sidecar fetches
 // every 30s ran for the entire life of a resident tray app against a window
-// nobody could see — /api/blocks among them, which has no ADR-0057 report-cache
-// entry and so re-folds the whole corpus on every call.
+// nobody could see (an /api/blocks among them, until ADR-0142 retired it: it
+// re-folded the whole corpus on every call).
 //
-// The mount-time fetch is left alone deliberately: one round of four fetches at
+// The mount-time fetch is left alone deliberately: one round of fetches at
 // launch (the popout must be readable the instant the first tray click lands,
 // and `popout:shown` invalidates on top of it anyway), then silence until that
 // click.
@@ -141,9 +139,11 @@ const UPDATE_AVAILABLE_EVENT = "update:available";
 
 // /api/status, four-piece style (ADR-0004) — the popout needs `ready` +
 // `hasData` (the first-launch inset, which takes BOTH per ADR-0047; see
-// packages/shared/src/popout-view.ts) and `usageConnection` (the ADR-0030
-// limit-row dim), and the main window's copy lives in a zustand store fed by
-// its SSE channel, which a glance surface has no business standing up.
+// packages/shared/src/popout-view.ts), and `usageConnection` and the head
+// Organization's Limits answer and Window states (whether its limits can be
+// read, and which windows its plan reports), and the main window's copy lives
+// in a zustand store fed by its SSE channel, which a glance surface has no
+// business standing up.
 export function popoutStatusQueryKey(): [string] {
   return ["popout-status"];
 }
@@ -154,51 +154,88 @@ export async function fetchPopoutStatus(signal?: AbortSignal): Promise<StatusSna
   return statusSnapshotSchema.parse(await res.json());
 }
 
-// The readings are `popoutReadings`' over the four answers, shared with the
-// Headless client's `live`: ADR-0047's `ready`/`hasData` pair passed through
-// untouched so the view can apply `corpusIsEmpty` to both, and the Quota
-// organization's 5-hour Window state (#384) from the status the popout
-// already fetches.
+// The readings are `popoutReadings`' over the three answers: ADR-0047's
+// `ready`/`hasData` pair passed through untouched so the view can apply
+// `corpusIsEmpty` to both, and the head Organization's Limits answer and
+// Window states (#384) from the status the popout already fetches.
 export type PopoutData = PopoutReadings & {
   anyError: boolean;
   // The shell confirms the sidecar exited (ADR-0112). Raw: popoutView alone
   // decides whether that makes the down state a stop.
   engineStopped: boolean;
   settled: boolean;
-  // The Quota organization's label for the eyebrow (`popoutQuotaTag`).
+  // The head's Organization's label for the eyebrow (`popoutQuotaTag`): the
+  // one Membership's while the source is `membership`.
   quotaTag: string | null;
+  // Its plan word off the roster, null when unknown or not yet loaded.
+  plan: string | null;
   // The Scope is every tracked Membership, and more than one
   // (`ScopeView.isAll`): the Today row says so.
   allOrganizations: boolean;
-  // The ranked Popout's readings (#638) while `rankedPopoutMode` holds, else
-  // null: today's popout.
-  ranked: Pick<RankedPopoutViewInput, "memberships" | "headBlocks"> | null;
+  // The ranked Popout's readings (#638) while `popoutSource` is `ranked`,
+  // else null: the one-Membership Popout.
+  ranked: Pick<RankedPopoutViewInput, "memberships" | "plans" | "windowState"> | null;
 };
 
-// The ranked Popout (#638; #610's "head + ranked") draws over the Scope's
-// multi-Membership set: two or more Memberships, which only an install
-// tracking two or more Accounts has (`scopeMembershipSet`). A one-Account
-// install keeps today's popout under every Scope, All organizations
-// included, as the shell keeps its height (`/api/readout`'s
-// `popoutLimitRows`, read from the same set). Pure, for its test.
-export function rankedPopoutMode(set: readonly TrackedMembership[]): boolean {
-  return set.length >= 2;
+// What the Popout reads, by the Scope's multi-Membership set, which only an
+// install tracking two or more Accounts fills (`scopeMembershipSet`), as the
+// shell sizes it (`/api/readout`'s `popoutLimitRows`, read from the same
+// set):
+// - `head`: the set empty, as on a one-Account install under every Scope,
+//   All organizations included: the head Organization's usage current and
+//   status entry;
+// - `membership`: one Membership (#738): its own reading, connection and
+//   Limits answer off `/api/accounts`, as Live's card reads it, never its
+//   Organization's projection, which reads the Home Account's;
+// - `ranked`: two or more, the ranked Popout (#638; #610's "head + ranked").
+// Pure, for its test.
+export type PopoutSource = "head" | "membership" | "ranked";
+export function popoutSource(set: readonly TrackedMembership[]): PopoutSource {
+  return set.length === 0 ? "head" : set.length === 1 ? "membership" : "ranked";
 }
 
-// `now` is the popout's 1Hz tick: the ranked head is chosen by the windows
-// in flight at that moment, and its Blocks are asked for by its token.
-export function usePopoutData(now: number): PopoutData {
+// The one-Membership Popout's head: the set's one Membership while the
+// source is `membership` and `/api/accounts` has answered, its Organization
+// naming the eyebrow (`popoutQuotaTag`) and the plan; else the Scope's head
+// Organization. Pure, for its test.
+export type PopoutHeadSource = {
+  membership: ScopeMembershipReading | undefined;
+  organization: string | undefined;
+  quotaTag: string | null;
+  plan: string | null;
+};
+export function popoutHead(
+  source: PopoutSource,
+  readings: readonly ScopeMembershipReading[] | undefined,
+  quotaOrganization: string | undefined,
+  multi: boolean,
+  roster: readonly OrganizationEntry[] | undefined,
+): PopoutHeadSource {
+  const membership = source === "membership" ? readings?.[0] : undefined;
+  const organization = membership?.organizationUuid ?? quotaOrganization;
+  return {
+    membership,
+    organization,
+    quotaTag: popoutQuotaTag(multi, organization, roster),
+    plan: roster?.find((o) => o.uuid === organization)?.plan ?? null,
+  };
+}
+
+export function usePopoutData(): PopoutData {
   const { data: settings } = useSettings();
   const { params: scope, quotaOrganization, isAll, multi } = useScope();
   const { memberships: scopeSet } = useScopeMemberships();
-  const rankedMode = rankedPopoutMode(scopeSet);
+  const source = popoutSource(scopeSet);
+  const rankedMode = source === "ranked";
+  // The two sources that read the set read it off `/api/accounts`.
+  const readsSet = source !== "head";
   // Is this window on screen? FALSE is the truthful initial state: the popout
   // window is created hidden (`"visible": false` in tauri.conf.json) and stays
   // that way until the first tray click. Only the Rust pokes below move it —
   // nothing the renderer can read ever will.
   const [shown, setShown] = useState(false);
-  // Today's window and the blocks window, as `popoutQueryInputs` explains
-  // them; the Headless client's `live` requests the same two.
+  // Today's window, as `popoutQueryInputs` explains it; the Headless
+  // client's `live` requests the same.
   const inputs = popoutQueryInputs({
     mode: settings?.costMode ?? "auto",
     tz: settings?.timezone,
@@ -218,70 +255,55 @@ export function usePopoutData(now: number): PopoutData {
     retry: POPOUT_RETRY,
   });
   // `/api/accounts`, which `useScope` already reads on every popout: the
-  // Account roster that decides the mode, and in ranked mode every
-  // Membership's reading. This observer adds the deadline and, in ranked
-  // mode only, the popout's interval; on a one-Account install it fetches
-  // nothing `useScope` does not.
+  // Account roster that decides the source, and every Membership's reading
+  // while the Popout reads the set. This observer adds the deadline and,
+  // while it reads the set, the popout's interval; on a one-Account install
+  // it fetches nothing `useScope` does not.
   const accountsQ = useQuery({
     queryKey: accountsQueryKey(),
     queryFn: ({ signal }) => withDeadline(signal, (s) => fetchAccounts(s)),
-    refetchInterval: shown && rankedMode ? POPOUT_REFRESH_MS : false,
+    refetchInterval: shown && readsSet ? POPOUT_REFRESH_MS : false,
     retry: POPOUT_RETRY,
   });
-  // The roster, for the Quota organization's label, and in ranked mode every
-  // row's — fetched only on a machine that tracks more than one Organization
-  // or draws ranked, so a single-Organization, single-Account popout makes
-  // exactly its four fetches. Not part of `anyError`: a label is not a
-  // reading, so a failed roster leaves the eyebrow untagged (and ranked rows
-  // on the shared fallback label) rather than blanking the popout.
+  // The roster: the plan word (`none on Ultra`, ADR-0142 §2), the head
+  // Organization's label while more than one is tracked, and in ranked mode
+  // every row's name and Window states. Not part of `anyError`: a label is
+  // not a reading, so a failed roster leaves the eyebrow untagged, the plan
+  // unnamed (and ranked rows on the shared fallback label) rather than
+  // blanking the popout.
   const rosterQ = useQuery({
     queryKey: organizationsQueryKey(),
     queryFn: ({ signal }) => withDeadline(signal, (s) => fetchOrganizations(s)),
-    enabled: multi || rankedMode,
     retry: POPOUT_RETRY,
   });
   const roster = rosterQ.data?.organizations;
-  const rankedMemberships = useMemo(
+  // The set's readings while the Popout reads the set; undefined until
+  // `/api/accounts` answers.
+  const setReadings = useMemo(
     () =>
-      rankedMode
+      readsSet && accountsQ.data !== undefined
         ? scopeMembershipReadings(
             scopeSet,
-            accountsQ.data?.accounts ?? [],
+            accountsQ.data.accounts,
             organizationLabelMap(roster ?? []),
           )
-        : null,
-    [rankedMode, scopeSet, accountsQ.data, roster],
+        : undefined,
+    [readsSet, scopeSet, accountsQ.data, roster],
   );
-  const head = rankedMemberships === null ? null : popoutHeadMembership(rankedMemberships, now);
-  const headBlocksInput =
-    rankedMemberships === null ? null : rankedHeadBlocksInput(inputs.blocks, head);
-
-  // Ranked mode asks for the head Membership's own Blocks, or none while the
-  // head is idle; otherwise the Scope's, as ever.
-  const blocksInput = rankedMemberships === null ? inputs.blocks : headBlocksInput;
-  const blocksQ = useQuery({
-    queryKey: blocksQueryKey(blocksInput ?? inputs.blocks),
-    queryFn: ({ signal }) =>
-      withDeadline(signal, (s) => fetchBlocks(blocksInput ?? inputs.blocks, s)),
-    enabled: blocksInput !== null,
-    refetchInterval: shown ? POPOUT_REFRESH_MS : false,
-    retry: POPOUT_RETRY,
-  });
-  // Ranked rows read `/api/accounts`, so usage current is today's popout's
-  // alone.
+  const rankedMemberships = rankedMode ? (setReadings ?? []) : null;
+  const head = popoutHead(source, setReadings, quotaOrganization, multi, roster);
+  // The set's readings come off `/api/accounts`, so usage current is the
+  // head Organization's popout's alone.
   const usageQ = useQuery({
     queryKey: usageCurrentQueryKey(quotaOrganization),
     queryFn: ({ signal }) => withDeadline(signal, (s) => fetchUsageCurrent(s, quotaOrganization)),
-    enabled: !rankedMode,
+    enabled: !readsSet,
     refetchInterval: shown ? POPOUT_REFRESH_MS : false,
     retry: POPOUT_RETRY,
   });
 
   const anyError =
-    statusQ.isError ||
-    dailyQ.isError ||
-    (blocksInput !== null && blocksQ.isError) ||
-    (rankedMode ? accountsQ.isError : usageQ.isError);
+    statusQ.isError || dailyQ.isError || (readsSet ? accountsQ.isError : usageQ.isError);
   const exitQ = useQuery({
     queryKey: popoutSidecarExitQueryKey(),
     queryFn: () => sidecarExited(),
@@ -315,48 +337,41 @@ export function usePopoutData(now: number): PopoutData {
     };
   }, [queryClient]);
 
-  // Ranked mode has settled once the accounts it reads have answered (they
-  // have: the mode needs them), the head's Blocks too while it has one, and
-  // the roster, failed or not, so no row flashes the fallback label first.
+  // Settled once the roster has answered too, failed or not, so no row or
+  // note flashes the fallback label or plan first; while it reads the set,
+  // once the accounts it reads have answered (they have: the source needs
+  // them).
+  const rosterSettled = rosterQ.data !== undefined || rosterQ.isError;
   const settled =
     statusQ.data !== undefined &&
     dailyQ.data !== undefined &&
-    (blocksInput === null || blocksQ.data !== undefined) &&
-    (rankedMode
-      ? accountsQ.data !== undefined && (rosterQ.data !== undefined || rosterQ.isError)
-      : usageQ.data !== undefined);
+    rosterSettled &&
+    (readsSet ? accountsQ.data !== undefined : usageQ.data !== undefined);
 
   return {
     anyError,
     engineStopped: exitQ.data === true,
     settled,
     ...popoutReadings(
-      { status: statusQ.data, today: dailyQ.data, blocks: blocksQ.data, usage: usageQ.data },
+      {
+        status: statusQ.data,
+        today: dailyQ.data,
+        usage: usageQ.data,
+        ...(head.membership === undefined ? {} : { membership: head.membership }),
+      },
       inputs.todayYmd,
-      quotaOrganization,
+      head.organization,
     ),
-    // The head Blocks are the Unknown Membership's in place of an empty or
-    // idle Home membership (#644, #257): the eyebrow says "account not known".
-    quotaTag: withAccountNotKnown(
-      popoutQuotaTag(multi, quotaOrganization, rosterQ.data?.organizations),
-      blocksHeadAccountNotKnown(
-        blocksQ.data,
-        settings === undefined ? null : homeMembershipOf(settings),
-      ),
-    ),
+    quotaTag: head.quotaTag,
+    plan: head.plan,
     allOrganizations: isAll,
     ranked:
       rankedMemberships === null
         ? null
         : {
             memberships: rankedMemberships,
-            headBlocks:
-              head === null || headBlocksInput === null
-                ? null
-                : {
-                    token: head.key,
-                    block: activeBlockOf(blocksQ.data?.blocks ?? []) ?? null,
-                  },
+            plans: new Map((roster ?? []).map((o) => [o.uuid, o.plan])),
+            windowState: (uuid, window) => rosterWindowState(roster, uuid, window),
           },
   };
 }

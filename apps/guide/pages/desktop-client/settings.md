@@ -61,7 +61,7 @@ Under the cards, **Show model limit in tray popout** shows only when your plan h
 
 ### Connecting an Account
 
-Each claude.ai Account has its own [session key](../concepts/blocks.md#the-claudeai-session-key). Choose **+ Add account** beside **Claude** for a new one, **Connect** or **Reconnect** on a card, or a stale reading's **Reconnect**. The Connect step opens in place:
+Each claude.ai Account has its own [session key](../concepts/usage-limits.md#the-claudeai-session-key). Choose **+ Add account** beside **Claude** for a new one, **Connect** or **Reconnect** on a card, or a stale reading's **Reconnect**. The Connect step opens in place:
 
 ![Connect open under + Add account: the line saying MaxPrice reads which Account a key is from, the session key field with Connect and Cancel, and the line under it saying the key also goes to the Hub if the Hub holds no working key for that Account](../../screenshots/settings-connect.light.png "Connect, opened from + Add account")
 
@@ -71,7 +71,7 @@ Each claude.ai Account has its own [session key](../concepts/blocks.md#the-claud
 
 A key for another Account than the card you started from still connects: MaxPrice connects and tracks that Account and says **This key is for another Account**, naming it, while the one you started from stays as it was. claude.ai refusing the key, or a Claude Code token pasted by mistake, shows why under the field.
 
-Live's **Reconnect** links open this group with that Account's Connect already open. **⚠ Session expired — reconnect →** on its tiles does too when one Account's key expired; otherwise it opens the group, whose notice names each.
+Live's **Reconnect** and **Settings** links open this group with that Account's Connect already open.
 
 ### Gateways
 
@@ -116,7 +116,7 @@ The timezone MaxPrice counts days in and shows times in: where today starts, whi
 What **this week** means, for Live's [This week](live.md#this-week) tile, the **Week** Date range and the chart's **Week** span:
 
 - **Rolling 7d**, the default: today and the 6 days before.
-- **Limit reset**: since your [weekly limit](../concepts/blocks.md#usage-limits) last reset, as claude.ai reports it. Until there is a reading, it falls back to the last 7 days.
+- **Limit reset**: since your [weekly limit](../concepts/usage-limits.md) last reset, as claude.ai reports it. Until there is a reading, it falls back to the last 7 days.
 - **Custom**: since a weekday and time you choose, under **Week starts on** and **Week starts at**.
 
 The line under it says when this week started.

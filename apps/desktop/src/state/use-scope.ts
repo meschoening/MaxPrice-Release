@@ -15,7 +15,7 @@ import { useSettings } from "./use-settings";
 // `quotaOrganization` is the shared head rule's: settled from settings for
 // the common Scopes, else the sidecar's answer for the same params
 // (`/api/scope-head`), so the quota tiles read the Organization
-// `/api/usage/current` and `/api/blocks` head for that Scope.
+// `/api/usage/current` heads for that Scope.
 //
 // Memoized on the settings value, the Account list and the head's answer,
 // which TanStack's structural sharing keeps referentially stable until they

@@ -1,6 +1,6 @@
 import { cn } from "@/lib/utils";
 
-// Building blocks for the detail strip above the Sessions / Projects / Blocks
+// Building blocks for the detail strip above the Sessions / Projects
 // tables (ADR-0016), wearing the glass system (M4, ADR-0043).
 // The strip has two content modes the pages swap between: the selected row's
 // detail and the filter-wide aggregate ("filter totals"). Both render into the

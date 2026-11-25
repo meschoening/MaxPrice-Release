@@ -1,22 +1,24 @@
 import { terminalText } from "@maxprice/usage-core/terminal-text";
 import { CliError, EXIT, type Writer } from "./cli";
+import { runsHeadlessHub } from "./config";
 
 // What `maxprice-hub key` and `gateway` print with, and `status --json`:
 // their lines and tables through `terminalText` (ADR-0127 §11), since a path
 // the environment names, a label, a machine id and a Gateway's host all come
 // from outside this process, and their `--json` objects through
-// `terminalJson`. Their own refusal off Linux is here too.
+// `terminalJson`. Their own refusal on Windows is here too.
 
 // One line of output.
 export function say(out: Writer, line: string): void {
   out.write(`${terminalText(line)}\n`);
 }
 
-// ADR-0126 §9, ADR-0141 §7: the keys' file and the operator token are
-// Linux's; elsewhere the Hub keeps its keys in the keychain and its console
-// sets them. `elsewhere` names what to do there.
-export function linuxOnly(platform: NodeJS.Platform, elsewhere: string): void {
-  if (platform !== "linux") throw new CliError(EXIT.USAGE, `Linux only; ${elsewhere}`);
+// ADR-0126 §9, ADR-0141 §7, ADR-0146 §4: the keys' file and the operator
+// token are a Headless Hub's, on Linux and macOS; on Windows the Hub keeps its
+// keys in the keychain and its console sets them. `elsewhere` names what to
+// do there; the refusal's wording is the one it had before macOS.
+export function headlessOnly(platform: NodeJS.Platform, elsewhere: string): void {
+  if (!runsHeadlessHub(platform)) throw new CliError(EXIT.USAGE, `Linux only; ${elsewhere}`);
 }
 
 // An empty cell.

@@ -48,11 +48,12 @@ import { type SecretDeps, secretReader } from "./operator";
 import { createFileKeyStore, readHubSecrets, secretsPath } from "./secrets";
 import { readOnlyLockHolder } from "./serve-lock";
 import { createSetupTerminal } from "./setup-terminal";
-import { DASH, linuxOnly, say, terminalJson, terminalTable } from "./terminal-output";
+import { DASH, headlessOnly, say, terminalJson, terminalTable } from "./terminal-output";
 
 // `maxprice-hub key set|list|remove` (ADR-0126 §6, §9, ADR-0138 §7, §9,
 // ADR-0140 §6, §8): the claude.ai session keys the Hub holds, one per Account,
-// in secrets.json in its data dir. Linux only: elsewhere the Hub keeps its
+// in secrets.json in its data dir. A Headless Hub's, on Linux and macOS
+// (ADR-0146 §4): elsewhere the Hub keeps its
 // keys in the keychain and the console sets them. Each reaches the Hub as the
 // operator commands do (ADR-0127 §7): a running Hub through its own routes,
 // which store, list and remove the keys and apply each change at once; with
@@ -207,7 +208,7 @@ export async function setKey(
   io: Io,
   { env = process.env, platform = process.platform, label, ...deps }: KeySetOptions = {},
 ): Promise<KeySetResult> {
-  linuxOnly(platform, ELSEWHERE);
+  headlessOnly(platform, ELSEWHERE);
   const dataDir = requireHub(env, platform);
   let given: string | null = null;
   if (label !== undefined) {
@@ -452,7 +453,7 @@ export async function keyList(
   platform: NodeJS.Platform = process.platform,
   deps: Pick<KeyDeps, "reach"> = {},
 ): Promise<number> {
-  linuxOnly(platform, ELSEWHERE);
+  headlessOnly(platform, ELSEWHERE);
   const dataDir = requireHub(env, platform);
   const reached = await reachHub(dataDir, env, deps.reach);
   let rows: KeyListRow[];
@@ -509,7 +510,7 @@ export async function keyRemove(
   platform: NodeJS.Platform = process.platform,
   deps: Pick<KeyDeps, "reach" | "now"> = {},
 ): Promise<number> {
-  linuxOnly(platform, ELSEWHERE);
+  headlessOnly(platform, ELSEWHERE);
   const dataDir = requireHub(env, platform);
   if (account !== null && looksLikeKey(account)) {
     throw new CliError(

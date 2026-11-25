@@ -14,12 +14,11 @@ On a Linux server with no desktop, or a Mac that nobody sits at, use the [Headle
 
 ## What it shows
 
-The sidebar holds three reports and Settings:
+The sidebar holds two reports and Settings:
 
-- [Live](live.md): today's and this week's cost, the [Active block](../concepts/blocks.md#active-block), your [usage limits](../concepts/blocks.md#usage-limits) and a cost chart.
+- [Live](live.md): today's and this week's cost, your [usage limits](../concepts/usage-limits.md) and a cost chart.
 - [Projects](projects.md): your usage by [project](../concepts/projects.md), each project's Claude Code sessions, and the [detail](projects.md#session-detail) of one session.
-- [Blocks](blocks.md): your usage by [Block](../concepts/blocks.md#blocks), the 5-hour periods your plan limits.
-- [Settings](settings.md): where the logs are read from, your [claude.ai session key](../concepts/blocks.md#the-claudeai-session-key), a [Hub](../concepts/hubs.md), and the app itself.
+- [Settings](settings.md): where the logs are read from, your [claude.ai session key](../concepts/usage-limits.md#the-claudeai-session-key), a [Hub](../concepts/hubs.md), and the app itself.
 
 The [filters](filters.md) and the [Scope](filters.md#the-scope), which chooses whose usage counts by [Account and Organization](../concepts/organizations.md), narrow every report. **Find**, at the topbar's right, finds a session, a project or a setting from any page: see [Find](#find).
 

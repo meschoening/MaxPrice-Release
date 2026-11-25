@@ -38,19 +38,21 @@ export const EXIT = {
   // version within 30 s.
   FAILURE: 1,
   // A usage error, a secret given as an argument or not at all, `key`,
-  // `gateway`, `status`, `restore`, `service` or `update` off Linux, no Hub
+  // `gateway`, `status` or `restore` on Windows, `service` off Linux and
+  // macOS, `update` off Linux, no Hub
   // at the data dir, an invalid password or management key, a machine a
   // command cannot act on, an Account or an Organization a name does not
   // match alone (ADR-0140 §2), an Account that holds no key, a label `label`
   // cannot write, a Gateway URL that is none or names no Gateway the Hub
   // holds (ADR-0141 §8), a backup
   // restore cannot use, or a data dir that already holds a Hub's files; an
-  // invalid Hub page URL, or none set; `setup` off Linux, as root, off a
-  // terminal, or with a data dir the unit does not or would not serve.
+  // invalid Hub page URL, or none set; `setup` off Linux and macOS, as
+  // root, off a terminal, or with a data dir the unit or agent does not or
+  // would not serve.
   USAGE: 2,
   // `status` found no Hub running on the data dir (ADR-0127 §8), `service
-  // status` found the unit not active or not installed, or `service logs`
-  // found it not installed: ADR-0119 §6's "not running" code, which is
+  // status` found the unit or agent not active or not installed, or
+  // `service logs` found it not installed: ADR-0119 §6's "not running" code, which is
   // LSB's.
   NOT_RUNNING: 3,
   // The running Hub answered 409 on the protocol check: it speaks another
@@ -156,33 +158,50 @@ export type Verb = {
 };
 
 const DATA_DIR = `The data dir is MAXPRICE_HUB_DATA_DIR when it is set. Otherwise it is
-$XDG_DATA_HOME/maxprice-hub on Linux, or ~/.local/share/maxprice-hub when
-XDG_DATA_HOME is unset or not absolute; %APPDATA%\\maxprice-hub on Windows;
-and ~/Library/Application Support/maxprice-hub on macOS.`;
+$XDG_DATA_HOME/maxprice-hub on Linux and macOS, or
+~/.local/share/maxprice-hub when XDG_DATA_HOME is unset or not absolute;
+%APPDATA%\\maxprice-hub on Windows. The hub tray app's daemon on macOS keeps
+~/Library/Application Support/maxprice-hub.`;
 
 // What the four commands that act on the Hub's data share (ADR-0127 §7):
 // the running Hub's own route while one holds the data dir, else its files.
-const OPERATOR = `On Linux the data dir's serve.lock says whether a Hub runs there. While
-one does, the command goes through that Hub's own route, as the console
-does, with the data dir's operator-token, and the change applies at once,
-with no restart; the Hub must answer within 10 s. With the lock free, the
-command holds it and edits the data dir's files itself. Elsewhere it edits
-the files, and refuses while anything answers /healthz on hub.json's port.
+const OPERATOR = `On Linux and macOS the data dir's serve.lock says whether a Hub runs
+there. While one does, the command goes through that Hub's own route, as
+the console does, with the data dir's operator-token, and the change
+applies at once, with no restart; the Hub must answer within 10 s. With the
+lock free, the command holds it and edits the data dir's files itself.
+Elsewhere it edits the files, and refuses while anything answers /healthz
+on hub.json's port.
 It refuses a data dir with no hub.json: only serve or setup makes one, or
 restore copies one from a backup.
 
 ${DATA_DIR}`;
 
-const OPERATOR_EXIT_1 = `  1  On Linux, a Hub runs on the data dir but did not answer within 10 s
-     (see maxprice-hub service logs), serve.lock held a pid alone all that
-     time (a serve still starting, or another command at work), the Hub
-     refused the operator token or its status probe, sent an answer this
-     maxprice-hub cannot read, stopped while it waited, or was lost;
-     elsewhere, a Hub answers /healthz on hub.json's port; or flock failed
+const OPERATOR_EXIT_1 = `  1  On Linux and macOS, a Hub runs on the data dir but did not answer
+     within 10 s (see maxprice-hub service logs), serve.lock held a pid
+     alone all that time (a serve still starting, or another command at
+     work), the Hub refused the operator token or its status probe, sent an
+     answer this maxprice-hub cannot read, stopped while it waited, or was
+     lost; elsewhere, a Hub answers /healthz on hub.json's port; or flock failed
      on serve.lock`;
 
-const SKEW_EXIT_4 = `  4  On Linux, the running Hub speaks another Hub protocol: restart it to
-     finish the update`;
+const SKEW_EXIT_4 = `  4  On Linux and macOS, the running Hub speaks another Hub protocol:
+     restart it to finish the update`;
+
+// The help that differs by platform: on macOS the service is a LaunchAgent
+// (ADR-0146 §5–§7), on Linux a systemd user unit. Linux's text is as it was.
+const ON_MAC = process.platform === "darwin";
+
+const SERVE_LOGS = ON_MAC
+  ? `It logs to stdout and stderr; under its LaunchAgent both go to serve.log in
+the data dir.
+
+Under launchd, with MAXPRICE_SUPERVISOR=launchd as its LaunchAgent sets it,
+it bounds its own relaunches: a sixth start within 15 minutes, or another
+maxprice-hub holding the data dir, is recorded in relaunch.json in the data
+dir, and it exits 0, which launchd does not relaunch. It also moves a
+serve.log past 10 MB to serve.log.1 at boot.`
+  : "It logs to stdout and stderr; under systemd both go to the journal.";
 
 const SERVE_HELP = `Usage: maxprice-hub serve
 
@@ -194,19 +213,20 @@ ${DATA_DIR}
 
 serve creates the data dir and its hub.json, whose port and bind it serves
 on, when they are missing; otherwise only setup makes them, or restore,
-from a backup. On Linux it tightens the data dir to 0700 and holds a lock on
-serve.lock there, which records its pid and port, so one Hub runs per data
-dir. A lock another process holds it asks again for, every ${SERVE_LOCK_POLL_MS} ms for
-${SERVE_LOCK_RETRY_MS} ms, before it reads hub.json or binds anything. It refuses a data dir
-holding .restore-staging, which a restore killed while it placed its files
-leaves: move that data dir aside and restore again.
+from a backup. On Linux and macOS it tightens the data dir to 0700 and
+holds a lock on serve.lock there, which records its pid and port, so one
+Hub runs per data dir. A lock another process holds it asks again for,
+every ${SERVE_LOCK_POLL_MS} ms for ${SERVE_LOCK_RETRY_MS} ms, before it reads hub.json or binds anything.
+It refuses a data dir holding .restore-staging, which a restore killed
+while it placed its files leaves: move that data dir aside and restore
+again.
 
-On Linux it checks the update channel at boot and every 6 hours, writes
-what it found to update-check.json (0600) in the data dir, which
+On Linux and macOS it checks the update channel at boot and every 6 hours,
+writes what it found to update-check.json (0600) in the data dir, which
 'maxprice-hub status' shows, and logs a newer version once. It never
 installs anything: 'maxprice-hub update' does.
 
-It logs to stdout and stderr; under systemd both go to the journal.
+${SERVE_LOGS}
 
 SIGTERM, SIGINT and SIGHUP stop it cleanly, with exit 0.
 
@@ -228,7 +248,8 @@ describes its own: the Hub row (Online, Local only, Event sync down or Not
 responding), the claude.ai row, the Access row and the connected clients;
 then the session key (set or not, when and by whom, never any part of it),
 the Gateways, the Hub's version, Update, the data dir, and the pid and port
-serve.lock records. A row that has a fix names its command. Linux only.
+serve.lock records. A row that has a fix names its command. Linux and
+macOS only.
 
 With several Accounts, the claude.ai row counts them, as in '2 of 3
 connected · 1 expired', every Account the Hub knows counted, one it holds
@@ -253,13 +274,14 @@ command at work) prints no rows. status changes no file: it holds
 serve.lock only for the instant it asks it, which a serve starting just
 then waits out, asking again for ${SERVE_LOCK_RETRY_MS} ms. It refuses a data dir
 with no hub.json: only serve or setup makes one, or restore copies one
-from a backup. 'maxprice-hub service status' describes the systemd unit
-instead.
+from a backup. 'maxprice-hub service status' describes the systemd unit,
+or on macOS the LaunchAgent, instead.
 
 Options:
   --json  Print one object instead: the Hub page's view of the Hub, the Hub
           row's state, the keys, the data dir, the pid, the port and whether
-          the pid runs in maxprice-hub.service; for a Hub that recorded its
+          the pid runs in maxprice-hub.service (on macOS, the LaunchAgent
+          com.maxprice.headless-hub); for a Hub that recorded its
           port but did not answer, the state "not-responding" with the last
           four alone. It has no Update and reads no update-check.json
 
@@ -274,7 +296,7 @@ Exit codes:
      view, sent an answer this maxprice-hub cannot read, or stopped while it
      waited; serve.lock records a pid or port no Hub writes; or flock failed
      on serve.lock
-  2  A bad option or an argument, not Linux, or no Hub at the data dir
+  2  A bad option or an argument, Windows, or no Hub at the data dir
   3  No Hub runs on the data dir
 ${SKEW_EXIT_4}
 `;
@@ -291,15 +313,15 @@ typed; otherwise it reads all of stdin, as in
 'maxprice-hub password set < password.txt'. The password is never an
 argument: argv lands in shell history and ps.
 
-On Linux the data dir's serve.lock says whether a Hub runs there. While one
-does, the command sends the change to that Hub's own route, as the console
-does, with the data dir's operator-token, and the Hub applies it at once,
-with no restart; the Hub must answer within 10 s. With the lock free, the
-command holds it and rewrites hub.json, which the Hub reads when it starts.
-Elsewhere it rewrites hub.json without checking for a running Hub, which
-applies the change only once it restarts. It refuses a data dir with no
-hub.json: only serve or setup makes one, or restore copies one from a
-backup.
+On Linux and macOS the data dir's serve.lock says whether a Hub runs there.
+While one does, the command sends the change to that Hub's own route, as
+the console does, with the data dir's operator-token, and the Hub applies
+it at once, with no restart; the Hub must answer within 10 s. With the lock
+free, the command holds it and rewrites hub.json, which the Hub reads when
+it starts. Elsewhere it rewrites hub.json without checking for a running
+Hub, which applies the change only once it restarts. It refuses a data dir
+with no hub.json: only serve or setup makes one, or restore copies one
+from a backup.
 
 ${DATA_DIR}
 
@@ -307,12 +329,12 @@ Ctrl-C at a prompt stops with exit 130, having written nothing.
 
 Exit codes:
   1  The two entries did not match, flock failed on serve.lock, or hub.json
-     cannot be written; on Linux, a running Hub did not answer within 10 s
-     (see maxprice-hub service logs), serve.lock held a pid alone all that
-     time (a serve still starting, or another command at work), or the Hub
-     refused the operator token, its status probe or the change, sent an
-     answer this maxprice-hub cannot read, stopped while it waited, or was
-     lost
+     cannot be written; on Linux and macOS, a running Hub did not answer
+     within 10 s (see maxprice-hub service logs), serve.lock held a pid
+     alone all that time (a serve still starting, or another command at
+     work), or the Hub refused the operator token, its status probe or the
+     change, sent an answer this maxprice-hub cannot read, stopped while it
+     waited, or was lost
   2  A bad command or option, a password given as an argument, no Hub at
      the data dir, or no password or an invalid one
 ${SKEW_EXIT_4}
@@ -326,8 +348,8 @@ const KEY_HELP = `Usage: maxprice-hub key set [--label <label>]
 
 Store, list or remove the claude.ai session keys the Hub polls the Usage
 limits with. The Hub holds one key per claude.ai Account, in secrets.json in
-the data dir, readable by this user alone (0600). Linux only: elsewhere the
-Hub keeps its keys in the keychain, and the console sets them.
+the data dir, readable by this user alone (0600). Linux and macOS only: on
+Windows the Hub keeps its keys in the keychain, and the console sets them.
 
 Verbs:
   set     Read the key, check it with claude.ai, then hand it to the running
@@ -393,7 +415,7 @@ Exit codes:
      waited, or was lost, flock failed on serve.lock, secrets.json cannot be
      written, or set stored the key and the label was refused or not
      written
-  2  A bad command or option, an argument after set or list, not Linux, no
+  2  A bad command or option, an argument after set or list, Windows, no
      Hub at the data dir, no key given, an empty or too long --label, an
      <account> that matches no Account or several, or that holds no key,
      no unfiled key to remove, or remove given both or neither of
@@ -447,8 +469,9 @@ name the Membership each request was billed to. CLIProxyAPI is the one
 MaxPrice reads. Each is keyed by its URL, its management address, http://
 or https://. The Hub keeps each
 management key in secrets.json in the data dir, readable by this user alone
-(0600), and each URL in gateways.json beside it. Linux only: elsewhere the
-Hub keeps the keys in the keychain, and the console connects them.
+(0600), and each URL in gateways.json beside it. Linux and macOS only: on
+Windows the Hub keeps the keys in the keychain, and the console connects
+them.
 
 Verbs:
   connect  Read the management key, check it with the Gateway (one read of
@@ -501,8 +524,8 @@ Exit codes:
      failing its own check, sent an answer this maxprice-hub cannot read,
      stopped while it waited, or was lost, flock failed on serve.lock, or
      secrets.json or gateways.json cannot be written
-  2  A bad command or option, a missing <url> or an extra argument, not
-     Linux, no Hub at the data dir, a <url> that is not a Gateway's URL or
+  2  A bad command or option, a missing <url> or an extra argument,
+     Windows, no Hub at the data dir, a <url> that is not a Gateway's URL or
      Id, or that names no Gateway the Hub holds, or no management key given
      or an invalid one
 ${SKEW_EXIT_4}
@@ -598,9 +621,9 @@ history, for the Hub's own samples since the backup; give it once for each
 client. A sample the history already holds is dropped, and a line that is
 not a sample is skipped.
 
-It runs on Linux only, with the Hub stopped: it holds the data dir's
-serve.lock while it works, and refuses while anything else holds it or
-<dir>'s, or when <dir>'s events.sqlite changes while it is copied. It
+It runs on Linux and macOS only, with the Hub stopped: it holds the data
+dir's serve.lock while it works, and refuses while anything else holds it
+or <dir>'s, or when <dir>'s events.sqlite changes while it is copied. It
 refuses a data dir that already holds any of a Hub's files. A refused
 restore, or one that fails before it places a file, leaves no restored
 file there; one killed or failing while it places them leaves
@@ -618,14 +641,14 @@ Exit codes:
      backup file cannot be read, flock failed on a serve.lock, a copy,
      write, rename or fsync failed (a failure once a file is placed keeps
      .restore-staging), or the merged usage history did not read back
-  2  A bad option or argument, not Linux, no Hub to restore at <dir>, <dir>
+  2  A bad option or argument, Windows, no Hub to restore at <dir>, <dir>
      is the data dir or holds it, an input that overlaps .restore-staging,
      an unsafe serve.lock in the data dir, a data dir that already holds a
      Hub's files, a backup file restore cannot use, or a --samples file
      that cannot be read or has lines but no sample
 `;
 
-const SERVICE_HELP = `Usage: maxprice-hub service <install|uninstall|status|logs> [options]
+export const SERVICE_HELP_LINUX = `Usage: maxprice-hub service <install|uninstall|status|logs> [options]
 
 Run the Hub as a systemd user unit, maxprice-hub.service, in the user
 manager's config home (~/.config/systemd/user/maxprice-hub.service by
@@ -678,6 +701,63 @@ Exit codes:
      logs: the unit is not installed
 `;
 
+export const SERVICE_HELP_MACOS = `Usage: maxprice-hub service <install|uninstall|status|logs> [options]
+
+Run the Hub as a LaunchAgent in your login session
+(~/Library/LaunchAgents/com.maxprice.headless-hub.plist). It runs while you
+are logged in to this Mac, and starts again at your next login. Start it,
+or with -k restart it, with launchctl:
+  launchctl kickstart [-k] gui/$(id -u)/com.maxprice.headless-hub
+
+The agent runs 'maxprice-hub serve', which launchd starts again 10 s after
+a crash or a failed first bind (exit 1). serve bounds that itself: a sixth
+start within 15 minutes, or another maxprice-hub holding the data dir, is
+recorded in relaunch.json in the data dir, and serve exits 0, which launchd
+does not relaunch.
+
+Verbs:
+  install    Write the plist when it changed, load it and start the agent.
+             It clears the relaunch count in relaunch.json, makes the data
+             dir, bakes in MAXPRICE_HUB_DATA_DIR when this shell sets it, a
+             relative one made absolute against this directory, restarts a
+             running Hub when the file changed, and warns when the hub tray
+             app keeps a Hub on this Mac too.
+  uninstall  Unload the agent, which stops it, and remove its plist. The data
+             dir, its secrets.json, serve.log and relaunch.json stay.
+  status     The agent's state, pid, runs and last exit; why it stopped, from
+             relaunch.json, and its starts in the last 15 minutes; whether it
+             runs this maxprice-hub and serves this shell's data dir; whether
+             a Hub answers /healthz on the port the data dir's serve.lock
+             records; and who holds that lock when the agent stopped on it.
+  logs       The agent's log: tail on serve.log in its data dir. It exits
+             with tail's own code.
+
+Options for logs:
+  -f, --follow     Follow the log
+  -n, --lines <N>  Show the last N lines
+
+The data dir is MAXPRICE_HUB_DATA_DIR when it is set, else
+$XDG_DATA_HOME/maxprice-hub, or ~/.local/share/maxprice-hub when
+XDG_DATA_HOME is unset or not absolute. The agent never sees this shell's
+XDG_DATA_HOME, so when only that moves the data dir, set
+MAXPRICE_HUB_DATA_DIR before install; status flags an agent whose data dir
+is not this shell's, and setup refuses such a shell.
+
+With no launchd GUI session for this user, every verb fails; log in to this
+Mac, or run 'maxprice-hub serve' under a LaunchDaemon instead (the README
+shows one).
+
+Exit codes:
+  1  No launchd GUI session for this user, a launchctl step failed, or tail
+     is not on PATH
+  2  A bad verb or option, an argument after the verb, -f or -n with a verb
+     other than logs, or a -n that is not a whole number
+  3  status: the agent is not running or not installed;
+     logs: the agent is not installed
+`;
+
+const SERVICE_HELP = ON_MAC ? SERVICE_HELP_MACOS : SERVICE_HELP_LINUX;
+
 const UPDATE_HELP = `Usage: maxprice-hub update [--check [--json]]
 
 Install the newest maxprice-hub from the update channel over this binary. It
@@ -686,8 +766,9 @@ version, newer than this maxprice-hub, and its binary runs here and prints
 that version; anything else leaves this binary as it is. There is no
 downgrade and no rollback: the previous release stays on its release page.
 
-The channel is the Headless Hub's own, headless-hub-latest.json. Linux only:
-the hub tray app updates itself, its daemon included, through its own
+The channel is the Headless Hub's own, headless-hub-latest.json, with an
+entry for Linux x64 and one for macOS on Apple silicon. Linux and macOS
+only: the hub tray app updates itself, its daemon included, through its own
 updater.
 
 It never runs sudo: this user must be able to read, write and search the
@@ -697,11 +778,14 @@ After the swap, a running maxprice-hub.service whose ExecStart is this
 binary is restarted with 'systemctl --user restart maxprice-hub.service',
 and update waits up to 30 s for the restarted Hub to report the new version
 on its /page/view, at the port serve.lock records in the unit's data dir.
-One that runs another binary is left running, and update says so.
-Otherwise a 'maxprice-hub serve' run outside the unit on this shell's data
-dir is left running, and update says to restart it; with no such serve,
-update only swaps. Run as root, as for a shared /usr/local/bin, it restarts
-nothing: each user restarts their own unit.
+On macOS the same goes for a running LaunchAgent com.maxprice.headless-hub
+whose program is this binary, restarted with 'launchctl kickstart -k
+gui/<uid>/com.maxprice.headless-hub', in the agent's data dir. One that
+runs another binary is left running, and update says so. Otherwise a
+'maxprice-hub serve' run outside the service on this shell's data dir is
+left running, and update says to restart it; with no such serve, update
+only swaps. Run as root, as for a shared /usr/local/bin, it restarts
+nothing: each user restarts their own service.
 
 A Headless Hub's serve checks the channel at boot and every 6 hours, and
 never installs anything; 'maxprice-hub status' shows what it found on its
@@ -715,8 +799,8 @@ Options:
 
 This shell's data dir is MAXPRICE_HUB_DATA_DIR when it is set, else
 $XDG_DATA_HOME/maxprice-hub, or ~/.local/share/maxprice-hub when
-XDG_DATA_HOME is unset or not absolute. The unit's is found the same way
-from the unit's own Environment, never this shell's.
+XDG_DATA_HOME is unset or not absolute. The unit's, or the agent's, is
+found the same way from its own environment, never this shell's.
 
 Exit codes:
   0  Success; with --check, this maxprice-hub is current
@@ -724,7 +808,8 @@ Exit codes:
      and this binary is unchanged; or, with this binary already replaced,
      the restart failed or the restarted Hub did not report the new version
      within 30 s (see maxprice-hub service logs)
-  2  A bad option or an argument, --json without --check, or not Linux
+  2  A bad option or an argument, --json without --check, or not Linux or
+     macOS
   100  --check found a newer maxprice-hub
 `;
 
@@ -740,17 +825,19 @@ it prints an Apache snippet, and you install it with sudo.
 
 page reports the Hub page URL, the loopback target, a reading and the
 one-line contract for any other web server. With a URL set, it first asks
-/healthz whether the Hub runs: on Linux at the port serve.lock records,
-elsewhere at hub.json's port. It then fetches <url>view, waiting at most
-5 s, and reads published, another Hub's page, something other than the Hub
-page, the web server refusing this machine (403), the snippet not installed
-(404), the web server unable to reach the Hub (502 or 503), another status,
-or no answer. It asks both directly, never through a proxy HTTP_PROXY or
-its kin name. A stopped Hub reads Hub not running. While the Hub runs and
-the page is not published, page prints the steps that install the snippet
-on Debian or Ubuntu's Apache, sudo a2enmod proxy_http first. With no URL
-set, or a stored one that is not valid, which it names and the Hub treats
-as unset, it exits 0 and names the SSH tunnel route instead:
+/healthz whether the Hub runs: on Linux and macOS at the port serve.lock
+records, elsewhere at hub.json's port. It then fetches <url>view, waiting
+at most 5 s, and reads published, another Hub's page, something other than
+the Hub page, the web server refusing this machine (403), the snippet not
+installed (404), the web server unable to reach the Hub (502 or 503),
+another status, or no answer. It asks both directly, never through a
+proxy HTTP_PROXY or its kin name. A stopped Hub reads Hub not running.
+While the Hub runs and the page is not published, page prints the steps
+that install the snippet: on Linux for Debian or Ubuntu's Apache, sudo
+a2enmod proxy_http first, and on macOS for Apple's, its two proxy
+LoadModule lines first. With no URL set, or a stored one that is not
+valid, which it names and the Hub treats as unset, it exits 0 and names
+the SSH tunnel route instead:
 ssh -L <port>:127.0.0.1:<port> to the Hub's machine, then the loopback
 target.
 
@@ -786,18 +873,22 @@ Exit codes:
 const SETUP_HELP = `Usage: maxprice-hub setup
 
 Walk the Hub's setup on a terminal, in four steps: the claude.ai session
-keys, the Hub password, the Hub page URL and maxprice-hub.service. Each step
-runs its command's own code, key set, password set or clear, page set or
-clear, and service install, and has that command's effect; setup adds only
-the questions around them. Linux only: the hub tray app sets itself up.
+keys, the Hub password, the Hub page URL and maxprice-hub.service, or on
+macOS the LaunchAgent com.maxprice.headless-hub. Each step runs its
+command's own code, key set, password set or clear, page set or clear, and
+service install, and has that command's effect; setup adds only the
+questions around them. Linux and macOS only: the hub tray app sets itself
+up.
 
 Before it creates anything, it refuses root, since the Hub runs as its own
 user; a stdin that is not a terminal, listing the commands to run in its
-place, in order; and, with a systemd user manager, an installed
-maxprice-hub.service that serves another data dir than this shell's, or a
-shell from which the unit would serve another once installed: the unit
-never sees XDG_DATA_HOME, so where that alone moves the data dir, set
-MAXPRICE_HUB_DATA_DIR instead.
+place, in order; and, with a systemd user manager, or on macOS a launchd
+GUI session, an installed maxprice-hub.service or LaunchAgent that serves
+another data dir than this shell's, or a shell from which it would serve
+another once installed: neither sees XDG_DATA_HOME, so where that alone
+moves the data dir, set MAXPRICE_HUB_DATA_DIR instead. On macOS it warns,
+and goes on, when the hub tray app keeps a Hub on this Mac too: run one
+Hub per Mac.
 
 It first makes the data dir (0700) and its hub.json when they are missing,
 as serve does, so the Hub's first start already has its key and password.
@@ -815,17 +906,20 @@ each key it stores, it asks that Account's label as key set does (Enter
 skips), then for another key, and Enter ends the step. Each key is stored
 as it is accepted, and Ctrl-C keeps every key stored before it. Step 1
 removes no key: key remove does.
-An installed unit is installed again without a question, which restarts
-the Hub only when the unit's file changed.
+An installed unit or agent is installed again without a question, which
+restarts the Hub only when its file changed.
 
-At the end it waits up to 10 s for the Hub, when step 4 started the unit or
-serve.lock names a running Hub, and reads the Hub page as page does. It then
-lists the sudo steps still missing: loginctl enable-linger while the unit is
-installed and linger is off, and those that install the Apache snippet while
-the page is not published. Enter checks again, and q finishes. Last, it
-prints the address clients join. With no Hub running and none started, it
-says how to start serve under your own init, or, after an install that
-failed, to run service install again once fixed, and exits 0.
+At the end it waits up to 10 s for the Hub, when step 4 started the service
+or serve.lock names a running Hub, and reads the Hub page as page does. It
+then lists the sudo steps still missing: loginctl enable-linger while the
+unit is installed and linger is off, on Linux, and those that install the
+Apache snippet while the page is not published, for Apple's Apache on
+macOS. Enter checks again, and q finishes. On macOS, with the agent
+installed, it then says the Hub starts when you log in to this Mac. Last,
+it prints the address clients join. With no Hub running and none started,
+it says how to start serve under your own init, or a LaunchDaemon on
+macOS, or, after an install that failed, to run service install again once
+fixed, and exits 0.
 
 It never sets bind or port: edit them in hub.json, then restart the Hub.
 
@@ -833,14 +927,15 @@ ${DATA_DIR}
 
 Exit codes:
   1  The Hub did not answer within 10 s, at the start or at the end
-     (maxprice-hub service logs says why when the unit runs it), refused
+     (maxprice-hub service logs says why when the service runs it), refused
      the operator token or its status probe, sent an answer this
      maxprice-hub cannot read, or stopped while it waited; flock failed on
      serve.lock, or the data dir holds a restore that did not finish
      (.restore-staging)
-  2  An argument or option, not Linux, root, stdin not a terminal, or a
-     maxprice-hub.service that serves, or once installed from this shell
-     would serve, another data dir than this shell's
+  2  An argument or option, not Linux or macOS, root, stdin not a
+     terminal, or a maxprice-hub.service or LaunchAgent that serves, or
+     once installed from this shell would serve, another data dir than
+     this shell's
 ${SKEW_EXIT_4}
   130  Ctrl-C at a prompt, or Ctrl-D on an empty visible one; every step
        completed before it is kept
@@ -859,7 +954,7 @@ export const VERBS: Record<string, Verb> = {
     run: (_positionals, handlers) => handlers.serve(),
   },
   setup: {
-    summary: "Walk the Hub's setup on a terminal (Linux)",
+    summary: "Walk the Hub's setup on a terminal (Linux, macOS)",
     help: SETUP_HELP,
     options: {},
     positionals: true,
@@ -1077,7 +1172,9 @@ export const VERBS: Record<string, Verb> = {
     },
   },
   service: {
-    summary: "Run the Hub as a systemd user unit (Linux)",
+    summary: ON_MAC
+      ? "Run the Hub as a LaunchAgent (macOS)"
+      : "Run the Hub as a systemd user unit (Linux)",
     help: SERVICE_HELP,
     options: {
       follow: { type: "boolean", short: "f" },
@@ -1148,18 +1245,19 @@ Options:
   --version   Print the version
 
 The commands other than serve, setup, status, service, update, restore and
-page act on the Hub at the data dir. On Linux, while a Hub runs there, they
-go through its own routes with the data dir's operator-token, and it
-applies each change at once, with no restart; with none running, they edit
-the data dir's files. Elsewhere they edit the files, and key and gateway
-are Linux only. setup walks key set, password set, page set and service
-install on a terminal, on Linux, making the data dir first as serve does.
-status describes the Hub running there, the same way, on Linux. restore
-fills an empty data dir from a stopped Hub's backup, and service runs serve
-as a systemd user unit, both on Linux. update replaces this binary with the
-newest release, on Linux, and restarts the unit that runs it. page set and
-page clear edit hub.json beside a running Hub too, which reads the Hub page
-URL only for its boot log.
+page act on the Hub at the data dir. On Linux and macOS, while a Hub runs
+there, they go through its own routes with the data dir's operator-token,
+and it applies each change at once, with no restart; with none running,
+they edit the data dir's files. On Windows they edit the files, and key and
+gateway refuse. setup walks key set, password set, page set and service
+install on a terminal, making the data dir first as serve does. status
+describes the Hub running there, the same way, and restore fills an empty
+data dir from a stopped Hub's backup. All three run on Linux and macOS.
+service runs serve as a systemd user unit on Linux, and as a LaunchAgent
+on macOS. update replaces this binary with the newest release, on Linux
+and macOS, and restarts the unit or the LaunchAgent that runs it. page set
+and page clear edit hub.json beside a running Hub too, which reads the Hub
+page URL only for its boot log.
 
 Exit codes:
   0  Success, or serve stopped cleanly
@@ -1184,16 +1282,18 @@ Exit codes:
      version within 30 s
   2  Usage error, a secret given as an argument or not at all, no Hub at
      the data dir, an invalid password or management key, key, gateway,
-     status, restore, service or update, off Linux, a machine a command
-     cannot act on, an Account or an Organization a name does not match
-     alone, an Account that holds no key, a label a command cannot write, a
-     Gateway URL that is not one or that names no Gateway the Hub holds, a
-     backup restore cannot use, or a data dir that already holds a Hub's
-     files; an invalid Hub page URL, or none set; setup off Linux, as root,
-     off a terminal, or beside a unit that serves, or would serve, another
-     data dir
-  3  status: no Hub runs on the data dir; service status: the unit is not
-     active, or not installed; service logs: the unit is not installed
+     status or restore on Windows, service and update off Linux and macOS,
+     a machine a command cannot act on, an Account or an
+     Organization a name does not match alone, an Account that holds no
+     key, a label a command cannot write, a Gateway URL that is not one or
+     that names no Gateway the Hub holds, a backup restore cannot use, or a
+     data dir that already holds a Hub's files; an invalid Hub page URL, or
+     none set; setup off Linux and macOS, as root, off a terminal, or
+     beside a unit or LaunchAgent that serves, or would serve, another data
+     dir
+  3  status: no Hub runs on the data dir; service status: the unit or
+     agent is not active, or not installed; service logs: it is not
+     installed
   4  The running Hub speaks another Hub protocol: restart it to finish the
      update
   5  serve: another maxprice-hub held the data dir's serve.lock for ${SERVE_LOCK_RETRY_MS} ms

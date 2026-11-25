@@ -26,9 +26,9 @@
 // is byte-identical to no filter.
 //
 // The Quota organization retired with #632 (ADR-0136 §6): no single
-// Organization answers for every quota surface. Blocks form per Membership
-// (`createBlockReports`), and the surfaces that still read one Organization's
-// usage-limits reading take the Scope's head Organization below.
+// Organization answers for every quota surface. The surfaces that read one
+// Organization's usage-limits reading take the Scope's head Organization
+// below.
 
 import {
   effectiveScope,
@@ -130,9 +130,9 @@ export function requestScope(tokens: ScopeTokens, state: ScopeState): ResolvedSc
 // The Organization the status's usage connection describes (#637): the
 // persisted Scope's head, by the app's own head rule (`SidecarApp.scopeHead`)
 // over the tokens a request carrying that Scope sends, so the status names
-// the Organization /api/scope-head, /api/usage/current and /api/blocks name
-// for the renderer's requests. Computed at each status publish, synchronously
-// over the store and samples as they stand: no cached head to keep in step.
+// the Organization /api/scope-head and /api/usage/current name for the
+// renderer's requests. Computed at each status publish, synchronously over the
+// store as it stands: no cached head to keep in step.
 // Before the app exists (`scopeHead` null) no store is readable, so the rule
 // runs over no candidates. `null` only with no Home.
 export function statusHeadOrganization(

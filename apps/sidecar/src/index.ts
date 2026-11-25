@@ -55,7 +55,6 @@ import {
   type DiscoverOrgsResponse,
   type ErrorResponse,
   type ForgetSessionRef,
-  type IntradayResponse,
   type MembershipTotalsResponse,
   MEMBERSHIP_TOTALS_PATH,
   type OrganizationAssertionsResponse,
@@ -64,6 +63,7 @@ import {
   type PricingRefreshResponse,
   type ProjectMergeMutationRequest,
   type ProjectMergeMutationResponse,
+  type RankableMembership,
   type ReadoutResponse,
   type RescanResponse,
   type StorageCleanResponse,
@@ -75,13 +75,15 @@ import {
   type UsageKeyset,
   type UsageKeysResponse,
   type UsageHubKeysResponse,
-  type UsageSample,
   SCOPE_HEAD_PATH,
   scopeHasMembership,
   scopeMembershipReadings,
   scopeMembershipSet,
   rankedPopoutLimitRows,
+  headOrganizationStatus,
+  popoutLimitRowsOf,
   readoutPick,
+  type ReadoutPick,
   headOrganizationWithoutHome,
   type HomeMembership,
   type ResolvedScope,
@@ -113,7 +115,6 @@ import {
   libcGetppid,
   streamSSEPump,
   type DiscoverOrgResult,
-  type SampleScope,
   type UsagePollerCurrent,
 } from "@maxprice/usage-core";
 import type { SaturationSnapshot } from "./saturation";
@@ -126,7 +127,7 @@ import { aggregateDaily, aggregateDailyByMachine, aggregateDailyByProject } from
 import { aggregateMembershipTotals } from "./engine/membership-totals";
 import { aggregateIntraday } from "./engine/intraday";
 import { createReportCache } from "./engine/report-cache";
-import { createBlockReports, formationRows, noHomeFormation } from "./engine/block-formation-cache";
+import { createScopeMemberships } from "./engine/scope-memberships";
 
 export type BuildAppDeps = {
   allowedOrigins: string[];
@@ -201,15 +202,6 @@ export type BuildAppDeps = {
   // (MAXPRICE_AUTH_TOKEN unset) → no auth enforced, preserving the
   // Vite/standalone path; set to the env var at construction otherwise.
   authToken: string | null;
-  // The usage-history samples — /api/blocks and the `block` span read them for
-  // observed-window formation + the 5h limit % (ADR-0028). No scope is every
-  // sample held (no Home); a scope is one Organization's, unstamped lines
-  // counting as its `home`'s — the sample store's `all(scope)`. Block formation
-  // gives a Membership its Organization's samples when they resolve to its
-  // Account (`sampleAccount`). An accessor
-  // (not a snapshot) so the handler reads whatever the poller has appended at
-  // request time.
-  samples: (scope?: SampleScope) => readonly UsageSample[];
   // Hub opt-in (ADR-0035/0037): the renderer pushes {url, password} (password
   // nullable — open hub) or url:null (hub off) via POST /api/hub/config;
   // `bootSidecar` wires this to the hub-client.
@@ -724,8 +716,8 @@ const NO_HEAD: ScopeHeadResponse = { organizationUuid: null, accountUuid: null }
 // (`scopeHeadOf`), which the status's usage connection reads for the persisted
 // Scope (boot.ts), so the status never describes another Organization than
 // /api/scope-head answers for the same tokens. Exposed here because the
-// candidates come from the block reports, built inside `buildApp` over the
-// handlers' own store accessor and never injected.
+// candidates come from the Scope's Memberships, built inside `buildApp` over
+// the handlers' own store accessor and never injected.
 export type SidecarApp = Hono & { scopeHead: (tokens: ScopeTokens) => ScopeHeadResponse };
 
 export function buildApp(deps: BuildAppDeps): SidecarApp {
@@ -763,7 +755,9 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
     getStore: reportStore,
     getPricing: activePricingSnapshot,
   });
-  const blockReports = createBlockReports({ getStore: reportStore, getSamples: deps.samples });
+  // A Scope's Memberships, the head rule's candidates (ADR-0142 §3), read by
+  // `scopeHeadOf`.
+  const scopeMemberships = createScopeMemberships({ getStore: reportStore });
 
   // Host-header allowlist. The renderer always reaches us via the loopback
   // address it discovered through get_sidecar_url, and the Headless client's
@@ -824,6 +818,14 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
     return c.json(body, 500);
   });
 
+  // An unknown route answers the error envelope, as every other non-2xx does
+  // (`ErrorResponse`), rather than Hono's plain-text 404: the retired
+  // `/api/blocks` among them (ADR-0142 §5).
+  app.notFound((c) => {
+    const body: ErrorResponse = { error: "not found" };
+    return c.json(body, 404);
+  });
+
   app.get("/healthz", (c) => c.json({ ok: true, service: "maxprice-sidecar" }));
 
   // --- /api/daily ---------------------------------------------------------
@@ -833,11 +835,8 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
   // row total and the `totals` block are model-scoped. The Organization scope
   // (#278, `parseCommonQuery`) is one more such axis on every money endpoint,
   // the readout's `todayCost` included. The quota-shaped reads —
-  // /api/usage/current, the readout's utilization half, /api/blocks and the
-  // intraday `block` span — read one Membership or Organization: Blocks form
-  // per Membership from its own rows and samples (`createBlockReports`), and
-  // the usage-limits reads take the head Membership's Organization
-  // (`scopeHead`).
+  // /api/usage/current and the readout's utilization half — read one
+  // Organization: the head Membership's (`scopeHead`).
   // `aggregateDaily` does the date grouping and returns `{ daily, totals? }` —
   // `totals` is omitted on the 2+-project path per the E1 golden.
   //
@@ -1002,33 +1001,26 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
   //
   // The cost-chart time-series behind the span tabs. Originally sub-day-only
   // (`15m / 1h / 6h / 24h`, Part 5; `24h` was later renamed `today` — ADR-0020);
-  // since ADR-0018 it serves ALL six spans at
+  // since ADR-0018 it serves every span at
   // a caller-supplied bucket size, for the line chart styles' fixed 15-min
-  // granularity. The `span` query param (required; `spanSchema` — all six)
+  // granularity. The `span` query param (required; `spanSchema` — all five;
+  // the retired `block` is a 400 like any unknown span, ADR-0142 §5)
   // picks the window length from `SPAN_WINDOW_MS`; the optional `bucketMs` picks
   // the bucket duration (default: the span's native bars granularity from
   // `INTRADAY_SPANS`, which exists only for the three native-rung spans
-  // (15m / 1h / today) — `block` and `week` pin sidecar-side constants
-  // (`BLOCK_BUCKET_MS`, ADR-0031/0046; `WEEK_BUCKET_MS`, ADR-0083), and `30d`
+  // (15m / 1h / today) — `week` pins a sidecar-side constant
+  // (`WEEK_BUCKET_MS`, ADR-0083), and `30d`
   // has no intraday native; so only `30d` REQUIRES an explicit `bucketMs`).
   // `bucketMs` must divide the window evenly. The optional `prev` / `byProject`
   // flags (default `1`) toggle the ghost `previousBuckets` and the per-project
   // map for the lean line payload.
   // `mode` is optional and defaults to `"auto"`; any invalid param is HTTP 400.
   //
-  // `span=block` (ADR-0031): the active 5-hour quota block's growing frame
-  // (`[block start → now]`). The handler resolves the frame server-side via
-  // `blockReports.span` over the Scope's head Membership's formation (never
-  // project/model/machine-filtered — ADR-0017/0028; every row with no Home —
-  // ADR-0108) and passes it to the engine. No active block ⇒ 200 with empty
-  // buckets and `blockWindow: null`. `bucketMs` is optional for `block` — the
-  // engine picks the adaptive block-dividing rung (ADR-0031) when omitted.
-  //
   // `span=week` (ADR-0083): the anchored Week's growing frame
   // (`[weekStart → now]`). The renderer resolves the anchor (`resolveWeekWindow`
   // is the only resolver) and passes it as the REQUIRED `weekStart` ISO instant
   // — absent, unparseable, or in the future is a 400. `bucketMs` defaults to
-  // `WEEK_BUCKET_MS` (one anchor-aligned day); `blockWindow` is `null`.
+  // `WEEK_BUCKET_MS` (one anchor-aligned day).
   //
   // Store-query strategy — both the project AND the model filter are store-
   // query axes, the same as every report (ADR-0017). NO `since`/`until`
@@ -1089,36 +1081,31 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
         bucketMs = span === "week" ? WEEK_BUCKET_MS : nativeBucketMs(span);
       }
       // `30d` has no native size, so an absent `bucketMs` there is a 400.
-      // `block` is the exception (ADR-0031): an absent `bucketMs` means the
-      // engine picks the adaptive block-dividing rung.
-      if (bucketMs === undefined && span !== "block") {
+      if (bucketMs === undefined) {
         const body: ErrorResponse = { error: `bucketMs is required for span ${span}` };
         return c.json(body, 400);
       }
-      if (bucketMs !== undefined) {
-        if (SPAN_WINDOW_MS[span] % bucketMs !== 0) {
-          const body: ErrorResponse = {
-            error: `bucketMs ${bucketMs} does not divide the ${span} window`,
-          };
-          return c.json(body, 400);
-        }
-        // Reject a pathological bucket count before it reaches the engine — a
-        // tiny `bucketMs` over a long window would otherwise allocate millions of
-        // densified buckets (the engine guards this too; ADR-0018 / MAX ceiling).
-        if (SPAN_WINDOW_MS[span] / bucketMs > MAX_INTRADAY_BUCKETS) {
-          const body: ErrorResponse = {
-            error: `bucketMs ${bucketMs} yields more than ${MAX_INTRADAY_BUCKETS} buckets for the ${span} window`,
-          };
-          return c.json(body, 400);
-        }
+      if (SPAN_WINDOW_MS[span] % bucketMs !== 0) {
+        const body: ErrorResponse = {
+          error: `bucketMs ${bucketMs} does not divide the ${span} window`,
+        };
+        return c.json(body, 400);
+      }
+      // Reject a pathological bucket count before it reaches the engine — a
+      // tiny `bucketMs` over a long window would otherwise allocate millions of
+      // densified buckets (the engine guards this too; ADR-0018 / MAX ceiling).
+      if (SPAN_WINDOW_MS[span] / bucketMs > MAX_INTRADAY_BUCKETS) {
+        const body: ErrorResponse = {
+          error: `bucketMs ${bucketMs} yields more than ${MAX_INTRADAY_BUCKETS} buckets for the ${span} window`,
+        };
+        return c.json(body, 400);
       }
 
       const mode = parseMode(c);
       if (mode instanceof Response) return mode;
       const { projects, models, machines } = readFilters(c);
       // The Scope (#278, #632), resolved exactly as `parseCommonQuery`
-      // resolves it. Every span but `block` narrows by it; `block` answers the
-      // Scope's head Membership instead (see the block branch).
+      // resolves it. Every span narrows by it.
       const scope = requestScope(scopeTokens(c), deps.organizationScope());
       // The IANA zone — REQUIRED for the `today` calendar-day span (ADR-0020),
       // which anchors its window to local midnight in this zone; the other
@@ -1136,63 +1123,6 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
       const includeByMachine = c.req.query("byMachine") === "1";
 
       await deps.engineReady();
-
-      // span=block (ADR-0031): resolve the active block's frame from the Quota
-      // organization's formation — its events and samples alone, never
-      // project/model/machine-filtered (the ADR-0017/0028 invariant) — then
-      // aggregate that Organization's FILTERED events inside it. One `now` for
-      // both so the frame and the rung can't disagree.
-      if (span === "block") {
-        // ACCEPTED now() skew (ADR-0031): the block frame's active state is
-        // sampled from `deps.now()` per request, and `/api/blocks` samples its
-        // own `now` on its own request — so right at a 5h reset boundary the two
-        // can transiently disagree on isActive / blockWindow for the round-trip
-        // gap. Benign: boundaries are reset-aligned, and it self-heals on the
-        // next `block:tick` refetch (which re-frames both to the new block or
-        // the empty state).
-        const now = deps.now();
-        // Resolved after the engine is ready, from one scope read, right before
-        // the synchronous formation: the Home that picks the head Membership
-        // is the Home that presumes the store's owner-less rows and its
-        // unstamped samples. No Home is the unscoped formation, narrowed by
-        // the Scope's explicit Account keys (`noHomeFormation`, #635); a Scope
-        // with no Membership has no Block.
-        const scopeState = deps.organizationScope();
-        const home = scopeState.home;
-        const blockScope = requestScope(scopeTokens(c), scopeState);
-        const quota =
-          home === null
-            ? noHomeFormation(blockScope)
-            : blockReports.head({ scope: blockScope, home }, now);
-        const resolved = home !== null && quota === null ? null : blockReports.span(now, quota);
-        if (resolved === null) {
-          const body: IntradayResponse = {
-            buckets: [],
-            previousBuckets: [],
-            byProject: {},
-            ...(includeByMachine ? { byMachine: {} } : {}),
-            blockWindow: null,
-          };
-          return c.json(body);
-        }
-        // The series describes the frame's Membership: its formation's rows,
-        // never the money scope's (All sums Memberships; a quota cannot).
-        // Frame and series then both describe it, the ADR-0031 parity with
-        // `/api/blocks`' head under the same params. No Home is no scope:
-        // every event, or the named Accounts' alone.
-        const events = formationRows(reportStore(), quota, { projects, models, machines });
-        return c.json(
-          aggregateIntraday(events, mode, {
-            span: "block",
-            blockWindow: resolved,
-            bucketMs,
-            now,
-            includePrevious,
-            includeByProject,
-            includeByMachine,
-          }),
-        );
-      }
 
       const events = reportStore().query({ projects, models, machines, ...scope });
       if (span === "week") {
@@ -1282,56 +1212,6 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
         until: q.until,
       });
       return c.json(body);
-    }),
-  );
-
-  // --- /api/blocks --------------------------------------------------------
-  //
-  // Blocks describe the Scope's Memberships, each formed on its own — the one
-  // axis that shapes formation: a Membership's events and samples alone form
-  // the windows, annulment, grace evidence, burn rate, projection and limit %,
-  // so two Memberships' overlapping quota windows never meet. `blocks` is the
-  // head Membership's; `memberships` lists each while there are two or more. Cross-project by design — the 5-hour
-  // quota window is inherently cross-project, so the project filter never
-  // reaches it. The MODEL and MACHINE filters (ADR-0017, ADR-0041) are honoured
-  // as sum-narrowing options inside that formation: boundaries, isActive and
-  // projection stay all-model and all-machine, but each block's
-  // cost/token/model sums count only matching events.
-  app.get(
-    "/api/blocks",
-    withEngineErrors("/api/blocks", async (c) => {
-      const q = parseCommonQuery(c, deps.organizationScope());
-      if (q instanceof Response) return q;
-      await deps.engineReady();
-      // `q.scope` is the money scope and never reaches formation: All sums
-      // Memberships, a quota cannot. The Scope is resolved
-      // again here — after the engine is ready, from one scope read, right
-      // before the synchronous formation — so the Home that orders the
-      // Memberships is the Home that presumes the store's owner-less rows and
-      // their unstamped samples. Each Membership forms on its own.
-      const scopeState = deps.organizationScope();
-      const home = scopeState.home;
-      const scope = requestScope(scopeTokens(c), scopeState);
-      // One pass (ADR-0028): observed reset windows from the usage history
-      // partition block formation; the heuristic survives only in history
-      // holes; fiveHourLimitPct fills from the same samples. With an empty
-      // history this is the pure heuristic port.
-      const options = {
-        since: q.since,
-        until: q.until,
-        timeZone: q.tz,
-        models: q.models,
-        machines: q.machines,
-        now: deps.now(),
-      };
-      // No Home: the unscoped formation, narrowed by the Scope's explicit
-      // Account keys as the money reports are (#635), so `account=` never
-      // shows every row's Blocks.
-      return c.json(
-        home === null
-          ? blockReports.blocks(q.mode, options, noHomeFormation(scope))
-          : blockReports.scoped(q.mode, options, { scope, home }),
-      );
     }),
   );
 
@@ -1432,7 +1312,7 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
   });
 
   // Server-Sent Events channel — the renderer's live data pipeline (ADR-0007).
-  // The hub fans file-watch / block-tick / status messages here through the
+  // The hub fans file-watch / status messages here through the
   // bounded write-chain SSE pump (shared with the hub's /api/stream; see
   // packages/usage-core/src/sse-pump.ts): writes are serialized so frames never
   // interleave, the backlog is bounded, and the subscription is dropped when the
@@ -1483,11 +1363,11 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
   // its two parts: `homeHeadOf`, then `headOrganizationWithoutHome`), which the
   // renderer's quota surfaces apply too. Home's Organization while the Scope
   // holds the Home membership, which then heads it (no store needed), else
-  // the Organization of the head Membership Blocks form, so the reading and
-  // the Blocks shown never name two Organizations.
+  // the Organization of the Scope's head Membership (`scopeMemberships`), so
+  // every surface reading one Scope names the same Organization.
   //
-  // Synchronous, over the store and samples as they stand: the candidates are
-  // read from memory (`blockReports.candidates`). The handlers await the
+  // Synchronous, over the store as it stands: the candidates are read from
+  // memory (`scopeMemberships.candidates`). The handlers await the
   // engine first whenever the store is needed (`scopeHeadMembership`); the
   // status's usage connection calls it as it is (`SidecarApp.scopeHead`).
   function scopeHeadOf(tokens: ScopeTokens): ScopeHeadResponse {
@@ -1505,7 +1385,7 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
   // The head of a Scope that does not hold the Home membership, over the
   // store's candidates.
   function candidateHeadOf(scope: ResolvedScope, home: HomeMembership): ScopeHeadResponse {
-    const candidates = blockReports.candidates({ scope, home }, deps.now());
+    const candidates = scopeMemberships.candidates({ scope, home });
     const organizationUuid = headOrganizationWithoutHome(scope, home, candidates);
     const head = candidates[0]?.membership;
     return {
@@ -1548,8 +1428,8 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
   //
   // Both describe ONE Organization, the head Membership's (`scopeHead`): the
   // Home organization whenever the Scope holds the Home membership (no params,
-  // `all`, a stale value), else the Organization Blocks' head forms in —
-  // never a 400. One reading per Membership is #633's.
+  // `all`, a stale value), else the head Membership's Organization — never a
+  // 400. One reading per Membership is #633's.
   // With no live reading yet, the poller answers from that Organization's own
   // persisted history (unstamped legacy lines count as Home's), so the Week
   // anchor never borrows another Organization's reset. No Home answers no
@@ -1665,10 +1545,8 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
   // today's local date in the requested zone, and narrowed by the Scope as
   // the tile is — #278, #637). The tile itself reads that
   // window as a slice of the report cache's daily entry since #423, equal to
-  // this fold byte for byte (ADR-0116, pinned by test). And `blockLive`
-  // mirrors the renderer's usage-ring rule — a current sample whose
-  // fiveHour.resetAt is still ahead (NaN-guarded, like usageRingState). The
-  // shell supplies `mode`/`tz` from settings.json per poll, and the persisted
+  // this fold byte for byte (ADR-0116, pinned by test). The shell supplies
+  // `mode`/`tz` from settings.json per poll, and the persisted
   // Scope's tokens (`scope`, #637) as the repeated `account`,
   // `organization` and `membership` params, unresolved (none for the default
   // Scope); the sidecar keeps its no-ambient-params invariant and resolves them
@@ -1676,21 +1554,24 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
   //
   // The one Scope answers the two halves by two rules, read off ONE scope
   // state so they never disagree about Home: `todayCost` is money and sums the
-  // Scope (`requestScope`, so All is every tracked Organization's today), while `blockLive`, `utilizationPct` and
-  // `hasModelWindow` are quota and describe the Scope's head Organization
-  // alone (`scopeHead`, so All is Home's sample), the same Organization
-  // /api/usage/current answers for that Scope.
+  // Scope (`requestScope`, so All is every tracked Organization's today),
+  // while `mostUsed` is a limit reading (ADR-0142 §2): the most used window,
+  // of any kind, over the Scope's multi-Membership set (`scopeMembershipSet`)
+  // while it holds two or more Memberships, over its one Membership's own
+  // `/api/accounts` reading while it holds one (#738), else, as on every
+  // one-Account install, over the Scope's head Organization's reading
+  // (`scopeHead`, the Organization /api/usage/current answers for that
+  // Scope). Only a Readable membership drives it (ADR-0138 §8);
+  // with none holding a window in flight the body carries no `mostUsed`, and
+  // the shell shows money. `popoutLimitRows` and `hasModelWindow` size the
+  // Popout the renderer will draw over the same Memberships.
   //
-  // The optional `organizations` field (#291) names that Quota organization by
-  // its roster display label; it is filled from the roster only on a
-  // multi-Organization machine, so a single-Organization poll reads no roster
-  // and its body is unchanged. A failed roster read falls back to the short-id
-  // label, never to a 500. The optional `wideScope` (#622 item 4, #637) says
-  // what the money half sums when the Scope holds more than one Membership
-  // (`readoutWideScope`), so the tooltip can name it. The optional `mostUsed`
-  // and `popoutLimitRows` (#638) are the most used Readout and the ranked
-  // Popout's row count over the Scope's multi-Membership set
-  // (`scopeMembershipSet`), absent on a one-Account install.
+  // The head Membership is named (`mostUsed.top.label`) only while more than
+  // one Organization is tracked, by its roster display label; a
+  // single-Organization poll reads no roster. A failed roster read falls
+  // back to the short-id label, never to a 500. The optional `wideScope`
+  // (#622 item 4, #637) says what the money half sums when the Scope holds
+  // more than one Membership (`readoutWideScope`), so the tooltip can name it.
   app.get(
     "/api/readout",
     withEngineErrors("/api/readout", async (c) => {
@@ -1727,9 +1608,9 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
       const resolved = requestScope(tokens, scope);
       const now = deps.now();
       const quota = await scopeHead(c, tokens);
-      const sample = deps.usage.getCurrent(quota).sample;
-      const resetMs = sample?.fiveHour == null ? Number.NaN : Date.parse(sample.fiveHour.resetAt);
-      const blockLive = !Number.isNaN(resetMs) && resetMs > now;
+      const current = deps.usage.getCurrent(quota);
+      const status = deps.liveHub.getStatus();
+      const headStatus = headOrganizationStatus(status.organizations, quota ?? undefined);
 
       // `localDateUncached`, not `localDate`: `now` is a wall-clock reading, so
       // the memoized form would mint one permanently-retained entry per call —
@@ -1755,13 +1636,6 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
         todayCost = daily.daily.find((row) => row.date === today.dashed)?.totalCost ?? 0;
       }
 
-      const body: ReadoutResponse = {
-        blockLive,
-        utilizationPct: blockLive ? (sample?.fiveHour?.utilizationPct ?? null) : null,
-        todayCost,
-        hasData: deps.liveHub.getStatus().hasData,
-        hasModelWindow: sample?.weeklyModel !== undefined,
-      };
       const tracked = scope.trackedOrganizations ?? [];
       const homeOrganization = scope.home?.organizationUuid ?? null;
       const multi =
@@ -1785,20 +1659,43 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
         })();
         return labels;
       };
-      if (multi && quota !== null) {
-        // The key stays on a failed roster read, so the shell still names
-        // the Organization.
-        body.organizations = {
-          quotaLabel:
-            (await organizationLabels()).get(quota) ??
-            resolveOrganizationLabel({
-              uuid: quota,
-              rename: null,
-              organizationType: null,
-              hints: null,
-            }).label,
-        };
-      }
+
+      // The one-Membership Readout and Popout on a one-Account install (the
+      // multi-Membership set empty): the head Organization's reading, off the
+      // poller and the status the Popout reads. Named only while more
+      // than one Organization is tracked; the key stays on a failed roster
+      // read, so the shell still names the Organization.
+      const headLabel =
+        multi && quota !== null
+          ? ((await organizationLabels()).get(quota) ??
+            resolveOrganizationLabel({ uuid: quota, rename: null, login: null, hints: null }).label)
+          : null;
+      const head: RankableMembership[] =
+        quota === null
+          ? []
+          : [
+              {
+                key: quota,
+                label: headLabel ?? "",
+                connection: current.connection,
+                limits: headStatus?.limits ?? null,
+                reading: current.sample,
+              },
+            ];
+      // The one Membership's pick, named as the Readout names one: by its
+      // Organization while more than one is tracked, else not at all.
+      const namedPick = (one: RankableMembership[], label: string | null): ReadoutPick => {
+        const picked = readoutPick(one, now);
+        return picked === null ? null : { ...picked, top: { ...picked.top, label } };
+      };
+      let pick = namedPick(head, headLabel);
+      const body: ReadoutResponse = {
+        todayCost,
+        hasData: status.hasData,
+        hasModelWindow: current.sample?.weeklyModel != null,
+        popoutLimitRows: popoutLimitRowsOf(headStatus?.windowStates),
+      };
+
       // The money half's wide Scope (#622 item 4, #637). A machine that tracks
       // one Organization and one Account holds one Membership under every
       // Scope, so it reads no Account roster and its body is unchanged; the
@@ -1811,47 +1708,38 @@ export function buildApp(deps: BuildAppDeps): SidecarApp {
         const wide = readoutWideScope(resolved, scope, accounts);
         if (wide !== null) body.wideScope = wide;
 
-        // The most used Readout and the ranked Popout (#638; ADR-0136 §6's
-        // #610/#622 rows). Only the multi-Membership set switches them on
-        // (`scopeMembershipSet`: two or more tracked Accounts, the Memberships
-        // the Scope holds), the set Live's limit area reads, so a one-Account
-        // install's tray and Popout stay as they were. A failed roster read
-        // holds no Membership, and the body is today's.
+        // The multi-Membership set (#638; ADR-0136 §6's #610/#622 rows as
+        // ADR-0142 §2 amended them): two or more tracked Accounts, the
+        // Memberships the Scope holds, the set Live's limit area reads. With
+        // two or more of them the Readout and the ranked Popout read the set,
+        // so a one-Account install's tray and Popout keep the head
+        // Membership's. A failed roster read holds no Membership.
         const set = scopeMembershipSet(accounts, scope, resolved);
         if (set.length >= 2) {
           body.popoutLimitRows = rankedPopoutLimitRows(set.length);
+          body.hasModelWindow = false;
           const readings = scopeMembershipReadings(set, accounts, await organizationLabels());
-          const pick = readoutPick(readings, now);
-          switch (pick.kind) {
-            case "single":
-              break;
-            case "percent":
-              body.mostUsed = {
-                fiveHourLive: true,
-                count: pick.count,
-                top: pick.top,
-                next: pick.next,
-              };
-              break;
-            case "money":
-              // Idle means money (#622 item 1): with two or more Readable
-              // Memberships and no 5-hour window in flight among them, the
-              // head Organization's sample (which can be a dead key's stale
-              // reading, ADR-0138 §8) never switches the Readout to a percent.
-              body.blockLive = false;
-              body.utilizationPct = null;
-              if (pick.mostUsed !== null) {
-                body.mostUsed = {
-                  fiveHourLive: false,
-                  count: pick.count,
-                  top: pick.mostUsed,
-                  next: null,
-                };
-              }
-              break;
+          pick = readoutPick(readings, now);
+        } else if (set.length === 1) {
+          // A set of one (#738): any Scope holding one tracked Membership
+          // while two or more Accounts are tracked, the default Home-alone
+          // Scope included. It reads that Membership's own reading,
+          // connection and Limits answer off `/api/accounts`, as Live's card
+          // does, never the Organization's projection, which reads the Home
+          // Account's while its key works, so another Account's seat in a
+          // shared Organization shows its own. A failed roster read holds no
+          // Membership and reads the projection, as above.
+          const [own] = scopeMembershipReadings(set, accounts, await organizationLabels());
+          if (own !== undefined) {
+            pick = namedPick([own], multi ? own.organizationLabel : null);
+            body.hasModelWindow = own.reading?.weeklyModel != null;
+            body.popoutLimitRows = popoutLimitRowsOf(
+              headOrganizationStatus(status.organizations, own.organizationUuid)?.windowStates,
+            );
           }
         }
       }
+      if (pick !== null) body.mostUsed = pick;
       return c.json(body);
     }),
   );

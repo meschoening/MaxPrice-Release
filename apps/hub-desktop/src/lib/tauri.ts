@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import type { TrayTone } from "./presentation";
 
 // Tauri host detection. The renderer can run standalone under Vite with no
 // Tauri host, where `invoke` throws. Every entry point that touches a Tauri
@@ -129,6 +130,15 @@ export const getOperatorToken = makeCachedResolver(
 export async function setTrayTooltip(tooltip: string): Promise<void> {
   if (!insideTauri()) return;
   await invoke("set_tray_tooltip", { tooltip });
+}
+
+// Set the tray icon's tone (ADR-0148 §3), beside the tooltip and under the
+// same rules: a write on every tone change, a no-op outside Tauri, and a
+// rejection the caller logs. Rust draws it on macOS and keeps the orb
+// elsewhere.
+export async function setTrayTone(tone: TrayTone): Promise<void> {
+  if (!insideTauri()) return;
+  await invoke("set_tray_tone", { tone });
 }
 
 // The popout's three actions (ADR-0050). Restart hub (ADR-0112 §6) is below. All window manipulation lives in

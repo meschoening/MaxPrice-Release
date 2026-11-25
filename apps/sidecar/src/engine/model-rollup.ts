@@ -12,18 +12,12 @@ import type { StoredEvent } from "./store";
 // `emptyModelRollup` constructor, and `foldModelUsage` to fold one event in.
 //
 // `byTimestamp` lives here too. It guarantees timestamp-ascending order, but
-// the same three aggregators (and `blocks`) all need it for the same reason —
-// see below — so it is one export rather than four copies.
+// the same three aggregators all need it for the same reason — see below — so
+// it is one export rather than three copies.
 //
-// `blocks` does NOT share the rollup: a block carries a `Set<string>` of model
-// names and a verbose-named `TokenCounts`, not a per-model `ModelBreakdown`
-// map, so its fold is structurally different. `blocks` imports only
-// `byTimestamp`. The same divergence is the pricing-entry-point split
-// (ADR-0026): all five rollup fold sites — `daily`, `intraday`, `sessions`,
-// `projects`, `session-events` — price through `computeCostBreakdownInto` (the
-// first, third and fourth via `priceAndFold` below), while `blocks`
-// deliberately stays on plain `computeCost` because it bypasses this rollup
-// and never accumulates the cache-cost slices. Of the five, only `daily` /
+// All five rollup fold sites — `daily`, `intraday`, `sessions`, `projects`,
+// `session-events` — price through `computeCostBreakdownInto` (ADR-0026; the
+// first, third and fourth via `priceAndFold` below). Of the five, only `daily` /
 // `intraday` carry the ROW-level slices to the wire (`DailyRow` / `BucketRow`,
 // via `flushRollup`); `session-events` also calls `flushRollup` but its summary
 // frame picks fields explicitly, discarding the row-level slices; `sessions` /
@@ -211,7 +205,7 @@ export function flushRollup(rollup: ModelRollup): RollupTotals {
 //
 // Dropping `localeCompare` also removes ~70k ICU comparisons per fold on the
 // calibration corpus: the ordered-check runs once per adjacent pair over the
-// full array, on every intraday / daily / sessions / projects / blocks fold.
+// full array, on every intraday / daily / sessions / projects fold.
 export function byTimestamp(events: StoredEvent[]): StoredEvent[] {
   for (let i = 1; i < events.length; i += 1) {
     const prev = events[i - 1];

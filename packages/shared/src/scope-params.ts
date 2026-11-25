@@ -47,8 +47,7 @@ export function scopeKeyPart(scope: ScopeQueryParams): ScopeQueryParams | undefi
 //     retired the Quota organization; `headOrganization` in the sidecar): the
 //     scoped uuid, else Home's. It keys and fetches usage current, whose entry
 //     is one Organization's reading until #633 reads one per Membership, so All
-//     and Home read Home's uuid entry, and it names the Organization whose
-//     Blocks a surface shows, `/api/blocks`' head. The bare entry is left for a
+//     and Home read Home's uuid entry. The bare entry is left for a
 //     machine with no Home.
 export interface ScopeParams {
   organization: string[] | undefined;

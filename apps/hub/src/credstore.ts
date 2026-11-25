@@ -9,6 +9,7 @@ import {
   type HubKeyStore,
   type KeychainEntries,
 } from "./key-store";
+import { isEmbedded } from "./config";
 import { createFileGatewayKeyStore, createFileKeyStore, secretsPath } from "./secrets";
 
 // Where the Hub keeps its claude.ai session keys (ADR-0035, ADR-0126 §1,
@@ -147,19 +148,28 @@ export type OpenKeyStoreOptions = {
   run?: CredstoreRunner;
 };
 
-// serve's store for the keys (ADR-0126 §1). The platform decides, not
-// headlessness: on Linux every Hub, an embedded one run from source included,
+// Whether serve keeps its keys in `secrets.json` rather than the keychain
+// helper: every Hub on Linux, and a Headless Hub on macOS.
+function keepsKeyFile(platform: NodeJS.Platform, env: Record<string, string | undefined>): boolean {
+  return platform === "linux" || (platform === "darwin" && !isEmbedded(env));
+}
+
+// serve's store for the keys (ADR-0126 §1, ADR-0146 §4). On Linux every Hub,
+// an embedded one run from source included, and on macOS a Headless Hub,
 // keeps its keys in `<data dir>/secrets.json`, and never resolves the helper,
-// MAXPRICE_CREDSTORE_PATH included, nor falls back to memory, since the
-// helper's keyring there loses the key at a reboot or refuses every write
-// (#450). Elsewhere, as before: the helper, its uuid list beside hub.json,
-// else memory with a warning (ADR-0035's degraded mode: a client re-push
-// re-arms it).
+// MAXPRICE_CREDSTORE_PATH included, nor falls back to memory: the helper's
+// keyring on Linux loses the key at a reboot or refuses every write (#450),
+// and a Headless Hub has no console to re-key it. Elsewhere, the hub tray
+// app's embedded daemon above all, as before: the helper, its uuid list
+// beside hub.json, else memory with a warning (ADR-0035's degraded mode: a
+// client re-push re-arms it).
 export function openKeyStore(
   dataDir: string,
   { platform = process.platform, env = process.env, log, warn, run }: OpenKeyStoreOptions,
 ): HubKeyStore {
-  if (platform === "linux") return createFileKeyStore(secretsPath(dataDir), { log, warn });
+  if (keepsKeyFile(platform, env)) {
+    return createFileKeyStore(secretsPath(dataDir), { log, warn });
+  }
   const helper = resolveCredstorePath(env);
   if (helper !== null) {
     return createHelperKeyStore({
@@ -173,8 +183,8 @@ export function openKeyStore(
 }
 
 // serve's store for the Gateways' management keys (ADR-0141 §7), by the same
-// platform rule as `openKeyStore`: `secrets.json`'s `gateways` on Linux, the
-// keychain helper elsewhere, else memory. It says nothing of its own: the
+// rule as `openKeyStore`: `secrets.json`'s `gateways` where it keeps the
+// file, the keychain helper elsewhere, else memory. It says nothing of its own: the
 // memory-only warning is `openKeyStore`'s, made once for both.
 export function openGatewayKeyStore(
   dataDir: string,
@@ -184,7 +194,7 @@ export function openGatewayKeyStore(
     run,
   }: Pick<OpenKeyStoreOptions, "platform" | "env" | "run"> = {},
 ): HubGatewayKeyStore {
-  if (platform === "linux") return createFileGatewayKeyStore(secretsPath(dataDir));
+  if (keepsKeyFile(platform, env)) return createFileGatewayKeyStore(secretsPath(dataDir));
   const helper = resolveCredstorePath(env);
   if (helper !== null) return createHelperGatewayKeyStore(createKeychainEntries(helper, run));
   return createMemoryGatewayKeyStore();

@@ -48,13 +48,13 @@ On macOS and Windows, **MaxPrice isn't responding — open the window to retry.*
 
 ## Usage limits don't show
 
-- **⚠ Session expired — reconnect →** (or **⚠ 2 Accounts need reconnecting →**) on Live's tiles, or **Session expired** at the bottom of the sidebar: claude.ai session keys expire every few weeks. Choose the link: with one Account's key expired it opens that Account's Connect, and with more, [Settings](settings.md#notices), where a notice at the top names each Account that needs reconnecting. Choose **Reconnect** on its card, or its name in the notice, and paste a fresh [session key](../concepts/blocks.md#the-claudeai-session-key) from a browser signed in as that Account. Live's **Reconnect** beside a stale limit reading opens that Account's Connect directly.
+- **key expired · last known** on a limit card on Live, or **Session expired** at the bottom of the sidebar: claude.ai session keys expire every few weeks. The card's **Reconnect** opens that Account's Connect in Settings, and [Settings](settings.md#notices) opens with a notice at the top that names each Account that needs reconnecting. Choose **Reconnect** on its card, or its name in the notice, and paste a fresh [session key](../concepts/usage-limits.md#the-claudeai-session-key) from a browser signed in as that Account.
 - **claude.ai didn't accept this key.** when you connect: the key was mistyped, cut short or has expired. Copy it again, the whole `sessionKey` value.
 - **This is a Claude Code token, not a claude.ai session key.** when you connect: you pasted Claude Code's own token. Paste the `sessionKey` cookie from your browser instead.
 - **Couldn't reach Anthropic — check your connection and try again.**: claude.ai couldn't be reached from this computer.
-- **reports no 5-hour limit — blocks are estimated.** after an Organization's name: claude.ai reports no 5-hour limit for it, so its Blocks are [estimated](../concepts/blocks.md#exact-ended-early-and-estimated-windows).
-- **Limits for … aren't readable:** claude.ai doesn't let this key read that Organization's limits, so its Blocks are estimated.
-- No key at all: the limit meters don't show. See [Connect your claude.ai account](first-run.md#connect-your-claudeai-account).
+- **no 5-hour limit on this plan** on a limit card: claude.ai reports no 5-hour limit for that plan, as for some Ultra plans. Its weekly limits still show.
+- **not readable now** on a limit card: claude.ai doesn't let this key read that Organization's limits, or gave no reading.
+- **not connected**, or **No limits read — connect an Account in Settings.**: no key reads that Account. See [Connect your claude.ai account](first-run.md#connect-your-claudeai-account).
 
 ## The Hub doesn't connect
 

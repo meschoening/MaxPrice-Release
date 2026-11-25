@@ -37,10 +37,10 @@ export type SplitRule = "none" | "account" | "organization";
 // filter shows (two or more tracked Accounts, `accountFilterVisible` over
 // `/api/accounts`), else none. The shared rule (`scopeMembershipSet`), which
 // the tray readout's sidecar half reads too, so the tray, the Popout and Live
-// switch together (#638). A single-Account user sees no split bars and
-// keeps the Active Block tile and This week's meter under every Organization
+// switch together (#638). A single-Account user sees no split bars and one
+// limit card, the head Membership's (ADR-0142 §2), under every Organization
 // scope chip choice, All organizations included (#613 §8, ADR-0106 §9's #637
-// note): Live is exactly as it was before #637. Empty, with no split, until
+// note). Empty, with no split, until
 // settings and `/api/accounts` answer.
 export function liveScopeMemberships(
   accounts: readonly AccountEntry[] | undefined,

@@ -76,8 +76,8 @@
   --grid: oklch(30% 0.03 280 / 0.14);
   --ring-track: oklch(30% 0.03 280 / 0.14);
 
-  /* Aurora's pair — the Active Block trackers only (ring + limit meter):
-     the one true glow in the glass system, earned by the live block. */
+  /* Aurora's pair — the live window's trackers only (ring + limit meter):
+     the one true glow in the glass system, earned by liveness. */
   --accent-a: oklch(58% 0.15 220);
   --accent-b: oklch(52% 0.22 300);
   --accent-glow: oklch(50% 0.12 265 / 0.3);

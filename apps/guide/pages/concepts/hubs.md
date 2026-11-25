@@ -1,8 +1,8 @@
 # Hubs and the fleet
 
-A Hub is an optional MaxPrice service that runs all the time on one of your machines. Each client you join to it shares its usage through it, so every machine's reports can show the whole fleet, and the Hub reads your claude.ai [usage limits](blocks.md#usage-limits) for all of them.
+A Hub is an optional MaxPrice service that runs all the time on one of your machines. Each client you join to it shares its usage through it, so every machine's reports can show the whole fleet, and the Hub reads your claude.ai [usage limits](usage-limits.md) for all of them.
 
-There are two Hubs, which do the same job: the [Hub tray app](../hub-tray-app/overview.md) on Windows, and the [Headless Hub](../headless-hub/overview.md) on a Linux server. Run one Hub for all your machines.
+There are two Hubs, which do the same job: the [Hub tray app](../hub-tray-app/overview.md) on Windows or a Mac, and the [Headless Hub](../headless-hub/overview.md) on a Linux server or a Mac. Run one Hub for all your machines, and only one on a Mac ([one Hub per Mac](../hub-tray-app/install.md#one-hub-per-mac)).
 
 ## The fleet
 
@@ -13,7 +13,7 @@ The fleet is every machine joined to one Hub. A machine is one client: a Desktop
 
 ## What a Hub does
 
-- **It reads the usage limits once for everyone.** While a client is connected, the Hub is the only thing that polls claude.ai, for every [Organization](organizations.md) its [session keys](blocks.md#the-claudeai-session-key) list. It keeps one key per claude.ai [Account](organizations.md#accounts), and each key reads its own Account's limits in every Organization the Account belongs to. It sends each reading to every client. Its console lists each Account with those Organizations ([the Accounts card](../hub-tray-app/popout-and-console.md#accounts)); its Popout and [Hub page](../headless-hub/hub-page.md) only count the keys, naming no Account.
+- **It reads the usage limits once for everyone.** While a client is connected, the Hub is the only thing that polls claude.ai, for every [Organization](organizations.md) its [session keys](usage-limits.md#the-claudeai-session-key) list. It keeps one key per claude.ai [Account](organizations.md#accounts), and each key reads its own Account's limits in every Organization the Account belongs to. It sends each reading to every client. Its console lists each Account with those Organizations ([the Accounts card](../hub-tray-app/popout-and-console.md#accounts)); its Popout and [Hub page](../headless-hub/hub-page.md) only count the keys, naming no Account.
 - **It keeps the fleet's usage.** Each client sends the Hub its usage, and the Hub keeps every machine's in one archive. Clients copy that archive back, so each one can report on every machine.
 - **It reads your Gateways for everyone.** If Claude Code on your machines runs through a [Gateway](organizations.md#how-maxprice-knows-the-organization), such as CLIProxyAPI, rather than, or as well as, a direct login, the Hub reads its records and keeps them for a week for every client, so each one learns which Account and Organization served its own requests. A client reads a Gateway it holds itself only while it has no Hub, can't reach it, or the Hub can't read that Gateway.
 - **It shares what you set up once:** Account and Organization labels, project merges, assigned sessions, machine names and Gateways.
@@ -71,7 +71,7 @@ A Hub can also require a Hub password, which each client enters once when it joi
 
 ## Versions
 
-A client and its Hub must speak the same version of the Hub protocol. Two releases apart they may not; update the Hub and every client to the same release and they always match. Until then the client falls back to its own polling, and reads **Hub version mismatch — update both apps; polling locally**.
+A client and its Hub must speak the same version of the Hub protocol. A new release can change that version, so a client and a Hub on different releases may not match; update the Hub and every client to the same release and they always do. Until then the client falls back to its own polling and reads **Hub version mismatch — update both apps; polling locally**. It reads your limits only with a [session key](usage-limits.md#the-claudeai-session-key) of its own, and shows none without one, and it sends the Hub no usage until both match.
 
 ## The Machine filter and grouping by machine
 

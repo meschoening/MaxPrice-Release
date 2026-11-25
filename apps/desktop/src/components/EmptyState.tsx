@@ -2,7 +2,7 @@ import { Link } from "react-router-dom";
 import { Inbox } from "lucide-react";
 
 // First-launch empty state (Part 6, Task 6.5) — shown on Live / Sessions /
-// Projects / Blocks when the engine's event store holds no usage data at all
+// Projects when the engine's event store holds no usage data at all
 // (a genuinely empty corpus, not merely an empty date range). The
 // corpus-empty signal is `useLiveStatus`'s range-independent `hasData` flag;
 // the pages gate on `hasData === false` AND their own report query resolving

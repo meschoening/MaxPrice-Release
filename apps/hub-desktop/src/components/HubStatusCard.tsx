@@ -12,6 +12,7 @@ import {
   hubDaemonDot,
   hubDaemonLabel,
   hubDaemonState,
+  hubLastReadAt,
   isDeliberateLoopback,
 } from "@maxprice/shared";
 import { formatUptime } from "@/lib/relative-time";
@@ -80,17 +81,17 @@ export function HubStatusCard(): React.ReactElement {
             title="Whether this installed app is registered to launch when you log in"
           />
         ) : null}
-        {/* Named for the archive, not the poll (ADR-0049): this pair and the
-            Fleet events pair below are the daemon's two stores and when each
-            last grew. The Claude account card carries Last sample too, as key
-            freshness — one duplicated number, two honest meanings. */}
+        {/* The Usage history's size, and the last successful read of the
+            limits (ADR-0145 §6), which the Claude account card carries too.
+            The Fleet events pair below is the other store and when it last
+            grew. */}
         <Row
           label="Usage samples"
           value={status !== undefined ? formatCount(status.sampleCount) : "—"}
         />
         <Row
-          label="Last sample"
-          value={isPending ? "…" : formatRelativeTime(status?.usageLastSampleAt ?? null, now)}
+          label="Last read"
+          value={isPending ? "…" : formatRelativeTime(hubLastReadAt(status?.accounts ?? []), now)}
         />
         {status?.events !== undefined ? (
           <>

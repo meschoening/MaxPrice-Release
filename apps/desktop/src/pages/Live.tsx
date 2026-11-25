@@ -8,46 +8,40 @@ import { useTimeDisplay } from "@/state/use-settings";
 import { useWeekWindow } from "@/state/use-week";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { AXIS_LABELS, GROUP_BY_AXES, selectionLabel, type GroupByAxis } from "@/lib/group-by";
-import { useQuotaSurface } from "@/state/use-quota-surface";
 import { useCorpusEmpty } from "@/state/use-corpus-empty";
 import { useBootPaintPublisher } from "@/lib/boot-paint";
 import { EmptyState } from "@/components/EmptyState";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { TodayTile } from "@/components/today-tile";
 import { ThisWeekTile } from "@/components/this-week-tile";
-import { ActiveBlockTile } from "@/components/active-block-tile";
 import { LimitAreaView } from "@/components/limit-area";
 import { useLimitArea } from "@/state/use-limit-area";
 import { useNowTick } from "@/state/use-now-tick";
 import { useOrganizationLabels } from "@/state/use-organizations";
-import { useBlockSpanPick } from "@/state/use-block-span-pick";
 import { useScopeMemberships } from "@/state/use-scope-memberships";
 import type { SplitInput } from "@/lib/money-split";
-import { ChartSpanControl } from "@/components/chart-span-note";
 import { CostChartCard } from "@/components/cost-chart-card";
 import { ListRow } from "@/components/list-row";
 import { useFlipList } from "@/state/use-flip-list";
 import { cn } from "@/lib/utils";
 
-// `block` replaced `6h` (ADR-0031): it frames the ACTIVE 5-hour block — a
-// growing window from the block's start, resolved sidecar-side. All six tabs
-// are enabled as of Part 5's T5.4b; `today` was `24h` (a rolling last-24h
-// window) until ADR-0020 made it the local calendar day.
-const SPAN_TABS: readonly Span[] = ["15m", "1h", "block", "today", "week", "30d"];
+// `today` was `24h` (a rolling last-24h window) until ADR-0020 made it the
+// local calendar day. No tab took the retired `block` span's place
+// (ADR-0142 §2).
+const SPAN_TABS: readonly Span[] = ["15m", "1h", "today", "week", "30d"];
 
-// The display label per span — `today`, `block`, and `week` differ from their
-// ids only by capitalization. The `today` label is honest about being the
+// The display label per span — `today` and `week` differ from their ids only
+// by capitalization. The `today` label is honest about being the
 // calendar day rather than a fixed duration (ADR-0020); `week` replaced `7d`
 // and follows the Week setting, so it names the concept, not a duration
 // (ADR-0083).
 const SPAN_LABELS: Partial<Record<Span, string>> = {
   today: "Today",
-  block: "Block",
   week: "Week",
 };
 
-// The chart card itself — the span × axes → data-source resolution, the
-// compose step, and the block span's empty state — lives in
+// The chart card itself — the span × axes → data-source resolution and the
+// compose step — lives in
 // `@/components/cost-chart-card` over `useChartSource` (the one data-source
 // seam; architecture review 2026-07-18, candidate 1).
 
@@ -121,23 +115,16 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
   // ADR-0083: the This-week tile follows the Week setting.
   const week = useWeekWindow();
   const display = useTimeDisplay();
-  // The block span frames the Quota organization's block (ADR-0108); under All
-  // a note beside the controls says whose.
-  const { tag: quotaTag } = useQuotaSurface();
 
-  // #637: the Scope's Memberships decide the money tiles' split bars (D6) and
-  // the limit area (D7). One Membership keeps today's tiles exactly; two or
-  // more put a card per Membership where the Active Block tile was, and This
-  // week's weekly meter moves into those cards.
+  // #637, ADR-0142 §2: the Scope's Memberships decide the money tiles' split
+  // bars (D6) and the limit area (D7). One Membership gets one limit card
+  // between Today and This week; two or more put the cards, or the board, on
+  // a row of their own. Either way the weekly meter is the cards'.
   const nowMs = useNowTick(60_000);
   const area = useLimitArea(nowMs);
   const { accounts } = useScopeMemberships();
   const organizationLabels = useOrganizationLabels();
   const many = area.kind !== "single";
-  // #619 variant 1, #638: whose Active block the Block span frames, picked
-  // among the Scope's Memberships with a live Block; `single` on a
-  // one-Account install, which keeps today's span.
-  const blockPick = useBlockSpanPick(nowMs);
   const splits = useMemo(() => {
     const rule = data.splitRule;
     if (rule === "none") return { today: undefined, week: undefined };
@@ -151,15 +138,7 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
     <>
       <section className={cn("tiles", many && "tiles-many")} aria-label="Usage summary">
         <TodayTile row={data.todayRow} yesterday={data.yesterdayRow} split={splits.today} />
-        {many ? (
-          <LimitAreaView area={area} nowMs={nowMs} />
-        ) : (
-          <ActiveBlockTile
-            block={data.activeBlock}
-            typicalBlockTokens={data.typicalBlockTokens}
-            accountNotKnown={data.activeBlockAccountNotKnown}
-          />
-        )}
+        <LimitAreaView area={area} nowMs={nowMs} />
         <ThisWeekTile
           rows={data.weekRows}
           prevRows={data.prevWeekRows}
@@ -167,7 +146,6 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
           week={week}
           display={display}
           split={splits.week}
-          meterMoved={many}
         />
       </section>
 
@@ -181,12 +159,6 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
               groupByAxes={groupByAxes}
               setGroupByAxes={setGroupByAxes}
               visibleAxes={visibleAxes}
-            />
-            <ChartSpanControl
-              span={span}
-              quotaTag={quotaTag}
-              pick={blockPick.pick}
-              onPick={blockPick.setPick}
             />
           </div>
           <div className="seg" role="tablist" aria-label="Span">
@@ -214,7 +186,6 @@ function LiveContent({ data }: { data: ReturnType<typeof useLiveData> }): React.
           onToggleGhost={() => setGhostOverlay(!ghostOverlay)}
           logScale={logScale}
           onToggleLogScale={() => setLogScale(!logScale)}
-          blockPick={blockPick.pick}
         />
       </section>
 

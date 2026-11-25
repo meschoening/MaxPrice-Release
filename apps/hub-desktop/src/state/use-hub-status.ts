@@ -2,10 +2,12 @@ import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import type { HubStatus } from "@maxprice/shared";
 import { fetchHubStatus, hubStatusQueryKey } from "@/lib/hub-api";
 
-export function useHubStatus(): UseQueryResult<HubStatus> {
-  return useQuery({
+// The query's options, apart from the hook for their test: the two load-bearing
+// flags below are what keep the hidden popout writing the tray.
+export function hubStatusQueryOptions() {
+  return {
     queryKey: hubStatusQueryKey(),
-    queryFn: ({ signal }) => fetchHubStatus(signal),
+    queryFn: ({ signal }: { signal?: AbortSignal }) => fetchHubStatus(signal),
     refetchInterval: 30_000, // backstop if the SSE channel drops
     // LOAD-BEARING, do not strip (ADR-0049, re-aimed by ADR-0050). Both hub
     // windows are hidden as their NORMAL state — the console closes to tray,
@@ -30,5 +32,20 @@ export function useHubStatus(): UseQueryResult<HubStatus> {
     // this bounds staleness in practice rather than guaranteeing 30s — fast
     // detection comes from `useHubStream`'s `onDisconnect` invalidation.
     refetchIntervalInBackground: true,
-  });
+    // LOAD-BEARING for the same reason (Map 9, #757): no retry. TanStack's
+    // retryer holds a retry until the page is visible again (`canContinue`
+    // asks `focusManager.isFocused()`), so in the hidden popout a failed fetch
+    // never reached `isError`: a dead daemon left the tray reading online until
+    // someone opened the popout. Seen on macOS, whose hidden popout reports
+    // `hidden`. The 30s interval, and the stream's `onDisconnect`
+    // invalidation, are the retry. A loopback fetch fails only when the daemon
+    // isn't answering, and `getHubUrl` already waits out its start. Windows
+    // takes it too, as does the console: one failed fetch now reads Not
+    // responding at once, where the client default's one retry absorbed it.
+    retry: false,
+  } as const;
+}
+
+export function useHubStatus(): UseQueryResult<HubStatus> {
+  return useQuery(hubStatusQueryOptions());
 }

@@ -270,7 +270,7 @@ export const STORAGE_COPY = {
     },
     usageHistory: {
       label: "Usage limit readings",
-      note: "One reading a minute. Old readings are what place your 5-hour block boundaries, so they're kept.",
+      note: "One reading a minute while a limit window is open. claude.ai keeps no history of them, so they're kept.",
     },
     logs: { label: "Logs", note: "Capped at 5 MB, with one older copy kept." },
     other: {

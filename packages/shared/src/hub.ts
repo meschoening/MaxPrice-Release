@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  newestInstant,
   organizationRosterHintsSchema,
   orgLimitsAnswerSchema,
   usageConnectionSchema,
@@ -38,7 +39,10 @@ import { hubGatewaySchema } from "./gateway";
 // v7 (ADR-0139, ADR-0137 §6): fleet event rows and Usage samples carry
 // Account tags, the Hub status lists the Hub's Accounts, and the Hub holds a
 // session key per Account. One bump across the map.
-export const HUB_PROTOCOL_VERSION = 7;
+// v8 (ADR-0145 §4): a Usage sample may omit its five-hour window (a plan with
+// none, such as a verified Ultra plan, or one idle beside a weekly window in
+// flight), which a v7 peer's sample schema rejects.
+export const HUB_PROTOCOL_VERSION = 8;
 
 // The hub's fixed default port. Unlike the sidecar (ADR-0002's dynamic port +
 // stdout handshake — only possible with a parent process), remote clients must
@@ -135,12 +139,22 @@ export const hubAccountSchema = z.object({
 });
 export type HubAccount = z.infer<typeof hubAccountSchema>;
 
+// The Hub's last successful read of any limits (ADR-0145 §6): the newest
+// `lastReadAt` of its Accounts' Memberships, which both Hub console cards show
+// as Last read. Null before a read succeeds: the read time lives in memory, so
+// a Hub restart clears it.
+export function hubLastReadAt(accounts: readonly HubAccount[]): string | null {
+  return newestInstant(accounts.flatMap((a) => a.memberships.map((m) => m.lastReadAt)));
+}
+
 // GET /api/status response AND the hub:status SSE payload. `service` is a
 // literal so a client pointed at some other HTTP server fails loudly here
 // rather than misparsing. `accounts` (v7, ADR-0139 §1) is every Account the
 // Hub knows with its Memberships, sorted by provider, then account uuid (the
 // legacy entry first), its Memberships by Organization; a connected sidecar
 // projects its per-Organization state from it (`hubMembershipProjection`).
+// `usageLastSampleAt` is the newest line of the Hub's Usage history, the
+// sample sync's cursor and nothing else (ADR-0145 §6).
 // `samplesStampedAt` (ADR-0139 §8) is when the Hub's history last gained an
 // Account stamp on a sample it already held; null until then.
 export const hubStatusSchema = z.object({

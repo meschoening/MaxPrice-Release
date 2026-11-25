@@ -1,7 +1,6 @@
 import { useMemo } from "react";
 import { CostChart, CostChartLegend } from "@/components/cost-chart";
 import { GlassToggle } from "@/components/glass-toggle";
-import { WindowSourceNote } from "@/components/window-source";
 import type { Composed } from "@/lib/composed-series";
 import { logScaleApplies, type GroupByAxis } from "@/lib/group-by";
 import { applyMute, type MutedComposed } from "@/lib/mute";
@@ -12,7 +11,6 @@ import {
   type MutedState,
   type Span,
 } from "@/state/filters";
-import type { BlockSpanWindow } from "@maxprice/shared";
 
 // The cost-chart render tail — the <CostChart> plus its <ChartFoot> (legend +
 // summary). `CostChartCard` (components/cost-chart-card.tsx) resolves the
@@ -46,9 +44,6 @@ export type ChartCardBodyProps = {
   isError: boolean;
   errorMessage?: string;
   prevRangeLabel: string;
-  // ADR-0031 — the block span's resolved frame (intraday paths only); the foot
-  // shows a provenance note for non-observed windows.
-  blockWindow?: BlockSpanWindow | null;
 };
 
 export function ChartCardBody({
@@ -67,7 +62,6 @@ export function ChartCardBody({
   isError,
   errorMessage,
   prevRangeLabel,
-  blockWindow,
 }: ChartCardBodyProps): React.ReactElement {
   // Mute (ADR-0042) — applied HERE, the one shared render tail, so every Live
   // data-source component gets it and nothing else (the compact strip charts
@@ -104,7 +98,6 @@ export function ChartCardBody({
         prevRangeLabel={prevRangeLabel}
         logScale={logScale}
         onToggleLogScale={onToggleLogScale}
-        blockWindow={blockWindow}
         muted={muted}
         onToggleMute={toggleMute}
       />
@@ -131,7 +124,6 @@ function ChartFoot({
   prevRangeLabel,
   logScale,
   onToggleLogScale,
-  blockWindow,
   muted,
   onToggleMute,
 }: {
@@ -143,10 +135,6 @@ function ChartFoot({
   prevRangeLabel: string;
   logScale: boolean;
   onToggleLogScale: () => void;
-  // ADR-0031 — the block span's resolved frame; the foot shows a provenance
-  // note for non-observed windows (estimated start / annulled), mirroring the
-  // Blocks view's dot language.
-  blockWindow?: BlockSpanWindow | null;
   // Mute (ADR-0042) — every legend entry toggles its value's series.
   muted: MutedState;
   onToggleMute: (axis: GroupByAxis, value: string) => void;
@@ -164,12 +152,7 @@ function ChartFoot({
         onToggleMute={onToggleMute}
       />
       <div className="chart-foot">
-        <span className="inline-flex items-center gap-3 flex-wrap">
-          <ChartSummary values={composed.totals} metric={metric} />
-          {blockWindow != null && blockWindow.source !== "observed" ? (
-            <WindowSourceNote source={blockWindow.source} />
-          ) : null}
-        </span>
+        <ChartSummary values={composed.totals} metric={metric} />
         <div className="foot-toggles">
           <GlassToggle
             label="Log scale"

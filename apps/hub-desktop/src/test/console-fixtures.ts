@@ -1,15 +1,16 @@
-import type {
-  HubAccount,
-  HubLabelDirectory,
-  HubMachine,
-  HubMembership,
-  HubOrganization,
-  HubStatus,
-  UsageConnection,
+import {
+  HUB_PROTOCOL_VERSION,
+  type HubAccount,
+  type HubLabelDirectory,
+  type HubMachine,
+  type HubMembership,
+  type HubOrganization,
+  type HubStatus,
+  type UsageConnection,
 } from "@maxprice/shared";
 
 // The Hub console's fixtures for several Accounts (#641), after the throwaway
-// prototype's (#614: `0`, `1`, `1m`, `3c`, `14c`), as v7 data: the status, the
+// prototype's (#614: `0`, `1`, `1m`, `3c`, `14c`), as Hub data: the status, the
 // Organization roster, the Label directory and the Machine directory a Hub
 // would answer. The component tests and the console stills rig
 // (scripts/acceptance/hub-console/) read them. `3t` and `14t` hold a ChatGPT
@@ -186,7 +187,7 @@ function fixture(
     title,
     status: {
       service: "maxprice-hub",
-      protocolVersion: 7,
+      protocolVersion: HUB_PROTOCOL_VERSION,
       accounts,
       samplesStampedAt: null,
       usageLastSampleAt: specs.length === 0 ? null : ago(1),

@@ -70,8 +70,8 @@ export function accountLabel(
 }
 
 // The words for a Membership whose Account is not known (ADR-0137 §3's note:
-// rows whose Account resolves to none, the `accountUuid: null` Membership of
-// `/api/blocks`): every surface that names such an Account says this (#635:
+// rows whose Account resolves to none, the `accountUuid: null` Membership):
+// every surface that names such an Account says this (#635:
 // "if unsure what account it came from it should say it's unknown").
 export const ACCOUNT_NOT_KNOWN = "Account not known";
 

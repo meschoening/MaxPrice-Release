@@ -14,15 +14,13 @@ import {
 import { cn } from "@/lib/utils";
 import { OrganizationLabelParts } from "./membership-name";
 
-// Live's limit area for a Scope of two or more Memberships (#613 §5, #610,
-// #637 D7): two to four get a card each, most used first; five or more get
-// one board, a row per Membership, the four most used until Show all. Every
-// number is one Membership's own window, never a sum. One Membership keeps
-// the Active Block tile, which `LivePage` renders instead (`kind:
-// "single"`). The rules are `lib/limit-area.ts`.
+// Live's limit area (#613 §5, #610, #637 D7, ADR-0142 §2): one Membership
+// gets one card under a `Limits ·` eyebrow, two to four a card each, most
+// used first, and five or more one board, a row per Membership, the four most
+// used until Show all. Every number is one Membership's own window, never a
+// sum. The rules are `lib/limit-area.ts`.
 
-// The limit area in the Active Block tile's place, once the Scope holds two
-// or more Memberships; nothing for one.
+// The limit area between the Today and This week tiles.
 export function LimitAreaView({
   area,
   nowMs,
@@ -31,8 +29,12 @@ export function LimitAreaView({
   area: LimitArea;
   nowMs: number;
   initiallyAll?: boolean;
-}): React.ReactElement | null {
-  if (area.kind === "single") return null;
+}): React.ReactElement {
+  if (area.kind === "single") {
+    if (area.card === undefined) return <LimitsLoadingCard />;
+    if (area.card === null) return <NoLimitsCard />;
+    return <LimitCardView card={area.card} nowMs={nowMs} single />;
+  }
   if (area.kind === "board")
     return <LimitBoard area={area} nowMs={nowMs} initiallyAll={initiallyAll} />;
   return (
@@ -191,15 +193,44 @@ const STATE_NOTE: Partial<Record<LimitCard["state"], string>> = {
   stale: "key expired · last known",
 };
 
+// The one card's place while settings and the roster load: its eyebrow
+// alone, so no "nothing to read" flashes before they answer.
+function LimitsLoadingCard(): React.ReactElement {
+  return (
+    <div className="tile panel limit-card" data-state="loading">
+      <span className="eyebrow">Limits</span>
+    </div>
+  );
+}
+
+// One Membership with nothing to read: no head, or none the roster lists yet.
+function NoLimitsCard(): React.ReactElement {
+  return (
+    <div className="tile panel limit-card" data-state="none">
+      <span className="eyebrow">Limits</span>
+      <div className="inset dashed my-auto">
+        <p>
+          No limits read — connect an Account in <Link to="/settings">Settings</Link>.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 export function LimitCardView({
   card,
   nowMs,
+  single = false,
 }: {
   card: LimitCard;
   nowMs: number;
+  // The Scope's one card: it wears the `Limits ·` eyebrow, since no board or
+  // sibling says what it is.
+  single?: boolean;
 }): React.ReactElement {
   const stale = card.state === "stale";
   const note = STATE_NOTE[card.state];
+  const sub = [card.accountLabel, card.plan].filter((x) => x !== null).join(" · ");
   return (
     <div
       className={cn("tile panel limit-card", card.tone && `hot-${card.tone}`)}
@@ -208,6 +239,7 @@ export function LimitCardView({
       <div className="limit-card-head">
         <span className="limit-card-name">
           <span className="limit-card-title">
+            {single ? <span className="eyebrow limit-card-eyebrow">Limits · </span> : null}
             <b className="mname" title={card.organizationLabel}>
               <OrganizationLabelParts label={card.organizationLabel} />
             </b>
@@ -217,9 +249,9 @@ export function LimitCardView({
               </span>
             ) : null}
           </span>
-          {card.accountLabel !== null ? (
-            <span className="tile-sub limit-card-account" title={card.accountLabel}>
-              {card.accountLabel}
+          {sub !== "" ? (
+            <span className="tile-sub limit-card-account" title={sub}>
+              {sub}
             </span>
           ) : null}
           {note !== undefined ? (
@@ -233,6 +265,9 @@ export function LimitCardView({
       {card.windows.map((w) => (
         <LimitWindowRow key={w.kind} window={w} stale={stale} />
       ))}
+      {card.noFiveHour ? (
+        <span className="limit-note mute limit-card-none">no 5-hour limit on this plan</span>
+      ) : null}
       <LimitCardFoot card={card} nowMs={nowMs} />
     </div>
   );

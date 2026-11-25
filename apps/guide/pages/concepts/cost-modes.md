@@ -14,7 +14,7 @@ The cost mode decides where each request's cost comes from. Change it in Setting
 
 Current versions of Claude Code record no cost in their logs, so on recent usage **auto** and **calculate** give the same figures, and **display** shows $0.
 
-The mode applies to every report, [Blocks](blocks.md#blocks) included. It shows only in Settings: nothing else on screen says which mode is on. On the Headless client it is the `cost-mode` setting ([reference](../../../cli/README.md#maxprice-settings-getsetunset)).
+The mode applies to every report. It shows only in Settings: nothing else on screen says which mode is on. On the Headless client it is the `cost-mode` setting ([reference](../../../cli/README.md#maxprice-settings-getsetunset)).
 
 ## Where prices come from
 

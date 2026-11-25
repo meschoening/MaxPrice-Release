@@ -67,7 +67,8 @@ export type LiveStatusState = {
   // updated live on every `status:changed` frame (success AND failure) so the
   // Settings section and future status indicator always reflect the poller.
   usageConnection: UsageConnection;
-  usageLastSampleAt: string | null;
+  // The head Organization's last successful read (ADR-0145 §6).
+  usageLastReadAt: string | null;
   organizations: StatusSnapshot["organizations"];
   // Hub connection state (ADR-0035). `off` until a hub URL is configured.
   hubConnection: HubConnection;
@@ -120,7 +121,7 @@ export const useLiveStatus = create<LiveStatusState>((set) => ({
   bootFailure: null,
   engineStop: null,
   usageConnection: "disconnected",
-  usageLastSampleAt: null,
+  usageLastReadAt: null,
   organizations: {},
   hubConnection: "off",
   lastSettledHubConnection: null,
@@ -149,7 +150,7 @@ export const useLiveStatus = create<LiveStatusState>((set) => ({
       // composition — rather than `undefined` leaking into the store.
       bootProgress: snapshot.bootProgress ?? null,
       usageConnection: snapshot.usageConnection,
-      usageLastSampleAt: snapshot.usageLastSampleAt,
+      usageLastReadAt: snapshot.usageLastReadAt,
       organizations: snapshot.organizations,
       hubConnection: snapshot.hubConnection,
       // The last SETTLED hub state, feeding foot-status' sticky rule. Derived

@@ -113,46 +113,36 @@ pub const POPOUT_GAP: f64 = 8.0;
 
 /// The popout's logical content heights, ADDITIVE over a measured base (map
 /// #168 M3's T3 pixel contract, re-measured 2026-08-26 when the Weekly-limit
-/// row joined and the Projected row left): the BASE holds the ring head, the
-/// 5-hour / Weekly / Today rows and the two actions; a `<Model> limit` row —
-/// present exactly while the current sample carries a Model-scoped weekly
-/// limit, which the readout reports as `hasModelWindow` — adds one 30px row
-/// plus its 1px gap; the pending-only "Update available" row adds its 38.
+/// row joined and the Projected row left, and kept when the most used
+/// window's head replaced the Active block's, ADR-0142 §2): the BASE holds the
+/// ring head, two limit rows, Today and the two actions. Each limit row past
+/// two adds one 30px row plus its 1px gap, and one fewer takes one away: the
+/// readout's `popoutLimitRows` counts them, the ranked popout's Memberships or
+/// the one-Membership popout's 5-hour and weekly rows. A `<Model> limit` row —
+/// present exactly while the one-Membership reading carries a Model-scoped
+/// weekly limit, which the readout reports as `hasModelWindow` — adds a row
+/// too; the pending-only "Update available" row adds its 38.
 /// The BASE height is also what tauri.conf.json's `popout` window declares —
 /// a lib.rs contract test binds the two — and `toggle_popout` re-derives the
 /// height from the ambient module's state on every open, exactly where it
-/// already re-asserts size against DPI drift. Both extras are shell-side
-/// facts by design: the window is sized BEFORE it is shown (never resized by
+/// already re-asserts size against DPI drift. Every extra is a shell-side
+/// fact by design: the window is sized BEFORE it is shown (never resized by
 /// the webview — ADR-0050/0076), so a row's presence must be known here.
 pub const POPOUT_HEIGHT: f64 = 260.0;
-pub const POPOUT_MODEL_ROW_HEIGHT: f64 = 31.0;
+pub const POPOUT_LIMIT_ROW_HEIGHT: f64 = 31.0;
 pub const POPOUT_UPDATE_ROW_HEIGHT: f64 = 38.0;
+/// The limit rows the BASE holds.
+pub const POPOUT_BASE_LIMIT_ROWS: u32 = 2;
 
-/// Which height this open should re-assert: base + each optional row that
-/// the renderer will draw. Named so the call site reads as the contract
-/// ("height follows the rows") rather than as arithmetic.
-pub fn popout_content_height(model_row: bool, update_pending: bool) -> f64 {
+/// Which height this open should re-assert: the base, its limit rows past or
+/// short of two, and each optional row that the renderer will draw. Named so
+/// the call site reads as the contract ("height follows the rows") rather
+/// than as arithmetic.
+pub fn popout_content_height(limit_rows: u32, model_row: bool, update_pending: bool) -> f64 {
+    let rows = f64::from(limit_rows) - f64::from(POPOUT_BASE_LIMIT_ROWS)
+        + if model_row { 1.0 } else { 0.0 };
     POPOUT_HEIGHT
-        + if model_row {
-            POPOUT_MODEL_ROW_HEIGHT
-        } else {
-            0.0
-        }
-        + if update_pending {
-            POPOUT_UPDATE_ROW_HEIGHT
-        } else {
-            0.0
-        }
-}
-
-/// The ranked popout's height (#638; #610's head + ranked rows): while the
-/// readout carries `popoutLimitRows` (two or more Memberships in the Scope's
-/// multi-Membership set) the renderer draws that many limit rows in place of
-/// the base's two (5-hour, Weekly), each a model row's 31px, and no
-/// `<Model> limit` row; the update row adds as ever. Two rows is the base.
-pub fn ranked_popout_content_height(limit_rows: u32, update_pending: bool) -> f64 {
-    POPOUT_HEIGHT
-        + f64::from(limit_rows.saturating_sub(2)) * POPOUT_MODEL_ROW_HEIGHT
+        + rows * POPOUT_LIMIT_ROW_HEIGHT
         + if update_pending {
             POPOUT_UPDATE_ROW_HEIGHT
         } else {
@@ -565,32 +555,37 @@ mod tests {
     // is told in.
     #[test]
     fn content_height_is_additive_over_the_base() {
-        assert_eq!(popout_content_height(false, false), POPOUT_HEIGHT);
+        assert_eq!(popout_content_height(2, false, false), POPOUT_HEIGHT);
         assert_eq!(
-            popout_content_height(true, false),
-            POPOUT_HEIGHT + POPOUT_MODEL_ROW_HEIGHT
+            popout_content_height(2, true, false),
+            POPOUT_HEIGHT + POPOUT_LIMIT_ROW_HEIGHT
         );
         assert_eq!(
-            popout_content_height(false, true),
+            popout_content_height(2, false, true),
             POPOUT_HEIGHT + POPOUT_UPDATE_ROW_HEIGHT
         );
         assert_eq!(
-            popout_content_height(true, true),
-            POPOUT_HEIGHT + POPOUT_MODEL_ROW_HEIGHT + POPOUT_UPDATE_ROW_HEIGHT
+            popout_content_height(2, true, true),
+            POPOUT_HEIGHT + POPOUT_LIMIT_ROW_HEIGHT + POPOUT_UPDATE_ROW_HEIGHT
         );
     }
 
     #[test]
-    fn ranked_height_adds_a_row_per_limit_row_past_two() {
-        assert_eq!(ranked_popout_content_height(2, false), POPOUT_HEIGHT);
+    fn height_follows_the_limit_rows() {
+        // An Organization with no weekly limit: one row fewer than the base.
         assert_eq!(
-            ranked_popout_content_height(3, false),
-            POPOUT_HEIGHT + POPOUT_MODEL_ROW_HEIGHT
+            popout_content_height(1, false, false),
+            POPOUT_HEIGHT - POPOUT_LIMIT_ROW_HEIGHT
+        );
+        // The ranked popout's three Memberships: a row past the base.
+        assert_eq!(
+            popout_content_height(3, false, false),
+            POPOUT_HEIGHT + POPOUT_LIMIT_ROW_HEIGHT
         );
         // Four rows and the `+N more` row: 5 × 31 in place of the base's 2.
         assert_eq!(
-            ranked_popout_content_height(5, true),
-            POPOUT_HEIGHT + 3.0 * POPOUT_MODEL_ROW_HEIGHT + POPOUT_UPDATE_ROW_HEIGHT
+            popout_content_height(5, false, true),
+            POPOUT_HEIGHT + 3.0 * POPOUT_LIMIT_ROW_HEIGHT + POPOUT_UPDATE_ROW_HEIGHT
         );
     }
 

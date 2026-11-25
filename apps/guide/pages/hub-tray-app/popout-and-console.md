@@ -1,10 +1,10 @@
 # The Popout and the console
 
-The Hub tray app has two surfaces: the Popout, a glance at the Hub from its tray icon, and the console, the window where you run it. Closing the console only hides it; the Hub keeps running until you [quit](update-and-quit.md#quit) it.
+The Hub tray app has two surfaces: the Popout, a glance at the Hub from its icon in the Windows tray or the macOS menu bar, and the console, the window where you run it. Closing the console only hides it; the Hub keeps running until you [quit](update-and-quit.md#quit) it.
 
 ## The Popout
 
-Click the tray icon, with either button, to open the Popout. Click anywhere else, or press Esc, to close it.
+Click the icon, with either button, to open the Popout. Click anywhere else, or press Esc, to close it.
 
 ![The Popout: the Hub row reads Online, claude.ai 2 connected, Access No password, then 3 connected clients, Open window and Quit MaxPrice Hub](../../screenshots/hub-tray-popout.light.png "The Popout")
 
@@ -25,7 +25,11 @@ Then two actions:
 
 When the Hub has stopped, a third action, **Restart hub**, comes first ([Troubleshooting](troubleshooting.md#the-hub-row-reads-stopped)).
 
-Hover the tray icon for the same answer in one line, such as `MaxPrice Hub — online`, or `MaxPrice Hub — online · key expired` when the key needs you. With several keys the clause names the row, as in `MaxPrice Hub — online · claude.ai: 1 key expired`.
+Hover the icon for the same answer in one line, such as `MaxPrice Hub — online`, or `MaxPrice Hub — online · key expired` when the key needs you. With several keys the clause names the row, as in `MaxPrice Hub — online · claude.ai: 1 key expired`.
+
+## The menu-bar icon
+
+On a Mac the icon carries the Hub row's answer too. While the Hub is **Online** it is a plain glyph in the menu bar's own colour, like the icons beside it. Any other answer adds a small dot at its top right, in the Hub row's colour: orange for **Local only** and **Event sync down**, red for **Stopped** and **Not responding**, and grey for **Starting…** and for a Hub that serves this Mac alone on purpose. The glyph follows the menu bar, dark on a light bar and light on a dark one. On Windows the icon is the MaxPrice Hub logo in every state, and its tooltip carries the answer.
 
 ## The console
 
@@ -39,8 +43,9 @@ The card's heading shows the same answer as the Popout's Hub row. Its rows:
 
 - **Listening:** the address other machines reach the Hub at, its tailnet address and port. A client joins at `http://` and this address ([Join clients](join-clients.md)).
 - **Uptime:** how long the Hub has run since it last started.
-- **Starts at login:** whether the app starts when you log in to Windows ([Install](install.md#starts-at-login)).
-- **Usage samples** and **Last sample:** how many usage samples the Hub has kept, and when it took or received the last one.
+- **Starts at login:** whether the app starts when you log in to Windows ([Install](install.md#starts-at-login)). A Mac shows no such row.
+- **Usage samples:** how many usage samples the Hub has kept. It keeps one a minute for each Membership while any of its limits has a window in progress.
+- **Last read:** when the Hub last read the limits of any Account it holds a key for. A dash until a read succeeds after the Hub starts.
 - **Fleet events** and **Last event:** how many [Fleet events](../concepts/hubs.md#what-a-client-sends) the Hub's archive holds and its size on disk, and when the last one arrived.
 
 Below them, the card shows how much synchronization history the archive keeps, and how much unused space its database holds. **Compact now** gives that unused space back to the disk, and keeps all usage and synchronization history.
@@ -53,7 +58,7 @@ A Hub that knows one claude.ai [Account](../concepts/organizations.md#accounts) 
 
 The card's heading shows whether the Hub's session key reads your usage limits: **Connected**, **Session expired**, **Connection error** or **Not connected**. Its rows:
 
-- **Last sample:** when the Hub last read the limits.
+- **Last read:** when the Hub last read the limits. A dash until a read succeeds after the Hub starts.
 - **Organization:** the [Organization](../concepts/organizations.md) the key belongs to.
 - **Key:** whether a key is set, when, and by whom: `locally` when you set it in this console, or `healed by` and the id of the machine whose client sent it under [Send keys to the Hub](../concepts/hubs.md#send-keys-to-the-hub).
 
@@ -61,7 +66,7 @@ The card's heading shows whether the Hub's session key reads your usage limits: 
 
 **Clear** removes the key, and the Hub stops reading the limits until a key comes back. The Hub records when you cleared it, so [Send keys to the Hub](../concepts/hubs.md#send-keys-to-the-hub) doesn't send the same key straight back; a key pasted after that, here or on any client, brings it back.
 
-Each key is kept in the Windows Credential Manager, one entry per Account, and never shown. A key kept from before keys were per Account has no record of when or by whom it was set, so its Key row reads **Key set (time unknown)** until it moves under its Account.
+Each key is kept in the Windows Credential Manager or the macOS Keychain, one entry per Account, and never shown. A key kept from before keys were per Account has no record of when or by whom it was set, so its Key row reads **Key set (time unknown)** until it moves under its Account.
 
 ### Accounts
 
@@ -91,7 +96,7 @@ A Gateway, such as CLIProxyAPI, serves Claude Code's requests on claude.ai Accou
 
 The card's heading counts the Gateways the Hub holds, or reads **None**. Each row is one Gateway, by its address: whether the Hub drains it (**Draining**), or why not (**Unreachable**, **Key refused**, **Statistics off** or **Error**), and when its last record arrived, as **Last record 2m ago**, or **No record yet**. **Remove** stops draining it. A Gateway a client connected and sent up shows here too, and is removed only here.
 
-**Connect a Gateway…** takes the Gateway's URL and its management key, and checks that the Gateway answers and accepts the key. Once connected it reminds you to keep the Gateway's usage records for at least an hour, and that MaxPrice must be the only consumer of them. The key is kept in the Windows Credential Manager and never shown.
+**Connect a Gateway…** takes the Gateway's URL and its management key, and checks that the Gateway answers and accepts the key. Once connected it reminds you to keep the Gateway's usage records for at least an hour, and that MaxPrice must be the only consumer of them. The key is kept in the Windows Credential Manager or the macOS Keychain, and never shown.
 
 ### Access
 

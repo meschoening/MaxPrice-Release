@@ -18,8 +18,8 @@ import { membershipReadability } from "./usage-limits";
 
 // The Scope's Memberships and the one-number surfaces over them (#638;
 // ADR-0136 §6 as amended by #610/#622, ADR-0138 §8). Pure, so the sidecar's
-// `/api/readout`, the renderer's Live limit area and split bars, the Popout
-// and the Blocks surfaces read one rule each:
+// `/api/readout`, the renderer's Live limit area and split bars and the
+// Popout read one rule each:
 //
 // - `scopeMembershipSet`: the multi-Membership world. Every #610/#622/#638
 //   surface turns on only where it holds two or more Memberships; a
@@ -28,11 +28,11 @@ import { membershipReadability } from "./usage-limits";
 //   built on 2026-11-10, #638's D1; ADR-0136 §6's rows count the
 //   Readable memberships in this set, not in the whole Scope).
 // - `scopeMembershipName`: a Membership's name, in its two parts.
-// - `readoutPick`, `popoutHeadMembership`, `liveBlockMemberships`: which
-//   Membership the Readout, the Popout head and the Block span read, by the
-//   one most used ordering (`rankMemberships`). Only Readable memberships
-//   drive any of them: a dead key's stale reading keeps its rank on the
-//   surfaces that list Memberships, and never picks the one number (§8).
+// - `readoutPick`, `liveReadable`: which Membership and window the Readout
+//   and the Popout's head read, by the one most used ordering
+//   (`rankMemberships`). Only Readable memberships drive either: a dead
+//   key's stale reading keeps its rank on the surfaces that list
+//   Memberships, and never picks the one number (§8).
 
 // One tracked Membership: a tracked Account's Membership in a tracked
 // Organization (Home's included), with its `membership` token.
@@ -152,8 +152,8 @@ export type ScopeMembershipReading = RankableMembership & {
 };
 
 // The set's Memberships as `rankMemberships` takes them, and every surface
-// that lists them builds on (the Readout, the Popout, Live's limit area, the
-// Blocks tabs, the Block span's picker): each named by `scopeMembershipName`,
+// that lists them builds on (the Readout, the Popout, Live's limit area):
+// each named by `scopeMembershipName`,
 // with its Account's connection and its own Limits answer and reading (none
 // for an Account or Membership the roster lacks).
 export function scopeMembershipReadings(
@@ -189,39 +189,37 @@ export function scopeMembershipReadings(
 
 // --- The one number -----------------------------------------------------------
 
-// One Membership's most used live window, as the Readout words it.
+// One Membership's most used live window, as the Readout words it. `label`
+// null: the Readout names no Membership (`ReadoutResponse.mostUsed`).
 export type ReadoutMembership = {
-  label: string;
+  label: string | null;
   window: LiveWindowKind;
   // The scoped family of a `weeklyModel` window ("Fable").
   model?: string;
   pct: number;
 };
 
-// What the Readout shows over the set (ADR-0136 §6's #610/#622 rows):
-// - `single`: fewer than two Readable memberships, today's Readout exactly;
-// - `percent`: two or more, and some Readable 5-hour window in flight: the
-//   most used Membership's most used window (`top`), then the second;
-// - `money`: two or more and no 5-hour window in flight: today's money, with
-//   the most used live window (`mostUsed`, null when none is live).
-// `count` is the set's Memberships, every state.
-export type ReadoutPick =
-  | { kind: "single" }
-  | { kind: "percent"; top: ReadoutMembership; next: ReadoutMembership | null; count: number }
-  | { kind: "money"; mostUsed: ReadoutMembership | null; count: number };
+// What the Readout shows over the Memberships it reads (ADR-0142 §2, which
+// replaced both halves of ADR-0136 §6's rule): the most used window, of any
+// kind, of the most used Readable membership (`top`), then the second
+// (`next`); null when no Readable membership holds a window in flight, which
+// is money. `count` is the Memberships given, every state.
+export type ReadoutPick = {
+  top: ReadoutMembership;
+  next: ReadoutMembership | null;
+  count: number;
+} | null;
 
 const isReadable = (m: RankableMembership): boolean =>
   membershipReadability(m.connection, m.limits) === "readable";
 
-// A 5-hour window in flight: held, and its reset still ahead.
-function fiveHourInFlight(m: RankableMembership, nowMs: number): boolean {
-  const window = m.reading?.fiveHour;
-  return window != null && Date.parse(window.resetAt) > nowMs;
-}
-
-// Readable memberships with a live window, most used first. A stale reading,
-// however high, is never among them (ADR-0138 §8).
-function liveReadable<T extends RankableMembership>(memberships: readonly T[], nowMs: number): T[] {
+// Readable memberships with a live window, most used first: the Readout's
+// order and the Popout head's. A stale reading, however high, is never among
+// them (ADR-0138 §8).
+export function liveReadable<T extends RankableMembership>(
+  memberships: readonly T[],
+  nowMs: number,
+): T[] {
   return rankMemberships(
     memberships.filter((m) => isReadable(m) && mostUsedWindow(m.reading, nowMs) !== null),
     nowMs,
@@ -244,58 +242,13 @@ export function readoutPick(
   memberships: readonly RankableMembership[],
   nowMs: number,
 ): ReadoutPick {
-  const readable = memberships.filter(isReadable);
-  // One Readable membership keeps today's Readout. None among several is
-  // money (ADR-0136 §6's "No Readable membership" row): an expired key's
-  // retained reading never drives it (ADR-0138 §8).
-  if (memberships.length < 2 || readable.length === 1) return { kind: "single" };
-  const ranked = liveReadable(readable, nowMs);
-  const count = memberships.length;
-  const [top, next] = ranked;
-  // Only a 5-hour window in flight switches to a percent: a weekly window is
-  // open for days (#622 item 3).
-  if (top !== undefined && readable.some((m) => fiveHourInFlight(m, nowMs))) {
-    return {
-      kind: "percent",
-      top: readoutMembership(top, nowMs),
-      next: next === undefined ? null : readoutMembership(next, nowMs),
-      count,
-    };
-  }
+  const [top, next] = liveReadable(memberships, nowMs);
+  if (top === undefined) return null;
   return {
-    kind: "money",
-    mostUsed: top === undefined ? null : readoutMembership(top, nowMs),
-    count,
+    top: readoutMembership(top, nowMs),
+    next: next === undefined ? null : readoutMembership(next, nowMs),
+    count: memberships.length,
   };
-}
-
-// The Popout head (ADR-0136 §6's Popout paragraph): the most used Readable
-// membership whose 5-hour window is in flight, drawn live. That is the
-// Readout's Membership whenever its own 5-hour window is in flight, since it
-// is the most used of all. With none in flight the head is the most used
-// Readable membership with any live window (the Readout's `Most used:`),
-// drawn idle; with none of those, null: today's idle head.
-export function popoutHeadMembership(
-  memberships: readonly RankableMembership[],
-  nowMs: number,
-): { key: string; idle: boolean } | null {
-  const ranked = liveReadable(memberships, nowMs);
-  const live = ranked.find((m) => fiveHourInFlight(m, nowMs));
-  if (live !== undefined) return { key: live.key, idle: false };
-  const top = ranked[0];
-  return top === undefined ? null : { key: top.key, idle: true };
-}
-
-// The Memberships with a live Block: Readable, their 5-hour window in flight,
-// most used first (the Block span's picker).
-export function liveBlockMemberships<T extends RankableMembership>(
-  memberships: readonly T[],
-  nowMs: number,
-): T[] {
-  return rankMemberships(
-    memberships.filter((m) => isReadable(m) && fiveHourInFlight(m, nowMs)),
-    nowMs,
-  );
 }
 
 // The ranked Popout's limit rows: the four most used, then one `+N more` row

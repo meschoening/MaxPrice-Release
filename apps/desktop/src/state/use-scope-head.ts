@@ -13,7 +13,7 @@ import { getSidecarUrl } from "@/lib/sidecar";
 // Scope's candidate Memberships, which only the store knows. The ADR-0004
 // four-piece split; the URL builder and key live in `@maxprice/shared`.
 // "scope-head" is in `DATA_QUERY_KEYS`, so `usage:new` refreshes it with the
-// Blocks whose head it names.
+// reports, as its candidates gain rows.
 
 export const scopeHeadQueryKey = scopeHeadKey;
 

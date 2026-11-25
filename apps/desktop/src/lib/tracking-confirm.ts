@@ -70,10 +70,10 @@ export function trackCopy(facts: TrackingFacts): string[] {
       copy.push("Its limits are read once a minute.");
       break;
     case "unreadable":
-      copy.push("Its limits can't be read, so its blocks are estimated.");
+      copy.push("Its limits can't be read.");
       break;
     case "unlisted":
-      copy.push("It isn't on this account's list, so its blocks are estimated.");
+      copy.push("It isn't on this account's list, so its limits can't be read.");
       break;
     case null:
       break;

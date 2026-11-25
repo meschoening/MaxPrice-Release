@@ -1,5 +1,5 @@
 import { Fragment, memo, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { Span } from "@maxprice/shared";
+import type { Span } from "@/state/filters";
 import {
   buildChartLayout,
   chartViewAt,
@@ -190,8 +190,7 @@ export function GlassChart({
 
   // The hover index CLAMPED against the model as it stands NOW. handleMove
   // clamps at mousemove time, but a refetch can shrink the bucket count under
-  // a stationary pointer — `block` rolls over 300 → 1, local midnight takes
-  // `today` 721 → 1 — leaving a stale index that would read off the end of the
+  // a stationary pointer — local midnight takes `today` 721 → 1 — leaving a stale index that would read off the end of the
   // tooltip and (via centersX) paint a NaN crosshair. Clamping rather than
   // clearing is deliberate: the pointer hasn't moved, so the chart keeps
   // reporting a bucket across the rollover instead of blanking.
@@ -315,9 +314,8 @@ export function GlassChart({
 
 // Dense mode's marks (ADR-0046): ONE step-area <path> per series, replacing the
 // one-rect-per-series-per-bucket clusters. Above ~121 buckets a cluster's rects,
-// clip and hit rect are all sub-pixel — and ruinous in number, since `block` at
-// a one-minute bucket is 300 buckets × up to 64 series ≈ 19k transitioning
-// nodes. Collapsing each series to a single path makes the node count depend on
+// clip and hit rect are all sub-pixel — and ruinous in number, since a
+// 300-bucket window × up to 64 series is ≈ 19k transitioning nodes. Collapsing each series to a single path makes the node count depend on
 // the series set alone.
 //
 // Deliberately NOT transitioned: `d` is not interpolable everywhere (see

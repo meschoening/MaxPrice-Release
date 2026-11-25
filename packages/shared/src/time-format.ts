@@ -273,12 +273,12 @@ const MONTHS = [
   "Dec",
 ] as const;
 
-// A calendar day as "May 21" — the day half of a block's window label. No clock
+// A calendar day as "May 21" — the day half of a window label. No clock
 // time at all, so `display.timeFormat` is deliberately unread; it still takes a
 // whole `TimeDisplay` so every date/clock site in the app threads ONE value
 // rather than choosing between two near-identical parameter shapes.
 //
-// This exists so `Blocks.tsx` doesn't reach for `toLocaleDateString`, which is
+// This exists so a surface doesn't reach for `toLocaleDateString`, which is
 // wrong twice over: its month name follows the HOST locale (a de-DE host would
 // render "14. Mai" beside English tooltips — the app's chrome is English-only,
 // per ADR-0060 decision 2), and an options-bearing call constructs a FRESH

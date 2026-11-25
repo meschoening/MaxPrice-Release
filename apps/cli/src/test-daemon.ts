@@ -34,6 +34,7 @@ export function fixtureStatus(over: Record<string, unknown> = {}): Record<string
     hasData: true,
     usageConnection: "connected",
     usageLastSampleAt: "2026-10-19T11:57:00.000Z",
+    usageLastReadAt: "2026-10-19T11:57:00.000Z",
     organizations: {
       [HOME_ORG]: {
         limits: "windows",

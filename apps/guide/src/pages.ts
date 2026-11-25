@@ -83,7 +83,6 @@ export const PAGES: readonly Page[] = [
   guidePage("Desktop client", "desktop-client/first-run", "First run"),
   guidePage("Desktop client", "desktop-client/live", "Live"),
   guidePage("Desktop client", "desktop-client/projects", "Projects"),
-  guidePage("Desktop client", "desktop-client/blocks", "Blocks"),
   guidePage("Desktop client", "desktop-client/filters", "Filters and the Scope"),
   guidePage("Desktop client", "desktop-client/settings", "Settings"),
   guidePage("Desktop client", "desktop-client/tray", "Tray and Popout"),
@@ -120,7 +119,7 @@ export const PAGES: readonly Page[] = [
   guidePage("Headless Hub", "headless-hub/hub-page", "The Hub page"),
 
   guidePage("Concepts", "concepts/organizations", "Accounts and Organizations"),
-  guidePage("Concepts", "concepts/blocks", "Blocks and usage limits"),
+  guidePage("Concepts", "concepts/usage-limits", "Usage limits"),
   guidePage("Concepts", "concepts/cost-modes", "Cost modes and pricing"),
   guidePage("Concepts", "concepts/projects", "Projects"),
   guidePage("Concepts", "concepts/hubs", "Hubs and the fleet"),

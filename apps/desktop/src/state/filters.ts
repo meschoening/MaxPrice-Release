@@ -4,13 +4,11 @@ import { z } from "zod";
 import { parentProjectSlug, type DateRangePreset, type Span, spanSchema } from "@maxprice/shared";
 import { groupByAxisSchema, normalizeAxes, type GroupByAxis } from "@/lib/group-by";
 
-// `Span` + `spanSchema` are owned by the shared package (`./intraday`); they are
-// re-exported here so consumers importing `Span` from this module (cost-chart,
-// use-live-data) keep working without reaching across the package boundary.
-// `GroupByAxis` is likewise owned by `@/lib/group-by` (ADR-0033) and re-exported
-// for the same reason.
-export type { Span };
-export type { GroupByAxis };
+// The Live chart's spans are the shared `spanSchema`'s (`./intraday`). Every
+// renderer module takes `Span` from here. `GroupByAxis` is owned by
+// `@/lib/group-by` (ADR-0033) and re-exported so chart consumers import both
+// from one place.
+export type { GroupByAxis, Span };
 
 export type Metric = "cost" | "tokens";
 export type ChartStyle = "bars" | "cumulative" | "trend";
@@ -62,11 +60,6 @@ export type FiltersState = {
   chartStyle: ChartStyle;
   logScale: boolean;
   muted: MutedState;
-  // The Membership whose Active block the Live chart's Block span frames, a
-  // `membership` token (#619 variant 1, #638); null before the viewer picks.
-  // Never persisted: a pick holds for the session, and one no longer live
-  // falls back to the default (`blockSpanPick`).
-  blockSpanMembership: string | null;
   setDateRange: (v: DateRangePreset) => void;
   setProjects: (v: string[]) => void;
   setModels: (v: string[]) => void;
@@ -78,7 +71,6 @@ export type FiltersState = {
   setChartStyle: (v: ChartStyle) => void;
   setLogScale: (v: boolean) => void;
   toggleMute: (axis: GroupByAxis, value: string) => void;
-  setBlockSpanMembership: (token: string) => void;
 };
 
 export const useFilters = create<FiltersState>()(
@@ -95,7 +87,6 @@ export const useFilters = create<FiltersState>()(
       chartStyle: "bars",
       logScale: false,
       muted: EMPTY_MUTED,
-      blockSpanMembership: null,
       setDateRange: (v) => set({ dateRange: v }),
       setProjects: (v) => set({ projects: v }),
       setModels: (v) => set({ models: v }),
@@ -118,19 +109,11 @@ export const useFilters = create<FiltersState>()(
               : [...s.muted[axis], value],
           },
         })),
-      setBlockSpanMembership: (token) => set({ blockSpanMembership: token }),
     }),
     {
       name: "maxprice.filters",
       storage: createJSONStorage(() => localStorage),
-      version: 14,
-      // The Block span's pick stays out of the payload, which keeps its v14
-      // shape (#638).
-      partialize: (state) => {
-        const persisted: Partial<FiltersState> = { ...state };
-        delete persisted.blockSpanMembership;
-        return persisted;
-      },
+      version: 15,
       // Merge runs on every hydration (regardless of version match), so all
       // validation lives here. Same-version corrupt payloads, unknown enum
       // values, missing fields, and migrate→undefined all reach this point.
@@ -154,10 +137,13 @@ export const useFilters = create<FiltersState>()(
       // v12 → v13 maps a persisted worktree slug onto the project that now
       // owns it (ADR-0061). v13 → v14 renames `7d` to `week` — BOTH the span
       // and the Date-range preset, which now follow the Week setting
-      // (ADR-0083).
+      // (ADR-0083). v14 → v15 rewrites the retired `block` span to `today`,
+      // the nearest frame to a 5-hour window, and keeps everything else
+      // (ADR-0142 §6): left alone, `block` would fail the schema and `merge`
+      // would drop every filter with it.
       migrate: (state, version) => {
-        if (version === 14) return state;
-        if (version === 12 || version === 13) {
+        if (version === 15) return state;
+        if (version === 12 || version === 13 || version === 14) {
           if (!state || typeof state !== "object") return undefined;
           const next = { ...(state as Record<string, unknown>) };
           // v12 → v13 (ADR-0061): worktrees fold into their project, so a
@@ -166,7 +152,7 @@ export const useFilters = create<FiltersState>()(
           // the sidecar matches it exactly — but it would select nothing the
           // menu can show as selected, so the rail would look unfiltered while
           // the data was not.
-          if (Array.isArray(next.projects)) {
+          if (version <= 13 && Array.isArray(next.projects)) {
             next.projects = [
               ...new Set(
                 next.projects.map((p) => (typeof p === "string" ? parentProjectSlug(p) : p)),
@@ -177,6 +163,8 @@ export const useFilters = create<FiltersState>()(
           // Date-range preset, both now following the Week setting.
           if (next.span === "7d") next.span = "week";
           if (next.dateRange === "7d") next.dateRange = "week";
+          // v14 → v15 (ADR-0142 §6): the Block span is gone.
+          if (next.span === "block") next.span = "today";
           return next;
         }
         return undefined;

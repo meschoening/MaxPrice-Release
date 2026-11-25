@@ -43,9 +43,9 @@ export type Column<Row> = {
   width?: string;
   // Does this row's cell hold nothing worth a labelled slot? Read ONLY by the
   // narrow arrangement, where the row wraps to a second line and each value
-  // carries its column's name (map #151 / T13, ADR-0073). Without it a done
-  // Blocks row spends three of its six slots printing "BURN RATE —" and runs to
-  // a third line against the active row's two — rows that no longer measure the
+  // carries its column's name (map #151 / T13, ADR-0073). Without it a row
+  // whose cell is an em dash spends a labelled slot printing "NAME —" and can
+  // run to a line more than its neighbours — rows that no longer measure the
   // same height, which is what makes a table read as improvised.
   //
   // It lives on the Column because CSS cannot select on text at all and the
@@ -65,10 +65,6 @@ export type DataTableProps<Row> = {
   // Per-row searchable strings — free-text search matches if any contains the
   // query (case-insensitive). Omit to disable search.
   searchKeys?: (row: Row) => string[];
-  // A row excluded from the sortable/virtualized body and rendered inside the
-  // sticky header block instead — the Blocks page's pinned active block. It
-  // stays put regardless of sort order AND scroll position (.row.pinned).
-  pinnedRow?: Row;
   // Width floor for the table grid, in px. Below it the table scrolls
   // horizontally (the wrapper's overflow-x-auto) instead of letting the
   // flexible minmax(0,…) name columns collapse to nothing — the fixed-width
@@ -109,7 +105,7 @@ const ESTIMATED_ROW_HEIGHT = 52;
 
 // Generic sortable / searchable / virtualized table on the M4 glass recipes:
 // one frosted panel, flat-tint hairline rows, the sticky frosted column
-// header. One primitive, used by the Sessions, Projects, and Blocks views.
+// header. One primitive, used by the Sessions and Projects views.
 export function DataTable<Row>({
   title,
   rows,
@@ -119,7 +115,6 @@ export function DataTable<Row>({
   selectedId,
   defaultSort,
   searchKeys,
-  pinnedRow,
   minWidth,
   rowClassName,
   tree,
@@ -176,8 +171,6 @@ export function DataTable<Row>({
     onSearchChange?.(search);
   }, [search, onSearchChange]);
 
-  const pinnedId = pinnedRow ? rowId(pinnedRow) : undefined;
-
   // The rendered body. All of search / sort / flatten lives in the pure
   // `flattenTreeRows` (lib/table-tree.ts) so its rules are unit-testable — the
   // component only supplies the active column's sort key and the search
@@ -188,7 +181,7 @@ export function DataTable<Row>({
     const col = columns.find((c) => c.id === sortColumnId) ?? columns[0];
     const needle = search.trim().toLowerCase();
     return flattenTreeRows<Row>({
-      rows: rows.filter((r) => rowId(r) !== pinnedId),
+      rows,
       rowId,
       // No column, or an unsortable one named by `defaultSort` — a constant key
       // leaves the rows in the order the caller gave them. Unreachable by click:
@@ -202,7 +195,7 @@ export function DataTable<Row>({
       childrenOf: tree ? tree.childrenOf : null,
       expanded,
     });
-  }, [rows, columns, sortColumnId, sortDir, search, searchKeys, rowId, pinnedId, tree, expanded]);
+  }, [rows, columns, sortColumnId, sortDir, search, searchKeys, rowId, tree, expanded]);
 
   const rowVirtualizer = useVirtualizer({
     count: entries.length,
@@ -228,8 +221,6 @@ export function DataTable<Row>({
   // Virtualized rows are absolutely positioned by the virtualizer and
   // self-measure (measureElement) so they keep their natural content height —
   // a fixed height shorter than the two-line cells pushed text off-center.
-  // The pinned row renders through the same path with the `pinned` treatment
-  // and no virtualizer wiring.
   const toggleExpand = (id: string): void => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -241,7 +232,6 @@ export function DataTable<Row>({
   const renderRow = (
     row: Row,
     virtual?: { index: number; start: number },
-    pinned = false,
     child = false,
   ): React.ReactElement => {
     const id = rowId(row);
@@ -282,12 +272,7 @@ export function DataTable<Row>({
             : undefined),
           gridTemplateColumns,
         }}
-        className={cn(
-          "grid items-center row",
-          pinned && "pinned",
-          child && "child",
-          rowClassName?.(row),
-        )}
+        className={cn("grid items-center row", child && "child", rowClassName?.(row))}
       >
         {columns.map((col, i) => (
           <div
@@ -344,7 +329,7 @@ export function DataTable<Row>({
         title={title}
         search={searchInput}
         onSearch={setSearchInput}
-        count={topCount + (pinnedRow ? 1 : 0)}
+        count={topCount}
         searchPlaceholder={searchPlaceholder}
         action={headerAction}
       />
@@ -371,8 +356,8 @@ export function DataTable<Row>({
           className="table-scroll thin-scroll flex-1 min-h-0 overflow-y-auto"
         >
           <div role="table" aria-label={title}>
-            {/* One sticky frosted surface: the column-header row plus (on
-                Blocks) the pinned active row — rows blur sliding beneath. */}
+            {/* One sticky frosted surface: the column-header row — rows blur
+                sliding beneath. */}
             <div className="sticky-head">
               <div role="row" style={{ gridTemplateColumns }} className="grid col-head">
                 {columns.map((col) => {
@@ -420,7 +405,6 @@ export function DataTable<Row>({
                   );
                 })}
               </div>
-              {pinnedRow ? renderRow(pinnedRow, undefined, true) : null}
             </div>
 
             {entries.length === 0 && error ? (
@@ -435,11 +419,11 @@ export function DataTable<Row>({
                 {rowVirtualizer.getVirtualItems().map((vi) => {
                   const entry = entries[vi.index];
                   if (!entry) return null;
-                  return renderRow(entry.row, vi, false, entry.child);
+                  return renderRow(entry.row, vi, entry.child);
                 })}
               </div>
             ) : (
-              entries.map((entry) => renderRow(entry.row, undefined, false, entry.child))
+              entries.map((entry) => renderRow(entry.row, undefined, entry.child))
             )}
           </div>
           <div className="fade" aria-hidden />

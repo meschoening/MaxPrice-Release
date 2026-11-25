@@ -3,10 +3,10 @@
    and that tracks two or more Organizations (#637). Imported after
    globals.css (main.tsx), so it sits where its rules sat there.
 
-   Under All the quota half names the head Organization, and it is the half
-   that yields: "All organizations" keeps its width and the quota label
+   Under All the limits half names the head Organization, and it is the half
+   that yields: "All organizations" keeps its width and the limits label
    truncates, so no Home label can crowd the scope out. Below the narrow
-   threshold the quota half drops and the pill caps at 180px, so a long label
+   threshold the limits half drops and the pill caps at 180px, so a long label
    cannot wrap the right cluster onto a second topbar row. The pill clips
    anything left over; its own focus outline sits outside the box and is not
    clipped. The icon and caret never shrink: a flex item SVG otherwise takes

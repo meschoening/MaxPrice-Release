@@ -43,11 +43,16 @@ The Desktop client keeps its settings, its archive, its caches and its logs in o
 | Windows | `%APPDATA%\com.maxprice.desktop`                                          |
 | Linux   | `~/.local/share/com.maxprice.desktop`, or under `$XDG_DATA_HOME` when set |
 
-In it, `settings.json` holds the settings, `local-archive.sqlite` the Local archive, `fleet-events.sqlite` the Fleet replica, and `logs/sidecar.log` the log. The claude.ai [session keys](blocks.md#the-claudeai-session-key), Gateway management keys and the Hub password are never in that folder: they are in the system's keychain, the macOS Keychain, the Windows Credential Manager or the Secret Service on Linux.
+In it, `settings.json` holds the settings, `local-archive.sqlite` the Local archive, `fleet-events.sqlite` the Fleet replica, and `logs/sidecar.log` the log. The claude.ai [session keys](usage-limits.md#the-claudeai-session-key), Gateway management keys and the Hub password are never in that folder: they are in the system's keychain, the macOS Keychain, the Windows Credential Manager or the Secret Service on Linux.
 
 ### Hub tray app
 
-The Hub's files are in `%APPDATA%\maxprice-hub`, laid out as a [Headless Hub's data dir](../../../hub/README.md#the-data-dir) is, and its log is `%APPDATA%\com.maxprice.hub\logs\hub.log`. Its session keys and Gateway management keys are in the Windows Credential Manager.
+The Hub's files are in its data dir, laid out as a [Headless Hub's data dir](../../../hub/README.md#the-data-dir) is. Its log is `logs/hub.log` in a folder of its own, and its session keys and Gateway management keys are in the system's keychain.
+
+| System  | Data dir                                     | Log folder                                       | Keys                           |
+| ------- | -------------------------------------------- | ------------------------------------------------ | ------------------------------ |
+| macOS   | `~/Library/Application Support/maxprice-hub` | `~/Library/Application Support/com.maxprice.hub` | The macOS Keychain             |
+| Windows | `%APPDATA%\maxprice-hub`                     | `%APPDATA%\com.maxprice.hub`                     | The Windows Credential Manager |
 
 ### Headless client and Headless Hub
 

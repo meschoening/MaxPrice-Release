@@ -296,7 +296,7 @@ export async function runConnect(deps: ConnectDeps, input: ConnectInput): Promis
     return {
       organizationUuid: org.id,
       label: organizationLabel(labels, org.id),
-      plan: r?.plan ?? organizationPlan({ organizationType: null, hints: org.hints }),
+      plan: r?.plan ?? organizationPlan({ login: null, hints: org.hints }),
       readability: membershipReadability("connected", org.limits),
       isNew: r === undefined ? true : isNewOrganization(r, input.lastOpenedAt),
       tracked: r?.tracked ?? false,
@@ -349,15 +349,4 @@ export function parseSettingsConnect(search: string): string | null {
     SETTINGS_CONNECT_PARAM,
   );
   return value === null || value.trim() === "" ? null : value;
-}
-
-// Where the tiles' expired-key hint goes (usage-expired-hint.tsx): with one
-// dead key and its Account known, that Account's Connect; otherwise Settings
-// › Accounts, whose strips name each Account that needs a key (and the legacy
-// key, whose Account is not known).
-export function reconnectHintPath(keys: UsageKeysResponse | undefined): string {
-  const expired = (keys?.keys ?? []).filter((k) => k.connection === "expired");
-  const legacyExpired = keys?.legacy?.connection === "expired";
-  if (expired.length === 1 && !legacyExpired) return settingsConnectPath(expired[0]!.accountUuid);
-  return `/settings#${SETTINGS_ACCOUNTS_ANCHOR}`;
 }

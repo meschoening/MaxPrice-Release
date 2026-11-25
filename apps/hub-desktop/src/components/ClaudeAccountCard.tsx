@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   formatRelativeTime,
   hubKeyHeld,
+  hubLastReadAt,
   hubKeyProvenance,
   usageConnectionDot,
   usageConnectionLabel,
@@ -30,7 +31,7 @@ export function ClaudeAccountCard(): React.ReactElement {
     <ClaudeAccountCardContent
       account={status?.accounts[0]}
       rows={organizations?.organizations}
-      lastSampleAt={status?.usageLastSampleAt ?? null}
+      lastReadAt={hubLastReadAt(status?.accounts ?? [])}
       now={now}
     />
   );
@@ -41,29 +42,29 @@ export function ClaudeAccountCard(): React.ReactElement {
 export function ClaudeAccountCardContent({
   account,
   rows,
-  lastSampleAt,
+  lastReadAt,
   now,
 }: {
   // The Hub's one Account, undefined while it knows none.
   account: HubAccount | undefined;
   rows: readonly HubOrganization[] | undefined;
-  lastSampleAt: string | null;
+  lastReadAt: string | null;
   now: number;
 }): React.ReactElement {
   const entry = account !== undefined && hubKeyHeld(account) ? account : undefined;
-  return <AccountCard entry={entry} rows={rows} lastSampleAt={lastSampleAt} now={now} />;
+  return <AccountCard entry={entry} rows={rows} lastReadAt={lastReadAt} now={now} />;
 }
 
 function AccountCard({
   entry,
   rows,
-  lastSampleAt,
+  lastReadAt,
   now,
 }: {
   // The held key this card shows; undefined: no key at all.
   entry: HubAccount | undefined;
   rows: readonly HubOrganization[] | undefined;
-  lastSampleAt: string | null;
+  lastReadAt: string | null;
   now: number;
 }): React.ReactElement {
   const qc = useQueryClient();
@@ -102,8 +103,8 @@ function AccountCard({
       </div>
       <div className="krows">
         <div className="krow">
-          <span>Last sample</span>
-          <b>{formatRelativeTime(lastSampleAt, now)}</b>
+          <span>Last read</span>
+          <b>{formatRelativeTime(lastReadAt, now)}</b>
         </div>
         <AccountOrganizationRow rows={rows} entry={entry} />
         <div className="krow">

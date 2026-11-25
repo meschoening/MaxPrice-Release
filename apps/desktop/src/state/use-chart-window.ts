@@ -10,14 +10,14 @@ import { useProjectAxis } from "./use-project-axis";
 
 // The Live cost chart's daily-flat data slice, split out of `useLiveData` so the
 // chart's data source (`useChartSource`) can read the chart window WITHOUT
-// subscribing to the four span-independent Live queries (week window, blocks,
-// sessions, projects). `useLiveData`'s single memo returns a fresh object
-// whenever ANY of its queries' data changes — a `block:tick` every ~30s churned
+// subscribing to the span-independent Live queries (week window, sessions,
+// projects). `useLiveData`'s single memo returns a fresh object whenever ANY
+// of its queries' data changes — the since-retired Blocks tick every ~30s churned
 // the whole `live` object and, through it, the chart's intraday source and the
 // downstream `composeSeries` memo, even though the chart data was unchanged
 // (architecture review 2026-07-18, finding #1). This hook memoizes on the
-// chart-window query's data + window bounds ALONE, so a block tick can't churn
-// it, and it runs the densify once instead of twice per render.
+// chart-window query's data + window bounds ALONE, so no other refetch can
+// churn it, and it runs the densify once instead of twice per render.
 //
 // The chart-window query is the SAME `useDaily` call (same key + URL) that
 // `useLiveData` composes below — so on the Live page, where both are mounted,

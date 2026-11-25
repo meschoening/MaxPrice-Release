@@ -1,4 +1,3 @@
-import type { BlockRow, BlocksResponse } from "./blocks";
 import type { ModelBreakdown } from "./models";
 import type { ProjectRow } from "./projects";
 import type { SessionRow } from "./sessions";
@@ -103,75 +102,4 @@ export function aggregateProjectsRange(rows: ProjectRow[]): ProjectsRangeAggrega
     sessions,
     breakdowns: mergeModelBreakdowns(rows.map((p) => p.modelBreakdowns)),
   };
-}
-
-export type BlocksAggregate = {
-  count: number;
-  totalCost: number;
-  totalTokens: number;
-  entries: number;
-  models: string[];
-};
-
-// Gap blocks carry no real usage — exclude them so "N blocks" means N activity
-// windows (matches the table's own gap styling, which de-emphasizes them).
-export function aggregateBlocks(rows: BlockRow[]): BlocksAggregate {
-  let totalCost = 0;
-  let totalTokens = 0;
-  let entries = 0;
-  const models = new Set<string>();
-  let count = 0;
-  for (const b of rows) {
-    if (b.isGap) continue;
-    count += 1;
-    totalCost += b.costUSD;
-    totalTokens += b.totalTokens;
-    entries += b.entries;
-    for (const m of b.models) models.add(m);
-  }
-  return { count, totalCost, totalTokens, entries, models: Array.from(models) };
-}
-
-// The usage in a Blocks answer whose Account is not known (ADR-0137 §3's and
-// ADR-0108's #635 notes): the Blocks of every Membership with
-// `accountUuid: null` in `memberships`, the head excepted. A report's table
-// and totals already show the head, which can itself be the Unknown
-// Membership (a Home membership whose Account is not known), so counting it
-// here would count it twice. Null when there is none, or it holds no usage:
-// it is shown only beside usage it describes. `memberships` is present only
-// while the Scope spans two or more Memberships, and follows the date range
-// like `blocks`. The Desktop's Blocks page and the Headless client's `blocks`
-// and `live` all read it here, so they agree on it.
-export function unknownAccountUsage(body: BlocksResponse | undefined): BlocksAggregate | null {
-  const rows = (body?.memberships ?? [])
-    .slice(1)
-    .filter((m) => m.accountUuid === null)
-    .flatMap((m) => m.blocks);
-  const sum = aggregateBlocks(rows);
-  return sum.totalCost > 0 || sum.totalTokens > 0 ? sum : null;
-}
-
-// The "typical" block — the MEDIAN `totalTokens` across the completed
-// (non-gap, non-active) blocks currently loaded for the active Date range.
-// Backs the Blocks strip's "Tokens vs typical" bar and the Active block tile's
-// "typical" row. Median, not mean, so one outlier block doesn't drag the
-// baseline up and make every other block read as "below typical". The
-// in-progress active block is excluded (its totals are incomplete) and gap rows
-// are excluded (they carry no usage). Returns 0 when there are no completed
-// blocks — callers render that as an em-dash.
-export function typicalBlockTokens(rows: BlockRow[]): number {
-  const tokens = rows
-    .filter((b) => !b.isGap && !b.isActive)
-    .map((b) => b.totalTokens)
-    .sort((a, b) => a - b);
-  const n = tokens.length;
-  if (n === 0) return 0;
-  const mid = Math.floor(n / 2);
-  // Odd count → the middle value; even → the mean of the two middle values.
-  // The `?? 0` fallbacks are unreachable for n >= 1 (mid and mid-1 are valid
-  // indices) but keep the access total under noUncheckedIndexedAccess.
-  const hi = tokens[mid] ?? 0;
-  if (n % 2 !== 0) return hi;
-  const lo = tokens[mid - 1] ?? 0;
-  return (lo + hi) / 2;
 }

@@ -18,17 +18,34 @@ import { checkHubPageUrl } from "./page-url";
 // Hub durable config (ADR-0035): hub.json in the hub's own data dir. It holds
 // the OPTIONAL hub password's argon2id HASH (ADR-0037) — never a plaintext
 // secret — the transport ACL (defense-in-depth on top of the tailnet), not the
-// account credential; the claude.ai session key is kept apart from it, on
-// Linux in the data dir's secrets.json (ADR-0126), elsewhere by the credstore
-// keychain helper.
+// account credential; the claude.ai session key is kept apart from it, for a
+// Headless Hub in the data dir's secrets.json (ADR-0126, ADR-0146 §4),
+// elsewhere by the credstore keychain helper.
 
-// The data dir. MAXPRICE_HUB_DATA_DIR wins everywhere; Windows and macOS keep
-// their app-data dirs. Everywhere else, Linux above all, the dir holds the
-// fleet archive and the usage history, which are data, so it follows
-// XDG_DATA_HOME by the Headless client's rule (ADR-0127 §4, ADR-0119): a
-// relative value is invalid and ignored, so a daemon and a command started
-// from different working directories agree on one path. No Linux Hub shipped
-// with the old `$XDG_CONFIG_HOME/maxprice-hub`, so nothing migrates.
+// True when the tray shell spawned this daemon as its sidecar: it sets
+// MAXPRICE_HUB_EMBEDDED=1. Gates the OPERATOR_TOKEN stdout emit and the
+// parent-death watchdog; a Headless `serve` leaves it unset (ADR-0035/0036)
+// and keeps its operator secret in a file instead (ADR-0126 §8).
+export function isEmbedded(env: Record<string, string | undefined> = process.env): boolean {
+  return env.MAXPRICE_HUB_EMBEDDED === "1";
+}
+
+// The platforms a Headless Hub runs on, Linux and macOS (ADR-0146 §1): where
+// it owns its data dir through serve.lock, keeps its keys and its operator
+// token in files, and its commands reach it through its own routes.
+export function runsHeadlessHub(platform: NodeJS.Platform): boolean {
+  return platform === "linux" || platform === "darwin";
+}
+
+// The data dir. MAXPRICE_HUB_DATA_DIR wins everywhere; Windows keeps its
+// app-data dir, and so does the hub tray app's embedded daemon on macOS.
+// Everywhere else, Linux and a Headless Hub on macOS above all, the dir holds
+// the fleet archive and the usage history, which are data, so it follows
+// XDG_DATA_HOME by the Headless client's rule (ADR-0127 §4, ADR-0119,
+// ADR-0146 §2): a relative value is invalid and ignored, so a daemon and a
+// command started from different working directories agree on one path. No
+// Linux Hub shipped with the old `$XDG_CONFIG_HOME/maxprice-hub`, and no
+// macOS Hub shipped at all, so nothing migrates.
 export function defaultDataDir(
   env: Record<string, string | undefined> = process.env,
   platform: NodeJS.Platform = process.platform,
@@ -38,7 +55,9 @@ export function defaultDataDir(
   if (platform === "win32") {
     return join(env.APPDATA ?? join(home, "AppData", "Roaming"), "maxprice-hub");
   }
-  if (platform === "darwin") return join(home, "Library", "Application Support", "maxprice-hub");
+  if (platform === "darwin" && isEmbedded(env)) {
+    return join(home, "Library", "Application Support", "maxprice-hub");
+  }
   const xdg = env.XDG_DATA_HOME;
   return join(xdg && isAbsolute(xdg) ? xdg : join(home, ".local", "share"), "maxprice-hub");
 }

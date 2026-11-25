@@ -6,9 +6,8 @@ import { usageSampleSchema, type UsageSample } from "@maxprice/shared";
 // The usage history (ADR-0024): an append-only JSONL on disk loaded into a
 // sorted-by-capturedAt array in memory. The array is kept sorted UNCONDITIONALLY
 // — append() and merge() insert each admitted sample in place, loadHistory()
-// sorts once after its bulk admit — so the latest-sample reads (latest() here;
-// latestSampleWindow + precomputeSamples' latestUtil in the engine's
-// block-windows.ts, all `samples[len - 1]`) stay correct even after merge()
+// sorts once after its bulk admit — so the latest-sample read (latest(),
+// `samples[len - 1]`) stays correct even after merge()
 // inserts a future-dated remote sample (cross-machine clock skew) ahead of a
 // later present-dated local append. Mirrors the engine's event store: cheap
 // in-memory range queries, no database.
@@ -37,7 +36,9 @@ import { usageSampleSchema, type UsageSample } from "@maxprice/shared";
 // stampAccountless() (the Account, ADR-0139 §8) are the only rewrites of the
 // append-only file. One link on the write chain rewrites it
 // text-preservingly — each line lacking the stamp gains only that field, every
-// other line stays byte-verbatim, and a line a held sample covers goes — through
+// other line stays byte-verbatim, a line a held sample covers goes, and a torn
+// line (TORN LINES) whose sample is stamped or goes keeps its fragment verbatim
+// on a line of its own — through
 // a synced `${path}.stamp-tmp` and a rename, and only then stamps the same
 // samples in memory, so a failed stamp stamps nothing anywhere. Memory is then
 // re-indexed by the identity rules, so it holds what a reload of the file
@@ -61,6 +62,17 @@ import { usageSampleSchema, type UsageSample } from "@maxprice/shared";
 // the history's rename, so a crash between the two can only make it newer than
 // the stamp — one exchange too many, never one too few — and loadHistory()
 // reads it back. Without one it lives in memory.
+//
+// TORN LINES (#747): an append that fails partway leaves the start of its line
+// in the file, cut short, with no newline: a short write on a full disk
+// (ENOSPC), a file-size limit (EFBIG), or a kill or power loss mid-write. Both
+// daemons on the dev primary did it on 2026-10-28 when its disk filled, and the
+// next append joined the fragment, losing two samples. So the write chain checks
+// the file's last byte before the first append after it starts, after any
+// failed append, and begins its line with a newline
+// when that byte is not one: a fragment then stands on its own line and loses
+// only its own sample. Readers (readHistoryLine) keep the whole sample a line
+// written before this fix holds after a fragment.
 //
 // ACCEPTED UNBOUNDED GROWTH (ADR-0024 "In-memory growth is unbounded"): the
 // in-memory `samples` array and usage-history.jsonl grow append-only forever
@@ -156,8 +168,8 @@ export type SampleStore = {
 export type MergeResult = { changed: number; stamped: number };
 
 // The factory returns a superset of the consumer contract: `flush()` resolves
-// once every disk write queued so far has settled. The consumers (poller,
-// /api/blocks) hold the narrower SampleStore and never need it — appends are
+// once every disk write queued so far has settled. The consumers (the poller,
+// the hub client) hold the narrower SampleStore and never need it — appends are
 // fire-and-forget — but it gives a graceful-shutdown / deterministic-test
 // barrier so pending writes don't outlive their context.
 type OwnedSampleStore = SampleStore & { flush: () => Promise<void> };
@@ -259,28 +271,62 @@ function mergeSorted(a: readonly UsageSample[], b: readonly UsageSample[]): Usag
   return out;
 }
 
-// The object of a history line that is a valid sample lacking `field`, else
-// null — blank, corrupt, schema-invalid and already-stamped lines all stay
-// verbatim.
-function unstampedLine(
-  line: string,
-  field: StampField,
-): { raw: Record<string, unknown>; sample: UsageSample } | null {
+// One history line read: its sample, the parsed object, and `at`, the offset
+// in the line where the sample starts. `at` is 0 for a whole line. On a torn
+// line (TORN LINES above) it is past the fragment: when the line is not JSON,
+// the earliest `{` from which the rest of the line is a valid sample. A suffix
+// starting inside the fragment carries the fragment's unclosed text, so it does
+// not parse. Null for a blank line, a line that parses as JSON but is no
+// sample, and a line holding no whole sample. Exported for the Hub's restore,
+// which reads client histories by the same rule (ADR-0130 §4).
+export type HistoryLine = { sample: UsageSample; raw: Record<string, unknown>; at: number };
+
+export function readHistoryLine(line: string): HistoryLine | null {
   const trimmed = line.trim();
   if (trimmed === "") return null;
-  let raw: unknown;
-  try {
-    raw = JSON.parse(trimmed);
-  } catch {
-    return null;
+  const read = (text: string, at: number): HistoryLine | null | undefined => {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      return undefined; // not JSON from here
+    }
+    const parsed = usageSampleSchema.safeParse(raw);
+    return parsed.success ? { sample: parsed.data, raw: raw as Record<string, unknown>, at } : null;
+  };
+  const whole = read(trimmed, 0);
+  if (whole !== undefined) return whole;
+  const lead = line.length - line.trimStart().length;
+  for (let at = line.indexOf("{", lead + 1); at !== -1; at = line.indexOf("{", at + 1)) {
+    const rest = read(line.slice(at), at);
+    if (rest) return rest;
   }
-  const parsed = usageSampleSchema.safeParse(raw);
-  if (!parsed.success || parsed.data[field] !== undefined) return null;
-  return { raw: raw as Record<string, unknown>, sample: parsed.data };
+  return null;
 }
 
 function isMissingFile(err: unknown): boolean {
   return (err as { code?: unknown } | null)?.code === "ENOENT";
+}
+
+// Whether the file's last byte is not a newline: it ends in a fragment. A
+// missing or empty file ends in none.
+async function endsMidLine(path: string): Promise<boolean> {
+  let file;
+  try {
+    file = await open(path, "r");
+  } catch (err) {
+    if (isMissingFile(err)) return false;
+    throw err;
+  }
+  try {
+    const { size } = await file.stat();
+    if (size === 0) return false;
+    const last = Buffer.alloc(1);
+    await file.read(last, 0, 1, size - 1);
+    return last[0] !== 0x0a;
+  } finally {
+    await file.close();
+  }
 }
 
 async function syncedWrite(path: string, text: string): Promise<void> {
@@ -341,6 +387,9 @@ export function createSampleStore(opts: {
   // without blocking the serving event loop. A failed append must not reject
   // into the poller, so each append link swallows its own error.
   let writeChain: Promise<void> = Promise.resolve();
+  // Whether the file is known to end with a whole line (TORN LINES): not until
+  // the chain's first append, and not after a failed one.
+  let tailWhole = false;
 
   // Readiness deferred (F6): resolved by the FIRST loadHistory() completion,
   // whichever path it takes. Idempotent — later loadHistory() calls don't
@@ -428,11 +477,22 @@ export function createSampleStore(opts: {
     views.clear();
     const line = `${JSON.stringify(s)}\n`;
     writeChain = writeChain
-      .then(() => appendFile(path, line))
+      .then(() => appendLine(line))
       .catch((err) => {
         console.warn(failure, err);
       });
     return admission;
+  }
+
+  // One write-chain append: a newline first when the file may end in a
+  // fragment and does (TORN LINES), so the line never joins one. A tail that
+  // cannot be read takes the newline too: at worst a blank line, which every
+  // reader skips, never a dropped sample.
+  async function appendLine(line: string): Promise<void> {
+    const lead = !tailWhole && (await endsMidLine(path).catch(() => true)) ? "\n" : "";
+    tailWhole = false;
+    await appendFile(path, lead + line);
+    tailWhole = true;
   }
 
   // Public loader: wraps the read/parse in a `finally` so `ready` settles on
@@ -467,14 +527,10 @@ export function createSampleStore(opts: {
     // line the poller already holds in memory.
     const parsedLines: UsageSample[] = [];
     for (const line of text.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed === "") continue;
-      try {
-        const parsed = usageSampleSchema.safeParse(JSON.parse(trimmed));
-        if (parsed.success) parsedLines.push(parsed.data);
-      } catch {
-        // skip a corrupt line (e.g. a crash mid-write)
-      }
+      // A corrupt line is skipped; a torn one yields the sample after its
+      // fragment (TORN LINES).
+      const read = readHistoryLine(line);
+      if (read !== null) parsedLines.push(read.sample);
     }
     admitBulk(parsedLines);
   }
@@ -628,16 +684,23 @@ export function createSampleStore(opts: {
     for (let i = 0; i < lines.length; i += 1) {
       const line = lines[i]!;
       const eol = i < lines.length - 1 ? "\n" : ""; // keeps the trailing newline as found
-      const unstamped = unstampedLine(line, field);
-      if (unstamped === null) {
+      const read = readHistoryLine(line);
+      // Blank, corrupt, schema-invalid and already-stamped lines stay verbatim.
+      if (read === null || read.sample[field] !== undefined) {
         out.push(line + eol);
         continue;
       }
+      // A torn line's fragment stays verbatim, on a line of its own (TORN LINES).
+      const fragment = line.slice(0, read.at);
       // Superseded by rule (c): a stamped copy is held at this instant, so the
-      // line goes (with its newline) rather than become a second sample.
-      if (covered(unstamped.sample)) continue;
-      out.push(JSON.stringify({ ...unstamped.raw, [field]: value }) + eol);
-      stampedIds.add(`${unstamped.sample.capturedAt}\u0001${identityKey(unstamped.sample)}`);
+      // sample goes (with its newline) rather than become a second sample.
+      if (covered(read.sample)) {
+        if (fragment !== "") out.push(fragment + eol);
+        continue;
+      }
+      const stamped = JSON.stringify({ ...read.raw, [field]: value });
+      out.push((fragment === "" ? "" : `${fragment}\n`) + stamped + eol);
+      stampedIds.add(`${read.sample.capturedAt}\u0001${identityKey(read.sample)}`);
       count += 1;
     }
     // LOCAL STAMP TIME: durable before the history's rename, and a failure

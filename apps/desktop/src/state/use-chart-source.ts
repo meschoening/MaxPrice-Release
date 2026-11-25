@@ -6,7 +6,6 @@ import {
   resolveChartSource,
   type ChartSource,
 } from "@/lib/chart-source";
-import { blockSpanMembership, intradayScopeFor, type BlockSpanPick } from "@/lib/block-span-pick";
 import type { GroupByAxis } from "@/lib/group-by";
 import { useFilters, type ChartStyle, type Span } from "./filters";
 import { useSettings, useTimeDisplay } from "./use-settings";
@@ -34,7 +33,7 @@ import { useProjectAxis } from "./use-project-axis";
 // The daily-flat slice comes from `useChartWindow`, NOT `useLiveData`: the chart
 // only needs the chart-window rows, and subscribing to the whole `useLiveData`
 // object churned this hook's assembly (and the downstream compose) on every
-// block tick even when the chart data was unchanged (finding #1). The
+// unrelated refetch even when the chart data was unchanged (finding #1). The
 // chart-window query dedupes with `useLiveData`'s own — both mounted on the
 // Live page — so it costs no extra fetch and needs no gate.
 export function useChartSource(input: {
@@ -44,24 +43,14 @@ export function useChartSource(input: {
   ghostOverlay: boolean;
   // The resolved Week (ADR-0083; `useWeekWindow`) — routes the `week` span.
   week: WeekWindow;
-  // The Block span's Membership picker (#619 variant 1, #638): on that span a
-  // picked Membership names the intraday request's Scope in place of the wide
-  // one (`blockSpanMembership`), so the span's series, its ghost and its
-  // group-by describe that Membership alone.
-  blockPick: BlockSpanPick;
 }): ChartSource {
-  const { span, chartStyle, axes, ghostOverlay, week, blockPick } = input;
+  const { span, chartStyle, axes, ghostOverlay, week } = input;
   const { data: settings } = useSettings();
   const costMode = settings?.costMode ?? "auto";
   const tz = settings?.timezone;
   // ADR-0106: the Organization scope rides all three gated queries beside
   // `mode` and `tz`, and the assembly memo below deps on it.
   const { params: scope } = useScope();
-  // #638: the intraday query's Scope, the picked Membership's alone on the
-  // Block span; the daily queries never serve that span.
-  // Keyed on the token, a primitive: the pick object is new each clock tick.
-  const blockToken = blockSpanMembership(span, blockPick);
-  const intradayScope = useMemo(() => intradayScopeFor(scope, blockToken), [scope, blockToken]);
   // ADR-0060. The while-loading fallback (`?? DEFAULT_SETTINGS.timeFormat`) is
   // stated ONCE, in `useTimeDisplay` — writing it a second time here is exactly
   // the divergence that hook exists to prevent. Its internal `useSettings()`
@@ -108,7 +97,7 @@ export function useChartSource(input: {
       span,
       mode: costMode,
       tz,
-      ...intradayScope,
+      ...scope,
       weekStart: request.intraday.weekStart,
       projects,
       models,
@@ -163,7 +152,6 @@ export function useChartSource(input: {
   return useMemo(
     () =>
       resolveChartSource({
-        span,
         ghostOverlay,
         display,
         request,
@@ -182,7 +170,6 @@ export function useChartSource(input: {
       // ADR-0106, #637: the Scope re-keys the three queries beside `mode`/`tz`;
       // listed so a Scope flip is an explicit dep, never an incidental one.
       scope,
-      intradayScope,
       // ADR-0060. The exhaustive-deps rule is DISABLED on this hook, so nothing
       // but this line makes the chart re-label when the user flips the setting;
       // omit it and every bucket keeps its mount-time format until an unrelated

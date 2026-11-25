@@ -1299,8 +1299,11 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
     let (model_row, update_pending, limit_rows) = {
         let ambient = app.state::<ambient::AmbientState>();
         let model_window = *ambient.model_window.lock();
-        // The ranked popout's row count (#638), None for today's popout.
-        let limit_rows = *ambient.popout_limit_rows.lock();
+        // The popout's limit rows; the base's two before any readout.
+        let limit_rows = ambient
+            .popout_limit_rows
+            .lock()
+            .unwrap_or(popout::POPOUT_BASE_LIMIT_ROWS);
         let update_pending = ambient.pending_update.lock().is_some();
         // The row is an opt-in (Settings › Claude account) on top of the
         // wire's presence bit; settings.json is re-read here rather than
@@ -1312,10 +1315,7 @@ fn toggle_popout(app: &AppHandle, rect: &tauri::Rect) {
             .unwrap_or(false);
         (model_window && enabled, update_pending, limit_rows)
     };
-    let height = match limit_rows {
-        Some(rows) => popout::ranked_popout_content_height(rows, update_pending),
-        None => popout::popout_content_height(model_row, update_pending),
-    };
+    let height = popout::popout_content_height(limit_rows, model_row, update_pending);
     let logical = popout_logical_size(app.config()).map(|(w, _)| (w, height));
     if let Some(logical) = logical {
         #[cfg(target_os = "macos")]

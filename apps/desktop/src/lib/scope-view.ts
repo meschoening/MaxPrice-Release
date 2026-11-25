@@ -48,9 +48,9 @@ export interface ScopeView {
   // The report inputs' Scope fields (`ReportQueryInput`, `IntradayHookInput`).
   params: ScopeQueryParams;
   // The Scope's head Organization (the shared head rule, `scope-head.ts` in
-  // @maxprice/shared): whose usage current and Blocks a one-Membership
-  // surface shows, the Organization the sidecar's `/api/usage/current` and
-  // `/api/blocks` head read for the same params. Settings head the default
+  // @maxprice/shared): whose usage current a one-Membership surface shows,
+  // the Organization the sidecar's `/api/usage/current` head reads for the
+  // same params. Settings head the default
   // Scope, every Scope holding the Home membership and every one-Organization
   // Scope (`settledHeadOrganization`); any other is the sidecar's to say
   // (`headPending`), and until `useScope` has its answer this is the rule's

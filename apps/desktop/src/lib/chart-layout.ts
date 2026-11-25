@@ -1,4 +1,4 @@
-import type { Span } from "@maxprice/shared";
+import type { Span } from "@/state/filters";
 import type { ChartModel } from "@/lib/chart-model";
 
 // The pure paint-geometry layer of the glass chart (M3, #61): ChartModel →
@@ -231,8 +231,8 @@ function barGeom(view: ChartView, n: number, ghost: boolean, compact: boolean) {
 // geometry floors in barGeom (summed from them, not restated). Below this the
 // twin would overdraw its neighbours, so the layout switches to dense mode
 // (ADR-0046). Against the 668-unit plot that lands the switch at 122 buckets,
-// which ONLY the `block` span ever reaches — about two hours into its window.
-// `1h` tops out at 60 one-minute buckets (~11.1 units per cluster, twice the
+// which no Live span reaches since the `block` span went (ADR-0142): the
+// Projects strip's long daily ranges do. `1h` tops out at 60 one-minute buckets (~11.1 units per cluster, twice the
 // threshold) and stays comfortably sparse; `today`'s bars stay on the calendar
 // hour at 24, its line is a lines mark (never dense), and week/30d bars are daily.
 //
@@ -249,7 +249,7 @@ export const SPARSE_MIN_CLUSTER_W = GHOST_MIN_W + GAP_MIN_W + BAR_MIN_W;
 // SPARSE_MIN_CLUSTER_W is doing two jobs, and only one of them is fluid: a
 // geometric fit, which scales with `view.w`, and ADR-0046's node budget, which
 // does not. Re-derived against a fluid view the threshold moves 121 → 242 at
-// wide and 121 → 97 at narrow, so a `block` between minute 122 and 242 would be
+// wide and 121 → 97 at narrow, so a window of 122 to 242 buckets would be
 // sparse bars maximized and dense bands half-screen — and the two modes share
 // no elements, so crossing the boundary REMOUNTS the marks layer and replays
 // the rise animation partway through a window drag.
@@ -386,15 +386,13 @@ function labelIndices(n: number, mode: LabelMode): Set<number> {
   return set;
 }
 
-// The spans whose window GROWS a bucket at a time as the clock runs: `block`
-// runs from the active block's start to now (ADR-0031), `today` from local
-// midnight to now (ADR-0020), and an ANCHORED `week` from the Week's start to
-// now at anchor-aligned daily buckets — 1 → 7 bars across the week (ADR-0083).
-// All three are append-only — bucket i keeps its identity as the window
-// extends — so their bucket count must NOT force a remount: at the one-minute
-// bucket (ADR-0046) `block`/`today` would replay the `rise` animation every
-// single minute for as long as the window stays sparse, and an anchored week
-// would replay it at every day boundary.
+// The spans whose window GROWS a bucket at a time as the clock runs: `today`
+// runs from local midnight to now (ADR-0020), and an ANCHORED `week` from the
+// Week's start to now at anchor-aligned daily buckets — 1 → 7 bars across the
+// week (ADR-0083). Both are append-only — bucket i keeps its identity as the
+// window extends — so their bucket count must NOT force a remount: `today`
+// would replay the `rise` animation at every bucket it grows, and an anchored
+// week at every day boundary.
 // `week` is listed UNCONDITIONALLY even though only its anchored form grows:
 // a ROLLING week's bars are seven densified calendar days (`densifyDays`, via
 // chart-source.ts), so its count is a constant 7 and dropping `n` is inert
@@ -404,7 +402,7 @@ function labelIndices(n: number, mode: LabelMode): Set<number> {
 // Every other span has a fixed bucket count for its window, where a changed
 // count means a genuinely different window (bucket 0 of `15m` is not bucket 0
 // of `30d`) and rebuilding is right.
-const GROWING_SPANS: ReadonlySet<Span> = new Set<Span>(["block", "today", "week"]);
+const GROWING_SPANS: ReadonlySet<Span> = new Set<Span>(["today", "week"]);
 
 export function buildChartLayout(
   model: ChartModel,
@@ -709,15 +707,14 @@ export function buildChartLayout(
   // different window. Two exemptions:
   //   - dense bands and lines are ONE element per series whose `d` / `points`
   //     simply change, so a bucket-count change never mismatches elements;
-  //   - a GROWING span (`block` / `today` / an anchored `week`) appends buckets
-  //     while keeping every existing bucket's identity, so its rects should
-  //     morph through the 0.45s transitions. At the one-minute bucket `block`
-  //     and `today` grow every minute, and keying on `n` replayed the rise
-  //     animation that often (ADR-0046); an anchored week grows one bar a day
-  //     (ADR-0083).
+  //   - a GROWING span (`today` / an anchored `week`) appends buckets while
+  //     keeping every existing bucket's identity, so its rects should morph
+  //     through the 0.45s transitions. Keying on `n` replayed the rise
+  //     animation at every bucket `today` grew (ADR-0046); an anchored week
+  //     grows one bar a day (ADR-0083).
   // The dense flag itself rides the key — the two modes share no elements.
   // The span rides it too: with `n` gone for growing spans and lines, nothing
-  // else distinguishes the windows (all four intraday spans label "time",
+  // else distinguishes the windows (the three intraday spans label "time",
   // week/30d both label "day"), so a span switch would silently snap the marks
   // instead of rebuilding them.
   const shapeKey = [

@@ -46,63 +46,50 @@ pub const UPDATE_AVAILABLE_EVENT: &str = "update:available";
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Readout {
-    pub block_live: bool,
-    pub utilization_pct: Option<f64>,
     pub today_cost: f64,
     pub has_data: bool,
-    /// The current sample carries a Model-scoped weekly limit, so the popout
-    /// will draw its `<Model> limit` row — the shell sizes the window for it
-    /// (`popout::popout_content_height`) before showing.
+    /// The one-Membership popout's reading carries a Model-scoped weekly
+    /// limit, so the popout will draw its `<Model> limit` row — the shell
+    /// sizes the window for it (`popout::popout_content_height`) before
+    /// showing. Always false for the ranked popout.
     pub has_model_window: bool,
-    /// Present only while more than one Organization is tracked (ADR-0106
-    /// §11) — absent, not null, on a single-Organization machine, so its body
-    /// and therefore its tooltip stay byte-identical to before the scope.
-    /// Absent reads as None (so does a `null` the sidecar never sends); a
-    /// present-but-malformed object still fails the parse, a contract break
-    /// like any other field's. The label is the sidecar's (roster-resolved,
-    /// collision-suffixed), never resolved here.
-    #[serde(default)]
-    pub organizations: Option<ReadoutOrganizations>,
     /// Present only while the requested Scope holds more than one Membership
     /// (#622 item 4, #637): what the money half sums. Absent under a
-    /// one-Membership Scope, so a single-Organization, single-Account body and
-    /// tooltip are byte-identical to before. The sidecar decides it; the shell
-    /// only words it (`wide_scope_words`).
+    /// one-Membership Scope. The sidecar decides it; the shell only words it
+    /// (`wide_scope_words`).
     #[serde(default)]
     pub wide_scope: Option<WideScope>,
-    /// Present only while the Scope's multi-Membership set holds two or more
-    /// Readable memberships and at least one of them reads a live window
-    /// (#638; ADR-0136 §6's #610/#622 rows): the Readout picks the most used
-    /// Membership. Absent on a
-    /// one-Account install, whose tooltip and title stay byte-identical.
+    /// The Readout's percent (ADR-0142 §2): the most used window, of any
+    /// kind, of the most used Readable membership, at every count. Absent
+    /// while no Readable membership holds a window in flight: money.
     #[serde(default)]
     pub most_used: Option<MostUsed>,
-    /// Present only while that set holds two or more Memberships: the ranked
-    /// popout's limit rows (`popout::ranked_popout_content_height`).
-    #[serde(default)]
-    pub popout_limit_rows: Option<u32>,
+    /// The popout's limit rows (`popout::popout_content_height`): the ranked
+    /// popout's Memberships, or the one-Membership popout's 5-hour and weekly
+    /// rows (one when the Organization has no weekly limit).
+    pub popout_limit_rows: u32,
 }
 
 /// The most used Readout (packages/shared/src/readout.ts
-/// `readoutMostUsedSchema`; keep in lockstep). `five_hour_live`: some Readable
-/// membership's 5-hour window is in flight, so the title and the tooltip's
-/// head are `top`'s percent; false is money, with `top` as `Most used:`.
-/// `count` is the set's Memberships, every state, for `+N more`.
+/// `readoutMostUsedSchema`; keep in lockstep): `top` is the title's and the
+/// tooltip's head, `next` the tooltip's `Next:`, and `count` the Memberships
+/// the Readout reads, every state, for `+N more`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MostUsed {
-    pub five_hour_live: bool,
     pub count: u64,
     pub top: ReadoutMembership,
     pub next: Option<ReadoutMembership>,
 }
 
 /// One Membership's most used live window, labelled by the sidecar
-/// (`Org · Account` while the set spans Accounts); `pct` unrounded.
+/// (`Org · Account` while the set spans Accounts; None where naming it would
+/// tell nothing apart, one Membership on a one-Organization machine); `pct`
+/// unrounded.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadoutMembership {
-    pub label: String,
+    pub label: Option<String>,
     pub window: LimitWindow,
     #[serde(default)]
     pub model: Option<String>,
@@ -116,15 +103,6 @@ pub enum LimitWindow {
     FiveHour,
     Weekly,
     WeeklyModel,
-}
-
-/// The readout's multi-Organization half (packages/shared/src/readout.ts;
-/// keep in lockstep): `quota_label` names the Organization whose limit the
-/// utilization half reads (the Scope's head Organization — Home under All).
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadoutOrganizations {
-    pub quota_label: String,
 }
 
 /// The money half's wide Scope (packages/shared/src/readout.ts
@@ -151,8 +129,8 @@ pub struct AmbientState {
     /// Sticky across a vanished readout (a sidecar hiccup must not make the
     /// popout jump 31px on its next open); a readout that ANSWERS overwrites.
     pub model_window: Mutex<bool>,
-    /// The last readout's `popout_limit_rows` — the ranked popout's row count
-    /// (#638), None for today's popout. Sticky like `model_window`.
+    /// The last readout's `popout_limit_rows` — the popout's limit rows, None
+    /// before any readout answers. Sticky like `model_window`.
     pub popout_limit_rows: Mutex<Option<u32>>,
     kick: Mutex<Option<mpsc::Sender<()>>>,
 }
@@ -172,53 +150,24 @@ pub fn kick(state: &AmbientState) {
 /// (T5 decision 5), degrading to the bare app name when there is nothing
 /// honest to say (T5 decision 6 — vanish, not apologize).
 ///
-/// While more than one Organization is tracked (the readout carries
-/// `organizations`; ADR-0106 §11) the tooltip has the room the menu-bar title
-/// lacks, so it names what each metric describes: the limit is always ONE
-/// Organization's — the Scope's head, Home under All — so it carries that
-/// label. Today's cost is the Scope's money, so a Scope of more than one
-/// Membership (`wideScope`, #622 item 4, #637) says which: `(all accounts)`,
-/// `(all organizations)` or `(N memberships)`. A single-Membership tooltip is
-/// byte-identical to before.
+/// The percent names its Membership and window (`ranked_tooltip`), the
+/// Membership only where the sidecar labels it. Today's cost is the Scope's
+/// money, so a Scope of more than one Membership (`wideScope`, #622 item 4,
+/// #637) says which: `(all accounts)`, `(all organizations)` or
+/// `(N memberships)`.
 ///
 /// The mirror of `title_text` below, and dead for the same reason on the other
 /// side: only the non-macOS write path calls it, while the tests that pin its
 /// wording must keep running everywhere.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn tooltip_text(readout: Option<&Readout>) -> String {
-    let organizations = readout.and_then(|r| r.organizations.as_ref());
-    let wide = readout.and_then(|r| r.wide_scope.as_ref());
-    let most_used = readout.and_then(|r| r.most_used.as_ref());
-    match (ambient_metric(readout), most_used) {
-        (Metric::MostUsed(most_used), _) => ranked_tooltip(most_used),
-        (Metric::Today(cost), Some(most_used)) => {
-            let money = match wide {
-                Some(wide) => format!("MaxPrice — today ${cost:.2} ({})", wide_scope_words(wide)),
-                None => format!("MaxPrice — today ${cost:.2}"),
-            };
-            let top = &most_used.top;
-            // `Most used:` shortens its label to fit Windows' limit, and
-            // drops when even a short one cannot.
-            let budget = TOOLTIP_MAX.saturating_sub(utf16_len(&money) + 1);
-            let suffix = format!(" {}", short_pct(top));
-            match fit_label_line("Most used: ", &top.label, &suffix, budget) {
-                Some(line) => format!("{money}\n{line}"),
-                None => fit_tooltip(money),
-            }
-        }
-        (Metric::Limit(pct), _) => {
-            let suffix = format!(" 5-hour limit {pct}%");
-            organizations
-                .and_then(|orgs| {
-                    fit_label_line("MaxPrice — ", &orgs.quota_label, &suffix, TOOLTIP_MAX)
-                })
-                .unwrap_or_else(|| format!("MaxPrice —{suffix}"))
-        }
-        (Metric::Today(cost), None) => fit_tooltip(match wide {
+    match ambient_metric(readout) {
+        Metric::MostUsed(most_used) => ranked_tooltip(most_used),
+        Metric::Today(cost, wide) => fit_tooltip(match wide {
             Some(wide) => format!("MaxPrice — today ${cost:.2} ({})", wide_scope_words(wide)),
             None => format!("MaxPrice — today ${cost:.2}"),
         }),
-        (Metric::None, _) => "MaxPrice".to_string(),
+        Metric::None => "MaxPrice".to_string(),
     }
 }
 
@@ -347,26 +296,35 @@ fn window_name(m: &ReadoutMembership) -> String {
     }
 }
 
-/// The percent Readout's tooltip (#610): the most used Membership and window,
-/// then `Next:`, then `+N more` for the set's Memberships not named. Past
-/// Windows' limit (`TOOLTIP_MAX`) `Next:` drops first (its Membership joins
-/// `+N more`); the head line then shortens its label, never its percent, to
-/// leave room for `+N more`, which drops only when the label would keep
-/// fewer than `MIN_LABEL` units.
+/// The percent Readout's tooltip (#610, ADR-0142 §2): the most used
+/// Membership and window, then `Next:`, then `+N more` for the Memberships
+/// not named. Past Windows' limit (`TOOLTIP_MAX`) `Next:` drops first (its
+/// Membership joins `+N more`); the head line then shortens its label, never
+/// its percent, to leave room for `+N more`, which drops only when the label
+/// would keep fewer than `MIN_LABEL` units. An unnamed head (one Membership
+/// on a one-Organization machine) is `MaxPrice — weekly limit 64%`.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn ranked_tooltip(most_used: &MostUsed) -> String {
     let top = &most_used.top;
     let prefix = "MaxPrice — ";
-    let suffix = format!(" {} {}%", window_name(top), top.pct.round() as i64);
+    let pct = top.pct.round() as i64;
+    let Some(label) = top.label.as_deref() else {
+        return fit_tooltip(format!("{prefix}{} {pct}%", window_name(top)));
+    };
+    let suffix = format!(" {} {pct}%", window_name(top));
     let more_line = |named: u64| -> Option<String> {
         let more = most_used.count.saturating_sub(named);
         (more > 0).then(|| format!("+{more} more"))
     };
-    let head = format!("{prefix}{}{suffix}", top.label);
+    let head = format!("{prefix}{label}{suffix}");
     if let Some(next) = most_used.next.as_ref() {
         let mut lines = vec![
             head.clone(),
-            format!("Next: {} {}", next.label, short_pct(next)),
+            format!(
+                "Next: {} {}",
+                next.label.as_deref().unwrap_or(""),
+                short_pct(next)
+            ),
         ];
         lines.extend(more_line(2));
         let full = lines.join("\n");
@@ -377,11 +335,11 @@ fn ranked_tooltip(most_used: &MostUsed) -> String {
     let more = more_line(1);
     if let Some(more) = more.as_ref() {
         let budget = TOOLTIP_MAX.saturating_sub(utf16_len(more) + 1);
-        if let Some(head) = fit_label_line(prefix, &top.label, &suffix, budget) {
+        if let Some(head) = fit_label_line(prefix, label, &suffix, budget) {
             return format!("{head}\n{more}");
         }
     }
-    fit_label_line(prefix, &top.label, &suffix, TOOLTIP_MAX).unwrap_or_else(|| fit_tooltip(head))
+    fit_label_line(prefix, label, &suffix, TOOLTIP_MAX).unwrap_or_else(|| fit_tooltip(head))
 }
 
 /// The macOS menu-bar title: T4's fixed formats — integer percent / two-decimal
@@ -408,48 +366,30 @@ fn ranked_tooltip(most_used: &MostUsed) -> String {
 pub fn title_text(readout: Option<&Readout>) -> String {
     match ambient_metric(readout) {
         Metric::MostUsed(most_used) => format!(" {}", short_pct(&most_used.top)),
-        Metric::Limit(pct) => format!(" {pct}%"),
-        Metric::Today(cost) => format!(" ${cost:.2}"),
+        Metric::Today(cost, _) => format!(" ${cost:.2}"),
         Metric::None => String::new(),
     }
 }
 
-/// The metric switch (charter decision 5, one rule for both platforms):
-/// 5-hour-limit percent while a block is live, today's cost otherwise, nothing
-/// when there is no data at all (fresh install) or no readout (sidecar
-/// unreachable). `blockLive` without a percent is treated as not-live — the
-/// schema forbids it, but a formatter must not render "…limit %" on a
-/// contradiction.
-///
-/// A readout carrying `mostUsed` (#638) decides by it alone: its percent
-/// while some Readable 5-hour window is in flight, else money. `blockLive`,
-/// the Scope's head Organization's, is not read then, so a dead key's
-/// projection never turns money into a percent (ADR-0138 §8).
+/// The metric switch (ADR-0142 §2, one rule for both platforms): the most
+/// used window's percent, of any kind, while the readout carries one; today's
+/// cost otherwise; nothing when there is no data at all (fresh install) or no
+/// readout (sidecar unreachable). The sidecar sends `mostUsed` only while a
+/// Readable membership holds a window in flight, so a dead key's stale
+/// reading never turns money into a percent (ADR-0138 §8).
 enum Metric<'a> {
-    Limit(i64),
     MostUsed(&'a MostUsed),
-    Today(f64),
+    Today(f64, Option<&'a WideScope>),
     None,
 }
 
 fn ambient_metric(readout: Option<&Readout>) -> Metric<'_> {
     match readout {
-        Some(r) => {
-            if let Some(most_used) = &r.most_used {
-                if most_used.five_hour_live {
-                    return Metric::MostUsed(most_used);
-                }
-            } else if r.block_live {
-                if let Some(pct) = r.utilization_pct {
-                    return Metric::Limit(pct.round() as i64);
-                }
-            }
-            if r.has_data {
-                Metric::Today(r.today_cost)
-            } else {
-                Metric::None
-            }
-        }
+        Some(r) => match (&r.most_used, r.has_data) {
+            (Some(most_used), _) => Metric::MostUsed(most_used),
+            (None, true) => Metric::Today(r.today_cost, r.wide_scope.as_ref()),
+            (None, false) => Metric::None,
+        },
         None => Metric::None,
     }
 }
@@ -667,7 +607,7 @@ fn poll_readout_once(app: &AppHandle) {
     if let Some(r) = &readout {
         let ambient = app.state::<AmbientState>();
         *ambient.model_window.lock() = r.has_model_window;
-        *ambient.popout_limit_rows.lock() = r.popout_limit_rows;
+        *ambient.popout_limit_rows.lock() = Some(r.popout_limit_rows);
     }
     write_tray_readout(app, readout);
 }
@@ -806,27 +746,15 @@ fn apply_badge(app: &AppHandle, pending: bool) {
 mod tests {
     use super::*;
 
-    fn readout(block_live: bool, pct: Option<f64>, today: f64, has_data: bool) -> Readout {
+    /// A readout with no percent: money, or vanish without data.
+    fn money(today: f64, has_data: bool) -> Readout {
         Readout {
-            block_live,
-            utilization_pct: pct,
             today_cost: today,
             has_data,
             has_model_window: false,
-            organizations: None,
             wide_scope: None,
             most_used: None,
-            popout_limit_rows: None,
-        }
-    }
-
-    fn scoped(r: Readout, label: &str, wide: Option<WideScope>) -> Readout {
-        Readout {
-            organizations: Some(ReadoutOrganizations {
-                quota_label: label.to_string(),
-            }),
-            wide_scope: wide,
-            ..r
+            popout_limit_rows: 2,
         }
     }
 
@@ -837,160 +765,19 @@ mod tests {
         }
     }
 
-    // --- the metric switch + fixed formats (T4 decision 3, T5 decision 5) ---
-
-    #[test]
-    fn live_block_reads_as_the_limit_percent() {
-        let r = readout(true, Some(82.0), 12.4, true);
-        assert_eq!(tooltip_text(Some(&r)), "MaxPrice — 5-hour limit 82%");
-        assert_eq!(title_text(Some(&r)), " 82%");
-    }
-
-    #[test]
-    fn the_percent_is_an_integer_no_padding() {
-        // Fixed formats (T4): integer percent — 82.6 rounds, never "82.6%",
-        // never "082%".
-        let r = readout(true, Some(82.6), 0.0, true);
-        assert_eq!(title_text(Some(&r)), " 83%");
-        let single = readout(true, Some(7.2), 0.0, true);
-        assert_eq!(title_text(Some(&single)), " 7%");
-    }
-
-    #[test]
-    fn no_live_block_reads_as_todays_cost_two_decimals() {
-        let r = readout(false, None, 12.4, true);
-        assert_eq!(tooltip_text(Some(&r)), "MaxPrice — today $12.40");
-        assert_eq!(title_text(Some(&r)), " $12.40");
-        // $0 with data is an honest reading, not a vanish.
-        let zero = readout(false, None, 0.0, true);
-        assert_eq!(title_text(Some(&zero)), " $0.00");
-    }
-
-    #[test]
-    fn vanish_not_apologize() {
-        // Sidecar unreachable / failed poll → bare name, empty title.
-        assert_eq!(tooltip_text(None), "MaxPrice");
-        assert_eq!(title_text(None), "");
-        // Fresh install (hasData false, nothing live) → same vanish.
-        let fresh = readout(false, None, 0.0, false);
-        assert_eq!(tooltip_text(Some(&fresh)), "MaxPrice");
-        assert_eq!(title_text(Some(&fresh)), "");
-    }
-
-    #[test]
-    fn the_gap_is_one_leading_space_and_vanish_carries_none() {
-        // The item's centring rests on all three of these: the pad is LEADING
-        // (a trailing one drags the content left of the slot's centre), it is
-        // exactly one space, and the vanish state is genuinely empty — a
-        // whitespace-only title would off-centre the icon-only state.
-        for r in [
-            readout(true, Some(82.0), 12.4, true),
-            readout(false, None, 12.4, true),
-            readout(false, None, 0.0, true),
-        ] {
-            let t = title_text(Some(&r));
-            assert!(t.starts_with(' '), "{t:?} must lead with the gap space");
-            assert!(!t[1..].starts_with(' '), "{t:?} must pad by exactly one");
-            assert_eq!(t.trim_end(), t, "{t:?} must not pad on the trailing side");
-        }
-        assert!(title_text(None).is_empty());
-    }
-
-    #[test]
-    fn a_live_flag_without_a_percent_falls_through_rather_than_lying() {
-        // Schema-forbidden, formatter-defended: blockLive with a null percent
-        // must not render "limit %"; with data it degrades to today's cost.
-        let r = readout(true, None, 3.5, true);
-        assert_eq!(tooltip_text(Some(&r)), "MaxPrice — today $3.50");
-    }
-
-    // --- more than one tracked Organization (#291; ADR-0106 §11) ---
-
-    #[test]
-    fn more_than_one_tracked_names_the_quota_organization_in_the_tooltip() {
-        let live = scoped(readout(true, Some(82.0), 12.4, true), "Team", None);
-        assert_eq!(
-            tooltip_text(Some(&live)),
-            "MaxPrice — Team 5-hour limit 82%"
-        );
-        // Under All the limit is still one Organization's (the Scope's head, Home).
-        let live_all = scoped(
-            readout(true, Some(40.0), 12.4, true),
-            "Acme",
-            Some(WideScope::Organizations),
-        );
-        assert_eq!(
-            tooltip_text(Some(&live_all)),
-            "MaxPrice — Acme 5-hour limit 40%"
-        );
-        // The today fallback is money: under All it says so; scoped to one it does not.
-        let today_all = scoped(
-            readout(false, None, 12.4, true),
-            "Acme",
-            Some(WideScope::Organizations),
-        );
-        assert_eq!(
-            tooltip_text(Some(&today_all)),
-            "MaxPrice — today $12.40 (all organizations)"
-        );
-        let today_one = scoped(readout(false, None, 12.4, true), "Team", None);
-        assert_eq!(tooltip_text(Some(&today_one)), "MaxPrice — today $12.40");
-        // Vanish stays bare.
-        let fresh = scoped(
-            readout(false, None, 0.0, false),
-            "Acme",
-            Some(WideScope::Organizations),
-        );
-        assert_eq!(tooltip_text(Some(&fresh)), "MaxPrice");
-    }
-
-    // --- a Scope of more than one Membership (#622 item 4, #637) ---
-
-    #[test]
-    fn the_today_fallback_names_a_wide_scope() {
-        let today = readout(false, None, 12.4, true);
-        assert_eq!(
-            tooltip_text(Some(&wide(today.clone(), WideScope::Accounts))),
-            "MaxPrice — today $12.40 (all accounts)"
-        );
-        assert_eq!(
-            tooltip_text(Some(&wide(today.clone(), WideScope::Organizations))),
-            "MaxPrice — today $12.40 (all organizations)"
-        );
-        assert_eq!(
-            tooltip_text(Some(&wide(
-                today.clone(),
-                WideScope::Memberships { count: 3 }
-            ))),
-            "MaxPrice — today $12.40 (3 memberships)"
-        );
-        // A one-Organization machine of several Accounts carries no quota label,
-        // and its limit half is unchanged.
-        let live = wide(readout(true, Some(82.0), 12.4, true), WideScope::Accounts);
-        assert_eq!(tooltip_text(Some(&live)), "MaxPrice — 5-hour limit 82%");
-        // No wide Scope, no suffix: today's single-Membership tooltip.
-        assert_eq!(tooltip_text(Some(&today)), "MaxPrice — today $12.40");
-    }
-
-    #[test]
-    fn the_macos_title_never_names_an_organization() {
-        let live = scoped(readout(true, Some(82.0), 12.4, true), "Team", None);
-        assert_eq!(title_text(Some(&live)), " 82%");
-        let today_all = scoped(
-            readout(false, None, 12.4, true),
-            "Acme",
-            Some(WideScope::Organizations),
-        );
-        assert_eq!(title_text(Some(&today_all)), " $12.40");
-        let accounts = wide(readout(false, None, 12.4, true), WideScope::Accounts);
-        assert_eq!(title_text(Some(&accounts)), " $12.40");
-    }
-
-    // --- the most used Readout (#638; ADR-0136 §6's #610/#622 rows) ---
-
     fn member(label: &str, window: LimitWindow, pct: f64) -> ReadoutMembership {
         ReadoutMembership {
-            label: label.to_string(),
+            label: Some(label.to_string()),
+            window,
+            model: None,
+            pct,
+        }
+    }
+
+    /// One Membership on a one-Organization machine: unnamed.
+    fn unnamed(window: LimitWindow, pct: f64) -> ReadoutMembership {
+        ReadoutMembership {
+            label: None,
             window,
             model: None,
             pct,
@@ -999,105 +786,172 @@ mod tests {
 
     fn most_used(
         r: Readout,
-        five_hour_live: bool,
         count: u64,
         top: ReadoutMembership,
         next: Option<ReadoutMembership>,
     ) -> Readout {
         Readout {
-            most_used: Some(MostUsed {
-                five_hour_live,
-                count,
-                top,
-                next,
-            }),
-            popout_limit_rows: Some(count.min(4) as u32 + u32::from(count > 4)),
+            most_used: Some(MostUsed { count, top, next }),
             ..r
         }
     }
 
+    /// The one-Membership percent: `money` with its head window.
+    fn one(top: ReadoutMembership) -> Readout {
+        most_used(money(12.4, true), 1, top, None)
+    }
+
+    // --- one Membership (ADR-0142 §2: the most used window at every count) ---
+
     #[test]
-    fn a_live_five_hour_window_reads_the_most_used_percent() {
-        let r = most_used(
-            readout(true, Some(12.0), 12.4, true),
-            true,
-            4,
-            member("Team", LimitWindow::FiveHour, 90.6),
-            Some(member("Acme", LimitWindow::Weekly, 82.0)),
-        );
-        assert_eq!(title_text(Some(&r)), " 91%");
-        // Short names, so all three lines fit in 63 units.
+    fn a_five_hour_window_reads_its_bare_percent() {
+        let r = one(unnamed(LimitWindow::FiveHour, 41.4));
+        assert_eq!(title_text(Some(&r)), " 41%");
+        assert_eq!(tooltip_text(Some(&r)), "MaxPrice — 5-hour limit 41%");
+    }
+
+    #[test]
+    fn a_weekly_window_reads_wk() {
+        let r = one(unnamed(LimitWindow::Weekly, 63.5));
+        assert_eq!(title_text(Some(&r)), " 64% wk");
+        assert_eq!(tooltip_text(Some(&r)), "MaxPrice — weekly limit 64%");
+    }
+
+    #[test]
+    fn ultra_alone_reads_its_most_used_weekly_window() {
+        // An Ultra plan reports no 5-hour window: its weekly or model weekly
+        // window is the percent, never money.
+        let r = one(ReadoutMembership {
+            model: Some("Fable".to_string()),
+            ..unnamed(LimitWindow::WeeklyModel, 71.0)
+        });
+        assert_eq!(title_text(Some(&r)), " 71% wk");
+        assert_eq!(tooltip_text(Some(&r)), "MaxPrice — Fable weekly limit 71%");
+    }
+
+    #[test]
+    fn a_max_plan_between_five_hour_windows_reads_its_weekly_percent() {
+        // Money before ADR-0142; the weekly window is in flight, so a percent.
+        let r = one(unnamed(LimitWindow::Weekly, 33.0));
+        assert_eq!(title_text(Some(&r)), " 33% wk");
+        assert_ne!(title_text(Some(&r)), " $12.40");
+    }
+
+    #[test]
+    fn nothing_readable_reads_as_todays_cost_two_decimals() {
+        assert_eq!(title_text(Some(&money(12.4, true))), " $12.40");
         assert_eq!(
-            tooltip_text(Some(&r)),
-            "MaxPrice — Team 5-hour limit 91%\nNext: Acme 82% wk\n+2 more"
+            tooltip_text(Some(&money(12.4, true))),
+            "MaxPrice — today $12.40"
+        );
+        assert_eq!(title_text(Some(&money(0.0, true))), " $0.00");
+    }
+
+    #[test]
+    fn the_percent_is_an_integer_no_padding() {
+        assert_eq!(
+            title_text(Some(&one(unnamed(LimitWindow::FiveHour, 5.0)))),
+            " 5%"
+        );
+        assert_eq!(
+            title_text(Some(&one(unnamed(LimitWindow::FiveHour, 100.0)))),
+            " 100%"
+        );
+        assert_eq!(
+            title_text(Some(&one(unnamed(LimitWindow::FiveHour, 81.6)))),
+            " 82%"
         );
     }
 
     #[test]
-    fn any_other_window_reads_wk_and_names_its_kind() {
-        let weekly = most_used(
-            readout(false, None, 12.4, true),
-            true,
-            2,
-            member("Team · Alex", LimitWindow::Weekly, 82.0),
-            Some(member("Acme · Blair", LimitWindow::FiveHour, 40.0)),
-        );
-        assert_eq!(title_text(Some(&weekly)), " 82% wk");
+    fn vanish_not_apologize() {
+        // No readout (sidecar unreachable) or no data at all: bare app name on
+        // Windows, empty title on macOS — never "$0.00" or "unavailable".
+        assert_eq!(tooltip_text(None), "MaxPrice");
+        assert_eq!(title_text(None), "");
+        assert_eq!(tooltip_text(Some(&money(0.0, false))), "MaxPrice");
+        assert_eq!(title_text(Some(&money(0.0, false))), "");
+    }
+
+    #[test]
+    fn the_gap_is_one_leading_space_and_vanish_carries_none() {
+        // The icon→title gap is the title's leading space (see `title_text`):
+        // exactly one, never trailing, and nothing at all for vanish.
+        for r in [one(unnamed(LimitWindow::Weekly, 40.0)), money(3.5, true)] {
+            let t = title_text(Some(&r));
+            assert!(t.starts_with(' ') && !t.starts_with("  ") && !t.ends_with(' '));
+        }
+        assert!(title_text(None).is_empty());
+    }
+
+    #[test]
+    fn a_named_membership_heads_the_tooltip_never_the_title() {
+        // One Membership while several Organizations are tracked: the sidecar
+        // labels it, the tooltip names it, the menu bar has no room.
+        let r = one(member("Acme · 1a2b3c4d", LimitWindow::FiveHour, 82.0));
         assert_eq!(
-            tooltip_text(Some(&weekly)),
-            "MaxPrice — Team · Alex weekly limit 82%\nNext: Acme · Blair 40%"
+            tooltip_text(Some(&r)),
+            "MaxPrice — Acme · 1a2b3c4d 5-hour limit 82%"
         );
-        let model = most_used(
-            readout(false, None, 12.4, true),
-            true,
+        assert_eq!(title_text(Some(&r)), " 82%");
+    }
+
+    #[test]
+    fn the_today_fallback_names_a_wide_scope() {
+        let r = wide(money(12.4, true), WideScope::Accounts);
+        assert_eq!(
+            tooltip_text(Some(&r)),
+            "MaxPrice — today $12.40 (all accounts)"
+        );
+        assert_eq!(title_text(Some(&r)), " $12.40");
+        let r = wide(money(12.4, true), WideScope::Organizations);
+        assert_eq!(
+            tooltip_text(Some(&r)),
+            "MaxPrice — today $12.40 (all organizations)"
+        );
+        let r = wide(money(12.4, true), WideScope::Memberships { count: 3 });
+        assert_eq!(
+            tooltip_text(Some(&r)),
+            "MaxPrice — today $12.40 (3 memberships)"
+        );
+    }
+
+    // --- several Memberships (#638's ranked lines) ---
+
+    #[test]
+    fn the_most_used_membership_and_window_head_the_tooltip() {
+        let r = most_used(
+            money(1.0, true),
             3,
+            member("Personal", LimitWindow::Weekly, 64.0),
+            Some(member("Team", LimitWindow::FiveHour, 41.0)),
+        );
+        assert_eq!(title_text(Some(&r)), " 64% wk");
+        let t = tooltip_text(Some(&r));
+        assert_eq!(
+            t,
+            "MaxPrice — Personal weekly limit 64%\nNext: Team 41%\n+1 more"
+        );
+        assert!(utf16_len(&t) <= TOOLTIP_MAX);
+        let model = most_used(
+            money(1.0, true),
+            2,
             ReadoutMembership {
                 model: Some("Fable".to_string()),
                 ..member("Team", LimitWindow::WeeklyModel, 77.0)
             },
             None,
         );
-        assert_eq!(title_text(Some(&model)), " 77% wk");
         assert_eq!(
             tooltip_text(Some(&model)),
-            "MaxPrice — Team Fable weekly limit 77%\n+2 more"
+            "MaxPrice — Team Fable weekly limit 77%\n+1 more"
         );
-    }
-
-    #[test]
-    fn no_five_hour_window_in_flight_reads_money_and_the_most_used() {
-        // blockLive is the head Organization's (a dead key's projection, say):
-        // the most used rule ignores it.
-        let r = most_used(
-            wide(readout(true, Some(97.0), 12.4, true), WideScope::Accounts),
-            false,
-            3,
-            member("Acme", LimitWindow::Weekly, 90.0),
-            None,
-        );
-        assert_eq!(title_text(Some(&r)), " $12.40");
-        assert_eq!(
-            tooltip_text(Some(&r)),
-            "MaxPrice — today $12.40 (all accounts)\nMost used: Acme 90% wk"
-        );
-        // No data: vanish, as today.
-        let fresh = most_used(
-            readout(false, None, 0.0, false),
-            false,
-            2,
-            member("A", LimitWindow::Weekly, 5.0),
-            None,
-        );
-        assert_eq!(title_text(Some(&fresh)), "");
-        assert_eq!(tooltip_text(Some(&fresh)), "MaxPrice");
     }
 
     #[test]
     fn next_drops_first_past_the_63_unit_limit() {
-        // 75 units with Next; without it the head and `+2 more` fit whole.
         let r = most_used(
-            readout(false, None, 1.0, true),
-            true,
+            money(1.0, true),
             3,
             member("Team · Alex", LimitWindow::FiveHour, 50.0),
             Some(member("Acme · Blair Robertson", LimitWindow::Weekly, 40.0)),
@@ -1112,8 +966,7 @@ mod tests {
         // The VM's 14-Membership head: 66 units whole, cut to "…limit 9" by the
         // shell before this cap (#646).
         let r = most_used(
-            readout(false, None, 1.0, true),
-            true,
+            money(1.0, true),
             14,
             member(
                 "Team plan · 0646000d · Account 0646ffff",
@@ -1135,7 +988,6 @@ mod tests {
             head.ends_with("Account 0646ffff weekly limit 95%"),
             "{head}"
         );
-        assert!(head.contains('…'));
     }
 
     #[test]
@@ -1143,8 +995,7 @@ mod tests {
         // An astral character is two UTF-16 units: the cut never splits one.
         let long = "😀".repeat(80);
         let r = most_used(
-            readout(false, None, 1.0, true),
-            true,
+            money(1.0, true),
             2,
             member(&long, LimitWindow::FiveHour, 50.0),
             Some(member("B", LimitWindow::FiveHour, 10.0)),
@@ -1158,57 +1009,17 @@ mod tests {
         let label = "a".repeat(TOOLTIP_MAX - utf16_len("MaxPrice —  5-hour limit 50%"));
         let fits = format!("MaxPrice — {label} 5-hour limit 50%");
         assert_eq!(utf16_len(&fits), TOOLTIP_MAX);
-        let r = most_used(
-            readout(false, None, 1.0, true),
-            true,
-            1,
-            member(&label, LimitWindow::FiveHour, 50.0),
-            None,
-        );
+        let r = one(member(&label, LimitWindow::FiveHour, 50.0));
         assert_eq!(tooltip_text(Some(&r)), fits);
     }
 
     #[test]
-    fn most_used_shortens_its_label_and_drops_only_when_none_fits() {
-        // The VM's idle tooltip: cut at 64 units before.
-        let r = most_used(
-            readout(false, None, 1.47, true),
-            false,
-            14,
-            member(
-                "Team plan · 0646000d · Account 0646ffff",
-                LimitWindow::Weekly,
-                95.0,
-            ),
-            None,
-        );
-        let t = tooltip_text(Some(&r));
-        assert!(utf16_len(&t) <= TOOLTIP_MAX, "{t}");
-        let (money, line) = t.split_once('\n').expect("two lines");
-        assert_eq!(money, "MaxPrice — today $1.47");
-        assert!(line.starts_with("Most used: Team pl…"), "{line}");
-        assert!(line.ends_with("0646ffff 95% wk"), "{line}");
-        // A wide Scope's money words leave no room for a label: the line drops.
-        let wide_r = most_used(
-            wide(readout(false, None, 12.4, true), WideScope::Accounts),
-            false,
-            2,
-            member(&"x".repeat(100), LimitWindow::Weekly, 90.0),
-            None,
-        );
-        assert_eq!(
-            tooltip_text(Some(&wide_r)),
-            "MaxPrice — today $12.40 (all accounts)"
-        );
-    }
-
-    #[test]
-    fn the_quota_label_shortens_before_the_percent() {
-        let r = scoped(
-            readout(true, Some(82.0), 12.4, true),
+    fn a_long_single_label_shortens_before_the_percent() {
+        let r = one(member(
             &"Northwind Traders Enterprise ".repeat(3),
-            None,
-        );
+            LimitWindow::FiveHour,
+            82.0,
+        ));
         let t = tooltip_text(Some(&r));
         assert!(utf16_len(&t) <= TOOLTIP_MAX, "{t}");
         assert!(t.starts_with("MaxPrice — Northwind"), "{t}");
@@ -1222,33 +1033,6 @@ mod tests {
         let s = shorten_label(&"😀".repeat(10), 9);
         assert!(utf16_len(&s) <= 9, "{s}");
         assert!(s.contains('…'));
-    }
-
-    #[test]
-    fn parses_the_optional_most_used_fields() {
-        let base = r#"{"blockLive":false,"utilizationPct":null,"todayCost":1,"hasData":true,"hasModelWindow":false"#;
-        let body = format!(
-            r#"{base},"mostUsed":{{"fiveHourLive":true,"count":3,"top":{{"label":"Team","window":"weeklyModel","model":"Fable","pct":77}},"next":null}},"popoutLimitRows":3}}"#
-        );
-        let r = parse_readout(&body).expect("parses");
-        assert_eq!(r.popout_limit_rows, Some(3));
-        assert_eq!(
-            r.most_used,
-            Some(MostUsed {
-                five_hour_live: true,
-                count: 3,
-                top: ReadoutMembership {
-                    model: Some("Fable".to_string()),
-                    ..member("Team", LimitWindow::WeeklyModel, 77.0)
-                },
-                next: None,
-            })
-        );
-        // Absent is None, and an unknown window is a contract break.
-        let plain = parse_readout(&format!("{base}}}")).expect("parses");
-        assert_eq!((plain.most_used, plain.popout_limit_rows), (None, None));
-        let bad = body.replace("weeklyModel", "monthly");
-        assert_eq!(parse_readout(&bad), None);
     }
 
     // --- settings mirroring (the background_residency_enabled precedent) ---
@@ -1488,43 +1272,56 @@ mod tests {
 
     #[test]
     fn parses_the_shared_wire_shape() {
-        let body = r#"{"blockLive":true,"utilizationPct":82,"todayCost":12.48,"hasData":true,"hasModelWindow":true}"#;
+        let body =
+            r#"{"todayCost":12.48,"hasData":true,"hasModelWindow":true,"popoutLimitRows":2}"#;
         assert_eq!(
             parse_readout(body),
             Some(Readout {
                 has_model_window: true,
-                ..readout(true, Some(82.0), 12.48, true)
+                ..money(12.48, true)
             })
         );
-        let idle = r#"{"blockLive":false,"utilizationPct":null,"todayCost":0,"hasData":false,"hasModelWindow":false}"#;
-        assert_eq!(parse_readout(idle), Some(readout(false, None, 0.0, false)));
-        // The pre-model-row wire (no hasModelWindow) is a contract break too.
-        let old = r#"{"blockLive":true,"utilizationPct":82,"todayCost":12.48,"hasData":true}"#;
-        assert_eq!(parse_readout(old), None);
         assert_eq!(parse_readout("not json"), None);
         // A missing field is a contract break, not a default — refuse it.
-        assert_eq!(parse_readout(r#"{"blockLive":false}"#), None);
+        assert_eq!(
+            parse_readout(r#"{"todayCost":1,"hasData":true,"hasModelWindow":false}"#),
+            None
+        );
+        // The retired Block wire (`blockLive`, ADR-0142 §5) carries no
+        // `popoutLimitRows`, so it fails too: one version, no shim.
+        let old = r#"{"blockLive":true,"utilizationPct":82,"todayCost":12.48,"hasData":true,"hasModelWindow":true}"#;
+        assert_eq!(parse_readout(old), None);
     }
 
     #[test]
-    fn parses_the_optional_organizations_field() {
-        let body = r#"{"blockLive":true,"utilizationPct":82,"todayCost":12.48,"hasData":true,"hasModelWindow":false,"organizations":{"quotaLabel":"Acme · 1a2b3c4d"}}"#;
-        assert_eq!(
-            parse_readout(body),
-            Some(scoped(
-                readout(true, Some(82.0), 12.48, true),
-                "Acme · 1a2b3c4d",
-                None
-            ))
+    fn parses_the_most_used_field() {
+        let base = r#"{"todayCost":1,"hasData":true,"hasModelWindow":false,"popoutLimitRows":3"#;
+        let body = format!(
+            r#"{base},"mostUsed":{{"count":3,"top":{{"label":"Team","window":"weeklyModel","model":"Fable","pct":77}},"next":{{"label":null,"window":"fiveHour","pct":12}}}}}}"#
         );
-        // A malformed organizations object is a contract break, not a default.
-        let bad = r#"{"blockLive":true,"utilizationPct":82,"todayCost":12.48,"hasData":true,"hasModelWindow":false,"organizations":{"label":"Acme"}}"#;
-        assert_eq!(parse_readout(bad), None);
+        let r = parse_readout(&body).expect("parses");
+        assert_eq!(r.popout_limit_rows, 3);
+        assert_eq!(
+            r.most_used,
+            Some(MostUsed {
+                count: 3,
+                top: ReadoutMembership {
+                    model: Some("Fable".to_string()),
+                    ..member("Team", LimitWindow::WeeklyModel, 77.0)
+                },
+                next: Some(unnamed(LimitWindow::FiveHour, 12.0)),
+            })
+        );
+        // Absent is None, and an unknown window is a contract break.
+        let plain = parse_readout(&format!("{base}}}")).expect("parses");
+        assert_eq!(plain.most_used, None);
+        let bad = body.replace("weeklyModel", "monthly");
+        assert_eq!(parse_readout(&bad), None);
     }
 
     #[test]
     fn parses_the_optional_wide_scope_field() {
-        let base = r#"{"blockLive":false,"utilizationPct":null,"todayCost":1,"hasData":true,"hasModelWindow":false"#;
+        let base = r#"{"todayCost":1,"hasData":true,"hasModelWindow":false,"popoutLimitRows":2"#;
         let with = |wide: &str| format!(r#"{base},"wideScope":{wide}}}"#);
         assert_eq!(
             parse_readout(&with(r#"{"kind":"accounts"}"#)).and_then(|r| r.wide_scope),

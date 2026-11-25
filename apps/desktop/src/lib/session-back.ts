@@ -1,6 +1,6 @@
 // Where the session page's back chip goes (#640). The Sessions page it used
 // to return to is gone, and the session page is reached from several places
-// (Live's Top sessions, Projects, Blocks), so Back means the browser's back:
+// (Live's Top sessions, Projects), so Back means the browser's back:
 // one step in history when the page was reached in-app. A session page that
 // is the history's first entry (React Router's location key "default": a
 // reload or a cold deep link) has nothing in-app behind it, so it goes to

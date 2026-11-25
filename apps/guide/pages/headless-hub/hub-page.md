@@ -22,14 +22,14 @@ Whether the Hub can do its job for the fleet.
 
 ### claude.ai
 
-Whether the Hub can read your claude.ai [usage limits](../concepts/blocks.md#usage-limits). The Hub keeps one session key per claude.ai Account. With one key, the row reads:
+Whether the Hub can read your claude.ai [usage limits](../concepts/usage-limits.md). The Hub keeps one session key per claude.ai Account. With one key, the row reads:
 
-| Reads            | What it means                                                                                          |
-| ---------------- | ------------------------------------------------------------------------------------------------------ |
-| **Connected**    | The Hub's [session key](../concepts/blocks.md#the-claudeai-session-key) works, and it reads the limits |
-| **No key**       | The Hub has no session key, or has just started and is waiting for claude.ai's first answer            |
-| **Key expired**  | claude.ai no longer accepts the Hub's session key                                                      |
-| **Poll failing** | The Hub has a key, but it can't read the limits with it, as when it can't reach claude.ai              |
+| Reads            | What it means                                                                                                |
+| ---------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Connected**    | The Hub's [session key](../concepts/usage-limits.md#the-claudeai-session-key) works, and it reads the limits |
+| **No key**       | The Hub has no session key, or has just started and is waiting for claude.ai's first answer                  |
+| **Key expired**  | claude.ai no longer accepts the Hub's session key                                                            |
+| **Poll failing** | The Hub has a key, but it can't read the limits with it, as when it can't reach claude.ai                    |
 
 With keys for several Accounts, the row counts them and names none, since the page is public to whoever can reach it:
 

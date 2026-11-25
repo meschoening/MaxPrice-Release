@@ -14,6 +14,7 @@ import { HUB_DEFAULT_PORT } from "@maxprice/shared";
 import { clientPath } from "@maxprice/usage-core/test-loopback";
 import { UPDATE_CHECK_FILE } from "@maxprice/usage-core/update-check";
 import { MANIFEST_NAME, PRODUCT } from "./update-channel";
+import { checksForUpdates } from "./index";
 
 // `maxprice-hub` from source, as `bun src/index.ts`, each run in a sandbox of
 // its own, for the suites that spawn it: serve-lifecycle.test.ts,
@@ -223,6 +224,14 @@ export function spawnHub(
   return watched(proc, startedAt);
 }
 
+// Stops or resumes a spawned Hub. Through process.kill, never
+// Subprocess.kill: Bun 1.3.14 reads a signal's name by Linux's numbers on
+// macOS, so `proc.kill("SIGSTOP")` sends 19, macOS's SIGCONT, and the Hub
+// never stops.
+export function pause(spawned: Spawned, signal: "SIGSTOP" | "SIGCONT"): void {
+  process.kill(spawned.proc.pid, signal);
+}
+
 // A script of the case's own, written into the sandbox's root and run there
 // with the sandbox's environment: a stand-in for a Hub that a case stops
 // (SIGSTOP) without stopping itself. The cleanup kills it, stopped or not.
@@ -372,8 +381,11 @@ export function offeringChannel(version: string): { channel: UpdateChannel; requ
 // earlier serve left in the data dir never counts. The check starts once the
 // boot lines are out and settles on its own time, so a case that pins the
 // data dir's files across a running serve, or reads the Update row, waits
-// for the record first. A serve that has ended fails it at once.
+// for the record first. A serve that has ended fails it at once. A serve that
+// checks no channel (checksForUpdates: on macOS until its channel entry
+// ships, ADR-0147 §6) writes none, and there is nothing to wait for.
 export async function checked(sandbox: Sandbox, spawned: Spawned): Promise<void> {
+  if (!checksForUpdates({}, process.platform)) return;
   await until(() => {
     stillRunning(spawned);
     return checkedSince(updateCheckFile(sandbox), spawned.startedAt);

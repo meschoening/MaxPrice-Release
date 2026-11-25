@@ -5,8 +5,6 @@ import {
   type MembershipKey,
   type ResolvedScope,
 } from "./scope";
-import { ACCOUNT_NOT_KNOWN } from "./accounts";
-import type { BlocksResponse } from "./blocks";
 import type { HomeMembership } from "./settings";
 
 // The Scope's head (ADR-0136 §6): the one Membership a surface that shows one
@@ -14,19 +12,19 @@ import type { HomeMembership } from "./settings";
 // /api/usage/current, the readout's utilization half, the quota tiles and the
 // usage connection describe until those surfaces read one reading per
 // Membership (#633, #638). ONE rule, here, which the sidecar's endpoints
-// (`scopeHead`, Blocks' formation order) and the renderer's quota surfaces
+// (`scopeHead`) and the renderer's quota surfaces
 // (`useScope().quotaOrganization`) both apply, so a tile never names another
-// Organization than the reading and the Blocks beside it (#637).
+// Organization than the reading beside it (#637).
 //
 // Its inputs are the resolved Scope, the Home membership in force, and the
 // Scope's candidate Memberships: every (Organization, Account) the Scope
-// reaches that the stored rows resolve to, that an Organization's usage-limits
-// readings resolve to, or the Home membership, each with whether the store
-// holds rows for it in the Scope. The candidates are the store's to know, so
-// the rule is staged:
+// reaches that the stored rows resolve to, or the Home membership, each with
+// whether the store holds rows for it in the Scope (the sidecar's
+// `scope-memberships.ts`; the Usage history mints none, ADR-0145 §7). The
+// candidates are the store's to know, so the rule is staged:
 //   1. With no Home the head names no Organization (`null`, the poller's
 //      answer that names none). Whenever the Scope holds the Home membership
-//      its Organization heads: the default Scope, All, and every Scope naming
+//      it heads (ADR-0142 §3), rows or not, and its Organization with it: the default Scope, All, and every Scope naming
 //      Home's part. A Scope whose Organization axis names one Organization
 //      can be headed by no other: every candidate lies in it, and with none
 //      stage 3 names it too. Settings alone tell all three
@@ -44,84 +42,20 @@ import type { HomeMembership } from "./settings";
 // it in the Scope.
 export type HeadCandidate = { membership: MembershipKey; rows: boolean };
 
-// The Membership that leads the candidates: the Home membership, unless its
-// Organization's Membership with an Account not known holds rows in the Scope
-// and either the Home membership holds none (#644, the owner's decision:
-// "show unknown") or the Home membership holds no Active block while the
-// Unknown one holds it (#257). So the Active block of usage that carries no
-// Account evidence shows, labelled "account not known"
-// (`blocksHeadAccountNotKnown`), rather than an idle Home's "No active
-// block". `holdsActiveBlock` answers whether a Membership's own Blocks hold
-// the Active block now; it is asked only of these two, and only while both
-// hold rows. With the Home membership's Account not known the two are one
-// Membership. No other Membership's Active block takes the lead: a known
-// Account's would need a label naming it, and another Organization's would
-// move the head Organization off the one settings settle.
-export function headLead(
-  candidates: readonly HeadCandidate[],
-  home: HomeMembership,
-  holdsActiveBlock: (membership: MembershipKey) => boolean,
-): MembershipKey {
-  const homeKey: MembershipKey = {
-    organizationUuid: home.organizationUuid,
-    accountUuid: home.accountUuid,
-  };
-  if (home.accountUuid === null) return homeKey;
-  const unknownKey: MembershipKey = { organizationUuid: home.organizationUuid, accountUuid: null };
-  const rowsOf = (account: string | null) =>
-    candidates.some(
-      (c) =>
-        c.rows &&
-        c.membership.organizationUuid === home.organizationUuid &&
-        c.membership.accountUuid === account,
-    );
-  if (!rowsOf(null)) return homeKey;
-  if (!rowsOf(home.accountUuid)) return unknownKey;
-  return !holdsActiveBlock(homeKey) && holdsActiveBlock(unknownKey) ? unknownKey : homeKey;
-}
-
-// The candidates' order, head first: the lead (`headLead`: the Home
-// membership, or in its place its Organization's Unknown one), then one with
-// rows before one without, then `compareMemberships`. Blocks list a wide
-// Scope's Memberships in this order (`/api/blocks`' `memberships`).
+// The candidates' order, head first: the Home membership, then one with rows
+// before one without, then `compareMemberships`.
 export function compareHeadCandidates(
   a: HeadCandidate,
   b: HeadCandidate,
   home: HomeMembership,
-  lead: MembershipKey,
 ): number {
-  const isLead = (m: MembershipKey) =>
-    m.organizationUuid === lead.organizationUuid && m.accountUuid === lead.accountUuid;
+  const isHome = (m: MembershipKey) =>
+    m.organizationUuid === home.organizationUuid && m.accountUuid === home.accountUuid;
   return (
-    Number(isLead(b.membership)) - Number(isLead(a.membership)) ||
+    Number(isHome(b.membership)) - Number(isHome(a.membership)) ||
     Number(b.rows) - Number(a.rows) ||
     compareMemberships(a.membership, b.membership, home)
   );
-}
-
-// Whether a Blocks body's head is the Unknown Membership leading in place of
-// a Home membership whose Account is known (`headLead`): its Blocks are usage
-// whose Account is not known, and the surfaces showing them say so.
-export function blocksHeadAccountNotKnown(
-  body: Pick<BlocksResponse, "memberships"> | undefined,
-  home: HomeMembership | null,
-): boolean {
-  const head = body?.memberships?.[0];
-  return (
-    head !== undefined &&
-    home !== null &&
-    home.accountUuid !== null &&
-    head.accountUuid === null &&
-    head.organizationUuid === home.organizationUuid
-  );
-}
-
-// An eyebrow tag with "account not known" added when the head is the Unknown
-// Membership (`blocksHeadAccountNotKnown`).
-export function withAccountNotKnown(tag: string | null, accountNotKnown: boolean): string | null {
-  if (!accountNotKnown) return tag;
-  const words = ACCOUNT_NOT_KNOWN.toLowerCase();
-  return tag === null ? words : `${tag} · ${words}`;
 }
 
 // Stage 1: the head Organization settings alone can tell: `null` with no
@@ -179,12 +113,9 @@ export function headOrganizationWithoutHome(
 ): string {
   const named = oneOrganizationHead(scope);
   if (named !== undefined) return named;
-  // The Scope does not hold the Home membership, so it is no candidate with
-  // rows, and `headLead` never asks for an Active block.
-  const lead = headLead(candidates, home, () => false);
   let head: HeadCandidate | undefined;
   for (const c of candidates) {
-    if (head === undefined || compareHeadCandidates(c, head, home, lead) < 0) head = c;
+    if (head === undefined || compareHeadCandidates(c, head, home) < 0) head = c;
   }
   return (
     head?.membership.organizationUuid ?? headOrganization(scope, home) ?? home.organizationUuid
@@ -196,10 +127,8 @@ export function headOrganizationWithoutHome(
 // The head the sidecar applies to a request's Scope params, for the renderer's
 // quota surfaces when the head is not settled (stage 2): the Organization
 // whose reading /api/usage/current answers for the same params, and the head
-// Membership's Account (`null` when not known, or with no candidate). While
-// the Scope holds the Home membership that is the Home membership's Account,
-// even where its Organization's Unknown Membership leads Blocks (`headLead`):
-// the reading is the Organization's, and so the same either way.
+// Membership's Account (`null` when not known, or with no candidate): the Home
+// membership's whenever the Scope holds it.
 export const SCOPE_HEAD_PATH = "/api/scope-head";
 
 export const scopeHeadResponseSchema = z.object({

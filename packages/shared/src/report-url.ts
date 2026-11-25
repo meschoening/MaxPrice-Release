@@ -126,8 +126,8 @@ export type IntradayHookInput = {
   mode?: CostMode;
   // `tz` (Part 6, ADR-0015) — the `today` span anchors its calendar-day window
   // to local midnight in this zone (ADR-0020), so it is load-bearing there; the
-  // now-relative spans (`15m`/`1h`/`week`/`30d`) and the server-resolved `block`
-  // window ignore it. Carried for every span so a Timezone-setting change re-keys.
+  // now-relative spans (`15m`/`1h`/`30d`) and the anchored `week` ignore it.
+  // Carried for every span so a Timezone-setting change re-keys.
   tz?: string;
   // ADR-0083: the `span=week` anchor, an ISO instant — REQUIRED by the sidecar
   // for that span (400 otherwise), absent on every other. Re-keys: the window

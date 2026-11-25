@@ -1,6 +1,5 @@
 import {
   SSE_EVENT,
-  type BlockTickEvent,
   type EmittedStatusSnapshot,
   type StatusSnapshot,
   type UsageEvent,
@@ -13,7 +12,6 @@ import {
 // drift from the renderer's listeners.
 export type LiveMessage =
   | { type: typeof SSE_EVENT.usageNew; data: UsageEvent }
-  | { type: typeof SSE_EVENT.blockTick; data: BlockTickEvent }
   | { type: typeof SSE_EVENT.statusChanged; data: StatusSnapshot }
   | { type: typeof SSE_EVENT.usageSample; data: UsageSampleEvent }
   // Fleet machine-directory poke (ADR-0041 M5) — empty data, a pure refetch
@@ -84,15 +82,12 @@ export type CreateLiveHubOptions = {
   // `pricing` from the boot literal in boot.ts is a compile error rather than
   // a silent em dash in Settings' App info row.
   initialStatus: EmittedStatusSnapshot;
-  // block:tick cadence — refreshes the active block's burn rate / projection
-  // even with no file activity. Default 30s.
-  blockTickMs?: number;
   // SSE heartbeat cadence — a comment line keeps proxies / WebView2 from
   // dropping an idle connection. Default 15s.
   heartbeatMs?: number;
   // Injectable timer seam (additive; defaults to the global setInterval /
-  // clearInterval). Tests pass a controllable fake clock so the block:tick /
-  // heartbeat intervals can be advanced deterministically instead of waiting on
+  // clearInterval). Tests pass a controllable fake clock so the heartbeat
+  // interval can be advanced deterministically instead of waiting on
   // real wall-clock time. Production passes neither and keeps the real timers.
   // The handle is opaque to the hub: whatever `setIntervalImpl` returns is only
   // ever handed straight back to `clearIntervalImpl`.
@@ -100,11 +95,10 @@ export type CreateLiveHubOptions = {
   clearIntervalImpl?: (handle: unknown) => void;
 };
 
-// Pub/sub hub between the file watcher and the SSE clients. The block:tick and
-// heartbeat intervals are ref-counted on subscribers — they only run while at
-// least one client is connected, so an idle app does no periodic work.
+// Pub/sub hub between the file watcher and the SSE clients. The heartbeat
+// interval is ref-counted on subscribers — it only runs while at least one
+// client is connected, so an idle app does no periodic work.
 export function createLiveHub(opts: CreateLiveHubOptions): LiveHub {
-  const blockTickMs = opts.blockTickMs ?? 30_000;
   const heartbeatMs = opts.heartbeatMs ?? 15_000;
   const setIntervalImpl =
     opts.setIntervalImpl ?? ((cb: () => void, ms: number) => setInterval(cb, ms));
@@ -118,7 +112,6 @@ export function createLiveHub(opts: CreateLiveHubOptions): LiveHub {
   // reset between first paint and SSE, and replays every Organization rather
   // than only the one that emitted last.
   const usageCurrent = new Map<string, UsageSampleEvent>();
-  let blockTickTimer: unknown = null;
   let heartbeatTimer: unknown = null;
 
   // A subscriber's transport (a closed SSE stream) must not break hub
@@ -137,19 +130,12 @@ export function createLiveHub(opts: CreateLiveHubOptions): LiveHub {
   }
 
   function startTimers(): void {
-    blockTickTimer ??= setIntervalImpl(() => {
-      broadcast({ type: SSE_EVENT.blockTick, data: { timestamp: new Date().toISOString() } });
-    }, blockTickMs);
     heartbeatTimer ??= setIntervalImpl(() => {
       broadcast({ type: SSE_EVENT.heartbeat });
     }, heartbeatMs);
   }
 
   function stopTimers(): void {
-    if (blockTickTimer !== null) {
-      clearIntervalImpl(blockTickTimer);
-      blockTickTimer = null;
-    }
     if (heartbeatTimer !== null) {
       clearIntervalImpl(heartbeatTimer);
       heartbeatTimer = null;

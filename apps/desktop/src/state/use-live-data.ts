@@ -1,9 +1,5 @@
 import { useMemo } from "react";
 import {
-  activeBlockOf,
-  blocksHeadAccountNotKnown,
-  homeMembershipOf,
-  type BlockRow,
   type DailyRow,
   type MembershipTotal,
   type ProjectRow,
@@ -12,7 +8,6 @@ import {
   ymdShift,
   resolveDateRange,
   foldProjectRows,
-  typicalBlockTokens,
 } from "@maxprice/shared";
 import { useFilters } from "./filters";
 import { useSettings } from "./use-settings";
@@ -21,7 +16,6 @@ import { useNowTick } from "./use-now-tick";
 import { useWeekWindow } from "./use-week";
 import { useChartWindow } from "./use-chart-window";
 import { useDaily } from "./use-daily";
-import { useBlocks } from "./use-blocks";
 import { useSessions } from "./use-sessions";
 import { useProjects } from "./use-projects";
 import { useMachineAxis } from "./use-machine-axis";
@@ -48,13 +42,6 @@ export type LiveData = {
   // the engine omits zero-spend days, so a quiet weekend shifted the tag onto
   // the first day with spend and misreported where the week began.
   rollingWeekStart: string;
-  activeBlock: BlockRow | null;
-  // The head Blocks are the Unknown Membership's, heading in place of an
-  // empty or idle Home membership (`headLead`, #644, #257;
-  // `blocksHeadAccountNotKnown`): the Active block tile says "account not
-  // known".
-  activeBlockAccountNotKnown: boolean;
-  typicalBlockTokens: number;
   chartRows: DailyRow[];
   prevChartRows: DailyRow[];
   topSessions: SessionRow[];
@@ -103,8 +90,8 @@ export function useLiveData(): LiveData {
   const projectAxis = useProjectAxis();
   const projects = projectAxis.projectParams;
   const models = useFilters((s) => s.models);
-  // ADR-0041 (M6): the rail's machine filter narrows every Live query (blocks
-  // narrows sums only, engine-side). Alias-closure-expanded, empty when gated
+  // ADR-0041 (M6): the rail's machine filter narrows every Live query.
+  // Alias-closure-expanded, empty when gated
   // off — so a hub-less client stays byte-identical to pre-M6.
   const machineAxis = useMachineAxis();
   const machines = machineAxis.machineParams;
@@ -194,10 +181,6 @@ export function useLiveData(): LiveData {
   // densified) come from `useChartWindow` — the same query `useChartSource`
   // mounts, so the two dedupe on the Live page (finding #1).
   const chart = useChartWindow();
-  // Blocks stays cross-project (the 5-hour quota window spans projects), but
-  // the model filter narrows each block's cost/token sums (ADR-0017) — the
-  // active-block tile's cost honours the rail's model filter; its projection
-  // stays all-model.
   // The split tiles' windows, exactly the tiles' own: Today is the local
   // date `today` (the 14-day window's today row), This week the rolling
   // window's dates or the anchored week's instant-bounded window, under the
@@ -215,15 +198,6 @@ export function useLiveData(): LiveData {
       : { since: weekStart, until: today, ...splitFilters },
     { enabled: splitOn },
   );
-  const blocksQ = useBlocks({
-    since: railSince,
-    until: railUntil,
-    mode: costMode,
-    tz,
-    ...scope,
-    models,
-    machines,
-  });
   const sessionsQ = useSessions({
     since: railSince,
     until: railUntil,
@@ -261,7 +235,6 @@ export function useLiveData(): LiveData {
     // Anchored: each response is already instant-bounded, so it IS the tile.
     const weekRows = anchored ? (anchoredWeekQ.data?.daily ?? []) : rollingWeekRows;
     const prevWeekRows = anchored ? (anchoredPrevWeekQ.data?.daily ?? []) : rollingPrevWeekRows;
-    const blocks = blocksQ.data?.blocks ?? [];
 
     const yesterdayIso = isoFromYmd(ymdShift(-1, tz));
 
@@ -270,16 +243,6 @@ export function useLiveData(): LiveData {
       rollingWeekRows.find((r) => r.date === yesterdayIso) ??
       rollingPrevWeekRows.find((r) => r.date === yesterdayIso) ??
       null;
-
-    const activeBlock = activeBlockOf(blocks) ?? null;
-    const activeBlockAccountNotKnown = blocksHeadAccountNotKnown(
-      blocksQ.data,
-      settings === undefined ? null : homeMembershipOf(settings),
-    );
-    // The "typical" block — median tokens across the range's completed blocks
-    // (excludes the active block + gaps). Backs the Active block tile's
-    // "typical" row.
-    const typical = typicalBlockTokens(blocks);
 
     const topSessions = (sessionsQ.data?.sessions ?? [])
       .slice()
@@ -300,9 +263,6 @@ export function useLiveData(): LiveData {
       weekRows,
       prevWeekRows,
       rollingWeekStart: weekStartIso,
-      activeBlock,
-      activeBlockAccountNotKnown,
-      typicalBlockTokens: typical,
       chartRows: chart.chartRows,
       prevChartRows: chart.prevChartRows,
       topSessions,
@@ -313,14 +273,12 @@ export function useLiveData(): LiveData {
         weekWindowQ.isPending ||
         (anchored && (anchoredWeekQ.isPending || anchoredPrevWeekQ.isPending)) ||
         chart.chartIsPending ||
-        blocksQ.isPending ||
         sessionsQ.isPending ||
         projectsQ.isPending,
       isError:
         weekWindowQ.isError ||
         (anchored && (anchoredWeekQ.isError || anchoredPrevWeekQ.isError)) ||
         chart.chartIsError ||
-        blocksQ.isError ||
         sessionsQ.isError ||
         projectsQ.isError,
       chartIsPending: chart.chartIsPending,
@@ -342,10 +300,6 @@ export function useLiveData(): LiveData {
     anchoredPrevWeekQ.isPending,
     anchoredPrevWeekQ.isError,
     chart,
-    blocksQ.data,
-    settings,
-    blocksQ.isPending,
-    blocksQ.isError,
     sessionsQ.data,
     sessionsQ.isPending,
     sessionsQ.isError,

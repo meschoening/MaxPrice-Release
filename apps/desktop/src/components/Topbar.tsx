@@ -7,10 +7,7 @@ import { useSettings } from "@/state/use-settings";
 import { useLiveStatus, type ConnectionState } from "@/state/use-live-status";
 import { useMachineAxis } from "@/state/use-machine-axis";
 import { useSessionRow } from "@/state/use-session-row";
-import { blocksSubtitleSuffix } from "@/lib/organization-scope-view";
 import { sessionBackTarget } from "@/lib/session-back";
-import { useQuotaSurface } from "@/state/use-quota-surface";
-import { useScopeMemberships } from "@/state/use-scope-memberships";
 import { RefreshPill } from "@/components/refresh-pill";
 import { TopbarScopeChip } from "@/components/topbar-scope-chip";
 import { FinderTrigger } from "@/components/finder";
@@ -19,7 +16,6 @@ import { cn } from "@/lib/utils";
 const TITLES: Record<string, string> = {
   "/live": "Live",
   "/projects": "Projects",
-  "/blocks": "Blocks",
   "/settings": "Settings",
 };
 
@@ -68,12 +64,6 @@ export function Topbar() {
     : isSettings
       ? "Durable app configuration, stored in settings.json."
       : RANGE_LABEL[dateRange];
-  // Every block on the Blocks page is the Quota organization's (ADR-0108), so
-  // while the Scope spans Organizations its subtitle says whose.
-  const { tag: quotaTag } = useQuotaSurface();
-  // Where the Blocks page names its Membership in a tab or its strip (#638),
-  // the suffix goes.
-  const { memberships: scopeMemberships } = useScopeMemberships();
 
   return (
     <header className={cn("topbar panel shrink-0", detailSessionId && "has-back")}>
@@ -86,9 +76,7 @@ export function Topbar() {
               <h1>{title}</h1>
               {isLive ? <StreamingBadge /> : null}
             </div>
-            <p className="subtitle truncate">
-              {subtitle + blocksSubtitleSuffix(location.pathname, quotaTag, scopeMemberships)}
-            </p>
+            <p className="subtitle truncate">{subtitle}</p>
           </div>
         )}
       </div>

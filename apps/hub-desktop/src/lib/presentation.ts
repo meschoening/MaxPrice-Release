@@ -8,10 +8,12 @@ import {
   formatRelativeTime,
   hasNonLoopbackBind,
   hubAccountLabel,
+  hubDaemonDot,
   hubDaemonLabel,
   hubKeyClause,
   hubKeyPending,
   hubMembershipState,
+  isDeliberateLoopback,
   mostUsedWindow,
   noFreshReading,
   rankMemberships,
@@ -28,8 +30,10 @@ import {
   type HubMachine,
   type HubMembershipState,
   type HubOrganization,
+  type HubRowStatus,
   type LabelEntry,
 } from "@maxprice/shared";
+import { dotVariant } from "./dot-variant";
 
 // An IPv6 host (the Tailscale ULA, fd7a:…) must be bracketed so a `host:port`
 // render is unambiguous AND paste-able back into Settings (`new URL` rejects an
@@ -143,6 +147,18 @@ export function trayTooltip(state: HubDaemonState, rows: readonly HubKeyRow[] | 
   if (noFreshReading(state) || rows === undefined) return head;
   const clauses = rows.map(hubKeyClause).filter((clause) => clause !== null);
   return [head, ...clauses].join(" · ");
+}
+
+// ── Tray icon tone (ADR-0148 §3) ─────────────────────────────────────────────
+
+// The tray icon's tone, which the macOS menu-bar icon carries (Map 9, #755):
+// the popout's Hub row dot, by the same two helpers HubStatusRows calls, so the
+// icon and the row never disagree. A deliberate loopback bind is soft there and
+// here. Rust's `set_tray_tone` reads these four words; Windows keeps its orb.
+export type TrayTone = ReturnType<typeof dotVariant>;
+
+export function trayTone(state: HubDaemonState, status: HubRowStatus | undefined): TrayTone {
+  return dotVariant(hubDaemonDot(state, isDeliberateLoopback(status)));
 }
 
 // Live first, then most-recently-seen. ISO-8601 strings compare lexicographi-
@@ -276,7 +292,7 @@ export function accountOrganizationValue(
 export function organizationLabelOf(uuid: string, labels: Map<string, string>): string {
   return (
     labels.get(uuid) ??
-    resolveOrganizationLabel({ uuid, rename: null, organizationType: null, hints: null }).label
+    resolveOrganizationLabel({ uuid, rename: null, login: null, hints: null }).label
   );
 }
 

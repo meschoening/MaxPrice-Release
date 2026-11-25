@@ -5,11 +5,15 @@ import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import {
   checkLabel,
+  fillLoginPlan,
   labelTaken,
+  loginPlanOf,
+  NO_LOGIN_PLAN,
   organizationRosterHintsSchema,
   organizationUuidKeySchema,
   orgLimitsAnswerSchema,
   resolveOrganizationLabel,
+  type LoginPlan,
   type OrganizationEntry,
   type OrganizationRosterHints,
   type OrganizationsResponse,
@@ -25,8 +29,9 @@ import { labelUnionFull, type LabelStore, type LabelUnionLock } from "./organiza
 // the Hub's roster on a hub-connected client (#366), or a Hub-less client's own
 // listing (#366) — remembered in a small registry so a plan word survives
 // logging out, and listed as the Settings roster (#287). The Home
-// organization select is one of its readers. UUIDs, `organizationType`,
-// first-seen times, and the listings' Limits answers and roster hints only.
+// organization select is one of its readers. UUIDs, each login's plan
+// (`organizationType` and `organizationRateLimitTier`), first-seen times, and
+// the listings' Limits answers and roster hints only.
 // `oauthAccount.emailAddress` leaves the parse only as its hash (`emailHash`,
 // ADR-0137 §1), the pair table's key, except through `readLoginEmails`, which
 // hands the clear address to its caller for display and keeps nothing.
@@ -52,6 +57,8 @@ const loginFileSchema = z
       .object({
         organizationUuid: z.string().min(1),
         organizationType: z.string().nullable().optional(),
+        // Tells the Ultra plan from the Max plan, which share `claude_max` (#718).
+        organizationRateLimitTier: z.string().nullable().optional(),
         accountUuid: z.string().min(1).nullable().optional(),
         emailAddress: z.string().nullable().optional(),
       })
@@ -66,9 +73,17 @@ const loginFileSchema = z
 // address is never kept here.
 export type LoginAccount = { accountUuid: string; emailHash: string | null };
 
-export type CurrentLogin = {
-  organizationUuid: string;
+// The login plan a current login or a registry entry holds, whose tier the
+// registry leaves absent rather than null.
+function planOf(held: {
   organizationType: string | null;
+  organizationRateLimitTier?: string | null;
+}): LoginPlan {
+  return loginPlanOf(held.organizationType, held.organizationRateLimitTier);
+}
+
+export type CurrentLogin = LoginPlan & {
+  organizationUuid: string;
   // Every Account a login file naming this Organization names, in candidate
   // order, each once by uuid (a later file fills only a missing hash). Empty
   // when no file names an `accountUuid`.
@@ -115,8 +130,9 @@ async function readLoginFiles(
 // once (labels decision 2): every candidate is read, and each Organization is
 // listed once, in candidate order — the first root in `claudePaths` order
 // first, the home login last. A later file naming the same Organization only
-// fills a plan word the earlier one lacked, and adds its Account. An
-// unreadable or malformed file is skipped; empty when none names one. The
+// fills what the earlier one's plan lacked (`fillLoginPlan`), and adds its
+// Account. An unreadable or malformed file is skipped; empty when none names
+// one. The
 // caller decides when this may be consulted — the home seed uses only the
 // first, as a boot tie-break/fallback, and never tracks it live (GLOSSARY.md).
 // Each login's Accounts are a pair source (`loginPairs`, ADR-0137 §1).
@@ -129,14 +145,12 @@ export async function readCurrentLogins(
   const logins = new Map<string, CurrentLogin>();
   for (const account of await readLoginFiles(roots, readFileImpl, homeDirectory)) {
     const organizationUuid = account.organizationUuid;
-    const organizationType = account.organizationType ?? null;
+    const plan = loginPlanOf(account.organizationType, account.organizationRateLimitTier);
     const prev = logins.get(organizationUuid);
     const login: CurrentLogin =
       prev === undefined
-        ? { organizationUuid, organizationType, accounts: [] }
-        : prev.organizationType === null && organizationType !== null
-          ? { ...prev, organizationType }
-          : prev;
+        ? { organizationUuid, ...plan, accounts: [] }
+        : { ...prev, ...fillLoginPlan(planOf(prev), plan) };
     const accountUuid = account.accountUuid ?? null;
     if (accountUuid !== null) {
       // Hashed here, so the clear address never reaches a returned structure.
@@ -223,8 +237,11 @@ export async function readRemoteControlAtStartup(
 }
 
 // organizations.json —
-// `{ version: 1, organizations: { [uuid]: { organizationType, limits?, hints?, firstSeenAt?, unlisted? } } }`.
-// `organizationType` is the plan word `remember()` keeps from a login file;
+// `{ version: 1, organizations: { [uuid]: { organizationType, organizationRateLimitTier?, limits?, hints?, firstSeenAt?, unlisted? } } }`.
+// `organizationType` and `organizationRateLimitTier` are the login plan
+// `remember()` keeps from a login file, the tier absent while no login has
+// named one (#718: an entry written before the field gains it at the next
+// login that names it);
 // `limits` (what the Organization's usage endpoint answered) and `hints` (the
 // listing's roster hints) come from a listing: Connect's discovery (#283), the
 // Hub's roster (#366), or a Hub-less client's own listing (#366), the latest
@@ -245,7 +262,8 @@ export async function readRemoteControlAtStartup(
 // is stamped at the first roster read that sees its usage (ADR-0105 §5). No
 // Organization `name` is ever stored — no listing parses it (ADR-0098 §6). The
 // version stays 1: the new fields are optional, so a file written before them
-// still loads.
+// still loads. The tier is kept raw and mapped at render (`loginPlanWord`), like
+// `organizationType`: no plan word is ever stored.
 // Disposable by contract: deleting it costs plan words and Connect's seed until
 // a later login or Connect relearns them, and first-seen times, which are lost —
 // each Organization is re-stamped at the later moment it is next seen — never
@@ -253,6 +271,7 @@ export async function readRemoteControlAtStartup(
 // `organization-labels.json` (./organization-labels.ts).
 const registryEntrySchema = z.object({
   organizationType: z.string().nullable(),
+  organizationRateLimitTier: z.string().optional(),
   limits: orgLimitsAnswerSchema.optional(),
   hints: organizationRosterHintsSchema.optional(),
   firstSeenAt: z.string().optional(),
@@ -275,9 +294,12 @@ export type LearnedOrg = {
 
 export type OrganizationRegistry = {
   load: () => Promise<void>;
-  // Record a plan word for an organization. A known plan word is never
-  // downgraded to null (logging out of an org must not erase its label).
-  remember: (uuid: string, organizationType: string | null) => Promise<void>;
+  // Record a login's plan for an organization, filled from the recorded one
+  // (`fillLoginPlan`): a plan with no type keeps the recorded plan (logging
+  // out of an org must not erase its label), one naming the recorded type
+  // and no tier keeps the recorded tier, and one naming a new type, or a new
+  // tier, replaces it.
+  remember: (uuid: string, plan: LoginPlan) => Promise<void>;
   // Record a listing: Connect's discovery (#283), the Hub's roster (#366) and
   // a Hub-less client's own listing (#366) all record through here. For each
   // Organization it names, the roster hints and a non-null Limits answer
@@ -346,11 +368,21 @@ export function createOrganizationRegistry(opts: {
     return chain;
   }
 
-  async function remember(uuid: string, organizationType: string | null): Promise<void> {
+  async function remember(uuid: string, plan: LoginPlan): Promise<void> {
     const prev = known.get(uuid);
-    if (prev?.organizationType === organizationType) return;
-    if (prev !== undefined && prev.organizationType !== null && organizationType === null) return;
-    known.set(uuid, { ...(prev ?? fresh()), organizationType });
+    const recorded = prev === undefined ? NO_LOGIN_PLAN : planOf(prev);
+    const { organizationType, organizationRateLimitTier } = fillLoginPlan(plan, recorded);
+    if (
+      prev !== undefined &&
+      recorded.organizationType === organizationType &&
+      recorded.organizationRateLimitTier === organizationRateLimitTier
+    ) {
+      return;
+    }
+    const next: RegistryEntry = { ...(prev ?? fresh()), organizationType };
+    if (organizationRateLimitTier === null) delete next.organizationRateLimitTier;
+    else next.organizationRateLimitTier = organizationRateLimitTier;
+    known.set(uuid, next);
     await persist();
   }
 
@@ -421,9 +453,11 @@ export function createOrganizationRegistry(opts: {
 // is dormant text.
 //
 // Each label is resolved by `resolveOrganizationLabel` (the user's rename,
-// else a plan word, else a short id). The plan word comes from a current login
-// naming the Organization, else from the registry — a login file that lost its
-// plan word must not lose the one remember() kept — else from Connect's hints.
+// else a plan word, else a short id). The plan comes from a current login
+// naming the Organization, filled from the registry's (`fillLoginPlan`) — a
+// login file that lost its plan word must not lose the one remember() kept —
+// and the hints name one where it names none, or Ultra where a `claude_max`
+// plan names no tier (`organizationPlan`).
 // The Limits answer is the poller's when it has one (`source: "poll"`), else
 // the answer a listing recorded (`source: "connect"`) while the latest listing
 // still names the Organization, else null. "Your account" (`seenOn.account`)
@@ -437,7 +471,10 @@ export function createOrganizationRegistry(opts: {
 export function listOrganizations(input: {
   home: string | null;
   // The roster reads no Account: a login's Organization and plan word only.
-  currentLogins: readonly Pick<CurrentLogin, "organizationUuid" | "organizationType">[];
+  currentLogins: readonly Pick<
+    CurrentLogin,
+    "organizationUuid" | "organizationType" | "organizationRateLimitTier"
+  >[];
   remoteControlAtStartup: boolean;
   seen: { machine: ReadonlySet<string>; fleet: ReadonlySet<string> };
   // The resolved tracked set; null excludes nothing, so every row is tracked.
@@ -463,7 +500,10 @@ export function listOrganizations(input: {
       const { label, renamed, plan } = resolveOrganizationLabel({
         uuid,
         rename: input.labels.get(uuid),
-        organizationType: login?.organizationType ?? entry?.organizationType,
+        login: fillLoginPlan(
+          login === undefined ? NO_LOGIN_PLAN : planOf(login),
+          entry === undefined ? NO_LOGIN_PLAN : planOf(entry),
+        ),
         hints: entry?.hints,
       });
       // An own key only, like planLabel: a uuid is never a prototype name.

@@ -38,6 +38,24 @@ impl Px {
 /// Gap between the tray icon / work-area edge and the popout, physical px.
 pub const POPOUT_GAP: f64 = 8.0;
 
+/// The popout's corner radius in POINTS (logical px), the client's radius-14
+/// geometry (ADR-0050's 2026-08-25 amendment, ADR-0148 §2).
+///
+/// macOS only, and it is the reason the number lives in Rust at all: Win11's
+/// DWM rounds the undecorated window itself at its own radius, so the Windows
+/// popout never asks anyone for a curve. macOS rounds nothing, so
+/// `round_popout_corners` in lib.rs masks the window's content layer to this
+/// radius and globals.css curves the frame that runs along it. Both halves
+/// must carry the same number or the hairline and the mask disagree; a
+/// contract test in lib.rs binds this constant to the stylesheet.
+///
+/// The only non-test reader is that `#[cfg(target_os = "macos")]` call site,
+/// so on Windows and Linux a plain `cargo clippy` (no test target) sees a
+/// constant nobody reads. The `allow` is scoped to exactly those platforms:
+/// on macOS dead_code still bites if the mask call ever goes away.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const POPOUT_CORNER_RADIUS: f64 = 14.0;
+
 /// The popout's physical inner size on the monitor it is about to open on:
 /// its CONFIGURED logical size (tauri.conf.json — the size the CSS layout was
 /// drawn against) times that monitor's live scale factor.

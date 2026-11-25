@@ -55,6 +55,29 @@ export interface SelfUpdateProduct {
   binaryName: string;
 }
 
+// Node's names for an architecture, as Tauri's platform keys spell them.
+const TAURI_ARCH: Record<string, string> = { x64: "x86_64", arm64: "aarch64" };
+
+/**
+ * A host's entry on a headless product's channel (ADR-0144 §5, ADR-0147 §6):
+ * Tauri's `<os>-<arch>` key, and the name CI signs that tarball under, which
+ * check 3 matches (ADR-0123 §2). For `binary` maxprice, linux-x64 is
+ * `linux-x86_64` and `maxprice_<v>_linux-x64.tar.gz`, darwin-arm64
+ * `darwin-aarch64` and `maxprice_<v>_darwin-arm64.tar.gz`; maxprice-hub's are
+ * the same with its name. Any other host gets a key no manifest carries,
+ * which the update refuses as it refuses any platform with no entry.
+ */
+export function channelEntry(
+  binary: string,
+  platform: string,
+  arch: string,
+): Pick<SelfUpdateProduct, "platform" | "assetName"> {
+  return {
+    platform: `${platform}-${TAURI_ARCH[arch] ?? arch}`,
+    assetName: (version) => `${binary}_${version}_${platform}-${arch}.tar.gz`,
+  };
+}
+
 /** The manifest's version and this product's entry, as served: unverified. */
 export interface ChannelRelease {
   version: string;

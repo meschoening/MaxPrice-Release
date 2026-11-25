@@ -4,7 +4,7 @@ Join the Desktop client to a [Hub](../concepts/hubs.md) to see the usage of ever
 
 ## Before you join
 
-You need a Hub running on a computer that stays on: the [Hub tray app](../hub-tray-app/overview.md) on Windows, or the [Headless Hub](../headless-hub/overview.md) on a Linux server. Each computer reaches it over your [tailnet](../concepts/hubs.md#tailnet), so this computer must be on the same one.
+You need a Hub running on a computer that stays on: the [Hub tray app](../hub-tray-app/overview.md) on Windows or a Mac, or the [Headless Hub](../headless-hub/overview.md) on a Linux server or a Mac. Each computer reaches it over your [tailnet](../concepts/hubs.md#tailnet), so this computer must be on the same one.
 
 The Hub's address is its computer's Tailscale name or address and the port, as `http://my-desktop.tailnet.ts.net:47100`. The Hub tray app's console shows it as **Listening** (see [Join clients](../hub-tray-app/join-clients.md)).
 
@@ -24,7 +24,7 @@ The status line above the address reads **Connected — hub is polling** once th
 
 The first time, MaxPrice copies the other machines' usage from the Hub, and a **Syncing fleet history** bar shows how far it has got. Once it is done, every report can show each machine's usage: Live's chart can be grouped **by machine**, and a **Machine** filter appears (see [the Machine filter](../concepts/hubs.md#the-machine-filter-and-grouping-by-machine)).
 
-While you are joined, [Settings › Claude](settings.md#claude) shows the state of the Hub's [session keys](../concepts/blocks.md#the-claudeai-session-key), not this computer's: each card reads **Connected through the Hub**, **Key expired at the Hub** or **No key at the Hub**, and says whether this machine also holds a key. While the Hub is connected, a notice at the top of Settings, **Limits come from the Hub**, names the Hub and carries the **Send keys to the Hub** switch, the same one as in Usage hub. Keep a key of your own anyway: this computer reads your limits with it whenever it [can't use the Hub](../concepts/hubs.md#fallback-polling), and with Send keys to the Hub on it gives the Hub its key for any Account the Hub holds none for.
+While you are joined, [Settings › Claude](settings.md#claude) shows the state of the Hub's [session keys](../concepts/usage-limits.md#the-claudeai-session-key), not this computer's: each card reads **Connected through the Hub**, **Key expired at the Hub** or **No key at the Hub**, and says whether this machine also holds a key. While the Hub is connected, a notice at the top of Settings, **Limits come from the Hub**, names the Hub and carries the **Send keys to the Hub** switch, the same one as in Usage hub. Keep a key of your own anyway: this computer reads your limits with it whenever it [can't use the Hub](../concepts/hubs.md#fallback-polling), and with Send keys to the Hub on it gives the Hub its key for any Account the Hub holds none for.
 
 ## The three switches
 

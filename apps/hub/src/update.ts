@@ -1,6 +1,8 @@
 import { realpathSync } from "node:fs";
 import { hubPageViewSchema } from "@maxprice/shared";
 import { displayPath, type Env, home } from "@maxprice/usage-core/home-path";
+import { printAgent } from "@maxprice/usage-core/launchctl";
+import { agentTarget, shellTarget } from "@maxprice/usage-core/launchd-agent";
 import {
   checkForUpdate,
   installUpdate,
@@ -19,10 +21,10 @@ import {
 } from "@maxprice/usage-core/systemctl";
 import { terminalText } from "@maxprice/usage-core/terminal-text";
 import { CliError, EXIT, type Hint, type Io, usageError } from "./cli";
-import { defaultDataDir } from "./config";
+import { defaultDataDir, runsHeadlessHub } from "./config";
 import { loopbackRequest } from "./loopback-http";
-import { serveLockPath, UNIT } from "./serve-lock";
-import { serveDataDir } from "./service";
+import { LABEL, serveLockPath, UNIT } from "./serve-lock";
+import { HUB_AGENT, serveDataDir } from "./service";
 import { PRODUCT } from "./update-channel";
 import { VERSION } from "./version";
 
@@ -40,9 +42,11 @@ import { VERSION } from "./version";
 // there is something to install, and writes nothing; the daemon's own check
 // is a Headless `serve`'s (ADR-0129 §6).
 //
-// Linux only, every form: the channel's one entry is linux-x86_64, and the
-// hub tray app's embedded binary, which runs the same verbs elsewhere, is
-// updated by Tauri's updater with the app.
+// Linux and macOS, every form (ADR-0147 §6): the channel carries a
+// linux-x86_64 and a darwin-aarch64 entry, and on macOS the restart is the
+// LaunchAgent's (ADR-0146 §8). Elsewhere it refuses: the hub tray app's
+// embedded binary, which runs the same verbs there, is updated by Tauri's
+// updater with the app.
 
 // What a test replaces; production passes none.
 export type UpdateDeps = {
@@ -62,6 +66,8 @@ export type UpdateDeps = {
   requestMs?: number;
   // The core's bound on each `--version` probe.
   versionTimeoutMs?: number;
+  // Which service restarts: the LaunchAgent on macOS, the systemd unit on
+  // Linux.
   platform?: NodeJS.Platform;
 };
 
@@ -93,6 +99,7 @@ type Context = {
   io: Io;
   env: Env;
   execPath: string;
+  platform: NodeJS.Platform;
   uid: number;
   readCgroup: ReadCgroup | undefined;
   waitMs: number;
@@ -193,11 +200,104 @@ async function reportsVersion(ctx: Context, dir: string, version: string): Promi
   }
 }
 
+// The line for a `serve` outside the service that still runs `from`.
+function outsideLine(io: Io, pid: number | null, from: string): void {
+  say(
+    io,
+    `A 'maxprice-hub serve' (pid ${pid}) still runs ${from}: restart it to finish the update.`,
+  );
+}
+
+// This shell's data dir's serve.lock holder, read without the lock, as
+// `service status` reads it (ADR-0127 §6). The data dir is a Headless Hub's
+// on either platform: Linux's rule, which a non-embedded Hub on macOS keeps
+// too (ADR-0146 §2), as service.ts's serveDataDir reads it.
+function shellHolder(ctx: Context) {
+  return readServeLockHolder(
+    serveLockPath(defaultDataDir(ctx.env, "linux", home(ctx.env))),
+    UNIT,
+    ctx.readCgroup,
+  );
+}
+
+// ADR-0146 §8, after a swap from `from` to `to` on macOS: restart the
+// LaunchAgent that runs this binary with `launchctl kickstart -k`, then wait
+// for its /page/view as on Linux, or say what still runs `from`. Run from a
+// shell, `update` is outside the agent, so restarting it never kills this
+// process. The Headless client's restartAgent (ADR-0143 §8) with the Hub's
+// names.
+async function restartAgent(ctx: Context, from: string, to: string): Promise<number> {
+  const { io, env, execPath } = ctx;
+  const kickstart = `launchctl kickstart -k ${shellTarget(HUB_AGENT)}`;
+  // Root's GUI domain does not run the users' agents, so a shared install's
+  // swap restarts nothing, as on Linux (ADR-0123 §6, ADR-0146 §8).
+  if (ctx.uid === 0) {
+    say(
+      io,
+      `Running as root, so nothing was restarted: each user who runs ${LABEL} restarts their own with '${kickstart}'.`,
+    );
+    return EXIT.OK;
+  }
+
+  // No agent loaded, or no launchctl: nothing to restart, which is no
+  // failure, since the swap is done.
+  const agent = await printAgent(HUB_AGENT, ctx.uid, env);
+  if (agent !== null && agent.state === "running") {
+    const program = agent.arguments[0];
+    if (program === undefined || !sameFile(program, execPath)) {
+      const other =
+        program === undefined
+          ? "a program this maxprice-hub cannot read"
+          : displayPath(program, env);
+      say(
+        io,
+        `${LABEL} runs ${other}, not this maxprice-hub, so it was not restarted; 'maxprice-hub service install' points it here.`,
+      );
+      return EXIT.OK;
+    }
+    const ran = await runTool(
+      "launchctl",
+      ["kickstart", "-k", agentTarget(HUB_AGENT, ctx.uid)],
+      env,
+    );
+    if (ran.code !== 0) {
+      throw new CliError(
+        EXIT.FAILURE,
+        `maxprice-hub is ${to} now, but '${kickstart}' failed: ${reason(ran)}`,
+        WHY,
+      );
+    }
+    // The agent's own data dir, which its baked MAXPRICE_HUB_DATA_DIR may set
+    // apart from this shell's (ADR-0146 §5), read as `service`'s descriptor
+    // reads it. launchd starts an agent in /, and install bakes an absolute
+    // path.
+    const dir = serveDataDir({ ...agent.environment, HOME: home(env) }, "/");
+    if (!(await reportsVersion(ctx, dir, to))) {
+      throw new CliError(
+        EXIT.FAILURE,
+        `${LABEL} did not report ${to} within ${ctx.waitMs / 1000} s`,
+        WHY,
+      );
+    }
+    say(io, `Restarted ${LABEL}, which now runs ${to}.`);
+    return EXIT.OK;
+  }
+
+  // A `serve` outside the agent, on this shell's data dir. macOS has no
+  // cgroup to say whose a pid is, so the holder is the agent's when its pid
+  // is the one launchctl reported (ADR-0143 §8), and this shell's line is
+  // the Linux one's otherwise, with its residuals.
+  const holder = shellHolder(ctx);
+  if (holder.running && holder.pid !== (agent?.pid ?? null)) outsideLine(io, holder.pid, from);
+  return EXIT.OK;
+}
+
 // ADR-0127 §10, after a swap from `from` to `to`: restart the unit that runs
 // this binary, or say what still runs `from`. Run from a shell, `update` is
 // outside the unit's cgroup, so restarting the unit never kills it.
 async function restart(ctx: Context, from: string, to: string): Promise<number> {
   const { io, env, execPath } = ctx;
+  if (ctx.platform === "darwin") return await restartAgent(ctx, from, to);
   // ADR-0123 §6: root's user manager does not run the users' units, so a
   // shared install's swap restarts nothing, and asks systemctl nothing. Until
   // each user restarts their own, their commands meet the old Hub, and exit 4
@@ -264,17 +364,8 @@ async function restart(ctx: Context, from: string, to: string): Promise<number> 
   // edit the data files with no Hub running (ADR-0127 §7, ADR-0130 §5), so
   // one at work just then is named here as a 'maxprice-hub serve' still
   // running the old version. It runs no Hub, and finishes on its own.
-  const holder = readServeLockHolder(
-    serveLockPath(defaultDataDir(env, "linux", home(env))),
-    UNIT,
-    ctx.readCgroup,
-  );
-  if (holder.running && !holder.service) {
-    say(
-      io,
-      `A 'maxprice-hub serve' (pid ${holder.pid}) still runs ${from}: restart it to finish the update.`,
-    );
-  }
+  const holder = shellHolder(ctx);
+  if (holder.running && !holder.service) outsideLine(io, holder.pid, from);
   return EXIT.OK;
 }
 
@@ -289,9 +380,10 @@ export async function hubUpdate(
   // from /proc/self/exe, and read after the swap it would name the unlinked
   // file, `…/maxprice-hub (deleted)` (self-update.ts's header).
   const execPath = deps.execPath ?? process.execPath;
-  if ((deps.platform ?? process.platform) !== "linux") {
+  const platform = deps.platform ?? process.platform;
+  // Windows keeps its message (restore and status kept theirs, #750).
+  if (!runsHeadlessHub(platform))
     throw new CliError(EXIT.USAGE, "maxprice-hub update is Linux only");
-  }
   if (json && !checkOnly) throw usageError("--json goes with --check", HELP);
   const product = deps.product ?? PRODUCT;
   if (checkOnly) return await report(io, product, json);
@@ -303,7 +395,15 @@ export async function hubUpdate(
       EXIT.FAILURE,
       "update replaces the compiled maxprice-hub binary, but this one runs from source " +
         `(${displayPath(execPath, env)} ${displayPath(Bun.main, env)})`,
-      [{ label: "Build the binary:", command: "bun apps/hub/scripts/build-binaries.ts linux-x64" }],
+      [
+        {
+          label: "Build the binary:",
+          command:
+            platform === "darwin"
+              ? "bun apps/hub/scripts/build-binaries.ts --headless darwin-arm64"
+              : "bun apps/hub/scripts/build-binaries.ts linux-x64",
+        },
+      ],
     );
   }
 
@@ -338,6 +438,7 @@ export async function hubUpdate(
       io,
       env,
       execPath,
+      platform,
       uid: deps.uid ?? process.getuid?.() ?? 0,
       readCgroup: deps.readCgroup,
       waitMs: deps.waitMs ?? WAIT_MS,

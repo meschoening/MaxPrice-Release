@@ -51,12 +51,6 @@ const REPORT_OPTIONS: Options = {
   json: { type: "boolean" },
 };
 
-// `blocks` takes every report flag but --project: a block is cross-project
-// (ADR-0017), and the Desktop's Blocks page sends no project.
-const BLOCKS_OPTIONS: Options = Object.fromEntries(
-  Object.entries(REPORT_OPTIONS).filter(([name]) => name !== "project"),
-);
-
 // `live` takes --account, --org and --json alone: it is the popout's
 // snapshot, which has no filter rail and no range.
 const LIVE_OPTIONS: Options = Object.fromEntries(
@@ -83,21 +77,17 @@ const SCOPE_OPTIONS_HELP = `  --account <account>  Only this Account, by its lab
   --org <org>          Only this Organization, by its label, its uuid or an
                        8-character uuid prefix`;
 
-// The report flags' help, with or without the --project line.
-function reportFlagsHelp({ project }: { project: boolean }): string {
-  const projectLine = project
-    ? "\n  --project <name>     Only this project, by its path or its folder name"
-    : "";
-  const repeated = project ? "--model, --project and --machine" : "--model and --machine";
-  return `Options:
+// The report flags' help.
+const REPORT_FLAGS_HELP = `Options:
   --since <date>       The first day, YYYYMMDD or YYYY-MM-DD
   --until <date>       The last day, YYYYMMDD or YYYY-MM-DD
                        Without either, the range is this week, as the Week
                        setting defines it.
-  --model <family>     Only this Model family: Fable, Opus, Sonnet or Haiku${projectLine}
+  --model <family>     Only this Model family: Fable, Opus, Sonnet or Haiku
+  --project <name>     Only this project, by its path or its folder name
   --machine <name>     Only this machine, by its name, id or an 8-character
                        id prefix; needs a Hub joined with the Fleet replica on
-                       ${repeated} repeat to name more.
+                       --model, --project and --machine repeat to name more.
 ${SCOPE_OPTIONS_HELP}
   --json               Print the daemon's response verbatim
   -h, --help           Show this help
@@ -114,7 +104,6 @@ ${REPORT_USAGE_EXIT}
   3  The daemon is not running
   4  The daemon runs another version than this maxprice
 `;
-}
 
 const DAILY_HELP = `Usage: maxprice daily [options]
 
@@ -125,116 +114,61 @@ Cost. On a terminal too narrow for them all, columns drop in this order:
 Cache read, Cache create, Input, Models, Output, Total tokens. Piped output
 keeps every column.
 
-${reportFlagsHelp({ project: true })}`;
-
-const BLOCKS_HELP = `Usage: maxprice blocks [options]
-
-The 5-hour blocks, newest first, with the active block first. They are one
-Organization's: Home's while the Scope holds the Home membership, as with
-no flag and under --org all, else the one Organization it names. While
-more than one Organization is tracked, the header under --org all names it
-(quota: <label>). Blocks are cross-project, so there is no --project.
-
-Columns: Window, Status, Burn rate, Total tokens, Cost, Projected, 5h limit.
-On a terminal too narrow for them all, columns drop in this order: Total
-tokens, Burn rate, Projected, 5h limit. Piped output keeps every column.
-
-A window marked ~ is heuristic, estimated with no Usage sample; one marked ×
-was annulled, cut short by an Out-of-band reset. The line under the table is
-their legend.
-
-While two or more Accounts are tracked and the Scope holds two or more of
-their Memberships (--account all, or --org all, for one), the table becomes
-one section per Membership that forms Blocks in the range, the most used
-first: by the highest percent of any live limit window, an expired key's
-last reading included, then those with no reading, by name. Each section is
-headed by the Membership (Organization · Account while the sections span
-Accounts), its plan, and every limit window, over that Membership's own
-Blocks:
-
-  Acme Research · Alex (Max plan): 5-hour 41% · weekly 20%
-
-A window with no live reading prints —. An expired key's last reading is
-marked stale; a Membership with no reading says not connected, not readable
-now or no limits instead. The Memberships that form no Blocks in the range
-(no 5-hour limit, or no usage) share one line after the sections:
-"No Blocks: Third · Blair, Side project · Alex". A Scope that holds one
-Membership, as with no flag, prints the one table.
-
-Usage whose Account is not known is in none of these Blocks. While the scope
-has some in the range, one more line names its cost and tokens:
-"Account not known: $2.75 · 2,500,000 tokens, outside these Blocks' limits".
-
-${reportFlagsHelp({ project: false })}`;
+${REPORT_FLAGS_HELP}`;
 
 const LIVE_HELP = `Usage: maxprice live [options]
 
-One snapshot of what the tray popout shows: the Active block, the Usage
-limits and today. It prints once and does not refresh.
+One snapshot of the Usage limits the tray popout reads, then today. It
+prints once and does not refresh.
 
-  Active block · <label>
-    Window        9:36 PM – 2:36 AM  (2h 20m in, 2:39 left)
-    Cost          $10.75  8.2M tok
-    Burn rate     60K tok/min · $4.74/h
-    Projected     $23.24 by 2:36 AM
-
+  Limits · Acme Research (Max plan)
     5-hour limit  41%  resets 2:36 AM
     Weekly limit  33%  resets in 3d 3h
     Today         $10.75  8.2M tok
 
-The Active block and the limits are one Organization's: Home's while the
-Scope holds the Home membership, as with no flag and under --org all, else
-the one it names. Its label follows "Active block" only while
-more than one Organization is tracked. With no Active block, the top section
-is the one line "No active block". Burn rate and Projected print while the
-block has them; Projected is its total if the burn rate holds.
-
-A limit prints — when it has no fresh reading (no limits connection, or a
-reading whose reset has passed), and then no reset time. A Model-scoped
+The limits are one Organization's: Home's while the Scope holds the Home
+membership, as with no flag and under --org all, else the one it names. Its
+plan follows its label in parentheses, unless the label is the plan. A line
+prints for each limit window the plan reports: on a plan with no 5-hour
+limit the 5-hour line reads "none on" and the plan (none on Ultra), and an
+Organization with no weekly limit prints no weekly line. A Model-scoped
 weekly limit adds its own line, named by the model it limits (Fable limit).
+
+A limit prints — when it has no fresh reading (no limits connection, an
+idle window, or a reading whose reset has passed), and then no reset time.
 Today is the cost and tokens of the day in the timezone setting, or with none
 set, the zone this shell is in (TZ); under --org all it is every Tracked
 organization's, and reads "Today · all".
 
-Usage whose Account is not known is in no Active block. While the scope has
-some since yesterday, a last line names its cost and tokens:
-"Account not known: $2.75  2.5M tok since yesterday, outside these limits".
-
 While two or more Accounts are tracked and the Scope holds two or more of
-their Memberships, the panel is the ranked popout's, with nothing folded:
-
-  Active block · Acme Research · Alex
-    Window        9:36 PM – 2:36 AM  (2h 20m in, 2:39 left)
-    Cost          $10.75  8.2M tok
+their Memberships, the panel lists them all, with nothing folded:
 
   Limits
     Third · Blair          5-hour 90% · weekly 60% · stale
+    Side project · Alex    weekly 64% (resets in 5d 1h) · no 5-hour limit
     Acme Research · Alex   5-hour 41% (resets 2:36 AM) · weekly 20%
                            (resets in 3d 3h)
-    Side project · Alex    not readable now
+    Beta · Blair           not readable now
 
     Today · All accounts   $12.40  9.1M tok
 
-The Active block is the most used Membership's whose 5-hour window is in
-flight, an expired key's aside; with none in flight, the top section reads
-"Most used · <Membership>" over "No active block". Limits lists every
-Membership in the Scope, one line each, the most used first, as blocks
-ranks its sections: every limit window with its reset, a window with no
-live reading as —, an expired key's last reading marked stale, and a
-Membership with no reading as not connected, not readable now or no
-limits. Today is the Scope's day, named for it as the report headers name
-the Scope. A Scope that holds one Membership, as with no flag, prints the
-panel above.
+Limits lists every Membership in the Scope, one line each, the most used
+first: by the highest percent of any live limit window, an expired key's
+last reading included, then those with no reading, by name. A line holds
+every limit window with its reset, a window with no live reading as —, and
+"no 5-hour limit" where the plan has none; an expired key's last reading is
+marked stale, and a Membership with no reading says not connected, not
+readable now or no limits. Today is the Scope's day, named for it as the
+report headers name the Scope. A Scope that holds one Membership, as with
+no flag, prints the panel above.
 
 Options:
 ${SCOPE_OPTIONS_HELP}
-  --json               Print {"blocks":…,"usage":…,"today":…}: the daemon's
-                       /api/blocks, /api/usage/current and /api/daily
-                       responses the panel reads, each verbatim. For the
-                       ranked panel, {"blocks":…,"accounts":…,"today":…}:
-                       the head Membership's /api/blocks (null with no
-                       5-hour window in flight), /api/accounts and
-                       /api/daily
+  --json               Print {"usage":…,"today":…}: the daemon's
+                       /api/usage/current and /api/daily responses the
+                       panel reads, each verbatim. For the panel of several
+                       Memberships, {"accounts":…,"today":…}: /api/accounts
+                       and /api/daily
   -h, --help           Show this help
 
 ${SCOPE_HELP}
@@ -266,7 +200,7 @@ drop in this order: Input and Output together, then Models, Total tokens,
 Machine, Organization, Account, Last activity. Piped output keeps every
 column.
 
-${reportFlagsHelp({ project: true })}`;
+${REPORT_FLAGS_HELP}`;
 
 const PROJECTS_HELP = `Usage: maxprice projects [options]
 
@@ -285,7 +219,7 @@ once more for each Account. On a terminal too narrow for them all, columns
 drop in this order: Path, Top model, Sessions, Machines, Organizations,
 Accounts, Total tokens, Last activity. Piped output keeps every column.
 
-${reportFlagsHelp({ project: true })}`;
+${REPORT_FLAGS_HELP}`;
 
 // The help that differs by platform: on macOS the service is a LaunchAgent
 // (ADR-0143), elsewhere a systemd user unit. Linux's text is as it was.
@@ -1033,15 +967,8 @@ export const COMMANDS: Record<string, Command> = {
     positionals: false,
     run: async (parsed, io) => (await import("./commands/projects")).projects(parsed, io),
   },
-  blocks: {
-    summary: "The 5-hour blocks, newest first",
-    help: BLOCKS_HELP,
-    options: BLOCKS_OPTIONS,
-    positionals: false,
-    run: async (parsed, io) => (await import("./commands/blocks")).blocks(parsed, io),
-  },
   live: {
-    summary: "The Active block, the limits and today, once",
+    summary: "The limits and today, once",
     help: LIVE_HELP,
     options: LIVE_OPTIONS,
     positionals: false,

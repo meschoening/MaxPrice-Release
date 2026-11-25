@@ -29,9 +29,11 @@ export const DEFAULT_CLAUDE_BASE_URL = "https://claude.ai/api";
 // Enterprise org's `five_hour` (2026-09-17). The WHOLE window tolerates null
 // too (#270): the same org's `seven_day` is the literal `null`, and that is
 // "answered, no weekly window", never a shape mismatch — a tracked Enterprise
-// org used to poll into a permanent "error" over it. Nullable is not optional:
-// a payload missing the key outright is still the shape change ADR-0023's
-// firebreak exists for. The three shapes are three Window states (#384): a
+// org used to poll into a permanent "error" over it. A missing key reads as
+// the literal `null` (ADR-0145 §5), so one window gone from the body hides no
+// window that parsed; a body holding none of `five_hour`, `seven_day` and
+// `limits` is still the shape change ADR-0023's firebreak exists for
+// (`upstreamUsageSchema`). The three shapes are three Window states (#384): a
 // null reset is an idle limit, a null window no limit, and `fetchUsage`
 // reports which beside the reading, which keeps only windows in flight.
 const upstreamWindowSchema = z
@@ -39,7 +41,7 @@ const upstreamWindowSchema = z
     utilization: z.number(),
     resets_at: z.string().nullable(),
   })
-  .nullable();
+  .nullish();
 // The `limits[]` list (observed 2026-08-26; kinds re-confirmed by the
 // 2026-09-17 probe): one entry per limit — `session` and `weekly_all` restate
 // the two top-level windows, and `weekly_scoped` carries the scoped weekly
@@ -71,7 +73,10 @@ const upstreamUsageSchema = z
     seven_day: upstreamWindowSchema,
     limits: z.array(upstreamLimitSchema.nullable().catch(null)).optional(),
   })
-  .passthrough();
+  .passthrough()
+  .refine((u) => "five_hour" in u || "seven_day" in u || "limits" in u, {
+    message: "none of five_hour, seven_day and limits",
+  });
 
 // The model of a recognized scoped limit, independent of its reset. Surface
 // scopes, unnamed models and malformed entries remain outside this contract.
@@ -147,7 +152,7 @@ export type FetchUsageResult =
 
 // One primary window's Window state, from its shape alone (#384).
 function windowState(window: z.infer<typeof upstreamWindowSchema>): WindowState {
-  if (window === null) return "absent";
+  if (window == null) return "absent";
   return window.resets_at === null ? "idle" : "active";
 }
 

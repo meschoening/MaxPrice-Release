@@ -1,11 +1,6 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import {
-  HUB_PROTOCOL_VERSION,
-  type HubStatus,
-  type UsageSample,
-  type UsageReading,
-} from "@maxprice/shared";
+import { HUB_PROTOCOL_VERSION, type HubStatus, type UsageSample } from "@maxprice/shared";
 import {
   createDeferredShutdown,
   createFleetEventStore,
@@ -26,11 +21,28 @@ import {
   type UsagePoller,
 } from "@maxprice/usage-core";
 import type { Env } from "@maxprice/usage-core/home-path";
+import { SUPERVISOR } from "@maxprice/usage-core/launchd-agent";
+import {
+  clearCause,
+  recordCause,
+  recordStart,
+  rotateLog,
+  START_LIMIT,
+  WINDOW_MS,
+} from "@maxprice/usage-core/relaunch-ledger";
+import { readServeLockHolder } from "@maxprice/usage-core/serve-lock";
 import { EXIT_INTERRUPTED } from "@maxprice/usage-core/secret-input";
 import { terminalText } from "@maxprice/usage-core/terminal-text";
 import { startUpdateChecks } from "@maxprice/usage-core/update-check";
-import { CliError, EXIT, runHubCli, type Writer } from "./cli";
-import { defaultDataDir, loadOrInitConfig, requireHub, savePasswordHash } from "./config";
+import { CliError, EXIT, renderError, runHubCli, type Writer } from "./cli";
+import {
+  defaultDataDir,
+  isEmbedded,
+  loadOrInitConfig,
+  requireHub,
+  runsHeadlessHub,
+  savePasswordHash,
+} from "./config";
 import { prepareDataDir } from "./data-dir";
 import { RESTORE_STAGING, restoreHub, unfinishedRestore } from "./restore";
 import { hubStatus } from "./status";
@@ -70,8 +82,8 @@ import { cliPage, cliPageClear, cliPageSet, cliPageSnippet } from "./page-publis
 import type { HubPageDeps } from "./page";
 import type { PageManifest } from "./page-manifest";
 import { buildHubApp, fleetEventsStatus } from "./server";
-import { takeServeLock, type ServeLock } from "./serve-lock";
-import { hubService } from "./service";
+import { serveLockPath, takeServeLock, UNIT, type ServeLock } from "./serve-lock";
+import { hubService, relaunchLedgerPath, serveLogPath } from "./service";
 import { runSetup, type SetupDeps } from "./setup";
 import { createSetupTerminal } from "./setup-terminal";
 import { hubUpdate } from "./update";
@@ -99,13 +111,14 @@ import {
 
 // maxprice-hub (ADR-0035): the standalone always-on usage poller. Its command
 // line is cli.ts's (ADR-0127 §2): no command, or `serve`, runs the daemon;
-// `status` (ADR-0127 §8, status.ts) describes the running daemon on Linux;
+// `status` (ADR-0127 §8, status.ts) describes the running daemon on Linux
+// and macOS;
 // `password set|clear` (ADR-0037, ADR-0128 §6), `key set|list|remove`
 // (ADR-0126 §6, ADR-0140 §6, §8; key-commands.ts), `gateway
 // connect|list|remove` (ADR-0141 §7, §8; gateway-commands.ts), `label
 // account|org` (ADR-0140 §9; label-commands.ts) and the operator verbs `rename`, `merge`,
 // `purge-machine` and `compact` (ADR-0041) act on the Hub at the data dir: on
-// Linux through the running daemon's own routes while one holds the data
+// Linux and macOS through the running daemon's own routes while one holds the data
 // dir, else on its files (ADR-0127 §7; operator.ts); `restore` (ADR-0130, restore.ts) fills an empty
 // data dir from a backup; `service install|uninstall|status|logs` (ADR-0127
 // §5–6, service.ts) runs serve as a systemd user unit on Linux; `update`
@@ -149,19 +162,20 @@ export function createMergeSamples(
   };
 }
 
-// Poller→fanout sample adapter: broadcast each fresh sample live and ride the
-// running sampleCount along on the status. Exported alongside createMergeSamples
-// so serve()'s status-patch wiring lives in one testable place. The poller
-// hands over the sample it appended to history, so the stream carries exactly
-// what the store kept, an Enterprise organization's five-hour-only line
-// included (#384). Each Membership's live reading reaches the status through
-// its `accounts` (hub-keys.ts, from the poller's Memberships), not here.
-export function createEmitUsageSample(
+// Poller→fanout history adapter: broadcast each sample the poller appended
+// and ride the running sampleCount along on the status. Exported alongside
+// createMergeSamples so serve()'s status-patch wiring lives in one testable
+// place. The poller hands over every sample it appended to history, every
+// Membership's, projected or not (#732), so the stream carries exactly what
+// the store kept, a line holding any one window in flight (ADR-0145 §2).
+// Each Membership's live reading reaches the status through its `accounts`
+// (hub-keys.ts, from the poller's Memberships), not here.
+export function createEmitHistory(
   store: Pick<SampleStore, "all">,
   fanout: Pick<HubFanout, "emitSample" | "patchStatus">,
-): (organization: string, sample: UsageReading | null, historical: UsageSample | null) => void {
-  return (_organization, _sample, historical) => {
-    if (historical !== null) fanout.emitSample(historical);
+): (sample: UsageSample) => void {
+  return (sample) => {
+    fanout.emitSample(sample);
     fanout.patchStatus({ sampleCount: store.all().length });
   };
 }
@@ -191,11 +205,13 @@ export function createHubKeyWiring(opts: {
   // The poller's publishes reach the status through the keys' `accounts`
   // (bound below: the keys need the poller and the poll set first).
   let keys: HubKeys | null = null;
-  // PollerHub adapter: poller broadcasts → fanout; sampleCount rides along.
+  // PollerHub adapter: poller history → fanout; sampleCount rides along. The
+  // live reading has no stream of its own here: it rides the status.
   const poller = createUsagePoller({
     store: sampleStore,
     liveHub: {
-      emitUsageSample: createEmitUsageSample(sampleStore, fanout),
+      emitUsageSample: () => {},
+      emitHistory: createEmitHistory(sampleStore, fanout),
       patchStatus: (status) => {
         fanout.patchStatus({ usageLastSampleAt: status.usageLastSampleAt });
         keys?.pollerPublished();
@@ -252,7 +268,7 @@ export function createBindStatusPatcher(
 //
 // The key seed is hub-keys.ts's `boot`: it reads the store, restores what the
 // status says about each key with it (when it was set and by whom, where the
-// store keeps them: secrets.json on Linux and every Account's keychain entry,
+// store keeps them: secrets.json for a Headless Hub and every Account's keychain entry,
 // ADR-0126 §3, ADR-0138 §6), stamps a pre-#283 legacy entry's history
 // (ADR-0104), arms the poller and the poll set, and starts ADR-0138 §12's
 // move of the legacy key in the background.
@@ -342,44 +358,35 @@ export async function runReadySequence(deps: ReadySequenceDeps): Promise<void> {
   }
 }
 
-// True when the tray shell (Phase 2) spawned us as its sidecar — it sets
-// MAXPRICE_HUB_EMBEDDED=1. Gates the OPERATOR_TOKEN stdout emit and the
-// parent-death watchdog; headless `serve` (Linux) leaves it unset (ADR-0035/0036)
-// and, on Linux, keeps its operator secret in a file instead (ADR-0126 §8).
-export function isEmbedded(env: Record<string, string | undefined> = process.env): boolean {
-  return env.MAXPRICE_HUB_EMBEDDED === "1";
-}
-
-// Whether `serve` owns its data dir through serve.lock (ADR-0127 §3): a
-// Headless Hub on Linux, where the Headless Hub runs and where flock binds
-// glibc's libc.so.6. An embedded daemon never does: the tray app's daemon is
-// unchanged, with no lock and no 0700 tightening.
+// Whether `serve` owns its data dir through serve.lock (ADR-0127 §3,
+// ADR-0146 §3): a Headless Hub, on Linux or macOS, where flock binds libc. An
+// embedded daemon never does: the tray app's daemon is unchanged, with no
+// lock and no 0700 tightening.
 export function isLockable(
   env: Record<string, string | undefined> = process.env,
   platform: NodeJS.Platform = process.platform,
 ): boolean {
-  return !isEmbedded(env) && platform === "linux";
+  return !isEmbedded(env) && runsHeadlessHub(platform);
 }
 
-// Whether `serve` checks the update channel (ADR-0129 §6): a Headless Hub on
-// Linux, the one `maxprice-hub update` can update, since the channel's one
-// entry is linux-x86_64 and `update` is Linux only. An embedded daemon never
-// does: the tray app has Tauri's updater, which reads `hub-latest.json`.
-// The same test as isLockable's today, kept apart because it answers
-// another question.
+// Whether `serve` checks the update channel (ADR-0129 §6, ADR-0147 §6): a
+// Headless Hub on Linux or macOS, the ones `maxprice-hub update` can update,
+// since the channel carries a linux-x86_64 and a darwin-aarch64 entry. An
+// embedded daemon never does: the tray app has Tauri's updater, which reads
+// `hub-latest.json`.
 export function checksForUpdates(
   env: Record<string, string | undefined> = process.env,
   platform: NodeJS.Platform = process.platform,
 ): boolean {
-  return !isEmbedded(env) && platform === "linux";
+  return !isEmbedded(env) && runsHeadlessHub(platform);
 }
 
 // Who mints the per-launch operator secret (ADR-0037's first lane) and where
 // it goes. An embedded daemon prints it for the tray shell (`OPERATOR_TOKEN`,
-// bootAnnouncement). A Headless Hub on Linux writes it to
+// bootAnnouncement). A Headless Hub on Linux or macOS writes it to
 // `<data dir>/operator-token`, 0600, for the commands on its own machine,
-// and never prints it, so it stays out of the journal (ADR-0126 §8). A
-// Headless Hub elsewhere mints none.
+// and never prints it, so it stays out of the journal (ADR-0126 §8,
+// ADR-0146 §3). A Headless Hub elsewhere mints none.
 export function operatorSecretCustody(
   env: Record<string, string | undefined> = process.env,
   platform: NodeJS.Platform = process.platform,
@@ -405,7 +412,7 @@ export function hubPageDeps(
 // web server proxies to, with the Hub page URL it is published at when one is
 // set, as read at boot (a later `page set` needs no restart, and leaves this
 // line stale until the next start), and, when this build carries no page
-// files (a source run, or a non-linux build run headless), a warning that
+// files (a source run, or a hub tray target's build run headless), a warning that
 // /page/ will 404 while /page/view still answers.
 export function hubPageBootLines(
   port: number,
@@ -416,7 +423,7 @@ export function hubPageBootLines(
     log: `[hub] Hub page: http://127.0.0.1:${port}/page/ (loopback only)${pageUrl === null ? "" : `, published at ${pageUrl}`}`,
     warn: Object.hasOwn(manifest, "index.html")
       ? null
-      : "[hub] this build embeds no Hub page files, so /page/ answers 404; the linux-x64 build embeds them (bun apps/hub/scripts/build-binaries.ts linux-x64)",
+      : "[hub] this build embeds no Hub page files, so /page/ answers 404; the Headless Hub builds embed them (bun apps/hub/scripts/build-binaries.ts linux-x64, or --headless darwin-arm64)",
   };
 }
 
@@ -537,18 +544,80 @@ export function resolveIdentityDirectory(store: IdentityDirectory): IdentityDire
 // The lock's descriptor, held for the process's whole life (ADR-0127 §3).
 let serveLock: ServeLock | null = null;
 
+const WINDOW_MINUTES = WINDOW_MS / 60_000;
+
+// Under launchd (`MAXPRICE_SUPERVISOR=launchd`, ADR-0146 §6, ADR-0143
+// §5–§6), which has no start limit and relaunches every nonzero exit, a
+// Headless serve bounds its own relaunches through relaunch.json, and moves a
+// serve.log past 10 MB to serve.log.1 first, before it logs anything, so this
+// boot's lines start the fresh file. A rotation that fails is logged and the
+// start still counts: exiting would put launchd's relaunches past the bound.
+// Returns whether this start is declined: the sixth within 15 minutes, which
+// is recorded and exits 0, the one exit launchd does not relaunch.
+function startUnderLaunchd(dataDir: string): boolean {
+  let rotated: boolean | Error;
+  try {
+    rotated = rotateLog(serveLogPath(dataDir));
+  } catch (error) {
+    rotated = error instanceof Error ? error : new Error(String(error));
+  }
+  prepareDataDir(dataDir);
+  if (rotated === true) console.error(`[hub] rotated ${serveLogPath(dataDir)} to serve.log.1`);
+  if (rotated instanceof Error) {
+    console.error(`[hub] could not rotate ${serveLogPath(dataDir)}: ${rotated.message}`);
+  }
+  const start = recordStart(relaunchLedgerPath(dataDir), new Date());
+  console.error(`[hub] under launchd: start ${start.starts} in the last ${WINDOW_MINUTES} minutes`);
+  if (!start.declined) return false;
+  console.error(
+    `[hub] stopped after repeated crashes: more than ${START_LIMIT} starts in ` +
+      `${WINDOW_MINUTES} minutes, recorded in relaunch.json; ` +
+      "'maxprice-hub service install' clears the count. Exiting 0 so launchd does not relaunch it",
+  );
+  return true;
+}
+
+// serve's take of serve.lock under launchd: exit 5's refusal, another
+// maxprice-hub holding the data dir, is recorded with the holder's pid and
+// declined, exit 0, since a relaunch cannot free the lock (ADR-0146 §6);
+// null for a declined take. A take that holds the lock clears the recorded
+// cause and keeps the start times.
+async function takeLockUnderLaunchd(dataDir: string, env: Env): Promise<ServeLock | null> {
+  const ledger = relaunchLedgerPath(dataDir);
+  let lock: ServeLock;
+  try {
+    lock = await takeServeLock(dataDir, env);
+  } catch (error) {
+    if (!(error instanceof CliError) || error.code !== EXIT.ALREADY_RUNNING) throw error;
+    const { pid } = readServeLockHolder(serveLockPath(dataDir), UNIT);
+    recordCause(ledger, { kind: "locked", at: new Date().toISOString(), pid });
+    process.stderr.write(renderError(error));
+    console.error(
+      "[hub] recorded another maxprice-hub's hold in relaunch.json; exiting 0 so launchd does not relaunch it",
+    );
+    return null;
+  }
+  clearCause(ledger);
+  return lock;
+}
+
 async function serve(): Promise<number> {
   const env = process.env;
   const embedded = isEmbedded(env);
   const dataDir = defaultDataDir(env);
-  // ADR-0127 §3: a Headless Hub on Linux makes its data dir 0700 and takes
+  // ADR-0127 §3: a Headless Hub (Linux, macOS) makes its data dir 0700 and takes
   // serve.lock before loadOrInitConfig can rewrite hub.json, so a second
   // serve on this dir exits 5 having changed nothing, once the take's bounded
   // retry has run out (serve-lock.ts). Everywhere else the dir
   // is made as it always was, with no lock. Only serve makes a data dir, and
   // setup, which makes it as this does before its first step (ADR-0128 §2),
   // and restore, which fills it from a backup (§4, ADR-0130).
-  if (isLockable(env)) {
+  // Under launchd, a declined start or take exits 0 before hub.json is read.
+  if (isLockable(env) && env[SUPERVISOR.name] === SUPERVISOR.value) {
+    if (startUnderLaunchd(dataDir)) return EXIT.OK;
+    serveLock = await takeLockUnderLaunchd(dataDir, env);
+    if (serveLock === null) return EXIT.OK;
+  } else if (isLockable(env)) {
     prepareDataDir(dataDir);
     serveLock = await takeServeLock(dataDir, env);
   } else {
@@ -568,7 +637,7 @@ async function serve(): Promise<number> {
   // Per-launch operator secret (ADR-0037's first lane), which passes the gate
   // whatever the password state (operatorSecretCustody). Embedded, the tray
   // shell captures it from stdout for the console. A Headless Hub on Linux
-  // keeps it in `operator-token`, written just before the first bind below and
+  // or macOS keeps it in `operator-token`, written just before the first bind below and
   // removed at the teardown, so whatever answers /healthz has it on disk
   // (ADR-0126 §8). A Headless Hub elsewhere mints none.
   const custody = operatorSecretCustody(env);
@@ -653,8 +722,8 @@ async function serve(): Promise<number> {
   const fanout = createHubFanout({ initialStatus });
   const sampleStamps = createHubSampleStamps({ path: sampleStampsPath, fanout });
 
-  // The key store, by platform (ADR-0126 §1, ADR-0138 §6): on Linux
-  // `<data dir>/secrets.json`, read once by the boot's key seed; elsewhere
+  // The key store, by platform (ADR-0126 §1, ADR-0138 §6, ADR-0146 §4): on
+  // Linux and for a Headless Hub on macOS `<data dir>/secrets.json`, read once by the boot's key seed; elsewhere
   // the keychain helper, its uuid list beside hub.json, else memory.
   const keyStore = openKeyStore(dataDir, {
     log: (line) => console.log(line),
@@ -680,8 +749,8 @@ async function serve(): Promise<number> {
   });
 
   // The Hub's Gateways (ADR-0141 §5, §7, §9): the URL list in gateways.json,
-  // each management key in the key store beside the session keys (on Linux
-  // secrets.json's `gateways`, elsewhere `gateway-credential/<id>` in the
+  // each management key in the key store beside the session keys (in
+  // secrets.json's `gateways` where openKeyStore uses the file, elsewhere `gateway-credential/<id>` in the
   // keychain), the 7-day record feed in gateway-records.json. Neither file is
   // written until a Gateway is connected or a record arrives. Drained from
   // `ready` on, after the keys' boot; stopped by the teardown.
@@ -802,7 +871,7 @@ async function serve(): Promise<number> {
   // presence gating in front of it that throw means another process owns the
   // port, because an address the machine doesn't have is never attempted: a
   // second hub instance on another data dir (serve.lock stops one on this dir,
-  // on Linux), or something that is no Hub at all, which a /healthz probe
+  // on Linux and macOS), or something that is no Hub at all, which a /healthz probe
   // tells apart. Every LATER pass is guarded and retries, which is what stops a
   // hub launched at login from being stranded on loopback when it beats
   // Tailscale to the interface.
@@ -902,7 +971,7 @@ async function serve(): Promise<number> {
     console.error("[hub] unhandled rejection:", err);
     void shutdown(1);
   });
-  // ADR-0129 §6: a Headless Hub on Linux checks its channel at boot and
+  // ADR-0129 §6, ADR-0147 §6: a Headless Hub checks its channel at boot and
   // every 6 h, in this process, writes update-check.json for `status`'s
   // Update row, and logs a newer version once, after the boot lines above.
   // It never installs anything (only `maxprice-hub update` does), and never
@@ -920,10 +989,10 @@ async function serve(): Promise<number> {
   return EXIT.OK;
 }
 
-// Whether an offline password change applies: on Linux the verb held
+// Whether an offline password change applies: on Linux and macOS the verb held
 // serve.lock, so no Hub runs and the next one to start reads it; elsewhere a
 // running daemon holds its config in memory until it restarts. A Hub running
-// on Linux was sent the change live instead (livePasswordSet).
+// there was sent the change live instead (livePasswordSet).
 function passwordApplies(locked: boolean): string {
   return locked ? "the Hub applies it when it starts" : "restart the hub daemon to apply";
 }
@@ -950,15 +1019,15 @@ export async function cliPasswordClear(dataDir: string, locked: boolean): Promis
 // ── M7 operator CLI verbs (ADR-0041): headless parity for the console's
 // rename / merge / purge / compact. Two writers on the data files would
 // corrupt them (and Windows blocks a rewrite's rename over the daemon's open
-// handle), so a running daemon stays their only writer: on Linux, while one
+// handle), so a running daemon stays their only writer: on Linux and macOS, while one
 // holds serve.lock, runOperatorVerb sends each verb to that daemon's own
 // route, the console's, and the change applies at once (ADR-0127 §7,
-// operator.ts's live twins). With the lock free, or off Linux once no daemon
+// operator.ts's live twins). With the lock free, or elsewhere once no daemon
 // answers on hub.json's port, the cli* functions below mutate the DATA FILES
 // directly, as the password verbs do: file access is the authority. Each
 // returns a success line; failures throw, and exit 2.
 
-// Off Linux, where there is no serve.lock, the archive verbs' only check:
+// Where there is no serve.lock (Windows), the archive verbs' only check:
 // whether a daemon answers on hub.json's port, which may have changed under
 // it.
 export async function daemonRunning(
@@ -981,7 +1050,7 @@ export type OperatorVerbOptions = {
   platform?: NodeJS.Platform;
   // rename, merge, purge-machine and compact, which open the fleet event
   // archive, and label, which edits the Label directory a running daemon
-  // holds in memory: off Linux they first probe for a running daemon, and
+  // holds in memory: with no serve.lock they first probe for a running daemon, and
   // any failure of their offline edit exits 2. The password verbs keep no check there,
   // and fail with their own codes.
   opensArchive?: boolean;
@@ -997,11 +1066,11 @@ export type OperatorVerbOptions = {
 // The frame of every command that acts on a Hub's data. It refuses a data dir
 // with no hub.json before it creates anything: only serve or setup makes a
 // Hub, or restore brings one back from a backup (ADR-0127 §4, ADR-0128 §2,
-// ADR-0130). On Linux it asks reachHub (operator-client.ts, ADR-0127 §7): a
+// ADR-0130). On Linux and macOS it asks reachHub (operator-client.ts, ADR-0127 §7): a
 // daemon holding serve.lock is sent the command `live`, through its own
 // route, whose refusals are the live function's CliErrors, and nothing here
 // touches a file; with the lock free the command runs `offline` under it, so
-// neither a serve nor another such command runs beside it (§3). Off Linux
+// neither a serve nor another such command runs beside it (§3). Elsewhere
 // there is no lock, and `offline` runs as it always has, after the archive
 // verbs' /healthz probe. Either returns the success line, printed here
 // through `terminalText` (ADR-0127 §11), as cli.ts prints an error: it
@@ -1025,7 +1094,7 @@ export async function runOperatorVerb(
   };
   const dataDir = requireHub(env, platform);
   let lock: ServeLock | null = null;
-  if (platform === "linux") {
+  if (runsHeadlessHub(platform)) {
     const reached = await reachHub(dataDir, env, reach);
     if (reached.kind === "live") {
       print(await live(reached.hub));
@@ -1267,7 +1336,7 @@ if (import.meta.main) {
     gatewayConnect: (url, io) => gatewayConnect(url, io),
     gatewayList: (json, io) => gatewayList(json, io),
     gatewayRemove: (url, io) => gatewayRemove(url, io),
-    // Off Linux it takes the archive verbs' /healthz check: a running
+    // With no serve.lock it takes the archive verbs' /healthz check: a running
     // daemon holds the Label directory in memory, and would write over it.
     label: (kind, name, label) =>
       runOperatorVerb(

@@ -39,7 +39,7 @@ export function hubOrganizationRows(
     const { label, renamed } = resolveOrganizationLabel({
       uuid,
       rename: Object.hasOwn(labels, uuid) ? labels[uuid]!.label : null,
-      organizationType: null,
+      login: null,
       hints,
     });
     return {

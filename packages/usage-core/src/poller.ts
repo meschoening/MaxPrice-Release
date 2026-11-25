@@ -1,5 +1,6 @@
 import {
-  completeUsageSample,
+  headLastReadAt,
+  usageSampleOf,
   sampleAsReading,
   type HubMembershipProjection,
   type OrganizationUsageStatus,
@@ -20,15 +21,14 @@ export type PollerStatus = {
 };
 
 export type PollerHub = {
-  // Even null carries its Organization at this internal adapter seam.
-  // `historical` is the sample the read appended to history, or null: the
-  // poller decides it once, from the read's Window states (#384), so the
-  // Hub broadcasts exactly what its store kept.
-  emitUsageSample: (
-    organization: string,
-    sample: UsageReading | null,
-    historical: UsageSample | null,
-  ) => void;
+  // An Organization's live reading: its projected Membership's. Even null
+  // carries its Organization at this internal adapter seam.
+  emitUsageSample: (organization: string, sample: UsageReading | null) => void;
+  // Each sample a read appended to history, whichever Membership read it,
+  // projected or not (#732): the Hub streams every line its store kept, so a
+  // client's since-cursor never moves past one it was not sent. The poller
+  // decides history once: a reading with a window in flight (ADR-0145 §2).
+  emitHistory: (sample: UsageSample) => void;
   patchStatus: (partial: PollerStatus) => void;
 };
 
@@ -129,6 +129,10 @@ export type UsagePoller = {
   expiredReaderOrganizations: () => string[];
   pollOnce: () => Promise<void>;
   getCurrent: (organization?: string | null) => UsagePollerCurrent;
+  // The Organization's last successful read, as the status map holds it
+  // (`headLastReadAt`): the freshness copy's time (ADR-0145 §6). With no
+  // Organization, the newest read of any.
+  lastReadAt: (organization: string | null) => string | null;
   // A remote snapshot owns live state while the Hub owns polling. History
   // replication is independent and never makes an absent entry an answer.
   setRemoteState: (state: RemoteState | null) => void;
@@ -207,9 +211,10 @@ const membershipId = (organization: string, account: string): string =>
 // Hub read (`organizations`, getCurrent(org), emitUsageSample(org, …)): an
 // Organization read by one Membership projects it; read by several, the one
 // whose Account is the Home membership's Account, else the first by
-// `rankMemberships`. Only the projected Membership's reading is emitted; every
-// Membership's complete reading enters history, Account-stamped when its key's
-// Account is known.
+// `rankMemberships`. Only the projected Membership's reading is emitted live;
+// every Membership's reading with a window in flight enters history (ADR-0145
+// §2), Account-stamped when its key's Account is known, and is emitted as
+// history (#732).
 export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
   const fetchUsageImpl =
     opts.fetchUsageImpl ?? ((c, signal) => fetchUsage({ ...c, baseUrl: opts.baseUrl, signal }));
@@ -439,7 +444,7 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
         (remoteCurrent === undefined
           ? entry?.weeklyResetAt
           : (remoteReset ?? entry?.weeklyResetAt)) ??
-        // A line without `weekly` is an Organization with no weekly limit (#384).
+        // The newest line's weekly reset, when it holds one (ADR-0145 §2).
         latest?.weekly?.resetAt ??
         null,
     };
@@ -514,7 +519,7 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
   // answered at all. Never history: nothing was appended.
   function emitProjection(organization: string, showing: Entry | undefined): void {
     if (remote !== null || showing?.current === undefined) return;
-    opts.liveHub.emitUsageSample(organization, showing.current, null);
+    opts.liveHub.emitUsageSample(organization, showing.current);
   }
 
   async function runPoll(
@@ -571,7 +576,7 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
           : { ...result.sample, organizationUuid: organization, ...accountUuid };
       entry.current = reading;
       entry.weeklyResetAt = reading?.weekly?.resetAt ?? entry.weeklyResetAt;
-      const historical = completeUsageSample(reading, result.windowStates);
+      const historical = usageSampleOf(reading);
       if (historical !== null) opts.store.append(historical);
       entry.status = {
         limits: limitsAnswer(result),
@@ -579,9 +584,8 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
         lastReadAt: new Date(now()).toISOString(),
         lastSampleAt: opts.store.latest(scope)?.capturedAt ?? null,
       };
-      if (projected(organization) === entry) {
-        opts.liveHub.emitUsageSample(organization, reading, historical);
-      }
+      if (historical !== null) opts.liveHub.emitHistory(historical);
+      if (projected(organization) === entry) opts.liveHub.emitUsageSample(organization, reading);
     } else {
       entry.status = {
         limits: limitsAnswer(result),
@@ -785,6 +789,7 @@ export function createUsagePoller(opts: CreateUsagePollerOptions): UsagePoller {
         }),
     pollOnce,
     getCurrent,
+    lastReadAt: (organization) => headLastReadAt(organizations(), organization),
     setRemoteState: (state) => {
       // A Home/set edit can add an Organization after the last remote frame;
       // copy its authoritative value before relinquishing Hub ownership too.

@@ -1,6 +1,6 @@
-// The ring's SVG stroke, for the r=40 circle the Active block tile and the
-// popout both draw. Renderer-only: the ring's fraction is the shared tile state
-// (packages/shared/src/active-block-tile-state.ts); only the SVG needs a dash.
+// The ring's SVG stroke, for the r=40 circle the limit card and the popout
+// both draw. Renderer-only: the ring's fraction is the shared view model's;
+// only the SVG needs a dash.
 const RING_CIRCUMFERENCE = 2 * Math.PI * 40;
 
 // A zero-length dash with a round linecap still paints a dot. Returning null

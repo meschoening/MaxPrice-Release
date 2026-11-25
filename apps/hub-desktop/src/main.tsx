@@ -2,8 +2,9 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
-import { Popout, PopoutErrorBoundary, TrayTooltip } from "./Popout";
+import { Popout, PopoutErrorBoundary, TrayStatus } from "./Popout";
 import { currentWindowLabel } from "./lib/tauri";
+import { isMacOS } from "./lib/platform";
 import { queryClient } from "./lib/query";
 import "./styles/globals.css";
 
@@ -13,20 +14,30 @@ import "./styles/globals.css";
 // on a warm, pre-created local webview. The body class scopes the popout's
 // opaque composite material in globals.css.
 const label = currentWindowLabel();
-if (label === "popout") document.body.classList.add("popout-window");
+if (label === "popout") {
+  document.body.classList.add("popout-window");
+  // macOS only, and stamped HERE rather than queried in CSS (ADR-0148 §2):
+  // Win11's DWM curves the undecorated window itself, while macOS rounds
+  // nothing, so Rust masks the window layer and this class curves the frame
+  // to match it. Drawing our radius inside DWM's would leave a sliver of
+  // ground between the two curves. Synchronous by design: a frame of square
+  // corners would show on every open.
+  if (isMacOS()) document.body.classList.add("popout-rounded");
+}
 
 // The popout tree is the one branch that gets an error boundary: it is a
 // frameless tray window with no titlebar, no menu and no reload, so an
 // uncaught render error would strand the user with a blank 224x224 square.
-// <TrayTooltip/> sits OUTSIDE the boundary as a render-nothing sibling — the
-// tray tooltip is the only hub UI while both windows are hidden, and it must
-// keep writing even if the popout's own tree is down (see Popout.tsx).
+// <TrayStatus/> sits OUTSIDE the boundary as a render-nothing sibling — the
+// tray's tooltip and icon are the only hub UI while both windows are hidden,
+// and they must keep writing even if the popout's own tree is down (see
+// Popout.tsx).
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       {label === "popout" ? (
         <>
-          <TrayTooltip />
+          <TrayStatus />
           <PopoutErrorBoundary>
             <Popout />
           </PopoutErrorBoundary>

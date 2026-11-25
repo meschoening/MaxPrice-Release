@@ -10,25 +10,23 @@ export type ReadoutWideScope = z.infer<typeof readoutWideScopeSchema>;
 
 // One Membership's most used live window, as the readout names it
 // (`ReadoutMembership`, ./membership-readout.ts): `pct` unrounded, the shell
-// rounds it.
+// rounds it. `label` is null where naming it would tell nothing apart: the
+// one Membership of a machine that tracks one Organization.
 export const readoutMembershipSchema = z.object({
-  label: z.string(),
+  label: z.string().nullable(),
   window: z.enum(["fiveHour", "weekly", "weeklyModel"]),
   model: z.string().optional(),
   pct: z.number(),
 });
 
-// The most used readout (`ReadoutResponse.mostUsed`, `readoutPick`).
+// The Readout's percent (`ReadoutResponse.mostUsed`, `readoutPick`): the most
+// used window, whatever its kind, of the most used Readable membership.
 export const readoutMostUsedSchema = z.object({
-  // Some Readable membership's 5-hour window is in flight: the title and the
-  // tooltip's head are `top`'s percent. False: money, and `top` is the
-  // tooltip's `Most used:` line.
-  fiveHourLive: z.boolean(),
-  // The Memberships in the set, every state: `+N more` counts the rest.
-  count: z.number().int().min(2),
+  // The Memberships the Readout reads, every state: `+N more` counts the
+  // rest. One on a one-Membership Scope.
+  count: z.number().int().min(1),
   top: readoutMembershipSchema,
-  // The second most used, for `Next:`; null with none, and always null for
-  // money.
+  // The second most used, for `Next:`; null with none.
   next: readoutMembershipSchema.nullable(),
 });
 export type ReadoutMostUsed = z.infer<typeof readoutMostUsedSchema>;
@@ -52,15 +50,6 @@ export const PERSISTED_SCOPE_PARAM = "persisted";
 // query params, read by the shell from settings.json on every poll — the
 // sidecar keeps its "no ambient mode/tz" invariant.
 export const readoutResponseSchema = z.object({
-  // The metric switch (charter decision 5, mirroring `usage-ring.ts`): a
-  // current usage sample exists AND its fiveHour.resetAt is still ahead of
-  // now. True ⇒ the readout shows the 5-hour-limit percent; false ⇒ today's
-  // cost.
-  blockLive: z.boolean(),
-  // The sample's fiveHour.utilizationPct, present exactly while `blockLive` —
-  // one bit, one representation: a stale percent beside `blockLive: false`
-  // would invite exactly the stale-reading bug ADR-0030 retired.
-  utilizationPct: z.number().nullable(),
   // Today's total cost in the requested zone + cost mode — the Today tile's
   // number (ADR-0020's calendar-day window), 0 when today has no events.
   todayCost: z.number(),
@@ -68,39 +57,38 @@ export const readoutResponseSchema = z.object({
   // shell's vanish rule (T5 decision 6: fresh install ⇒ bare app name, no
   // "$0.00") costs one poll instead of two.
   hasData: z.boolean(),
-  // Whether the current sample carries a Model-scoped weekly limit — the tray
-  // popout draws one extra limit row for it, and the shell sizes the popout
-  // window before showing it (windows are shell-owned; ADR-0050/0076), so the
-  // shell learns the row's presence here rather than from the webview.
+  // Whether the one-Membership Popout's reading carries a Model-scoped weekly
+  // limit — that Popout draws one extra limit row for it, and the shell
+  // sizes the popout window before showing it (windows are shell-owned;
+  // ADR-0050/0076), so the shell learns the row's presence here rather than
+  // from the webview. Always false for the ranked Popout, which draws none.
   hasModelWindow: z.boolean(),
-  // Present only while more than one Organization is tracked (ADR-0106 §11,
-  // #291): the Quota organization's display label — the rename, plan word or
-  // short id, collision-suffixed across the roster, never the upstream name.
-  // The utilization half is that one Organization's, and the shell names it in
-  // the Windows tooltip from this, never resolving a label itself. Absent, not
-  // null, on a single-Organization machine, so its body is byte-identical to
-  // before.
-  organizations: z.object({ quotaLabel: z.string() }).optional(),
   // Present only while the request's resolved Scope holds more than one
   // Membership (#622 item 4, #637; `readoutWideScope`): what the money half
   // sums, so the Windows tooltip's today fallback can say so. `accounts`: every
   // tracked Membership of several tracked Accounts ("all accounts");
   // `organizations`: every tracked Organization of one Account ("all
   // organizations", the v0.9.x All organizations wording); `memberships`: any
-  // other set of `count` Memberships. Absent under a one-Membership Scope, so a
-  // single-Organization, single-Account body is byte-identical to before.
+  // other set of `count` Memberships. Absent under a one-Membership Scope.
   wideScope: readoutWideScopeSchema.optional(),
-  // Present only while the Scope's multi-Membership set (`scopeMembershipSet`,
-  // two or more tracked Accounts) holds two or more Readable memberships and
-  // at least one of them reads a live window (#638; ADR-0136 §6's #610/#622
-  // rows, `readoutPick`): the Readout picks the most used one. Only a Readable membership counts or
-  // drives it; a dead key's stale reading never does (ADR-0138 §8). Absent
-  // otherwise, so a one-Account body is byte-identical to before.
+  // The Readout's percent, at every count (ADR-0142 §2, ADR-0136 §6's note
+  // of 2026-11-21): present while some Readable membership the Readout reads
+  // holds a window in flight, of any kind. Those are the Scope's
+  // multi-Membership set (`scopeMembershipSet`) while it holds two or more,
+  // its one Membership's own `/api/accounts` reading while it holds one
+  // (#738), else the Scope's head Organization's reading alone. Only a
+  // Readable membership counts
+  // or drives it; a dead key's stale reading never does (ADR-0138 §8).
+  // Absent: today's money.
   mostUsed: readoutMostUsedSchema.optional(),
-  // Present only while that set holds two or more Memberships: the ranked
-  // Popout's limit rows (`rankedPopoutLimitRows`), the four most used plus
-  // one `+N more` row past four, which the shell sizes the Popout by before
-  // showing it. Absent otherwise: today's Popout and height.
-  popoutLimitRows: z.number().int().min(2).optional(),
+  // The Popout's limit rows, which the shell sizes the window by before
+  // showing it. With two or more Memberships in that set, the ranked
+  // Popout's (`rankedPopoutLimitRows`): the four most used plus one `+N more`
+  // row past four. Otherwise the one-Membership Popout's 5-hour and weekly
+  // rows, one when the Organization it reads (the set's one Membership's,
+  // else the head's) reports no weekly limit; its model
+  // row is `hasModelWindow`'s, which the shell adds under the Settings
+  // opt-in (`popoutLimitRowsOf`).
+  popoutLimitRows: z.number().int().min(1),
 });
 export type ReadoutResponse = z.infer<typeof readoutResponseSchema>;

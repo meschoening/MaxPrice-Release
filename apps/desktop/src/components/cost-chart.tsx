@@ -99,7 +99,7 @@ export function CostChart(props: CostChartProps): React.ReactElement {
     // The "now" line marks the rightmost bucket — the in-progress "now" bucket.
     // True for every span: the daily-resolution tabs (week / 30d) and, as of
     // Part 5's T5.4b, the intraday tabs (then 15m / 1h / 6h / 24h; since
-    // ADR-0031 / ADR-0020: 15m / 1h / block / today), whose rightmost bucket
+    // ADR-0020 and ADR-0142: 15m / 1h / today), whose rightmost bucket
     // ends at "now" too.
     const showNowLine = true;
     return buildChartModel({
@@ -130,7 +130,7 @@ export function CostChart(props: CostChartProps): React.ReactElement {
   ]);
 
   // The x-axis label mode: daily spans (week / 30d) and the span-less compact
-  // strips label days; the intraday spans (15m / 1h / block / today) label
+  // strips label days; the intraday spans (15m / 1h / today) label
   // times — as does an ANCHORED week (ADR-0083), whose buckets are dated
   // instants from `/api/intraday` rather than calendar days. Rides the
   // layout's shapeKey, so a mode flip is a rebuild.

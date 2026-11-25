@@ -26,8 +26,9 @@ Release code and binaries for MaxPrice, a Claude Code cost/token tracker.
 
 ### Hub:
 
-- Windows (Installer): [install](https://meschoening.github.io/MaxPrice-Release/hub-tray-app/install.html)
-- Linux servers (Headless Hub: the `maxprice-hub` terminal binary, x64): [install](https://meschoening.github.io/MaxPrice-Release/headless-hub/overview.html#get-started), [manual](apps/hub/README.md)
+- macOS (Apple Silicon .dmg): [install](https://meschoening.github.io/MaxPrice-Release/hub-tray-app/install.html#macos)
+- Windows (Installer): [install](https://meschoening.github.io/MaxPrice-Release/hub-tray-app/install.html#windows)
+- Linux servers and Macs (Headless Hub: the `maxprice-hub` terminal binary, Linux x64 or macOS on Apple Silicon): [install](https://meschoening.github.io/MaxPrice-Release/headless-hub/overview.html#get-started), [manual](apps/hub/README.md)
 
 ## Building from source
 

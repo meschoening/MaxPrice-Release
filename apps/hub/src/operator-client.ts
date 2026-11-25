@@ -7,7 +7,6 @@ import {
 import { displayPath, type Env } from "@maxprice/usage-core/home-path";
 import { fsErrorName } from "@maxprice/usage-core/secrets-file";
 import {
-  describeHolder,
   type ReadCgroup,
   readServeLockHolder,
   type ServeLock,
@@ -17,7 +16,14 @@ import { CliError, EXIT, type Hint } from "./cli";
 import { loopbackRequest } from "./loopback-http";
 import { TEST_NO_ANSWER_MS } from "./no-answer";
 import { operatorTokenPath } from "./secrets";
-import { serveLockPath, takeLockOrHolder, UNIT } from "./serve-lock";
+import {
+  describeHubHolder,
+  serveLockPath,
+  serviceName,
+  takeLockOrHolder,
+  UNIT,
+  withService,
+} from "./serve-lock";
 import { HUB_PROTOCOL_MISMATCH } from "./server";
 
 // One client for the operator commands (ADR-0127 §7): how `rename`, `merge`,
@@ -238,11 +244,11 @@ async function exchange(
   return { status: answer.status, ok, body: parseBody(answer.body) };
 }
 
-// Exit 4, in ADR-0127 §7 and §10's wording: the unit when the holder runs in
-// it, else the foreground `serve` to restart.
+// Exit 4, in ADR-0127 §7 and §10's wording: the unit, or on macOS the agent,
+// when the holder runs in it, else the foreground `serve` to restart.
 function skewed(target: Target): CliError {
-  const restart = target.holder.service
-    ? `restart ${UNIT}`
+  const restart = withService(target.holder).service
+    ? `restart ${serviceName()}`
     : `restart its serve (pid ${target.holder.pid})`;
   return new CliError(
     EXIT.SKEW,
@@ -494,7 +500,7 @@ export async function reachHub(
       throw new HubNoAnswer(
         waited.kind,
         final.holder,
-        `maxprice-hub is running for ${shownDir} (${describeHolder(final.holder, UNIT)}) but did not answer within ${timeoutMs / 1000} s: ${waited.reason}`,
+        `maxprice-hub is running for ${shownDir} (${describeHubHolder(final.holder)}) but did not answer within ${timeoutMs / 1000} s: ${waited.reason}`,
         [WHY],
       );
     }

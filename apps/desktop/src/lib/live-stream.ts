@@ -2,9 +2,7 @@ import { useEffect } from "react";
 import type { QueryClient } from "@tanstack/react-query";
 import type { output, ZodType } from "zod";
 import {
-  BLOCKS_KEY_ROOT,
   DATA_QUERY_KEYS,
-  isBlockSpanIntradayKey,
   SESSION_KEY_ROOT,
   sessionKey,
   SSE_EVENT,
@@ -119,9 +117,8 @@ let roundGeneration = 0;
 // ── The visibility pause (F9) ──
 // A hidden main window is still a fully mounted React tree with live query
 // observers, so every round it runs refetches every report on screen for
-// nobody. On `/live` that is five queries, two of which — intraday and blocks —
-// sit outside ADR-0057's report cache, so each round costs at minimum one
-// whole-corpus `aggregateBlocks` fold plus an intraday fold. The worst case is
+// nobody. On `/live` intraday sits outside ADR-0057's report cache, so each
+// round costs at minimum an intraday fold. The worst case is
 // not a closed window at all but a `--hidden` autostart launch (ADR-0077),
 // which never shows the main window and so would run the machinery for the
 // entire session with nothing ever on screen.
@@ -322,31 +319,6 @@ export function handleUsageEvent(client: QueryClient, dataText: string): void {
   scheduleUsageInvalidation(client, event.sessionId);
 }
 
-// `block:tick` — 30s cadence; refresh the blocks family so burn rate /
-// projection stay current even with no file activity.
-//
-// Also invalidates the block-span intraday query (span=block). The block frame
-// is block-shaped data: when the active block ends (idle reset, out-of-band
-// reset via usage samples) with no concurrent JSONL write, usage:new never
-// fires — the chart would stay frozen on the dead frame until the next file
-// event. block:tick runs on the same 30s cadence as the Active block tile, so
-// invalidating the span=block intraday key here keeps the chart and tile in
-// sync (rolling to the new frame, or the empty state) within tick cadence even
-// with no file activity. Only span=block is targeted — block:tick fires every
-// 30s and must not trigger a refetch of every span's chart (ADR-0031).
-export function handleBlockTick(client: QueryClient): void {
-  // Pure refetch pressure on a 30s timer, and nothing else: no store is fed
-  // from here and no UI state depends on it, so a hidden window has nothing to
-  // keep current (F9). Deliberately a plain skip rather than a coalesced debt —
-  // the next round refetches the blocks family wholesale anyway, and a tick is
-  // a "time passed" signal whose value expires with the tick.
-  if (invalidationPaused) return;
-  void client.invalidateQueries({ queryKey: BLOCKS_KEY_ROOT });
-  void client.invalidateQueries({
-    predicate: (q) => isBlockSpanIntradayKey(q.queryKey),
-  });
-}
-
 // Two reads' Window states, by value; absent and null are one fact (no
 // successful read).
 function sameWindowStates(
@@ -363,7 +335,7 @@ function sameWindowStates(
 // active price snapshot's `capturedAt`. Cost is priced per event at query time
 // from the sidecar's active snapshot, so when a pricing refresh swaps it, every
 // cached report row is silently priced by the OLD snapshot until something else
-// refetches. `patchStatus` fires for block ticks, usage samples, and hub state
+// refetches. `patchStatus` fires for usage samples and hub state
 // too, so a blanket invalidation here would refetch every report constantly —
 // hence the compare. A failed attempt patches `lastAttempt` and leaves
 // `capturedAt` alone, so it never triggers. The first frame carrying pricing
@@ -659,9 +631,6 @@ async function openConnection(): Promise<void> {
   });
   es.addEventListener(SSE_EVENT.usageNew, (e) => {
     handleUsageEvent(queryClient, (e as MessageEvent).data);
-  });
-  es.addEventListener(SSE_EVENT.blockTick, () => {
-    handleBlockTick(queryClient);
   });
   es.addEventListener(SSE_EVENT.statusChanged, (e) => {
     handleStatusEvent(queryClient, (e as MessageEvent).data);

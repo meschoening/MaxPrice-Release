@@ -98,6 +98,13 @@ const PLAN_LABELS: Readonly<Record<string, string>> = {
   claude_free: "Free plan",
 };
 
+// The rate-limit tier of claude.ai's Ultra plan, which it renamed from the 20x
+// tier of the Max plan (#692): `claude_max` names both plans, and only this
+// tier tells the Ultra plan from the Max plan. It is Claude Code's own test.
+// Every other `default_claude_max*` tier is the Max plan.
+export const ULTRA_RATE_LIMIT_TIER = "default_claude_max_20x";
+const ULTRA_PLAN = "Ultra plan";
+
 // An own key only: "toString" and the other prototype names are not plan words.
 export function planLabel(organizationType: string | null | undefined): string | null {
   if (organizationType === null || organizationType === undefined) return null;
@@ -105,11 +112,62 @@ export function planLabel(organizationType: string | null | undefined): string |
   return PLAN_LABELS[organizationType] ?? null;
 }
 
+// A login file's plan as Claude Code writes it: `oauthAccount.organizationType`
+// and `oauthAccount.organizationRateLimitTier`, raw, mapped only at render
+// (#718). A null tier is one the login did not name, never the Max plan: a
+// login on the Max plan names its own tier. A tier is kept only beside a type
+// (`loginPlanOf`), since it names no plan on its own.
+export type LoginPlan = {
+  organizationType: string | null;
+  organizationRateLimitTier: string | null;
+};
+
+// No plan: an Organization known only from usage, a listing or a legacy push.
+export const NO_LOGIN_PLAN: LoginPlan = { organizationType: null, organizationRateLimitTier: null };
+
+export function loginPlanOf(
+  organizationType: string | null | undefined,
+  organizationRateLimitTier: string | null | undefined,
+): LoginPlan {
+  const type = organizationType ?? null;
+  return {
+    organizationType: type,
+    organizationRateLimitTier: type === null ? null : (organizationRateLimitTier ?? null),
+  };
+}
+
+// `primary`, with what it does not name filled from `fallback`: the whole plan
+// when `primary` names no type, and the tier when both name one type and only
+// `fallback` names a tier. Two different types never mix.
+export function fillLoginPlan(primary: LoginPlan, fallback: LoginPlan): LoginPlan {
+  if (primary.organizationType === null) return fallback;
+  if (
+    primary.organizationRateLimitTier === null &&
+    primary.organizationType === fallback.organizationType
+  ) {
+    return fallback;
+  }
+  return primary;
+}
+
+// A login plan as a plan word: `claude_max` with the Ultra tier is the Ultra
+// plan, and every other type its `PLAN_LABELS` word.
+export function loginPlanWord(login: LoginPlan): string | null {
+  if (
+    login.organizationType === "claude_max" &&
+    login.organizationRateLimitTier === ULTRA_RATE_LIMIT_TIER
+  ) {
+    return ULTRA_PLAN;
+  }
+  return planLabel(login.organizationType);
+}
+
 // Connect's roster hints (usage-limits.ts) as a plan word, for an Organization
 // no login file names. First match wins, and the table is total: every rule
 // yields one of its own fixed words and anything unrecognised yields null, so
 // no hint value ever becomes a label raw — `analyticsSubscriptionPlan` is not
-// uniformly token-shaped (docs/research/organization-limits-probe). The
+// uniformly token-shaped (docs/research/organization-limits-probe). The Ultra
+// tier comes first, since `claude_max` names the Max plan and Ultra alike (#718). The
 // capabilities read are `SUBSCRIPTION_CAPS`'s vocabulary (usage-limits.ts)
 // plus `raven_enterprise` and `api`. `billingType` maps nothing:
 // `stripe_subscription*` names no plan. Nor is the Limits answer a hint:
@@ -117,6 +175,8 @@ export function planLabel(organizationType: string | null | undefined): string |
 // cannot read it, so it names no plan either.
 export function planFromHints(hints: OrganizationRosterHints | null | undefined): string | null {
   if (hints === null || hints === undefined) return null;
+  const tier = hints.rateLimitTier;
+  if (tier === ULTRA_RATE_LIMIT_TIER) return ULTRA_PLAN;
   // Exactly a PLAN_LABELS key, never a prefix or a case-fold.
   const analytics = planLabel(hints.analyticsSubscriptionPlan);
   if (analytics !== null) return analytics;
@@ -125,20 +185,26 @@ export function planFromHints(hints: OrganizationRosterHints | null | undefined)
   if (caps.includes("claude_max")) return "Max plan";
   if (caps.includes("claude_pro")) return "Pro plan";
   if (caps.includes("raven_enterprise")) return "Enterprise";
-  const tier = hints.rateLimitTier;
   if (tier !== null && tier.startsWith("default_claude_max")) return "Max plan";
   if (tier === "default_raven_enterprise") return "Enterprise";
   if (caps.includes("api") && !caps.includes("chat")) return "API";
   return null;
 }
 
-// An Organization's plan word: a login file's `organizationType` always beats
-// a roster hint.
+// An Organization's plan word: a login file's beats a roster hint, except that
+// a `claude_max` login naming no tier cannot tell the Max plan from Ultra, so a hint
+// naming the Ultra plan names it (#718).
 export function organizationPlan(input: {
-  organizationType: string | null | undefined;
+  login: LoginPlan | null;
   hints: OrganizationRosterHints | null | undefined;
 }): string | null {
-  return planLabel(input.organizationType) ?? planFromHints(input.hints);
+  const hinted = planFromHints(input.hints);
+  const login = input.login ?? NO_LOGIN_PLAN;
+  const word = loginPlanWord(login);
+  if (word === null) return hinted;
+  const tierUnnamed =
+    login.organizationType === "claude_max" && login.organizationRateLimitTier === null;
+  return tierUnnamed && hinted === ULTRA_PLAN ? ULTRA_PLAN : word;
 }
 
 // The Organization label (GLOSSARY.md): the user's rename, else the plan word,
@@ -149,7 +215,7 @@ export type ResolvedOrganizationLabel = { label: string; renamed: boolean; plan:
 export function resolveOrganizationLabel(input: {
   uuid: string;
   rename: string | null; // the user's label, null when none or cleared
-  organizationType: string | null | undefined;
+  login: LoginPlan | null;
   hints: OrganizationRosterHints | null | undefined;
 }): ResolvedOrganizationLabel {
   const plan = organizationPlan(input);
@@ -212,7 +278,7 @@ export function organizationLabelMap(
 export function organizationLabel(labels: ReadonlyMap<string, string>, uuid: string): string {
   return (
     labels.get(uuid) ??
-    resolveOrganizationLabel({ uuid, rename: null, organizationType: null, hints: null }).label
+    resolveOrganizationLabel({ uuid, rename: null, login: null, hints: null }).label
   );
 }
 

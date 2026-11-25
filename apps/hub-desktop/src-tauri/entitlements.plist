@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    The hub tray app's copy of apps/desktop/src-tauri/entitlements.plist
+    (ADR-0077: per-app copies), whose comment records how both keys were
+    found. Notarization requires the hardened runtime, which denies
+    executable memory by default. The embedded daemon, maxprice-hub, is a
+    compiled Bun binary, so JavaScriptCore JITs: without these two
+    entitlements the kernel SIGKILLs it, and the console and every client
+    of this Hub see no daemon at all (ADR-0148 section 6).
+
+    BOTH keys are required: allow-jit alone runs a Bun binary started from
+    a shell, but not one the app spawns. Tauri applies this file to every
+    binary in Contents/MacOS, the app, maxprice-hub and maxprice-credstore;
+    scripts/release_macos.sh asserts both keys on the bundled daemon.
+
+    Only a signed build has the hardened runtime: `bun run build:hub`,
+    which skips signing, and `tauri dev` produce binaries the JIT is
+    unrestricted in. No double hyphen anywhere in this comment: XML forbids
+    one, and codesign refuses the file over it although plutil accepts it.
+  -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+</dict>
+</plist>

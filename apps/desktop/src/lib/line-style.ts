@@ -57,7 +57,7 @@ export type TodayClock = { tz?: string; now?: number };
 //
 // `week` reads the resolved Week (ADR-0083): an ANCHORED week's bars come from
 // `/api/intraday` at the sidecar's default `WEEK_BUCKET_MS` (so `bucketMs`
-// stays omitted, the `block` precedent) as daily buckets aligned to the
+// stays omitted) as daily buckets aligned to the
 // anchor's time-of-day — dated instants, not calendar days, hence `withDate`.
 // A rolling week (or no `week` at all) is exactly the pre-ADR-0083 request.
 export function lineRequestFor(
@@ -69,10 +69,7 @@ export function lineRequestFor(
   const line = isLineStyle(chartStyle);
   const anchoredWeek = span === "week" && week?.kind === "anchored";
   return {
-    // `block` never sends a bucketMs — the sidecar supplies the constant
-    // `BLOCK_BUCKET_MS` for BOTH styles (ADR-0046, pinning ADR-0031's adaptive
-    // rung — the one exception to renderer-owned policy).
-    bucketMs: line && span !== "block" ? lineBucketMsFor(span, clock) : undefined,
+    bucketMs: line ? lineBucketMsFor(span, clock) : undefined,
     withDate: (line && lineLabelsNeedDate(span)) || anchoredWeek,
   };
 }

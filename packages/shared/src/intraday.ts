@@ -1,10 +1,9 @@
 import { z } from "zod";
-import { windowSourceSchema } from "./blocks";
 import { modelBreakdownSchema } from "./models";
 
 // Part 5 — T5.4a: the `/api/intraday` wire contract.
 //
-// The Live view's cost chart has span tabs `15m / 1h / block / today / week / 30d`.
+// The Live view's cost chart has span tabs `15m / 1h / today / week / 30d`.
 // The two day-granular spans (`week`, `30d`) are served by `/api/daily` — its
 // `DailyRow.date` is `YYYY-MM-DD` and its `since`/`until` are `YYYYMMDD`, so
 // it can only express whole-day windows. The four intraday spans that shipped
@@ -35,13 +34,9 @@ import { modelBreakdownSchema } from "./models";
 // endpoint serves at `WEEK_BUCKET_MS` from a caller-supplied `weekStart`;
 // ADR-0083). Two are `now`-relative rolling windows (`15m`/`1h`); `today` is
 // the calendar-day window anchored to local
-// midnight in the request `tz`, growing to `now` (ADR-0020); `block` frames the
-// active 5-hour quota window, growing from the block's start to `now`
-// (ADR-0031). `block` has no `INTRADAY_SPANS` entry because its WINDOW (and
-// therefore its bucket count) is dynamic, not because its bucket size is
-// adaptive — the sidecar supplies the constant `BLOCK_BUCKET_MS` as the
-// `aggregateBlockSpan` default (ADR-0031/0046).
-export type IntradaySpan = "15m" | "1h" | "block" | "today";
+// midnight in the request `tz`, growing to `now` (ADR-0020). The `block` span
+// that framed a 5-hour window is retired (ADR-0142 §5).
+export type IntradaySpan = "15m" | "1h" | "today";
 
 // Each intraday span's bucket duration, plus `bucketCount` — the number of bars
 // the chart renders. For the two `now`-relative spans `bucketCount` is FIXED
@@ -49,13 +44,6 @@ export type IntradaySpan = "15m" | "1h" | "block" | "today";
 // is DYNAMIC (one bar per elapsed local hour, midnight→now), so its
 // `bucketCount` here is the day's MAXIMUM (24 hourly bars); the real count is
 // server-computed by `aggregateIntraday` from `now` + `tz` (ADR-0020).
-//
-// `block` is intentionally ABSENT — its window grows from the active block's
-// start (ADR-0031), so it has no fixed bucket COUNT; `INTRADAY_SPANS` can never
-// express it. Its bucket SIZE, though, is not adaptive: the sidecar supplies
-// the constant `BLOCK_BUCKET_MS` as the `aggregateBlockSpan` default
-// (ADR-0046). The Record key type is narrowed to
-// `Exclude<IntradaySpan, "block">` to enforce this at compile time.
 //
 //   span   buckets    bucket duration   window
 //   15m    15         1 minute          15 minutes  (now-relative)
@@ -68,13 +56,10 @@ export type IntradaySpan = "15m" | "1h" | "block" | "today";
 // the calendar hour — one bar per elapsed local hour IS the meaning of the tab
 // (ADR-0020), and its LINES carry the fine detail instead (`todayLineBucketMs`).
 //
-// The rolling counts no longer match the mock's `SPANS`: the mock predates both
-// ADR-0031 and ADR-0046 and is not updated retroactively, so it still lists a
-// 12-bucket `1h` and a `6h` span where the current code has `block`.
-export const INTRADAY_SPANS: Record<
-  Exclude<IntradaySpan, "block">,
-  { bucketCount: number; bucketMs: number }
-> = {
+// The rolling counts no longer match the mock's `SPANS`: the mock predates
+// ADR-0046 and is not updated retroactively, so it still lists a 12-bucket
+// `1h` and a `6h` span.
+export const INTRADAY_SPANS: Record<IntradaySpan, { bucketCount: number; bucketMs: number }> = {
   "15m": { bucketCount: 15, bucketMs: 60_000 },
   "1h": { bucketCount: 60, bucketMs: 60_000 },
   today: { bucketCount: 24, bucketMs: 3_600_000 },
@@ -84,14 +69,14 @@ export const INTRADAY_SPANS: Record<
 // Generalized span/granularity contract (ADR-0018)
 // ---------------------------------------------------------------------------
 //
-// The bars [[Chart style]] keeps the ADR-0013 model above: the four intraday
+// The bars [[Chart style]] keeps the ADR-0013 model above: the three intraday
 // spans bucket at `INTRADAY_SPANS` sizes, `week`/`30d` are daily-bucketed by
 // `/api/daily`. The LINE styles (`cumulative`/`trend`) instead want a fixed
 // 15-minute bucket on every span where that is finer, served by `/api/intraday`
-// for all six spans. That requires two things `INTRADAY_SPANS` can't express:
+// for all five spans. That requires two things `INTRADAY_SPANS` can't express:
 // a window length for `week`/`30d`, and a bucket size decoupled from the span.
 
-// All six chart spans. `week`/`30d` extend `IntradaySpan` — the endpoint now
+// All five chart spans. `week`/`30d` extend `IntradaySpan` — the endpoint now
 // serves them (at a caller-supplied bucket size) for the line path; the name
 // "intraday" is kept for historical reasons (ADR-0018). `week` replaced `7d`
 // under ADR-0083: the tab is no longer a rolling seven days but THE Week
@@ -100,10 +85,11 @@ export const INTRADAY_SPANS: Record<
 // anchor as a `weekStart` instant. No compat shim: `7d` is rejected outright.
 export type Span = IntradaySpan | "week" | "30d";
 
-// Endpoint validation for the generalized `span` param — all six spans.
+// Endpoint validation for the generalized `span` param — all five spans.
 // `/api/intraday` parses its required `span` query param against this; an
-// absent or unrecognized value is an HTTP 400.
-export const spanSchema = z.enum(["15m", "1h", "block", "today", "week", "30d"]);
+// absent or unrecognized value is an HTTP 400, the retired `block` included
+// (ADR-0142 §5).
+export const spanSchema = z.enum(["15m", "1h", "today", "week", "30d"]);
 
 // Each span's TOTAL window length in milliseconds — the `now`-relative range
 // the chart covers, independent of bucket size. For the intraday spans with
@@ -124,16 +110,9 @@ export const spanSchema = z.enum(["15m", "1h", "block", "today", "week", "30d"])
 // calendar-day guard).
 export const DAY_MS = 86_400_000;
 
-// The block span's MAXIMUM window length — a full 5-hour quota window
-// (ADR-0031). Like `today`, the REAL window is dynamic (block start → now,
-// and an annulled block's full extent is under 5h); this value backs the
-// bucketMs-divides-window validation and the label-granularity lookups.
-export const BLOCK_WINDOW_MS = 5 * 60 * 60_000;
-
 export const SPAN_WINDOW_MS: Record<Span, number> = {
   "15m": 15 * 60_000,
   "1h": 60 * 60_000,
-  block: BLOCK_WINDOW_MS,
   today: DAY_MS,
   week: 7 * DAY_MS,
   "30d": 30 * DAY_MS,
@@ -143,7 +122,7 @@ export const SPAN_WINDOW_MS: Record<Span, number> = {
 // time-of-day rather than to local midnight (bar k covers
 // `[weekStart + k·day, weekStart + (k+1)·day)`), so the anchor already carries
 // the zone and the span is not tz-aware. Applied sidecar-side as the
-// `aggregateWeekSpan` default, the `BLOCK_BUCKET_MS` precedent; the line path
+// `aggregateWeekSpan` default; the line path
 // still supplies its 15-minute floor, which divides a day and a week alike.
 export const WEEK_BUCKET_MS = DAY_MS;
 
@@ -155,18 +134,14 @@ export const WEEK_BUCKET_MS = DAY_MS;
 // `bucketMs` values, never a real chart request.
 export const MAX_INTRADAY_BUCKETS = 5000;
 
-// The span's native bars bucket size, or `undefined` for `block`/`week`/`30d`
-// (which have no `INTRADAY_SPANS` entry — `block`'s WINDOW is dynamic, so it
-// has no fixed bucket count, even though the sidecar pins its bucket SIZE to
-// the constant `BLOCK_BUCKET_MS`, ADR-0031/0046; `week` likewise pins
+// The span's native bars bucket size, or `undefined` for `week`/`30d`
+// (which have no `INTRADAY_SPANS` entry — `week` pins
 // `WEEK_BUCKET_MS` sidecar-side, ADR-0083; `30d` is bars-served by
 // `/api/daily`). The `in` check guards the lookup so the cast only narrows the
 // key inside the branch where it is sound, instead of a value-defeating cast
 // that would hide `undefined` from the caller.
 export function nativeBucketMs(span: Span): number | undefined {
-  return span in INTRADAY_SPANS
-    ? INTRADAY_SPANS[span as Exclude<IntradaySpan, "block">].bucketMs
-    : undefined;
+  return span in INTRADAY_SPANS ? INTRADAY_SPANS[span as IntradaySpan].bucketMs : undefined;
 }
 
 // The bucket duration the LINE chart styles request for a given span: a
@@ -218,9 +193,9 @@ const TODAY_LINE_LADDER_MS = [
 // readable as possible subject to "never fewer than ~this many points".
 //
 // ADR-0046 raised this 24 → 300. 300 is not arbitrary: it is the number of
-// minutes in the 5-hour `block` window, so `today`'s line matches the `block`
-// tab's minute resolution over any comparable stretch of the day rather than
-// being an order of magnitude coarser than the tab beside it.
+// minutes in a 5-hour window, so `today`'s line matched the since-retired
+// `block` tab's minute resolution over any comparable stretch of the day
+// rather than being an order of magnitude coarser than the tab beside it.
 //
 // DERIVATION (the single source for the boundary table below + ADR-0022's
 // table): a rung of size `ms` first clears the target when
@@ -249,9 +224,7 @@ export function todayBucketCount(elapsed: number, ms: number): number {
 // (ADR-0022/0046); the engine is unchanged and just honours the resulting
 // `bucketMs`.
 //
-// The guard + coarsest-rung loop used to live in a helper shared with an
-// adaptive `blockBucketMs`; ADR-0046 pinned `block` to a constant minute, so
-// this is the app's only adaptive bucket and the selection is inlined rather
+// This is the app's only adaptive bucket, so the selection is inlined rather
 // than kept behind a single-caller indirection.
 //
 //   The boundaries below are ≈ and DERIVED: each rung kicks in at
@@ -275,27 +248,6 @@ export function todayLineBucketMs(msSinceMidnight: number): number {
   }
   return chosen;
 }
-
-// ---------------------------------------------------------------------------
-// The `block` bucket (ADR-0031, pinned by ADR-0046)
-// ---------------------------------------------------------------------------
-//
-// The `block` span's window grows from the active block's start (ADR-0031), so
-// it originally picked an adaptive rung (1→15 min, target 16) to keep a
-// minutes-old block from drawing as a single bar. ADR-0046 replaced that ladder
-// with a constant MINUTE for both BARS and LINES: the ladder's mature end —
-// 15-minute bars on any block older than ~3h45m — was precisely the resolution
-// that made the tab too coarse to read.
-//
-// A block window is at most 5 hours (BLOCK_WINDOW_MS), so a fixed minute is
-// statically bounded at 300 buckets. That count is only drawable because the
-// renderer switches to its step-area dense mode above ~121 buckets (ADR-0046).
-//
-// Still applied SIDECAR-side (the `options.bucketMs ??` default in
-// `aggregateBlockSpan`) rather than sent by the renderer: a constant could
-// travel either way, but keeping the default where the resolved window lives
-// leaves `block` the one span whose bucket the server owns, as ADR-0031 had it.
-export const BLOCK_BUCKET_MS = 60_000;
 
 // ---------------------------------------------------------------------------
 // BucketRow — one time bucket's rollup
@@ -335,18 +287,6 @@ export type BucketRow = z.infer<typeof bucketRowSchema>;
 // IntradayResponse — the `/api/intraday` body
 // ---------------------------------------------------------------------------
 
-// The `block` span's resolved frame (ADR-0031): the active block's real window
-// + its formation provenance (ADR-0028/0029 — same vocabulary as BlockRow's
-// windowSource). `null` on the wire means "no active block" (the renderer's
-// empty state); non-block spans always carry `null`.
-export const blockSpanWindowSchema = z.object({
-  start: z.string(), // ISO — the block's start (exact, or the heuristic hour-floor)
-  end: z.string(), // ISO — the real reset / start+5h / the successor's start if annulled
-  source: windowSourceSchema, // same provenance vocabulary as BlockRow.windowSource
-});
-
-export type BlockSpanWindow = z.infer<typeof blockSpanWindowSchema>;
-
 // ADR-0041 (M6) — one machine's densified window pair, the byMachine entry.
 // Same shape as a byProject entry minus `path` (machines have no working
 // directory; names resolve renderer-side from the machine directory). When the
@@ -381,9 +321,7 @@ export const intradayMachineEntrySchema = z.object({
 //   is the local calendar day (local midnight in the request `tz` → now), not a
 //   `now`-relative `count*bucketMs` span, and `count` is DYNAMIC (server-derived
 //   from `now` + `tz`, one bar per elapsed local hour), not `SPAN_WINDOW_MS /
-//   bucketMs` (ADR-0020). EXCEPTION — the `block` span: its window is the active
-//   block's extent (block start → now, ≤ 5h), resolved server-side (ADR-0031).
-//   EXCEPTION — the `week` span: its window is the caller-supplied `weekStart`
+//   bucketMs` (ADR-0020). EXCEPTION — the `week` span: its window is the caller-supplied `weekStart`
 //   → now, at anchor-aligned daily buckets by default (ADR-0083).
 //
 // `previousBuckets` — the immediately-prior window of the same length:
@@ -394,12 +332,9 @@ export const intradayMachineEntrySchema = z.object({
 //   wasn't requested (`prev=0` → the lean ghost-off payload; ADR-0018).
 //   EXCEPTION — the `today` span: the ghost is the PRIOR CALENDAR DAY's same
 //   time-of-day slots (yesterday local-midnight → yesterday same-time), not a
-//   `count*bucketMs`-offset window (ADR-0020). EXCEPTION — the `block` span:
-//   the ghost is the PREVIOUS BLOCK's first `count` buckets aligned by
-//   time-into-block (ADR-0031), and it is `[]` when no previous block exists,
-//   even when the ghost was requested. EXCEPTION — the `week` span: the ghost
-//   is the PREVIOUS week (`weekStart − 7d` onward) aligned by time-into-week,
-//   the block rule (ADR-0083).
+//   `count*bucketMs`-offset window (ADR-0020). EXCEPTION — the `week` span:
+//   the ghost is the PREVIOUS week (`weekStart − 7d` onward) aligned by
+//   time-into-week (ADR-0083).
 //
 // `byProject` — per-project-slug buckets, for the chart's project-bearing
 //   group-bys. Each entry carries the project's real working-directory `path`
@@ -412,9 +347,8 @@ export const intradayMachineEntrySchema = z.object({
 //   lean by-model payload; ADR-0018).
 //
 //   Per-entry `previousBuckets` is `[]` when the ghost wasn't requested
-//   (`prev=0` — the lean ghost-off payload skips the per-slug previous grid)
-//   or the span has no previous window (the `block` span with no previous
-//   block). A slug active ONLY in the previous window still appears, its
+//   (`prev=0` — the lean ghost-off payload skips the per-slug previous grid).
+//   A slug active ONLY in the previous window still appears, its
 //   current `buckets` densified to zeros — the ghost overlay works in every
 //   group-by selection (ADR-0034).
 export const intradayResponseSchema = z.object({
@@ -427,7 +361,7 @@ export const intradayResponseSchema = z.object({
       buckets: z.array(bucketRowSchema),
       // ADR-0034 — the slug's previous-window ghost series: same count +
       // densification as the top-level `previousBuckets`, `[]` when the ghost
-      // wasn't requested (`prev=0`) or the span has no previous window.
+      // wasn't requested (`prev=0`).
       previousBuckets: z.array(bucketRowSchema),
     }),
   ),
@@ -437,8 +371,6 @@ export const intradayResponseSchema = z.object({
   // Keys are machineId-ascending; entries follow ADR-0034's ghost semantics
   // (per-machine previousBuckets, [] when the ghost wasn't requested).
   byMachine: z.record(z.string(), intradayMachineEntrySchema).optional(),
-  // ADR-0031 — the resolved active-block frame for span=block; null otherwise.
-  blockWindow: blockSpanWindowSchema.nullable(),
 });
 
 export type IntradayResponse = z.infer<typeof intradayResponseSchema>;

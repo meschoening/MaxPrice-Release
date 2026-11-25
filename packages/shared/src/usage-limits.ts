@@ -28,38 +28,34 @@ export const windowStatesSchema = z.object({
 });
 export type WindowStates = z.infer<typeof windowStatesSchema>;
 
-// One timestamped reading — persisted per line of usage-history.jsonl (ADR-0024)
-// with every window the Organization has in flight: the five-hour window
-// always, and the weekly one unless the Organization reports no weekly limit
-// (#384). `capturedAt` is when WE polled, not an upstream field.
+// A Usage sample (GLOSSARY.md): one reading kept as a line of
+// usage-history.jsonl (ADR-0024), holding the windows that were in flight when
+// it was read. Each window is optional, and one is enough (ADR-0145 §2): a
+// window missing from a line was not in flight at that instant, and the line
+// does not say whether it was idle or the plan has none (the Window states
+// say that, and stay with the live state). A plan with no 5-hour window, such
+// as a verified Ultra plan, is recorded like any other; a line holding no
+// window at all is malformed, and skipped like any other. `capturedAt` is when
+// WE polled, not an upstream field.
 //
-// FORWARD-COMPAT (review f8): usage-history.jsonl is the app's first cross-upgrade
-// persistent artifact — it outlives any single app version. `loadHistory` silently
-// SKIPS any line that fails this schema, so adding a NEW REQUIRED field here would
-// make every previously-written line (which lacks it) fail validation and be
-// dropped — silently wiping all prior history on upgrade. THEREFORE: any field
-// ADDED to UsageSample MUST be `.optional()` (or `.default(...)`) so old lines stay
-// backward-readable. The current fields stay required — every existing line already
-// has them. See ADR-0024 ("Consequences") for the recorded rule.
-//
-// `weekly` became OPTIONAL in #384, which loosens a field rather than adding
-// one: every older line still parses. Its absence means the Organization
-// reported no weekly limit on that read (an absent Window state, the Enterprise
-// shape), never an idle one — an idle weekly window keeps the reading out of
-// history (`completeUsageSample`). An older build skips such a line on load,
-// by the same rule, and protocol v6 keeps older peers off the Hub wire that
-// carries it (ADR-0024's #384 amendment).
-export const usageSampleSchema = z.object({
+// FORWARD-COMPAT (review f8): usage-history.jsonl outlives any single app
+// version, and `loadHistory` silently SKIPS any line that fails this schema.
+// A NEW field must therefore be `.optional()` (or `.default(...)`), or every
+// line written before it is dropped on upgrade (ADR-0024, "Consequences").
+// Loosening a field keeps every older line valid, as `weekly` (#384) and
+// `fiveHour` (ADR-0145) were loosened; an older build skips the looser line on
+// load, and a protocol bump (v6, v8) keeps older peers off the Hub wire that
+// carries it.
+const usageSampleFields = z.object({
   capturedAt: z.string(),
-  fiveHour: usageWindowSchema,
+  fiveHour: usageWindowSchema.optional(),
   weekly: usageWindowSchema.optional(),
   // The Model-scoped weekly limit (GLOSSARY.md): Anthropic's weekly cap on one
   // model family's share, reported beside the all-model weekly limit as a
   // `weekly_scoped` entry of the upstream `limits[]` with a model scope. Which
   // family is scoped rides along as `model` (today "Fable"), so every surface
-  // labels it from the wire and nothing assumes the family. OPTIONAL by the
-  // forward-compat rule above AND by meaning: absent when the account reports
-  // no scoped window — a complete sample, not a broken one.
+  // labels it from the wire and nothing assumes the family. Absent when the
+  // account reports no scoped window in flight.
   weeklyModel: usageWindowSchema.extend({ model: z.string() }).optional(),
   // The Organization (GLOSSARY.md) requested at poll time.
   // Absent = a legacy line written
@@ -73,38 +69,43 @@ export const usageSampleSchema = z.object({
   // Account. OPTIONAL by the forward-compat rule above.
   accountUuid: z.string().min(1).optional(),
 });
+export const usageSampleSchema = usageSampleFields.refine(
+  (s) => s.fiveHour !== undefined || s.weekly !== undefined || s.weeklyModel !== undefined,
+  { message: "a Usage sample holds at least one window" },
+);
 export type ModelScopedWindow = NonNullable<UsageSample["weeklyModel"]>;
 export type UsageSample = z.infer<typeof usageSampleSchema>;
 
 // Live windows are independent: an idle five-hour window must not erase a
-// valid weekly reading. History keeps its complete-sample contract above.
-export const usageReadingSchema = usageSampleSchema.extend({
+// valid weekly reading. A null window is one not in flight.
+export const usageReadingSchema = usageSampleFields.extend({
   fiveHour: usageWindowSchema.nullable(),
   weekly: usageWindowSchema.nullable(),
 });
 export type UsageReading = z.infer<typeof usageReadingSchema>;
 
 // A history line read as live state (the first-paint fallback before a read):
-// a line with no weekly window is a reading with none in flight (#384).
+// a window the line lacks is one not in flight.
 export function sampleAsReading(sample: UsageSample): UsageReading {
-  return { ...sample, weekly: sample.weekly ?? null };
+  return { ...sample, fiveHour: sample.fiveHour ?? null, weekly: sample.weekly ?? null };
 }
 
 /**
- * Only complete readings enter the block-reconstruction history: a five-hour
- * window in flight, and a weekly window in flight unless the read found the
- * Organization has none (#384). So an Enterprise organization's live five-hour
- * window is history, and its Blocks form from observed windows, while a reading
- * whose weekly window is merely idle stays live-only, as before.
+ * The Usage sample a reading writes to the history (ADR-0145 §2): its windows
+ * in flight, when at least one of the 5-hour, weekly and Model-scoped weekly
+ * windows is. A reading with none in flight writes no line.
  */
-export function completeUsageSample(
-  reading: UsageReading | null,
-  windowStates: WindowStates,
-): UsageSample | null {
-  if (reading?.fiveHour == null) return null;
-  const { weekly, ...rest } = reading;
-  if (weekly !== null) return { ...rest, fiveHour: reading.fiveHour, weekly };
-  return windowStates.weekly === "absent" ? { ...rest, fiveHour: reading.fiveHour } : null;
+export function usageSampleOf(reading: UsageReading | null): UsageSample | null {
+  if (reading === null) return null;
+  const { capturedAt, fiveHour, weekly, ...rest } = reading;
+  if (fiveHour === null && weekly === null && rest.weeklyModel === undefined) return null;
+  // The schema's key order, which is the line's byte order on disk.
+  return {
+    capturedAt,
+    ...(fiveHour === null ? {} : { fiveHour }),
+    ...(weekly === null ? {} : { weekly }),
+    ...rest,
+  };
 }
 
 // Connection lifecycle for the subtle status indicator (ADR-0023).
@@ -261,7 +262,8 @@ export const orgLimitsAnswerSchema = z.enum(["windows", "none", "forbidden", "er
 export type OrgLimitsAnswer = z.infer<typeof orgLimitsAnswerSchema>;
 
 // Only Organizations whose endpoint has answered appear here. lastReadAt is
-// the last SUCCESSFUL read (windows/none); lastSampleAt is complete history.
+// the last SUCCESSFUL read (windows/none); lastSampleAt is the newest line
+// of its history.
 // `windowStates` is what that last successful read said about each primary
 // window (#384), kept like `lastReadAt` across a failed read, and null before
 // any: the per-window fact a "no limit" surface reads.
@@ -274,6 +276,32 @@ export const organizationUsageStatusSchema = z.object({
 export const usageOrganizationsSchema = z.record(organizationUsageStatusSchema);
 export type OrganizationUsageStatus = z.infer<typeof organizationUsageStatusSchema>;
 export type UsageOrganizations = z.infer<typeof usageOrganizationsSchema>;
+
+// The newest of some ISO instants, null when none is set. Producers write
+// `toISOString()`, fixed-width UTC, so string order is time order.
+export function newestInstant(instants: Iterable<string | null>): string | null {
+  let newest: string | null = null;
+  for (const at of instants) {
+    if (at !== null && (newest === null || at > newest)) newest = at;
+  }
+  return newest;
+}
+
+/**
+ * When the Head membership's limits were last read (ADR-0145 §6), which the
+ * freshness copy words ("read 5m ago"): the head Organization's status, whose
+ * read is its projected Membership's, the Home membership's where the
+ * Organization holds it. With no head (no Home), the newest read of any
+ * Organization. Null before a read succeeds: the read time lives in memory,
+ * so a restart clears it.
+ */
+export function headLastReadAt(
+  organizations: UsageOrganizations,
+  head: string | null | undefined,
+): string | null {
+  if (head != null) return organizations[head]?.lastReadAt ?? null;
+  return newestInstant(Object.values(organizations).map((status) => status.lastReadAt));
+}
 
 // A Membership's readability (ADR-0138 §8, GLOSSARY.md): whether its Account's
 // key can read that Membership's limits now. `readable` — the key works and

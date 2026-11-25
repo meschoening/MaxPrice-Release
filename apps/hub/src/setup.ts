@@ -28,7 +28,7 @@ import {
 } from "./operator-client";
 import {
   cliPageClear,
-  PAGE_APACHE_LINES,
+  pageApacheLines,
   probePage,
   type ProbeDeps,
   readingLine,
@@ -36,8 +36,14 @@ import {
 } from "./page-publish";
 import { hostAndPort } from "./rebind";
 import { RESTORE_STAGING, unfinishedRestore } from "./restore";
-import { UNIT } from "./serve-lock";
-import { type HubAnswers, hubDataDirOnInstall, hubService, hubUnit } from "./service";
+import { serviceName, withService } from "./serve-lock";
+import {
+  type HubAnswers,
+  hubDataDirOnInstall,
+  hubService,
+  hubUnit,
+  trayHubWarning,
+} from "./service";
 import type { SetupTerminal } from "./setup-terminal";
 import { VERSION } from "./version";
 
@@ -48,7 +54,9 @@ import { VERSION } from "./version";
 // step 2 `password set`'s runPasswordSet or the `password clear` verb, which
 // index.ts hands in (setupPasswordSteps), step 3 `page set`'s setHubPageUrl,
 // its snippet left out (§3), or `page clear`, and step 4 `service install`,
-// its linger advice withheld for the ending.
+// its linger advice withheld for the ending. On macOS step 4 installs the
+// LaunchAgent, and the ending names the login where Linux names linger
+// (ADR-0146 §10).
 // Setup's own logic is the gates it passes before anything is created, the
 // unit's data dir among them (§1, §2), the prompting around the steps (§3),
 // the data dir and hub.json it makes first, as serve does (§2), and the
@@ -188,6 +196,9 @@ type Walk = {
   dataDir: string;
   // The data dir as lines show it.
   shown: string;
+  // The service step 4 installs, as lines name it: maxprice-hub.service, or
+  // on macOS the LaunchAgent com.maxprice.headless-hub.
+  service: string;
 };
 
 // One of setup's own lines, on stdout, any outside text in it made inert.
@@ -243,16 +254,23 @@ function readStatus(hub: RunningHub): HubStatus {
 // password (ADR-0127 §5). With no user manager nothing is installed, and
 // neither applies. The shell's dir is read against `cwd`, as `service
 // status` reads it.
-function refuseOtherDataDir(unit: UnitReading, dataDir: string, env: Env, cwd: string): void {
+function refuseOtherDataDir(
+  unit: UnitReading,
+  dataDir: string,
+  env: Env,
+  cwd: string,
+  platform: NodeJS.Platform,
+): void {
   if (unit.kind !== "unit") return;
+  const service = serviceName(platform);
   const shellDir = resolve(cwd, dataDir);
   const shellShown = displayPath(shellDir, env);
   if (unit.installed && unit.dataDir !== shellDir) {
     throw new CliError(
       EXIT.USAGE,
-      `${UNIT} serves ${displayPath(unit.dataDir, env)}, not this shell's ${shellShown}`,
+      `${service} serves ${displayPath(unit.dataDir, env)}, not this shell's ${shellShown}`,
       [
-        `Set MAXPRICE_HUB_DATA_DIR=${unit.dataDir} and run setup again, or point the unit here: MAXPRICE_HUB_DATA_DIR=${shellDir} maxprice-hub service install`,
+        `Set MAXPRICE_HUB_DATA_DIR=${unit.dataDir} and run setup again, or point the ${platform === "darwin" ? "agent" : "unit"} here: MAXPRICE_HUB_DATA_DIR=${shellDir} maxprice-hub service install`,
       ],
     );
   }
@@ -260,7 +278,7 @@ function refuseOtherDataDir(unit: UnitReading, dataDir: string, env: Env, cwd: s
   if (wouldServe !== shellDir) {
     throw new CliError(
       EXIT.USAGE,
-      `${UNIT} would serve ${displayPath(wouldServe, env)}, not this shell's ${shellShown}: the unit never sees XDG_DATA_HOME`,
+      `${service} would serve ${displayPath(wouldServe, env)}, not this shell's ${shellShown}: the ${platform === "darwin" ? "agent" : "unit"} never sees XDG_DATA_HOME`,
       [`Set MAXPRICE_HUB_DATA_DIR=${shellDir} and run setup again`],
     );
   }
@@ -457,22 +475,29 @@ async function stepPageUrl(walk: Walk): Promise<void> {
 // rather than to another init.
 type ServiceOutcome = { installed: boolean; started: boolean; failed: boolean };
 
-// Step 4, `maxprice-hub.service`, from the gate's reading of it. With no
-// user manager there is nothing to install, and the step says where a unit
-// for another init is. An installed unit is installed again, with no
+// Step 4, `maxprice-hub.service`, or on macOS the LaunchAgent, from the
+// gate's reading of it. With no user manager, or no launchd GUI session,
+// there is nothing to install, and the step says where a unit for another
+// init, or a LaunchDaemon, is. An installed unit is installed again, with no
 // question: install rewrites nothing that did not change and restarts only
 // what did. Install's lines are its own, its linger advice withheld; then
 // the state it left. A failure prints why and offers to try again.
 async function stepService(walk: Walk, unit: UnitReading): Promise<ServiceOutcome> {
+  const darwin = walk.platform === "darwin";
   if (unit.kind === "no-manager") {
-    say(walk, "4/4 Service: no systemd user manager");
+    say(walk, `4/4 Service: no ${darwin ? "launchd GUI session" : "systemd user manager"}`);
     say(walk, `    ${unit.message}`);
-    say(walk, "    apps/hub/README.md shows a unit for other inits.");
+    say(
+      walk,
+      darwin
+        ? "    apps/hub/README.md shows a LaunchDaemon."
+        : "    apps/hub/README.md shows a unit for other inits.",
+    );
     return { installed: false, started: false, failed: false };
   }
   if (unit.installed) {
-    say(walk, `4/4 Service: ${UNIT} is installed`);
-  } else if (!(await yesNo(walk, `4/4 Install and start ${UNIT}? [Y/n] `, true))) {
+    say(walk, `4/4 Service: ${walk.service} is installed`);
+  } else if (!(await yesNo(walk, `4/4 Install and start ${walk.service}? [Y/n] `, true))) {
     say(walk, "    Skipped.");
     return { installed: false, started: false, failed: false };
   }
@@ -485,6 +510,7 @@ async function stepService(walk: Walk, unit: UnitReading): Promise<ServiceOutcom
         platform: walk.platform,
         hubAnswers,
         adviseLinger: false,
+        warnTrayHub: false,
         self,
         cwd,
         uid: walk.uid,
@@ -495,7 +521,17 @@ async function stepService(walk: Walk, unit: UnitReading): Promise<ServiceOutcom
       if (await yesNo(walk, "    Try again? [y/N] ", false)) continue;
       return { installed: unit.installed, started: false, failed: true };
     }
-    const now = await hubUnit({ env: walk.env, hubAnswers, readCgroup });
+    const read = () =>
+      hubUnit({ env: walk.env, platform: walk.platform, uid: walk.uid, hubAnswers, readCgroup });
+    let now = await read();
+    // launchd reports a job it is still spawning as `xpcproxy` (seen on the
+    // Mac mini right after bootstrap), so on macOS step 4 reads again,
+    // briefly, until the agent runs.
+    for (let left = AGENT_SPAWN_READS; darwin && now.kind === "unit" && left > 0; left--) {
+      if (now.activeState === "running") break;
+      await Bun.sleep(AGENT_SPAWN_POLL_MS);
+      now = await read();
+    }
     if (now.kind === "unit" && now.activeState !== "") {
       say(
         walk,
@@ -505,6 +541,11 @@ async function stepService(walk: Walk, unit: UnitReading): Promise<ServiceOutcom
     return { installed: true, started: true, failed: false };
   }
 }
+
+// Step 4's wait on macOS for an agent launchd is still spawning: at most
+// 2 s, then whatever state it is in is the one printed.
+const AGENT_SPAWN_READS = 20;
+const AGENT_SPAWN_POLL_MS = 100;
 
 // /etc/passwd's text, or null when it cannot be read.
 function readPasswd(): string | null {
@@ -530,18 +571,20 @@ export function loginName(uid: number, passwd: string | null): string {
 // The sudo steps still missing (§5): the linger line while the unit is
 // installed and logind reads `Linger=no` (lingerOff, install's own rule),
 // then ADR-0125 §7's Apache lines while a Hub page URL is set and the page
-// is not published there, without `page`'s check, which the Enter makes.
+// is not published there, without `page`'s check, which the Enter makes. On
+// macOS there is no linger line, and the Apache lines are Apple's Apache's
+// (ADR-0146 §10, §11).
 async function sudoLines(
   walk: Walk,
   installed: boolean,
   published: boolean | null,
 ): Promise<string[]> {
   const lines: string[] = [];
-  if (installed && lingerOff(await readLinger(walk.env, walk.uid))) {
+  if (walk.platform !== "darwin" && installed && lingerOff(await readLinger(walk.env, walk.uid))) {
     const passwd = walk.deps.passwd === undefined ? readPasswd() : walk.deps.passwd;
     lines.push(`sudo loginctl enable-linger ${loginName(walk.uid, passwd)}`);
   }
-  if (published === false) lines.push(...PAGE_APACHE_LINES);
+  if (published === false) lines.push(...pageApacheLines(walk.platform));
   return lines;
 }
 
@@ -559,12 +602,17 @@ async function ending(walk: Walk, service: ServiceOutcome): Promise<number> {
   const { dataDir, env, deps } = walk;
   say(walk, "");
   const holder = runningHolder(dataDir, deps.reach?.readCgroup);
+  // Whether that holder runs in the service, read once, before the wait: a
+  // pid it relaunches meanwhile no longer matches the agent's.
+  const holderInService = holder !== null && withService(holder, env, walk.platform).service;
   if (!service.started && holder === null) {
     say(
       walk,
       service.failed
-        ? `No Hub is running: ${UNIT} did not start. Once what stopped it is fixed, run maxprice-hub service install, then check it with maxprice-hub page and maxprice-hub status.`
-        : "No Hub is running. Start 'maxprice-hub serve' under your own init (apps/hub/README.md shows a unit), then check it with maxprice-hub page and maxprice-hub status.",
+        ? `No Hub is running: ${walk.service} did not start. Once what stopped it is fixed, run maxprice-hub service install, then check it with maxprice-hub page and maxprice-hub status.`
+        : walk.platform === "darwin"
+          ? "No Hub is running. Start 'maxprice-hub serve' in a terminal or under a LaunchDaemon (apps/hub/README.md shows one), then check it with maxprice-hub page and maxprice-hub status."
+          : "No Hub is running. Start 'maxprice-hub serve' under your own init (apps/hub/README.md shows a unit), then check it with maxprice-hub page and maxprice-hub status.",
     );
     return EXIT.OK;
   }
@@ -576,7 +624,7 @@ async function ending(walk: Walk, service: ServiceOutcome): Promise<number> {
       readCgroup: deps.reach?.readCgroup,
     });
     if (awaited.kind === "none") {
-      const unitRuns = service.started || holder?.service === true;
+      const unitRuns = service.started || holderInService;
       throw new CliError(
         EXIT.FAILURE,
         `the Hub did not answer within ${waitMs / 1000} s: ${awaited.reason}`,
@@ -623,6 +671,10 @@ async function ending(walk: Walk, service: ServiceOutcome): Promise<number> {
   // the startup response is already the final reading: no second request.
   if (url !== null || service.installed) ({ hub, status } = await currentHub());
   if (separate) say(walk, "");
+  // §10: the agent runs only while this user is logged in.
+  if (walk.platform === "darwin" && service.installed) {
+    say(walk, "The Hub starts when you log in to this Mac.");
+  }
   for (const line of joinLines(status, hub.port, walk.shown)) say(walk, line);
   return EXIT.OK;
 }
@@ -635,8 +687,8 @@ async function ending(walk: Walk, service: ServiceOutcome): Promise<number> {
 export async function runSetup(io: Io, deps: SetupDeps): Promise<number> {
   const env = deps.env ?? process.env;
   const platform = deps.platform ?? process.platform;
-  if (platform !== "linux") {
-    throw new CliError(EXIT.USAGE, "Linux only; the hub tray app sets itself up");
+  if (platform !== "linux" && platform !== "darwin") {
+    throw new CliError(EXIT.USAGE, "Linux and macOS only; the hub tray app sets itself up");
   }
   const uid = deps.uid ?? process.getuid?.() ?? 0;
   if (uid === 0) {
@@ -652,10 +704,12 @@ export async function runSetup(io: Io, deps: SetupDeps): Promise<number> {
   const dataDir = defaultDataDir(env, platform);
   const unit = await hubUnit({
     env,
+    platform,
+    uid,
     hubAnswers: deps.service.hubAnswers,
     readCgroup: deps.reach?.readCgroup,
   });
-  refuseOtherDataDir(unit, dataDir, env, deps.service.cwd ?? process.cwd());
+  refuseOtherDataDir(unit, dataDir, env, deps.service.cwd ?? process.cwd(), platform);
 
   const shown = displayPath(dataDir, env);
   const walk: Walk = {
@@ -667,6 +721,7 @@ export async function runSetup(io: Io, deps: SetupDeps): Promise<number> {
     uid,
     dataDir,
     shown,
+    service: serviceName(platform),
   };
   // Setup words the tightening itself, under its first line.
   const prepared = prepareDataDir(dataDir, () => {});
@@ -675,6 +730,9 @@ export async function runSetup(io: Io, deps: SetupDeps): Promise<number> {
   if (prepared.tightenedFrom !== null) {
     say(walk, `    tightened ${shown} from ${octal(prepared.tightenedFrom)} to 0700`);
   }
+  // One Hub per Mac (ADR-0146 §13): a warning, never a refusal.
+  const tray = trayHubWarning(env, platform);
+  if (tray !== null) say(walk, `    Warning: ${tray}`);
   try {
     await stepKey(walk, state);
     await stepPassword(walk, state);

@@ -22,7 +22,7 @@ import { cn } from "@/lib/utils";
 // filter is hidden (fewer than two tracked Accounts) and two or more
 // Organizations are tracked (`buildScopeChipView`), so a single-Organization
 // machine, and every several-Account one, renders no chip. Under All it also
-// names the head Organization, whose limits and blocks the page still shows.
+// names the head Organization, whose limits the page still shows.
 //
 // A pick writes `scope` on the Organization axis alone (`chipScope`): Home as
 // `null`, All as `all`, another Organization as its uuid. It invalidates no
@@ -77,7 +77,7 @@ export function ScopeHiddenNote(): React.ReactElement {
 // The pure composition — the view handed in so the trigger is testable under
 // static rendering. The menu opens on the selected option, and closes on a pick
 // or Escape with focus back on the trigger (Radix). Under All the label holds
-// its width (`scope-chip-all`) and the quota half is what truncates. With a
+// its width (`scope-chip-all`) and the limits half is what truncates. With a
 // hidden selection the trigger wears an info mark, its accessible name and
 // title carry the note, and the menu heads with it.
 export function TopbarScopeChipContent({
@@ -104,7 +104,7 @@ export function TopbarScopeChipContent({
         <Building2 aria-hidden className="scope-chip-icon" />
         <span className={cn("truncate", view.isAll && "scope-chip-all")}>{view.chipLabel}</span>
         {view.isAll ? (
-          <span className="scope-chip-quota">{`quota · ${view.quotaLabel}`}</span>
+          <span className="scope-chip-quota">{`limits · ${view.quotaLabel}`}</span>
         ) : null}
         {view.hiddenSelection ? <Info aria-hidden className="scope-chip-hidden" /> : null}
         <ChevronDown aria-hidden className="caret" />

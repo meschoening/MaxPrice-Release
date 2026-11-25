@@ -1,10 +1,11 @@
 import { UPDATE_CHANNEL } from "@maxprice/shared";
-import type { SelfUpdateProduct } from "@maxprice/usage-core/self-update";
+import { channelEntry, type SelfUpdateProduct } from "@maxprice/usage-core/self-update";
 
 // The Headless Hub's view of the update channel (ADR-0129 §3, §4, §7):
 // `headless-hub-latest.json` on the `MP-Updates` release, signed by the key
-// UPDATE_CHANNEL carries, holding one linux-x86_64 entry whose tarball holds
-// `maxprice-hub`. `update` installs from it, and a Headless `serve` checks it
+// UPDATE_CHANNEL carries, holding a linux-x86_64 and a darwin-aarch64 entry
+// (ADR-0147 §6), each pointing at a tarball that holds `maxprice-hub`.
+// `update` installs from this host's entry, and a Headless `serve` checks it
 // at boot and every 6 h. The Headless client's is apps/cli/src/update-channel.ts;
 // `hub-latest.json` stays the Windows tray app's, read by Tauri's updater.
 //
@@ -31,8 +32,8 @@ const testChannel =
 export const PRODUCT: SelfUpdateProduct = {
   manifestUrl: testChannel?.manifestUrl ?? UPDATE_CHANNEL.baseUrl + MANIFEST_NAME,
   pubkey: testChannel?.pubkey ?? UPDATE_CHANNEL.pubkey,
-  platform: "linux-x86_64",
-  // ADR-0129 §4: the name CI signs the tarball under, which check 3 matches.
-  assetName: (version) => `maxprice-hub_${version}_linux-x64.tar.gz`,
+  // This host's entry and the name CI signs its tarball under, which check 3
+  // matches (ADR-0129 §4, ADR-0147 §6): usage-core's `channelEntry`.
+  ...channelEntry("maxprice-hub", process.platform, process.arch),
   binaryName: "maxprice-hub",
 };

@@ -1,5 +1,4 @@
 import {
-  appendFileSync,
   chmodSync,
   closeSync,
   constants,
@@ -13,7 +12,6 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
-  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -25,13 +23,13 @@ import { isDeepStrictEqual } from "node:util";
 import {
   LABEL_DIRECTORY_MAX,
   MEMBERSHIP_ASSERTION_DIRECTORY_MAX,
-  usageSampleSchema,
   type UsageSample,
 } from "@maxprice/shared";
 import {
   byCapturedAt,
   createSampleStore,
   FleetArchiveUnrestorable,
+  readHistoryLine,
   restoreHubArchive,
   type RestoredHubArchive,
 } from "@maxprice/usage-core";
@@ -39,7 +37,7 @@ import { displayPath, type Env } from "@maxprice/usage-core/home-path";
 import { fsErrorName } from "@maxprice/usage-core/secrets-file";
 import { describeHolder, type ReadCgroup } from "@maxprice/usage-core/serve-lock";
 import { CliError, EXIT, type Writer } from "./cli";
-import { defaultDataDir, hubFileConfigSchema, parseHubConfigText } from "./config";
+import { defaultDataDir, hubFileConfigSchema, parseHubConfigText, runsHeadlessHub } from "./config";
 import { prepareDataDir } from "./data-dir";
 import {
   LABEL_DIRECTORY_FILE,
@@ -52,7 +50,7 @@ import {
   MEMBERSHIP_ASSERTION_DIRECTORY_FILE,
   migrateOrganizationAssertionDirectoryFile,
 } from "./membership-assertion-directory";
-import { readOnlyLockHolder, serveLockPath, takeVerbLock, UNIT } from "./serve-lock";
+import { readOnlyLockHolder, serveLockPath, serviceName, takeVerbLock } from "./serve-lock";
 
 // `maxprice-hub restore <dir> [--samples <usage-history.jsonl>]...` (ADR-0130):
 // a stopped Hub's data dir, or a backup of one, copied into a data dir that
@@ -69,7 +67,7 @@ import { readOnlyLockHolder, serveLockPath, takeVerbLock, UNIT } from "./serve-l
 // past its own stalls for good. `--samples` merges clients' usage histories
 // into the restored one, for the Hub's own samples since the backup (§4).
 //
-// Linux only, with the daemon down (§5): it holds the data dir's serve.lock
+// Linux and macOS only (ADR-0146 §14), with the daemon down (§5): it holds the data dir's serve.lock
 // for its whole run, as the verbs that edit the data files do (ADR-0127 §3),
 // and has no path through a running Hub. A file copy reads only a stopped
 // Hub's archive consistently (§2), so restore also refuses a backup whose
@@ -234,9 +232,23 @@ function archiveState(source: string): string {
     .join("\n");
 }
 
+// realpathSync, but for a directory this user may search and not read: on
+// macOS realpath(3) opens the path, and a backup dir at 0311 refuses that
+// with EACCES, where Linux resolves it. Such a dir that is no symlink is its
+// real parent's entry.
+function realPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EACCES" || lstatSync(path).isSymbolicLink())
+      throw error;
+    return join(realpathSync(dirname(path)), basename(path));
+  }
+}
+
 function sameDir(a: string, b: string): boolean {
   try {
-    return realpathSync(a) === realpathSync(b);
+    return realPath(a) === realPath(b);
   } catch {
     // The data dir does not exist yet, so it is not <dir>.
     return false;
@@ -248,7 +260,7 @@ function sameDir(a: string, b: string): boolean {
 // has the same physical name as an input reached through another alias.
 function physicalPath(path: string): string {
   try {
-    return realpathSync(path);
+    return realPath(path);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
@@ -400,15 +412,10 @@ function readClientHistory(path: string, shown: (path: string) => string): Clien
   const samples: UsageSample[] = [];
   let skipped = 0;
   for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed === "") continue;
-    let parsed: ReturnType<typeof usageSampleSchema.safeParse> | null = null;
-    try {
-      parsed = usageSampleSchema.safeParse(JSON.parse(trimmed));
-    } catch {
-      // not JSON
-    }
-    if (parsed?.success) samples.push(parsed.data);
+    if (line.trim() === "") continue;
+    // A torn line yields the whole sample after its fragment (#747).
+    const read = readHistoryLine(line);
+    if (read !== null) samples.push(read.sample);
     else skipped += 1;
   }
   if (samples.length === 0 && skipped > 0) {
@@ -440,19 +447,6 @@ function fsyncPath(path: string): void {
   }
 }
 
-function endsWithNewline(path: string): boolean {
-  const size = statSync(path).size;
-  if (size === 0) return true;
-  const fd = openSync(path, "r");
-  try {
-    const last = Buffer.alloc(1);
-    readSync(fd, last, 0, 1, size - 1);
-    return last[0] === 0x0a;
-  } finally {
-    closeSync(fd);
-  }
-}
-
 const count = (n: number): string => n.toLocaleString("en-US");
 
 function counted(n: number, noun: string): string {
@@ -468,9 +462,8 @@ function counted(n: number, noun: string): string {
 // they are appended in it.
 async function mergeHistory(path: string, clients: readonly ClientHistory[]): Promise<string> {
   const inBackup = existsSync(path);
-  // A Hub killed mid-append leaves its last line cut short; the first merged
-  // line must not join it.
-  if (clients.length > 0 && inBackup && !endsWithNewline(path)) appendFileSync(path, "\n");
+  // A Hub killed mid-append leaves its last line cut short; the store's first
+  // append starts a new line rather than join it (#747).
   const store = createSampleStore({ path });
   await store.loadHistory();
   const historySummary = (): string => {
@@ -752,9 +745,12 @@ export async function restoreHub(
     readCgroup,
     betweenArchiveCopies,
   } = options;
-  // As `key set` (ADR-0126 §9): the lock and the modes are Linux's, and the
-  // tray app has no use for it. Refused before anything is read or created.
-  if (platform !== "linux") throw new CliError(EXIT.USAGE, "maxprice-hub restore is Linux only");
+  // As `key set` (ADR-0126 §9, ADR-0146 §14): the lock and the modes are a
+  // Headless Hub's, on Linux and macOS, and the tray app has no use for it.
+  // Refused before anything is read or created.
+  if (!runsHeadlessHub(platform)) {
+    throw new CliError(EXIT.USAGE, "maxprice-hub restore is Linux only");
+  }
   const shown = (path: string) => displayPath(path, env);
   const log = (line: string) => void stdout.write(`${line}\n`);
 
@@ -805,7 +801,7 @@ export async function restoreHub(
   if (holder !== null) {
     throw new CliError(
       EXIT.FAILURE,
-      `a Hub is running on ${shown(source)} (${describeHolder(holder, UNIT)}); stop it first: restore copies a stopped Hub's files`,
+      `a Hub is running on ${shown(source)} (${describeHolder(holder, serviceName(platform))}); stop it first: restore copies a stopped Hub's files`,
     );
   }
 

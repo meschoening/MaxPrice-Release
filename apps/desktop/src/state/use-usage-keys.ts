@@ -31,14 +31,6 @@ export function useUsageKeys() {
   });
 }
 
-// How many held keys are expired, the legacy key included: the count the
-// reconnect hint names (ADR-0138 §8).
-export function expiredKeyCount(report: UsageKeysResponse | undefined): number {
-  if (report === undefined) return 0;
-  const keys = report.keys.filter((k) => k.connection === "expired").length;
-  return keys + (report.legacy?.connection === "expired" ? 1 : 0);
-}
-
 // The upgrade's move (ADR-0138 §12): once the sidecar reports the legacy
 // key's Account, move it into that Account's entry (`moveLegacy`). The
 // sidecar retries the resolution at each boot and after each successful read,

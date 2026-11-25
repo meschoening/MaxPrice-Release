@@ -16,7 +16,7 @@ import type { ReportQueryOptions } from "./report-hook";
 // This honors the ADR-0004 four-piece hook split (key + URL + fetch + wrapper)
 // but does NOT go through `makeReportHook`: that helper builds a `since/until`
 // date-window URL, whereas `/api/intraday` windows itself on a fixed `span`
-// ("15m"/"1h"/"block"/"today" — and, since ADR-0018, the endpoint serves all six
+// ("15m"/"1h"/"today" — and, since ADR-0018, the endpoint serves all five
 // spans, "week"/"30d" included). So the four pieces are spelled out by hand —
 // the input, its normalization and the URL builder in `@maxprice/shared`'s
 // `report-url.ts`, the rest here — mirroring `makeReportHook`'s structure with

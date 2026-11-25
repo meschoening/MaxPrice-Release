@@ -12,7 +12,7 @@ Download the Desktop client for your system from the [releases page](https://git
 | Windows | `MaxPrice_<version>_x64-setup-win.exe` |
 | Linux   | `MaxPrice_<version>_linux.deb`         |
 
-The Windows file that starts `MaxPrice.Hub_` is the [Hub tray app](../hub-tray-app/overview.md), not the Desktop client.
+The files that start `MaxPrice.Hub_` are the [Hub tray app](../hub-tray-app/overview.md), not the Desktop client.
 
 ## Install it
 

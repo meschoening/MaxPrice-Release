@@ -1,10 +1,10 @@
-import { formatRemaining } from "./active-block";
+import { formatRemaining } from "./figure-format";
 import type { UsageWindow } from "./usage-limits";
 
 // Pure derivation for the usage-limit ring (ADR-0023): the arc fills with
 // utilization (the quantity that matters — how close to the cap), the center
-// counts down to the real reset. `fallback` tells the caller to render the
-// legacy local-block ring instead (disconnected / no sample / bad timestamp /
+// counts down to the real reset. `fallback` tells the caller there is no
+// limit to draw (disconnected / no sample / bad timestamp /
 // a reset that has already elapsed). Expiring at the reset boundary prevents a
 // last-known sample from surviving forever as a stale `0:00` account window.
 export type UsageRingState =

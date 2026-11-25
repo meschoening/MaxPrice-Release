@@ -34,8 +34,8 @@ export function UpdatesCard(): React.ReactElement {
   const now = useNowTick();
   // The platform gate is STATIC and resolved once, at mount — never inferred
   // from `check()` returning null, which means "up to date" AND "no entry for
-  // your platform" indistinguishably (map #143). Windows-only by SCOPE, not by
-  // bug: ADR-0050 scopes the packaged tray app to Windows.
+  // your platform" indistinguishably (map #143). Windows and macOS, the
+  // platforms hub-latest.json carries (ADR-0148 §7).
   const [state, setState] = useState<UpdateCardState>(() =>
     updatesSupported() ? { kind: "idle" } : { kind: "unsupported" },
   );
@@ -81,9 +81,10 @@ export function UpdatesCard(): React.ReactElement {
     if (update === null) return;
     const version = update.version;
     setState({ kind: "installing", version });
-    // On Windows this promise does not resolve: the plugin hands the installer
-    // to ShellExecuteW and then calls `std::process::exit(0)` (#144). Only the
-    // rejection path is reachable, and it is the one T2's table does not cover
+    // This promise does not resolve: on Windows the plugin hands the installer
+    // to ShellExecuteW and then calls `std::process::exit(0)` (#144), and on
+    // macOS `applyUpdate` relaunches the app once the new one is in place. Only
+    // the rejection path is reachable, and it is the one T2's table does not cover
     // — it returns to `available` with the button live and an `.err` line
     // inside the same inset, the console's established shape for a failed
     // action (HubStatusCard's firewall and compact insets do exactly this).

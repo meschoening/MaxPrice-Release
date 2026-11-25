@@ -5,10 +5,9 @@ import {
   LIMIT_STATE_WORDS,
   popoutView,
   rankedPopoutView,
-  type MembershipName,
   type PopoutHead,
+  type PopoutLimitRow,
   type PopoutViewState,
-  type RankedPopoutHead,
   type RankedPopoutRow,
   type RankedPopoutViewState,
 } from "@maxprice/shared";
@@ -19,13 +18,13 @@ import { cn } from "../lib/utils";
 import { MembershipNameView } from "./membership-name";
 import { usePendingUpdate, usePopoutData } from "../state/use-popout-data";
 import { useNowTick } from "../state/use-now-tick";
-import { useSettings, useTimeDisplay } from "../state/use-settings";
+import { useSettings } from "../state/use-settings";
 
 // The tray popout mini-dashboard (map #168 M3; the T3-approved "leaf" variant,
-// ADR-0050): a 54px-ring live header, quiet
-// 5-hour-limit / Weekly-limit / <Model>-limit (wire- AND setting-gated) /
-// Today (cost · tokens) rows, a pending-only accent update row, and
-// Open / Quit as kmenu items. Every quantity is a popout-owned sidecar fetch
+// ADR-0050): a 54px ring on the most used window (ADR-0142 §2), quiet limit
+// rows — a row per window the plan reports, <Model>-limit setting-gated, or
+// with several Memberships a row each — then Today (cost · tokens), a
+// pending-only accent update row, and Open / Quit as kmenu items. Every quantity is a popout-owned sidecar fetch
 // (use-popout-data — T5 decision 8); every window manipulation lives Rust-side
 // (ADR-0050 — blur dismissal never reaches this file; Esc invokes hide_popout).
 //
@@ -60,50 +59,34 @@ export function Popout(): React.ReactElement {
 }
 
 function PopoutDash(): React.ReactElement {
-  // 1Hz so the ring countdown crawls, like the Live tile. Throttled by the OS
+  // 1Hz so the head's reset countdown stays current. Throttled by the OS
   // while the window is hidden, which is exactly when nobody is looking.
   const now = useNowTick(1000);
-  const data = usePopoutData(now);
+  const data = usePopoutData();
   const pendingUpdate = usePendingUpdate();
-  const display = useTimeDisplay();
   const { data: settings } = useSettings();
 
-  const ranked =
-    data.ranked === null
-      ? null
-      : rankedPopoutView({
-          anyError: data.anyError,
-          engineStopped: data.engineStopped,
-          settled: data.settled,
-          ready: data.ready,
-          hasData: data.hasData,
-          todayCost: data.todayCost,
-          todayTokens: data.todayTokens,
-          now,
-          display,
-          allOrganizations: data.allOrganizations,
-          memberships: data.ranked.memberships,
-          headBlocks: data.ranked.headBlocks,
-        });
-  const view = popoutView({
+  const ladder = {
     anyError: data.anyError,
     engineStopped: data.engineStopped,
     settled: data.settled,
     ready: data.ready,
     hasData: data.hasData,
-    block: data.block,
-    usageWindow: data.usageWindow,
-    weeklyWindow: data.weeklyWindow,
-    modelWindow: data.modelWindow,
-    showModelLimit: settings?.showModelLimit ?? false,
-    usageConnected: data.usageConnected,
     todayCost: data.todayCost,
     todayTokens: data.todayTokens,
     now,
-    display,
-    quotaTag: data.quotaTag,
     allOrganizations: data.allOrganizations,
-    fiveHourState: data.fiveHourState,
+  };
+  const ranked = data.ranked === null ? null : rankedPopoutView({ ...ladder, ...data.ranked });
+  const view = popoutView({
+    ...ladder,
+    reading: data.reading,
+    usageConnection: data.usageConnection,
+    limits: data.limits,
+    windowStates: data.windowStates,
+    plan: data.plan,
+    showModelLimit: settings?.showModelLimit ?? false,
+    quotaTag: data.quotaTag,
   });
 
   const drawn = ranked ?? view;
@@ -149,15 +132,9 @@ export function PopoutBody({ view }: { view: PopoutViewState }): React.ReactElem
   return (
     <div className="pbody">
       <PopoutHeadRow head={view.head} />
-      <LimitRow
-        label="5-hour limit"
-        pct={view.limitPct}
-        emptyTrack={view.head.kind === "idle" && !view.noFiveHourLimit}
-      />
-      <LimitRow label="Weekly limit" pct={view.weeklyPct} />
-      {view.modelRow !== null ? (
-        <LimitRow label={view.modelRow.label} pct={view.modelRow.pct} />
-      ) : null}
+      {view.rows.map((row) => (
+        <LimitRow key={row.kind} row={row} />
+      ))}
       <TodayRow label={view.todayLabel} cost={view.todayText} tokens={view.todayTokensText} />
     </div>
   );
@@ -183,16 +160,16 @@ function TodayRow({
   );
 }
 
-// The ranked Popout (#638; #610's "head + ranked"): the head, the four most
-// used Memberships a row each, `+N more` past four, then Today. Every row is
-// one `.prow` (30px and a 1px gap), the height the shell gives each limit row
-// (`ranked_popout_content_height`). Exported for its test; the ladder's
-// other states are `PopoutBody`'s.
+// The ranked Popout (#638; #610's "head + ranked"): the most used window's
+// head, the four most used Memberships a row each, `+N more` past four, then
+// Today. Every row is one `.prow` (30px and a 1px gap), the height the shell
+// gives each limit row (`popout_content_height`). Exported for its test; the
+// ladder's other states are `PopoutBody`'s.
 export function RankedPopoutBody({ view }: { view: RankedPopoutViewState }): React.ReactElement {
   if (view.kind !== "ranked") return <PopoutBody view={view} />;
   return (
     <div className="pbody">
-      <RankedHeadRow head={view.head} />
+      <PopoutHeadRow head={view.head} />
       {view.rows.map((row) => (
         <RankedRow key={row.key} row={row} />
       ))}
@@ -211,8 +188,9 @@ export function RankedPopoutBody({ view }: { view: RankedPopoutViewState }): Rea
 // then its most used live window's meter and percent. A stale reading keeps
 // its last-known percent, greyed, with "key expired" in the meter's place; an
 // idle one the em-dash on an empty track (#320); the rest its state's words
-// (`LIMIT_STATE_WORDS`), dimmed. The name keeps its Account half whole while
-// the Organization part ellipsizes (`MembershipNameView`).
+// (`LIMIT_STATE_WORDS`), dimmed. The name keeps its plan word ahead of its
+// Account half, whose end stays (`MembershipNameView`), and its meter is
+// narrower than the one-Membership rows' to leave the name the room (#746).
 function RankedRow({ row }: { row: RankedPopoutRow }): React.ReactElement {
   const name = (
     <span className="name pname">
@@ -272,30 +250,24 @@ function RankedRow({ row }: { row: RankedPopoutRow }): React.ReactElement {
   );
 }
 
-// One usage-limit row: the mini meter + percent, or the ADR-0030 em-dash at
-// 0.55 row opacity when there is no fresh reading — never a stale percent.
-// `emptyTrack` is the 5-hour row under the idle head (#320: no active block
-// and no live 5-hour window): its em-dash keeps the meter's track beside it,
-// unfilled and hidden from assistive tech, so the row keeps its bar without
-// the bar reading as a measured 0%. A null pct alone cannot ask for it:
-// beside an active block null means a stale or unknown reading, and that row
-// keeps the bare em-dash. Nor does a Quota organization with no 5-hour limit
-// (#384: its Window state is absent), which has no window to be idle in.
-function LimitRow({
-  label,
-  pct,
-  emptyTrack = false,
-}: {
-  label: string;
-  pct: number | null;
-  emptyTrack?: boolean;
-}): React.ReactElement {
+// One limit row of the one-Membership Popout: the mini meter + percent, or
+// the ADR-0030 em-dash at 0.55 row opacity when there is no fresh reading —
+// never a stale percent. An idle window's em-dash keeps the meter's track
+// beside it (#320), unfilled and hidden from assistive tech, so the row
+// keeps its bar without the bar reading as a measured 0%. A plan with no
+// such limit says so in the meter's place (`none on Ultra`, ADR-0142 §2).
+function LimitRow({ row }: { row: PopoutLimitRow }): React.ReactElement {
+  const { label, pct } = row;
   return (
     <div className={pct === null ? "prow limit dim" : "prow limit"}>
       <span className="name">{label}</span>
-      {pct === null ? (
+      {row.note !== null ? (
         <span className="state">
-          {emptyTrack ? <span className="limit-meter" aria-hidden /> : null}
+          <span className="pnote">{row.note}</span>
+        </span>
+      ) : pct === null ? (
+        <span className="state">
+          {row.emptyTrack ? <span className="limit-meter" aria-hidden /> : null}
           <span className="num">—</span>
         </span>
       ) : (
@@ -308,7 +280,7 @@ function LimitRow({
             aria-valuemax={100}
             aria-label={`${label} used`}
           >
-            <i style={{ width: `${pct}%` }} />
+            <i style={{ width: `${pct}%` }} data-tone={row.tone ?? undefined} />
           </span>
           <b className="num">{pct}%</b>
         </span>
@@ -319,74 +291,66 @@ function LimitRow({
 
 const RING_VIEWBOX = 96; // the globals.css ring recipe: viewBox 96, r 40, stroke 7
 
-// The ranked head: today's ring or idle inset, or the `Most used:`
-// Membership drawn idle (#622 item 6): an empty ring with "—", the eyebrow
-// naming it, and no number, since it has no Active block to read.
-function RankedHeadRow({ head }: { head: RankedPopoutHead }): React.ReactElement {
-  if (head.kind === "ring") {
-    return (
-      <PopoutHeadRow
-        head={head}
-        eyebrow={<NamedEyebrow lead="Active block" name={head.eyebrowName} />}
-      />
-    );
+// The head (ADR-0142 §2): the most used window's ring, its eyebrow
+// `Most used · <Membership>` while it names one (the Membership alone when its
+// name has an Account half, #746), else `Most used · <window>`
+// (the window then leads the meta line), `64% used` and its reset, and
+// `Ultra: no 5-hour limit` on a line of its own where it applies; an empty
+// ring reading `Nothing used` while no window is in flight; the inset while
+// no limit can be read. The Membership's name keeps its plan word ahead of
+// its Account half, whose end stays (`MembershipNameView`).
+function PopoutHeadRow({ head }: { head: PopoutHead }): React.ReactElement {
+  if (head.kind === "none") {
+    return <div className="pinset">No limits read — connect an Account in Settings.</div>;
   }
-  if (head.kind !== "idle-ring") return <PopoutHeadRow head={head} />;
-  return (
-    <div className="a-head idle-ring">
-      <HeadRing frac={0} label={null} ariaLabel="No active block" />
-      <div className="hd">
-        <NamedEyebrow lead="Most used" name={head.eyebrowName} />
-        <div className="value idle-value">No active block</div>
-      </div>
-    </div>
-  );
-}
-
-// The ranked head's eyebrow: its words, then the Membership's name, whose
-// Organization part ellipsizes before its Account half.
-function NamedEyebrow({ lead, name }: { lead: string; name: MembershipName }): React.ReactElement {
-  return (
+  // A name with an Account half (two Memberships of one Organization) takes
+  // the lead's place: beside `Most used`, the eyebrow's 142px held neither
+  // its plan word nor its Account whole (#746).
+  const named = head.name;
+  const lead = <span className="eyebrow-lead">Most used</span>;
+  const eyebrow = (
     <span className="eyebrow eyebrow-named">
-      <span className="eyebrow-lead">{lead}</span>
-      <span className="eyebrow-tag eyebrow-sep"> · </span>
-      <MembershipNameView name={name} className="eyebrow-tag" />
+      {named === null ? (
+        <>
+          {lead}
+          {head.kind === "ring" ? (
+            <span className="eyebrow-tag eyebrow-window"> · {head.window}</span>
+          ) : null}
+        </>
+      ) : named.account !== null ? (
+        <MembershipNameView name={named} className="eyebrow-tag" title={head.title} />
+      ) : (
+        <>
+          {lead}
+          <span className="eyebrow-tag eyebrow-sep"> · </span>
+          <MembershipNameView name={named} className="eyebrow-tag" title={head.title} />
+        </>
+      )}
     </span>
   );
-}
-
-// `eyebrow` replaces the head's own (the ranked head names its Membership).
-function PopoutHeadRow({
-  head,
-  eyebrow,
-}: {
-  head: PopoutHead;
-  eyebrow?: React.ReactNode;
-}): React.ReactElement {
   if (head.kind === "idle") {
-    return <div className="pinset">No active block — start a Claude Code session to open one.</div>;
+    return (
+      <div className="a-head idle-ring">
+        <HeadRing frac={0} label={null} ariaLabel="No window in use" />
+        <div className="hd">
+          {eyebrow}
+          <div className="value idle-value">Nothing used</div>
+        </div>
+      </div>
+    );
   }
   return (
     <div className="a-head">
       <HeadRing
         frac={head.ringFrac}
         label={head.centerLabel}
-        ariaLabel={`Block time elapsed: ${Math.round(head.ringFrac * 100)}%`}
+        ariaLabel={`Most used limit: ${head.valueText}`}
       />
       <div className="hd">
-        {eyebrow ?? (
-          <span className="eyebrow">
-            Active block
-            {head.eyebrowTag !== null ? (
-              <span className="eyebrow-tag"> · {head.eyebrowTag}</span>
-            ) : null}
-          </span>
-        )}
-        <div className="value num">
-          {head.costText}
-          <span className="tokens">· {head.tokensText}</span>
-        </div>
+        {eyebrow}
+        <div className="value num">{head.valueText}</div>
         <div className="meta num">{head.metaText}</div>
+        {head.note !== null ? <div className="meta note">{head.note}</div> : null}
       </div>
     </div>
   );

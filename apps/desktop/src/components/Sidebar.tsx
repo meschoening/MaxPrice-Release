@@ -3,7 +3,6 @@ import { NavLink, useLocation } from "react-router-dom";
 import {
   Activity,
   Folder,
-  Layers,
   PanelLeftClose,
   PanelLeftOpen,
   Settings,
@@ -19,7 +18,6 @@ import { StatusBar } from "./StatusBar";
 const NAV = [
   { to: "/live", label: "Live", icon: Activity, showDot: true },
   { to: "/projects", label: "Projects", icon: Folder, showDot: false },
-  { to: "/blocks", label: "Blocks", icon: Layers, showDot: false },
   { to: "/settings", label: "Settings", icon: Settings, showDot: false },
 ] as const;
 

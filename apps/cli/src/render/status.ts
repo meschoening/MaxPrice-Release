@@ -186,11 +186,13 @@ function keyFact(health: SecretsHealth, now: number): string | null {
   return setAts.length === 1 ? `key set ${when}` : `${setAts.length} keys set, newest ${when}`;
 }
 
+// ADR-0145 §6: the age is the last read of the limits the connection
+// describes, the persisted Scope's head Organization's (`usageLastReadAt`).
 function limitsRow(status: StatusSnapshot, health: SecretsHealth, now: number): Row {
   const conn = status.usageConnection;
   const parts = [usageConnectionLabel(conn)];
-  if (conn === "connected" && status.usageLastSampleAt !== null) {
-    parts.push(`sampled ${formatRelativeTime(status.usageLastSampleAt, now)}`);
+  if (conn === "connected" && status.usageLastReadAt !== null) {
+    parts.push(`read ${formatRelativeTime(status.usageLastReadAt, now)}`);
   }
   const key = keyFact(health, now);
   if (key !== null) parts.push(key);
@@ -227,7 +229,7 @@ function keyLine(row: KeyRow, now: number): Row {
 
 // ADR-0140 §4: one line per stored key, under a header while some Account's
 // key is dead. With no key, or one, the Limits line is as it was: one line,
-// the Limits connection, its sample's age and the key's fact; but the one
+// the Limits connection, its last read's age and the key's fact; but the one
 // key being the unfiled key, expired, which says so. The key lines need the
 // keys' connections, so with none read the Limits line is as it was.
 function limitsRows(input: StatusInput): Row[] {

@@ -1,7 +1,5 @@
 import type { BucketRow, CostMode, IntradayResponse, Span } from "@maxprice/shared";
 import {
-  BLOCK_BUCKET_MS,
-  BLOCK_WINDOW_MS,
   computeCostBreakdownInto,
   DAY_MS,
   emptyCostBreakdown,
@@ -11,7 +9,6 @@ import {
   todayBucketCount,
   WEEK_BUCKET_MS,
 } from "@maxprice/shared";
-import type { ResolvedBlockSpan, WindowSpan } from "./block-windows";
 import { localClock, shiftYmd, wallClockReader, wallMidnightMs, zonedInstant } from "./local-date";
 import type { ModelRollup } from "./model-rollup";
 import { byTimestamp, emptyModelRollup, flushRollup, foldModelUsage } from "./model-rollup";
@@ -46,9 +43,8 @@ import type { StoredEvent } from "./store";
 // CAVEAT (f10): `today` is the calendar-day exception (ADR-0020) — it DOES
 // wall-clock-snap, anchoring to local midnight in `tz` and binning by tz-local
 // time-of-day; that regime lives in `aggregateToday`, not in the text below.
-// `block` (ADR-0031) and `week` (ADR-0083) are the two ANCHORED growing
-// windows — a caller-resolved start → now — in `aggregateBlockSpan` /
-// `aggregateWeekSpan`.
+// `week` (ADR-0083) is the ANCHORED growing window — a caller-resolved
+// start → now — in `aggregateWeekSpan`.
 //
 // For a now-relative span `S`: `ms = options.bucketMs ?? INTRADAY_SPANS[S].bucketMs`
 // (the explicit override else the span's native bars size), and
@@ -381,7 +377,6 @@ function assembleWindows(
     previousBuckets,
     byProject,
     ...(byMachine !== undefined ? { byMachine } : {}),
-    blockWindow: null,
   };
 }
 
@@ -430,19 +425,9 @@ export type AggregateIntradayOptions =
       // The chart span — picks the total window length from `SPAN_WINDOW_MS`.
       // The now-relative spans (`15m`/`1h`/`30d`); the line path requests
       // `30d` here too.
-      span: Exclude<Span, "today" | "block" | "week">;
+      span: Exclude<Span, "today" | "week">;
       // The IANA zone — ignored by the now-relative spans (they window purely by
       // epoch-ms), so optional here.
-      tz?: string;
-    } & IntradayCommonOptions)
-  | ({
-      // The active-block span (ADR-0031): the HANDLER resolves the frame via
-      // resolveBlockSpanWindow (all-model/all-project — the events passed HERE
-      // are filter-narrowed, the boundaries never are) and hands it in. `tz` is
-      // not load-bearing — the frame anchors at the block start, not a calendar
-      // boundary.
-      span: "block";
-      blockWindow: ResolvedBlockSpan;
       tz?: string;
     } & IntradayCommonOptions)
   | ({
@@ -509,11 +494,9 @@ function aggregateWith(
 ): IntradayResponse {
   // `today` is the calendar-day span (ADR-0020): a different windowing regime
   // — local midnight → now, tz-aware, bucket count grows with the day — so it
-  // has its own path. `block` is the active-block span (ADR-0031): a growing
-  // window anchored to the resolved block start, sidecar-side rung. Everything
+  // has its own path, and so does the anchored `week` (ADR-0083). Everything
   // below is the `now`-relative windowing the remaining spans share.
   if (options.span === "today") return aggregateToday(events, mode, options, assemble);
-  if (options.span === "block") return aggregateBlockSpan(events, mode, options, assemble);
   if (options.span === "week") return aggregateWeekSpan(events, mode, options, assemble);
 
   // ADR-0041 (M6) lean rule: with the machine axis ON, the project axis defaults
@@ -744,145 +727,15 @@ function aggregateToday(
   });
 }
 
-// Is `t` inside any exclusion window? Linear scan — the list is tiny (resolved
-// windows overlapping one block's span; usually zero or one).
-function inExclusion(t: number, exclusions: WindowSpan[]): boolean {
-  return exclusions.some((w) => t >= w.startMs && t < w.endMs);
-}
-
-// The `block` span (ADR-0031): the active block's GROWING window — block start
-// → now, rightmost bucket in progress — at a fixed one-minute bucket
-// (BLOCK_BUCKET_MS; ADR-0046 retired the adaptive rung this used to pick, and
-// the default stays sidecar-side where the resolved window lives) unless an
-// explicit bucketMs override is passed. A minute divides the 5h window, so the
-// divisibility guard below holds by construction. The ghost is the
-// PREVIOUS block, aligned by time-into-block: ghost bucket k covers the same
-// [k·ms, (k+1)·ms) offset from the previous block's start, same count — the
-// block analogue of today's "yesterday, same local hours". A future-dated
-// in-window event (clock skew: now < t < end) folds into the final in-progress
-// bucket so the buckets sum penny-exactly to the active BlockRow's
-// model-filtered sums (the aggregateToday f13 move, block edition). Events
-// inside an exclusion window belong to a NEIGHBORING resolved window (the
-// ADR-0028 heuristic seam overlap), never to this block — skipped in both
-// frames.
-function aggregateBlockSpan(
-  events: StoredEvent[],
-  mode: CostMode,
-  options: AggregateIntradayOptions,
-  assemble: Assemble,
-): IntradayResponse {
-  if (options.span !== "block") throw new Error("intraday: aggregateBlockSpan requires span block");
-  // ADR-0041 (M6) lean rule: machine axis on ⇒ project axis defaults off (see
-  // `aggregateIntraday`); off ⇒ pre-M6 default (on).
-  const {
-    now,
-    includePrevious = true,
-    includeByMachine = false,
-    includeByProject = !includeByMachine,
-  } = options;
-  const { startMs, endMs, source, exclusions } = options.blockWindow;
-
-  const ms = options.bucketMs ?? BLOCK_BUCKET_MS;
-  if (ms <= 0) throw new Error("intraday: no bucket size for span block");
-  if (BLOCK_WINDOW_MS % ms !== 0) {
-    throw new Error(`intraday: bucketMs ${ms} does not divide the 5h block window`);
-  }
-  // The growing frame: an active block always has now < endMs (the resolver's
-  // predicate), so elapsed < 5h and the count stays small; the ceiling guard
-  // protects direct callers with a pathological override regardless.
-  const elapsed = Math.max(0, now - startMs);
-  const count = todayBucketCount(elapsed, ms);
-  if (count > MAX_INTRADAY_BUCKETS) {
-    throw new Error(
-      `intraday: ${count} buckets for span block at bucketMs ${ms} exceeds the ${MAX_INTRADAY_BUCKETS} ceiling`,
-    );
-  }
-
-  const prevWin = includePrevious ? options.blockWindow.previous : null;
-  const currentStarts = Array.from({ length: count }, (_, k) =>
-    new Date(startMs + k * ms).toISOString(),
-  );
-  const previousStarts =
-    prevWin === null
-      ? []
-      : Array.from({ length: count }, (_, k) => new Date(prevWin.startMs + k * ms).toISOString());
-
-  const classify = (event: StoredEvent): EventClass => {
-    const t = event.ms;
-    if (Number.isNaN(t)) return SKIP;
-    // Ascending input: past the block's real end nothing later can land in
-    // either frame (the previous block is earlier still). The half-open right
-    // edge carries a measure-zero seam for HEURISTIC blocks only: the
-    // heuristic walk's strict `>` gap check means a heuristic block can include an event
-    // at exactly startMs + 5h, which `t >= endMs` excludes — accepted,
-    // unreachable for real JSONL timestamps and impossible for observed/
-    // annulled windows (their end is the real reset / truncation instant).
-    // Dual seam: a previous HEURISTIC block can likewise contain an event at
-    // exactly its startMs + 5h (the walk's strict `>`), which can coincide
-    // with the active heuristic block's floored start — `classify` claims it
-    // for the current frame while the tile counts it in the previous block;
-    // same unreachable measure-zero class.
-    if (t >= endMs) return STOP;
-    // The two frames are evaluated INDEPENDENTLY — never else-if'd on the time
-    // ranges. A heuristic block's hour-floored span can cut into the previous
-    // resolved window's tail (the ADR-0028 seam), so an event can sit in BOTH
-    // ranges; gating the ghost check on `t < startMs` would drop the previous
-    // block's tail there. No double-count is possible — a both-ranges event is
-    // either (a) inside one of the current block's exclusions (heuristic-current
-    // case: `exclusionsFor` hands it every overlapping resolved window, so the
-    // event falls through to the ghost) or (b) partition-owned by the current
-    // observed window itself (observed-current case: the event is claimed by the
-    // current branch and cannot be a heuristic-previous block's member, since
-    // heuristic blocks form only from residual events). Either way exactly one
-    // frame claims it — current and ghost membership stay partition-disjoint.
-    if (t >= startMs && !inExclusion(t, exclusions)) {
-      return {
-        kind: "bucket",
-        currentIdx: Math.min(Math.floor((t - startMs) / ms), count - 1),
-        previousIdx: null,
-      };
-    }
-    if (
-      prevWin !== null &&
-      t >= prevWin.startMs &&
-      t < prevWin.endMs &&
-      !inExclusion(t, prevWin.exclusions)
-    ) {
-      const idx = Math.floor((t - prevWin.startMs) / ms);
-      // Same-time-into-block only: the ghost stops where the current frame does.
-      if (idx < count) return { kind: "bucket", currentIdx: null, previousIdx: idx };
-    }
-    return SKIP;
-  };
-
-  const body = assemble(events, mode, {
-    count,
-    currentStarts,
-    previousStarts,
-    includePrevious: prevWin !== null,
-    includeByProject,
-    includeByMachine,
-    classify,
-  });
-  return {
-    ...body,
-    blockWindow: {
-      start: new Date(startMs).toISOString(),
-      end: new Date(endMs).toISOString(),
-      source,
-    },
-  };
-}
-
 // The `week` span (ADR-0083): an ANCHORED growing window — the Week's start →
 // now — at anchor-aligned daily buckets (bar k covers [start + k·day, start +
 // (k+1)·day)), so a Thursday-08:30 week draws Thu 08:30 → Fri 08:30 bars, the
-// last one live. The ghost is the previous week aligned by time-into-week (the
-// block span's rule). Future in-week events fold into the live bucket (the f13
+// last one live. The ghost is the previous week aligned by time-into-week.
+// Future in-week events fold into the live bucket (the f13
 // move) so the buckets sum penny-exactly to the This-week tile's instant-
 // bounded /api/daily query. Not tz-aware: the anchor carries the zone already.
-// Unlike `block`, the week never returns `stop` — a future-dated event must
-// fold, like `today`.
+// The week never returns `stop` — a future-dated event must fold, like
+// `today`.
 function aggregateWeekSpan(
   events: StoredEvent[],
   mode: CostMode,

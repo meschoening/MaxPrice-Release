@@ -6,9 +6,16 @@ import { useHubStatus } from "@/state/use-hub-status";
 import { useHubClients } from "@/state/use-hub-clients";
 import { useHubStream } from "@/state/use-hub-stream";
 import { useFirewallCheck } from "@/state/use-firewall";
-import { hidePopout, openMainWindow, quitApp, relaunchApp, setTrayTooltip } from "@/lib/tauri";
+import {
+  hidePopout,
+  openMainWindow,
+  quitApp,
+  relaunchApp,
+  setTrayTone,
+  setTrayTooltip,
+} from "@/lib/tauri";
 import { applyStoredTheme } from "@/lib/theme";
-import { trayTooltip } from "@/lib/presentation";
+import { trayTone, trayTooltip } from "@/lib/presentation";
 
 // Fire a Tauri command and log its rejection — never `void` it. Both sides of
 // these calls name the command with a STRING (lib/tauri.test.ts pins all three
@@ -122,34 +129,39 @@ function PopoutActions({ restart = false }: { restart?: boolean }): React.ReactE
   );
 }
 
-// The tray tooltip is driven from the popout webview, not the console
-// (ADR-0050 amending ADR-0049): the popout is the semantic tray surface, it is
-// always-alive (pre-created, only ever hidden), and it must open showing
-// current chips — one webview, one writer. Rejections are logged, never
-// swallowed: while both windows are hidden the tooltip is the only hub UI,
-// and a silently frozen one is indistinguishable from a quiet hub.
+// The tray tooltip, and on macOS the menu-bar icon's tone (ADR-0148 §3), are
+// driven from the popout webview, not the console (ADR-0050 amending
+// ADR-0049): the popout is the semantic tray surface, it is always-alive
+// (pre-created, only ever hidden), and it must open showing current chips —
+// one webview, one writer. Rejections are logged, never swallowed: while both
+// windows are hidden the tray is the only hub UI, and a silently frozen one is
+// indistinguishable from a quiet hub.
 //
 // It is a render-nothing SIBLING of <Popout/> rather than an effect inside it,
 // mounted outside the error boundary: React 19 unmounts the whole root on an
 // uncaught render error, so an effect living in Popout would die with it and
 // pin the tooltip on its last string forever. The SSE subscription rides along
-// for the same reason — it exists to flip this tooltip fast when the daemon
-// dies (no directory callbacks; the popout renders no directory).
-export function TrayTooltip(): null {
+// for the same reason — it exists to flip the tray fast when the daemon dies
+// (no directory callbacks; the popout renders no directory).
+export function TrayStatus(): null {
   useHubStream({ directories: false });
   const { data: status, isError } = useHubStatus();
   const { data: firewall } = useFirewallCheck();
   const exited = useHubDaemonExited(isError);
 
-  const tooltip = trayTooltip(
-    hubDaemonState(isError, status, firewall, exited),
-    status === undefined ? undefined : hubKeyRow(status.accounts),
-  );
+  const state = hubDaemonState(isError, status, firewall, exited);
+  const tooltip = trayTooltip(state, status === undefined ? undefined : hubKeyRow(status.accounts));
+  const tone = trayTone(state, status);
   useEffect(() => {
     setTrayTooltip(tooltip).catch((err: unknown) => {
       console.warn("[hub] tray tooltip update failed:", err);
     });
   }, [tooltip]);
+  useEffect(() => {
+    setTrayTone(tone).catch((err: unknown) => {
+      console.warn("[hub] tray icon update failed:", err);
+    });
+  }, [tone]);
 
   return null;
 }

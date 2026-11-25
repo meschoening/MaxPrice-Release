@@ -2067,10 +2067,13 @@ dependencies = [
 
 [[package]]
 name = "maxprice-hub-desktop"
-version = "0.9.5"
+version = "0.10.0"
 dependencies = [
+ "block2",
  "objc2",
  "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-quartz-core",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2258,6 +2261,7 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
+ "objc2-quartz-core",
 ]
 
 [[package]]

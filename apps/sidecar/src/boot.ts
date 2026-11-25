@@ -16,6 +16,7 @@ import {
   type ScopeSetting,
   type UsageKeyset,
   type GatewayConfigEntry,
+  NO_LOGIN_PLAN,
 } from "@maxprice/shared";
 import {
   createHubClient,
@@ -575,6 +576,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
       hasData: false,
       usageConnection: "disconnected",
       usageLastSampleAt: null,
+      usageLastReadAt: null,
       organizations: {},
       hubConnection: "off",
       // Not seeding a fleet replica at boot (ADR-0041 M5) — the pull loop sets
@@ -688,7 +690,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     .then(() =>
       bootLogin === null
         ? undefined
-        : organizationRegistry.remember(bootLogin.organizationUuid, bootLogin.organizationType),
+        : organizationRegistry.remember(bootLogin.organizationUuid, bootLogin),
     )
     .catch((err: unknown) => console.error("[sidecar] organization registry load failed:", err));
   // Every listing's answer records through here, after the boot load: Connect's
@@ -1284,8 +1286,8 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // The Hub's keyed Accounts are not part of it (#634 left the Hub's half to
   // #660). It names no usage row's Account since #635 (ADR-0137 §3's current
   // rule), only the Account an unstamped usage-limits reading presumes to
-  // (`sampleAccount`). A change swaps the presumption, so every report and
-  // Block formation rebinds, and pokes the Account roster.
+  // (`sampleAccount`). A change swaps the presumption, so every report
+  // rebinds, and pokes the Account roster.
   function installKeyRoster(): void {
     const roster = keyRoster(usageKeys.heldAccounts());
     if (!sameRoster(roster, currentPresumption.membershipRoster)) {
@@ -1400,7 +1402,7 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     learnLoginPairs(logins);
     // Every login file seen feeds the plan-word registry (labels decision 2).
     for (const login of logins) {
-      await organizationRegistry.remember(login.organizationUuid, login.organizationType);
+      await organizationRegistry.remember(login.organizationUuid, login);
     }
     // …and every Organization seen in usage gets a first-seen time, even one
     // no login or discovery ever named.
@@ -1595,11 +1597,11 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
         await recordIntoRegistry(orgs, { complete: false });
       },
       // #283: a legacy credential push keeps its Organization in the roster.
-      // `remember` never downgrades a known plan word, so a null here only
+      // `remember` never downgrades a known plan word, so no plan here only
       // adds an Organization the roster did not know.
       rememberOrganization: async (uuid) => {
         await registryReady;
-        await organizationRegistry.remember(uuid, null);
+        await organizationRegistry.remember(uuid, NO_LOGIN_PLAN);
       },
       learnFromKey: (sessionKey) => void keyListing.keyArrived(sessionKey),
     },
@@ -1655,7 +1657,6 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     // Every POST endpoint, and the Organization rename PUT (#287), requires a
     // matching `x-maxprice-auth` header when this is set (f22).
     authToken: options.authToken,
-    samples: (scope) => (scope === undefined ? sampleStore.all() : sampleStore.all(scope)),
     getSaturation: saturationReporting.snapshot,
     hub: {
       // Fan-out (ADR-0041): the hub-client owns the connection; the fleet's

@@ -106,7 +106,7 @@ export type StoredEvent = UsageRecord & {
   // build a `StoredEvent` literal outside the store and never patch
   // `timestamp` without re-deriving `ms` — a desynced pair is invisible
   // (the wire still shows the right timestamp) and silently rebuckets the
-  // event in blocks, intraday, and every instant-bounded query.
+  // event in intraday and every instant-bounded query.
   //
   // This is a RAM-only field: `storedEventToWire` does not carry it, and the
   // fleet wire shape (`FleetEvent`) has no such member.
@@ -253,15 +253,12 @@ export type StoreQuery = {
 // Case-insensitive substring match of one model name against a list of
 // requested model values. An empty list means "no filter" — everything
 // matches. This is THE model-matching semantics for the whole engine
-// (ADR-0017): the store query applies it to every model-filterable report,
-// and the blocks aggregator applies it to narrow per-block sums (blocks form
-// from ALL events — quota truth — but sum only matching events; see
-// engine/blocks.ts).
+// (ADR-0017): the store query applies it to every model-filterable report.
 // `toLowerCase` is locale-INDEPENDENT (ECMA-262 Unicode Default Case
 // Conversion, NOT the host locale — contrast `toLocaleLowerCase`), so lowering
 // a needle here is byte-identical to lowering it inside the per-event loop.
 // Hoisting it out of the hot loop is a measured win on the raw-param paths
-// (intraday, blocks, session-events, bounded daily), where the renderer sends
+// (intraday, session-events, bounded daily), where the renderer sends
 // capitalized filter values (`"Opus"`, `"Sonnet"`) and every event re-lowered
 // every needle.
 export function lowerModelNeedles(models: string[]): string[] {
@@ -566,13 +563,13 @@ export type EventStore = {
   // path (since/until unset, no project/session/model filter) returns the
   // shared memoized sorted snapshot DIRECTLY rather than a fresh copy (f27), so
   // mutating it would corrupt every later query. No current aggregator mutates
-  // it — daily/sessions/projects/intraday only iterate; blocks `.filter`s into a
-  // new array; every `.sort()` is on derived rows/buckets. In return, the store
+  // it — daily/sessions/projects/intraday only iterate; every `.sort()` is on
+  // derived rows/buckets. In return, the store
   // never writes an array it has returned (#417): a caller may hold one across
   // an await or for good, and later appends never change it. The ordering is part
   // of the contract: the aggregators fold events in timestamp order so
-  // `modelsUsed` / `modelBreakdowns` come out first-seen-ordered, and `blocks`
-  // forms blocks chronologically — none of them re-sort.
+  // `modelsUsed` / `modelBreakdowns` come out first-seen-ordered — none of
+  // them re-sort.
   query: (q?: StoreQuery) => StoredEvent[];
   // Subscribe to RAM changes (the report cache's feed — #113). One call per
   // append batch that changed at least one row (per scanned file, per watcher
