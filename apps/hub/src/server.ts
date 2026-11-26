@@ -39,6 +39,8 @@ import {
   hubSamplesPushRequestSchema,
   organizationRenameRequestSchema,
   accountLabelRequestSchema,
+  fleetDedupKey,
+  type FleetEvent,
   sessionPairKey,
   usageCredentialSchema,
   CLAUDE_CODE_TOKEN_REFUSAL,
@@ -612,22 +614,48 @@ export function buildHubApp(deps: BuildHubAppDeps): Hono {
       }
       if (parsed.data.epoch !== fleetEvents.epoch())
         return c.json({ error: "archive changed; renew the deletion action" }, 409);
-      const named = new Set(
-        parsed.data.sessions.map((s) => sessionPairKey(s.projectSlug, s.sessionId)),
+      // Pairs named whole, and the rows named by dedup key (#777, ADR-0149
+      // §3). A named row goes whichever of the caller's pairs the Hub holds
+      // it under: the Hub keeps one row per key, and a resumed session's
+      // copy may have reached it under the original's pair.
+      const whole = new Set<string>();
+      const rowKeys = new Set<string>();
+      for (const s of parsed.data.sessions) {
+        if (s.rows === undefined) whole.add(sessionPairKey(s.projectSlug, s.sessionId));
+        else for (const row of s.rows) rowKeys.add(fleetDedupKey(row.messageId, row.requestId));
+      }
+      // A body naming whole pairs only keeps the scope it always had, so a
+      // retried operation a Hub before `rows` recorded still matches it.
+      const pairs = [...whole].sort();
+      const scope = JSON.stringify(
+        rowKeys.size === 0 ? [machineId, pairs] : [machineId, pairs, [...rowKeys].sort()],
       );
-      const scope = JSON.stringify([machineId, [...named].sort()]);
+      const matches = (row: FleetEvent): boolean =>
+        row.machineId === machineId &&
+        (whole.has(sessionPairKey(row.projectSlug, row.sessionId)) ||
+          rowKeys.has(fleetDedupKey(row.messageId, row.requestId)));
       let receipt;
       try {
-        receipt = await fleetEvents.remove(
-          parsed.data.operationId,
-          scope,
-          (row) =>
-            row.machineId === machineId &&
-            named.has(sessionPairKey(row.projectSlug, row.sessionId)),
-        );
+        receipt = await fleetEvents.remove(parsed.data.operationId, scope, matches);
       } catch (error) {
-        if (error instanceof FleetUploadConflict) return c.json({ error: error.message }, 409);
-        throw error;
+        if (!(error instanceof FleetUploadConflict)) throw error;
+        // A Hub before `rows` recorded this operation as a whole-pair forget of
+        // every pair the body names, and its response was lost before this
+        // Hub replaced it: answer with that receipt, as any retry is answered.
+        const legacy = JSON.stringify([
+          machineId,
+          [
+            ...new Set(parsed.data.sessions.map((s) => sessionPairKey(s.projectSlug, s.sessionId))),
+          ].sort(),
+        ]);
+        if (rowKeys.size === 0 || legacy === scope) return c.json({ error: error.message }, 409);
+        try {
+          receipt = await fleetEvents.remove(parsed.data.operationId, legacy, matches);
+        } catch (legacyError) {
+          if (legacyError instanceof FleetUploadConflict)
+            return c.json({ error: legacyError.message }, 409);
+          throw legacyError;
+        }
       }
       fleetEvents.completeOperation(parsed.data.operationId);
       if (receipt.removed > 0) {

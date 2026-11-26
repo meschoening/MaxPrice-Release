@@ -853,6 +853,14 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   // A separate success-only gate would hang forever after a failed walk (#340).
   const homeSettled = currentHome !== null ? Promise.resolve() : localReady;
   let detachForeignEvidence: (() => void) | null = null;
+  // #777: set once the boot's archive and replica loads have seeded the live
+  // store (`engineReady`). Before that, and with no Local archive open, a key
+  // an earlier process admitted may not be in the store yet, so no row is
+  // taken as unsent.
+  let feedersSeeded = false;
+  function trackUnsent(store: EventStore): void {
+    if (feedersSeeded && localArchive.store() !== null) store.trackUnsent();
+  }
   // The pricing loop and its unpriced-model watch (#110) are assigned after the
   // handshake, but the fleet's `swapStore` (declared next) must re-attach the
   // watch — hence `let`s declared ahead of both.
@@ -877,9 +885,13 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
   function installStore(next: EventStore): void {
     engineStore = next;
     localArchive.attachStore(next);
+    // #777 (ADR-0149 §1): once the boot's disk feeders have run, a store is
+    // installed holding the Local archive's and the replica's rows, so a line
+    // it admits brand new and no push carries is one no Hub holds.
+    trackUnsent(next);
     detachForeignEvidence?.();
-    detachForeignEvidence = next.onForeignEvidence((sessions) => {
-      void whenBootResolves(engineReady, () => organizationRepair.invalidate(sessions));
+    detachForeignEvidence = next.onForeignEvidence((evidence) => {
+      void whenBootResolves(engineReady, () => organizationRepair.reclassify(evidence));
     });
     detachModelWatch?.();
     if (pricingRefresher) {
@@ -1015,6 +1027,10 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
     // #368 review: a done pair whose archive rows the live store now excludes
     // is repaired again, whatever build wrote its done entry.
     archivedExcludedPairs: () => localArchive.excludedPairs(),
+    // #777 (ADR-0149): live evidence is repaired row by row.
+    isExcludedKey: (key) => getEngineStore().isExcludedDedupKey(key),
+    forgetExcludedRowsFromLocalArchive: (rows) => localArchive.forgetExcludedRows(rows),
+    forgetRowsOnHub: (rows, target) => fleet.repairOrganizations(rows, target, { rows: true }),
   });
 
   // The ONE driver of Organization settings edits (#276) — constructed here,
@@ -2015,6 +2031,8 @@ export async function bootSidecar(options: BootOptions): Promise<void> {
       // presumption cell. Local disk only, and it never rejects.
       bootTrace.track("assertions", assertionsReady),
     ]).then(() => {
+      feedersSeeded = true;
+      trackUnsent(getEngineStore());
       fleet.notifyLocalChange();
       // The status's head Organization over the installed corpus: a Scope
       // the Home membership does not head is headed by the store's candidates

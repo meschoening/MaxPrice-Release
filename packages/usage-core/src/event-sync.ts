@@ -72,6 +72,12 @@ export type EventSyncDeps<Row extends StampableRow = StoredEventWire> = {
   localChanges?: LocalChanges<Row>;
   toWire: (row: Row) => StoredEventWire; // project a surviving row onto the push wire shape
   applyFleetDeletes?: (rows: FleetDeletion[], mayApply: () => boolean) => void | Promise<void>;
+  // The dedup keys (`fleetEventKey`) a push pass is about to send, as soon as
+  // it has chosen them and before its first request (#777): from here on the
+  // Hub may hold them. A pass sends a row it chose even if the row's source
+  // changes meanwhile, and one cut short may never send some of them; both
+  // read as sent, the safe answer. Synchronous.
+  onSending?: (keys: readonly string[]) => void;
   prepareContributions?: () => Promise<void>;
   // Engine RAM upsert; returns the changed count. May resolve LATER: fleet.ts
   // parks it on the engine's `ready` during the boot walk (ADR-0098).
@@ -478,6 +484,8 @@ export function createEventSync<Row extends StampableRow = StoredEventWire>(
           a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
         );
       }
+      if (unstamped.length > 0)
+        deps.onSending?.(unstamped.map((row) => fleetEventKey(row.messageId, row.requestId)));
       const size = deps.pushBatchSize ?? EVENT_PUSH_BATCH_MAX;
       for (let i = 0; i < unstamped.length; i += size) {
         if (!current(g) || !shareEnabled) return;

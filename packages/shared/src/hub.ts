@@ -650,13 +650,50 @@ export const forgetSessionRefSchema = z
   .passthrough();
 export type ForgetSessionRef = z.infer<typeof forgetSessionRefSchema>;
 
+// Rows per POST /api/events/forget, over every pair's `rows` (#777, ADR-0149):
+// the same cap as the pairs, enforced the same way.
+export const EVENT_FORGET_ROWS_MAX = 5000;
+
+// A row a forget names, by its dedup identity (the `fleetDedupKey` pair).
+export const forgetRowRefSchema = z.object({
+  messageId: z.string(),
+  requestId: z.string().optional(),
+});
+export type ForgetRowRef = z.infer<typeof forgetRowRefSchema>;
+
+// A row's dedup identity as a forget names it, with no other field.
+export function forgetRowRef(row: { messageId: string; requestId?: string }): ForgetRowRef {
+  return row.requestId === undefined
+    ? { messageId: row.messageId }
+    : { messageId: row.messageId, requestId: row.requestId };
+}
+
+// One pair a forget names (#777, ADR-0149 §3). With `rows`, only the caller's
+// rows with those dedup keys go, under whichever of its pairs the Hub holds
+// them: the Organization repair's row-scoped forget of rows live Gateway
+// evidence excluded after they reached the Hub. Without, every row of the
+// pair goes, as before. A Hub built before
+// `rows` strips nothing from a pair (the ref is passthrough) and forgets it
+// whole, which the caller's resync re-pushes. Its removal is the same but for
+// a named row it holds under another of the caller's pairs, which it keeps.
+export const forgetRequestSessionSchema = forgetSessionRefSchema.extend({
+  rows: z.array(forgetRowRefSchema).min(1).max(EVENT_FORGET_ROWS_MAX).optional(),
+});
+export type ForgetRequestSession = z.infer<typeof forgetRequestSessionSchema>;
+
 // POST /api/events/forget body. Attribution comes from x-maxprice-machine — the
 // id the HUB minted at push time — so the body never names a machine.
-export const hubEventsForgetRequestSchema = z.object({
-  operationId: z.string().uuid(),
-  epoch: z.string().min(1),
-  sessions: z.array(forgetSessionRefSchema).min(1).max(EVENT_FORGET_SESSIONS_MAX),
-});
+export const hubEventsForgetRequestSchema = z
+  .object({
+    operationId: z.string().uuid(),
+    epoch: z.string().min(1),
+    sessions: z.array(forgetRequestSessionSchema).min(1).max(EVENT_FORGET_SESSIONS_MAX),
+  })
+  .refine(
+    (body) =>
+      body.sessions.reduce((sum, s) => sum + (s.rows?.length ?? 0), 0) <= EVENT_FORGET_ROWS_MAX,
+    { message: `at most ${EVENT_FORGET_ROWS_MAX} rows per forget` },
+  );
 export type HubEventsForgetRequest = z.infer<typeof hubEventsForgetRequestSchema>;
 
 // `removed` is the race report: it counts what the rewrite ACTUALLY dropped, so

@@ -9,6 +9,8 @@ import {
   worktreeSlugPrefix,
   type FleetDedupTokens,
   type FleetEvent,
+  forgetRowRef,
+  type ForgetRowRef,
   type ForgetSessionRef,
 } from "@maxprice/shared";
 import { identityFromPath, parentSessionPath } from "../identity";
@@ -152,6 +154,26 @@ export type LocalAppend = {
   records: UsageRecord[];
   projectSlug: string;
   sessionId: string;
+};
+
+// One own row a batch's exclusion took away (#777, ADR-0149 §1): the admitted
+// contribution an excluded copy superseded, or a copy refused because an
+// excluded copy holds its key, in its own pair, by its dedup identity.
+// `reachedHub` is false only for a contribution this store admitted, brand
+// new, after `trackUnsent()`, and never handed to a push (`markSent`): no
+// process before this one admitted it (its Local archive and replica rows are
+// in the store by then), and none of this one's pushes carried it, so no Hub
+// holds it. Every other row may be on the Hub.
+export type ExcludedRow = ForgetSessionRef & ForgetRowRef & { reachedHub: boolean };
+
+// What one batch's new foreign evidence tells the repair (ADR-0141 §3,
+// ADR-0149). `sessions`: the batch's pair and every pair an eviction listed.
+// `listed`: those of them this batch put on the forget list for the first
+// time. `evicted`: the own rows the batch's exclusions evicted or refused.
+export type ForeignEvidence = {
+  sessions: readonly ForgetSessionRef[];
+  listed: readonly ForgetSessionRef[];
+  evicted: readonly ExcludedRow[];
 };
 
 // ---------------------------------------------------------------------------
@@ -619,7 +641,18 @@ export type EventStore = {
   // the repair's `localArchive.excludedPairs()` and its key-scoped forget ask
   // this of each record.
   isExcludedDedupKey: (key: string) => boolean;
-  onForeignEvidence: (listener: (sessions: readonly ForgetSessionRef[]) => void) => () => void;
+  onForeignEvidence: (listener: (evidence: ForeignEvidence) => void) => () => void;
+  // #777 (ADR-0149 §1): from now on, an own row a local append admits under a
+  // key this store has never held (no copy, no contribution, no excluded
+  // holder) is unsent until `markSent` names its key, and an exclusion that
+  // evicts it reports `reachedHub: false`. bootSidecar() calls it once the
+  // store holds its walk's rows, the Local archive's and the replica's: a key
+  // an earlier process admitted is then already held, so only a line no
+  // process admitted before is ever unsent. Idempotent.
+  trackUnsent: () => void;
+  // #777: the push loop is about to send these dedup keys to the Hub. Called
+  // before the request, so a row in flight counts as reached.
+  markSent: (keys: Iterable<string>) => void;
   // #311 (ADR-0107 §12): the dormant snapshot this store was built with — the
   // sessions whose owner-less own rows it refuses (`dormantSessions` in
   // ./presumption.ts). A construction-time constant, like the tracked set: a
@@ -998,7 +1031,20 @@ export function createEventStore(opts: {
   const accountMemberships = new Map<string, Set<string>>();
   const evidenceUuids = new Set<string>();
   const evidenceHashes = new Set<string>();
-  const foreignListeners = new Set<(sessions: readonly ForgetSessionRef[]) => void>();
+  const foreignListeners = new Set<(evidence: ForeignEvidence) => void>();
+  // #777 (ADR-0149 §1): `trackUnsent()` was called, and the own rows admitted
+  // brand new since then that no push has carried yet, by dedup key.
+  let trackingUnsent = false;
+  const unsent = new Set<string>();
+  function notifyForeignEvidence(evidence: ForeignEvidence): void {
+    for (const listener of foreignListeners) {
+      try {
+        listener(evidence);
+      } catch (err) {
+        console.error("[store] foreign evidence listener threw:", err);
+      }
+    }
+  }
   const organizationsSeen = { machine: new Set<string>(), fleet: new Set<string>() };
 
   function sessionKey(projectSlug: string, sessionId: string): string {
@@ -1071,6 +1117,8 @@ export function createEventStore(opts: {
   // `null` when the key is newly excluded with nothing to evict, and
   // `undefined` when it was not newly excluded (the copy lost, or replaced a
   // holder in place). Allocates only when a key is newly excluded (#361).
+  // An own contribution it evicts joins `evicted` (#777), with whether a Hub
+  // may hold it.
   function offerExcluded(
     key: string,
     total: number,
@@ -1078,6 +1126,7 @@ export function createEventStore(opts: {
     accountUuid: string | undefined,
     accountKey: string | undefined,
     changes: StoreChange[],
+    evicted: ExcludedRow[],
   ): StoredEvent | null | undefined {
     const holder = excludedHolders.get(key);
     if (holder !== undefined) {
@@ -1113,7 +1162,22 @@ export function createEventStore(opts: {
       return undefined;
     }
     excludedHolders.set(key, { total, organizationUuid, accountUuid, accountKey });
-    if (contributions.delete(key)) contributionChanged(null);
+    const contribution = contributions.get(key);
+    if (contribution !== undefined) {
+      contributions.delete(key);
+      contributionChanged(null);
+    }
+    // The own row the Hub may hold: this machine's contribution, or, with
+    // none, its own copy the replica gave (#777).
+    const own = contribution ?? (incumbent?.machineId === selfMachineId ? incumbent : undefined);
+    if (own !== undefined) {
+      evicted.push({
+        projectSlug: own.projectSlug,
+        sessionId: own.sessionId,
+        ...forgetRowRef(own),
+        reachedHub: contribution === undefined || !unsent.delete(key),
+      });
+    }
     if (incumbent === undefined) return null;
     events.delete(key);
     snapshot.discard();
@@ -1261,10 +1325,17 @@ export function createEventStore(opts: {
     let newForeignEvidence = false;
     // Other walked pairs whose admitted copy this batch evicted (#370).
     const evictedPairs = new Map<string, ForgetSessionRef>();
+    // The own rows this batch's exclusions evicted (#777).
+    const evicted: ExcludedRow[] = [];
+    // The pairs this batch put on the forget list for the first time (#370
+    // review).
+    const listed = new Map<string, ForgetSessionRef>();
+    const list = (pairKey: string, pair: ForgetSessionRef): void => {
+      if (!foreignSessions.has(pairKey)) listed.set(pairKey, pair);
+      foreignSessions.set(pairKey, pair);
+    };
     let changed = 0;
     const key = sessionKey(projectSlug, sessionId);
-    // Whether this pair was on the forget list before the batch (#370 review).
-    const listedBefore = foreignSessions.has(key);
     const batch = Array.isArray(records) ? (records as UsageRecord[]) : [...records];
     // #370 review: only a read that yielded a record marks the pair walked. An
     // unreadable file and an empty one reach here as an empty batch, as does an
@@ -1344,7 +1415,7 @@ export function createEventStore(opts: {
         // The pair holds an excluded record whether or not its copy wins the
         // key: an earlier build that tracked this Organization may have
         // archived or pushed its rows.
-        foreignSessions.set(key, { projectSlug, sessionId });
+        list(key, { projectSlug, sessionId });
         // #374: the copy competes for its key (`offerExcluded`); a loser
         // excludes nothing and evicts nothing.
         const incumbent = offerExcluded(
@@ -1354,6 +1425,7 @@ export function createEventStore(opts: {
           account.accountUuid,
           accountKey,
           changes,
+          evicted,
         );
         if (incumbent !== undefined) newForeignEvidence = true;
         if (incumbent !== undefined && incumbent !== null) {
@@ -1364,7 +1436,7 @@ export function createEventStore(opts: {
           const holder = sessionKey(incumbent.projectSlug, incumbent.sessionId);
           if (incumbent.machineId === selfMachineId && holder !== key && walkedPairs.has(holder)) {
             const pair = { projectSlug: incumbent.projectSlug, sessionId: incumbent.sessionId };
-            foreignSessions.set(holder, pair);
+            list(holder, pair);
             evictedPairs.set(holder, pair);
           }
         }
@@ -1385,14 +1457,23 @@ export function createEventStore(opts: {
       // copy that supersedes the holder takes the key back. After the dormant
       // test, so a dormant session's copy stays dormant and never foreign
       // (ADR-0107 §12).
+      const ownKey = dedupKey(record.messageId, record.requestId);
+      // #777: a key an excluded copy held is not brand new: an admitted copy
+      // of it may have been pushed before the exclusion.
+      let heldBefore = false;
       if (excludedHolders.size > 0) {
-        const recordKey = dedupKey(record.messageId, record.requestId);
-        if (!beatsExcludedHolder(recordKey, record, organizationUuid, account.accountUuid)) {
-          foreignSessions.set(key, { projectSlug, sessionId });
+        if (!beatsExcludedHolder(ownKey, record, organizationUuid, account.accountUuid)) {
+          list(key, { projectSlug, sessionId });
+          // #777: an earlier build may have pushed this copy, so its row is
+          // named for the repair's row-scoped forget.
+          evicted.push({ projectSlug, sessionId, ...forgetRowRef(record), reachedHub: true });
           continue;
         }
-        excludedHolders.delete(recordKey);
+        heldBefore = excludedHolders.delete(ownKey);
       }
+      // #777: whether this store has never held the key, before this upsert.
+      const brandNew =
+        trackingUnsent && !heldBefore && !events.has(ownKey) && !contributions.has(ownKey);
       if (
         upsert(
           {
@@ -1411,6 +1492,7 @@ export function createEventStore(opts: {
       ) {
         changed += 1;
       }
+      if (brandNew && contributions.has(ownKey)) unsent.add(ownKey);
     }
     if (changes.some((change) => change.event === null)) {
       // Exclusion is the only removal path on this feeder. Rebuild once per
@@ -1422,19 +1504,18 @@ export function createEventStore(opts: {
     // for the first time (#370 review), tells the repair, with every pair an
     // eviction listed. A pair already listed stays silent, so re-reading a
     // transcript (a rescan, the watcher's first read from byte 0) never
-    // re-invalidates it. No listener is attached during a boot or rebuild
+    // re-reports it. No listener is attached during a boot or rebuild
     // walk: bootSidecar() installs a store only after that walk has run, so it
     // lists its pairs silently and the boot-gate repair reads them against its
     // done lists. A rescan of the live store re-presents pairs already listed.
-    if (newForeignEvidence || (!listedBefore && foreignSessions.has(key))) {
-      const sessions = [{ projectSlug, sessionId }, ...evictedPairs.values()];
-      for (const listener of foreignListeners) {
-        try {
-          listener(sessions);
-        } catch (err) {
-          console.error("[store] foreign evidence listener threw:", err);
-        }
-      }
+    // Each eviction names its row (#777), so the repair forgets only rows a
+    // Hub may hold, and only those.
+    if (newForeignEvidence || listed.has(key)) {
+      notifyForeignEvidence({
+        sessions: [{ projectSlug, sessionId }, ...evictedPairs.values()],
+        listed: [...listed.values()],
+        evicted,
+      });
     }
     for (const listener of localAppendListeners) {
       try {
@@ -1468,6 +1549,8 @@ export function createEventStore(opts: {
     let changed = 0;
     // Walked pairs an archive line evicted an admitted copy from (#374).
     const evictedPairs = new Map<string, ForgetSessionRef>();
+    // The own rows those evictions took (#777).
+    const evicted: ExcludedRow[] = [];
     for (const row of rows) {
       // This machine's own rows: the archive, or a replica row carrying its id.
       const own = source === "archive" || row.machineId === selfMachineId;
@@ -1497,6 +1580,7 @@ export function createEventStore(opts: {
           row.accountUuid,
           row.accountUuid,
           changes,
+          evicted,
         );
         if (incumbent !== undefined && incumbent !== null) {
           changed += 1;
@@ -1565,13 +1649,7 @@ export function createEventStore(opts: {
     // the repair, as a walked eviction does (#370).
     if (evictedPairs.size > 0) {
       const sessions = [...evictedPairs.values()];
-      for (const listener of foreignListeners) {
-        try {
-          listener(sessions);
-        } catch (err) {
-          console.error("[store] foreign evidence listener threw:", err);
-        }
-      }
+      notifyForeignEvidence({ sessions, listed: sessions, evicted });
     }
     return changed;
   }
@@ -1970,6 +2048,13 @@ export function createEventStore(opts: {
     accountMemberships: () => accountMemberships,
     accountEvidenceSeen: () => ({ uuids: evidenceUuids, hashes: evidenceHashes }),
     accountPairs: () => accountPairs,
+    trackUnsent: () => {
+      trackingUnsent = true;
+    },
+    markSent: (keys) => {
+      if (unsent.size === 0) return;
+      for (const key of keys) unsent.delete(key);
+    },
     onForeignEvidence: (listener) => {
       foreignListeners.add(listener);
       return () => {

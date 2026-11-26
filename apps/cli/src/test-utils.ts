@@ -125,6 +125,8 @@ export type Spawned = {
   proc: Subprocess<"ignore" | Blob, "pipe", "pipe">;
   // Everything the child has written to stderr so far.
   stderr: () => string;
+  // Everything the child has written to stdout so far.
+  stdout: () => string;
   // The exit code, once stdout and stderr are read to their end.
   done: Promise<{ code: number; stdout: string; stderr: string }>;
 };
@@ -149,6 +151,13 @@ export function spawnScript(sandbox: Sandbox, source: string): Spawned {
   return spawnBun(sandbox, [script]);
 }
 
+// A child's stream as it arrives, so a case can wait on a line mid-run.
+async function readAll(stream: ReadableStream<Uint8Array>, append: (text: string) => void) {
+  const decoder = new TextDecoder();
+  for await (const chunk of stream) append(decoder.decode(chunk, { stream: true }));
+  append(decoder.decode());
+}
+
 function spawnBun(sandbox: Sandbox, args: string[], options: SpawnOptions = {}): Spawned {
   const channel = `MAXPRICE_TEST_UPDATE_CHANNEL=${JSON.stringify(sandbox.updateChannel)}`;
   const proc = Bun.spawn([process.execPath, "--define", channel, ...args], {
@@ -160,17 +169,15 @@ function spawnBun(sandbox: Sandbox, args: string[], options: SpawnOptions = {}):
   });
   children.push(proc);
   let stderr = "";
-  const stderrDone = (async () => {
-    const decoder = new TextDecoder();
-    for await (const chunk of proc.stderr) stderr += decoder.decode(chunk, { stream: true });
-  })();
-  const stdout = new Response(proc.stdout).text();
+  let stdout = "";
+  const stderrDone = readAll(proc.stderr, (text) => (stderr += text));
+  const stdoutDone = readAll(proc.stdout, (text) => (stdout += text));
   const done = (async () => {
     const code = await proc.exited;
-    await stderrDone;
-    return { code, stdout: await stdout, stderr };
+    await Promise.all([stderrDone, stdoutDone]);
+    return { code, stdout, stderr };
   })();
-  return { proc, stderr: () => stderr, done };
+  return { proc, stderr: () => stderr, stdout: () => stdout, done };
 }
 
 const DEADLINE_MS = 30_000;

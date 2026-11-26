@@ -8,6 +8,7 @@ import {
 import { whenBootResolves } from "./when-boot-resolves";
 import {
   createEventSync,
+  fleetEventKey,
   fleetTokenTotal,
   createFleetEventStore,
   createIdentityDirectory,
@@ -16,6 +17,7 @@ import {
   type HubFleetHooks,
 } from "@maxprice/usage-core";
 import {
+  EVENT_FORGET_ROWS_MAX,
   EVENT_FORGET_SESSIONS_MAX,
   HUB_ORGANIZATIONS_PATH,
   IDENTITY_PUSH_BATCH_MAX,
@@ -34,6 +36,8 @@ import {
   hubProjectIdentityResponseSchema,
   projectMergeAssertionKey,
   resolveProjectMergeAssertions,
+  forgetRowRef,
+  type ForgetRequestSession,
   type ForgetSessionRef,
   type HomeMembership,
   type HubLabelDirectory,
@@ -322,10 +326,13 @@ export type FleetSync = {
   // The durable intent records the mode, so a resumed forget completes in its
   // own mode, and while one is pending a caller of any other mode is refused
   // as `busy`.
+  // With `rows` (#777, ADR-0149 §3) it forgets only the named rows on the Hub
+  // (each pair's `rows`), with no Local archive half: the repair took them out
+  // of the archive before it asked.
   repairOrganizations: (
-    sessions: readonly ForgetSessionRef[],
+    sessions: readonly ForgetRequestSession[],
     target: string,
-    opts?: { keepLocalArchive?: boolean },
+    opts?: { keepLocalArchive?: boolean; rows?: boolean },
   ) => Promise<FleetForgetResult>;
   // The events epoch of the Hub at `target` while connected to it, from its
   // connect status and every hub:status frame since; null while disconnected,
@@ -413,6 +420,43 @@ function homePublishBody(home: HomeMembership | null): HubMachineSelfUpdateReque
 function seedEqual(a: HubSeed, b: HubSeed): boolean {
   if (a === null || b === null) return a === b;
   return a.cursor === b.cursor && a.target === b.target;
+}
+
+// A forget's batches (#777): at most EVENT_FORGET_SESSIONS_MAX pairs and
+// EVENT_FORGET_ROWS_MAX rows each, the Hub's caps. A pair naming more rows
+// than one batch takes is split across batches, each naming some of them. A
+// ref keeps only its pair and its rows.
+export function forgetBatches(sessions: readonly ForgetRequestSession[]): ForgetRequestSession[][] {
+  const batches: ForgetRequestSession[][] = [];
+  let batch: ForgetRequestSession[] = [];
+  let rows = 0;
+  for (const { projectSlug, sessionId, rows: named } of sessions) {
+    const parts: (ForgetRequestSession["rows"] | undefined)[] = [];
+    if (named === undefined) parts.push(undefined);
+    else
+      for (let i = 0; i < named.length; i += EVENT_FORGET_ROWS_MAX)
+        parts.push(named.slice(i, i + EVENT_FORGET_ROWS_MAX));
+    for (const part of parts) {
+      const count = part?.length ?? 0;
+      if (batch.length === EVENT_FORGET_SESSIONS_MAX || rows + count > EVENT_FORGET_ROWS_MAX) {
+        batches.push(batch);
+        batch = [];
+        rows = 0;
+      }
+      batch.push(
+        part === undefined
+          ? { projectSlug, sessionId }
+          : {
+              projectSlug,
+              sessionId,
+              rows: part.map(forgetRowRef),
+            },
+      );
+      rows += count;
+    }
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
 }
 
 export function createFleetSync(deps: FleetSyncDeps): FleetSync {
@@ -598,6 +642,9 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
         detach();
       }
     },
+    // #777 (ADR-0149 §1): a key a push carries may be on the Hub from now on,
+    // so an exclusion that later evicts its row forgets it there.
+    onSending: (keys) => deps.getStore().markSent(keys),
     applyFleetDeletes: async (rows, mayApply) => {
       await deps.ingestionReady;
       await deps.getStore().ready;
@@ -993,7 +1040,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   // `mode` is a new intent's. The empty resume (connect and sweep) writes no
   // new intent and compares no mode, so its default is never read.
   async function forget(
-    sessions: readonly ForgetSessionRef[],
+    sessions: readonly ForgetRequestSession[],
     target?: string,
     mode: FleetForgetMode = "pair",
   ): Promise<FleetForgetResult> {
@@ -1014,7 +1061,7 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
   }
 
   async function forgetInner(
-    sessions: readonly ForgetSessionRef[],
+    sessions: readonly ForgetRequestSession[],
     target: string | undefined,
     mode: FleetForgetMode,
   ): Promise<FleetForgetResult> {
@@ -1044,9 +1091,24 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
       };
     let intent = forgetIntent.read();
     if (intent !== null && sessions.length > 0) {
-      const scope = (rows: readonly ForgetSessionRef[]) =>
-        JSON.stringify(rows.map((row) => JSON.stringify([row.projectSlug, row.sessionId])).sort());
-      if (scope(sessions) !== scope(intent.batches.flatMap((batch) => batch.sessions)))
+      // A pair's rows are part of its scope (#777): a row-scoped forget of
+      // other rows is a different deletion.
+      const scope = (refs: readonly ForgetRequestSession[]) =>
+        JSON.stringify(
+          refs
+            .map((ref) =>
+              JSON.stringify([
+                ref.projectSlug,
+                ref.sessionId,
+                ref.rows?.map((row) => fleetEventKey(row.messageId, row.requestId)).sort() ?? null,
+              ]),
+            )
+            .sort(),
+        );
+      if (
+        scope(forgetBatches(sessions).flat()) !==
+        scope(intent.batches.flatMap((batch) => batch.sessions))
+      )
         return {
           ok: false,
           reason: "busy",
@@ -1122,15 +1184,13 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
           // #375: and the evidence repair's key-scoped archive half, which a
           // resume after a restart must run in place of the pair-wide one.
           ...(mode === "excluded" ? { excludedOnly: true } : {}),
-          batches: [],
-        } satisfies FleetForgetIntent;
-        for (let i = 0; i < sessions.length; i += EVENT_FORGET_SESSIONS_MAX)
-          intent.batches.push({
+          // #777: the row-scoped mode has no archive half left to run.
+          ...(mode === "rows" ? { rowsOnly: true, localComplete: true } : {}),
+          batches: forgetBatches(sessions).map((batch) => ({
             operationId: crypto.randomUUID(),
-            sessions: sessions
-              .slice(i, i + EVENT_FORGET_SESSIONS_MAX)
-              .map(({ projectSlug, sessionId }) => ({ projectSlug, sessionId })),
-          });
+            sessions: batch,
+          })),
+        } satisfies FleetForgetIntent;
         forgetIntent.write(intent);
       }
       for (const batch of intent.batches) {
@@ -2249,7 +2309,11 @@ export function createFleetSync(deps: FleetSyncDeps): FleetSync {
     },
     forget,
     repairOrganizations: (sessions, target, opts) =>
-      forget(sessions, target, opts?.keepLocalArchive === true ? "lossless" : "excluded"),
+      forget(
+        sessions,
+        target,
+        opts?.rows === true ? "rows" : opts?.keepLocalArchive === true ? "lossless" : "excluded",
+      ),
     hubEpoch: (target) =>
       conn !== null && conn.url.replace(/\/+$/, "") === target.replace(/\/+$/, "")
         ? connEpoch

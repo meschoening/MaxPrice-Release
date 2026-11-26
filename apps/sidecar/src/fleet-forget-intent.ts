@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
-import { forgetSessionRefSchema, hubEventsForgetResponseSchema } from "@maxprice/shared";
+import { forgetRequestSessionSchema, hubEventsForgetResponseSchema } from "@maxprice/shared";
 import { writeDurably } from "./durable-file";
 
 const intentSchema = z.object({
@@ -16,10 +16,14 @@ const intentSchema = z.object({
   // half; an older build's lossy intent (a user's Forget, or the repair's
   // before #375) has neither flag and resumes pair-wide, as it was written.
   excludedOnly: z.boolean().optional(),
+  // #777 (ADR-0149 §3): the repair's row-scoped mode. Its batches name rows
+  // (`rows` on each pair), and it is written already `localComplete`: the
+  // repair took the rows out of the Local archive before it asked.
+  rowsOnly: z.boolean().optional(),
   batches: z.array(
     z.object({
       operationId: z.string().uuid(),
-      sessions: z.array(forgetSessionRefSchema),
+      sessions: z.array(forgetRequestSessionSchema),
       receipt: hubEventsForgetResponseSchema.optional(),
     }),
   ),
@@ -28,10 +32,12 @@ export type FleetForgetIntent = z.infer<typeof intentSchema>;
 
 // A forget's mode, by its Local archive half: pair-wide and barred (a user's
 // Forget, ADR-0069 §8), key-scoped (the evidence repair, #375), or none at all
-// (the dormant half's lossless forget, #311).
-export type FleetForgetMode = "pair" | "excluded" | "lossless";
+// (the dormant half's lossless forget, #311, and the row-scoped one, #777,
+// whose rows the repair already took out of the archive).
+export type FleetForgetMode = "pair" | "excluded" | "lossless" | "rows";
 
 export function forgetIntentMode(intent: FleetForgetIntent): FleetForgetMode {
+  if (intent.rowsOnly === true) return "rows";
   if (intent.lossless === true) return "lossless";
   if (intent.excludedOnly === true) return "excluded";
   return "pair";

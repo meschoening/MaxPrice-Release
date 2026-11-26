@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { z } from "zod";
-import type { ForgetSessionRef } from "@maxprice/shared";
+import {
+  fleetDedupKey,
+  forgetRowRef,
+  type ForgetRequestSession,
+  type ForgetRowRef,
+  type ForgetSessionRef,
+} from "@maxprice/shared";
+import type { ExcludedRow } from "./engine/store";
 import type { FleetForgetResult } from "./fleet";
 
 // The one-shot repair of already-synced history (ADR-0098). Once the walk has
@@ -88,6 +95,27 @@ import type { FleetForgetResult } from "./fleet";
 // tracked, so no pair is newly excluded, and when the host persists that set
 // it is the same set, the same key. A v2 marker migrates through v3 the same
 // way.
+//
+// LIVE EVIDENCE IS ROW-SCOPED (#777, ADR-0149). A Gateway record that arrives
+// while the machine runs (ADR-0141 §3) excludes one line of a session whose
+// other rows stay admitted, and a long session meets one every few seconds.
+// The repair once forgot the whole session on the Hub for each, and the
+// re-push sent its admitted rows back unchanged, a loop as long as the
+// session. Now the store names every own row an exclusion evicted, and
+// whether a Hub may hold it (`ExcludedRow.reachedHub`): only a line read
+// after the walk and never pushed is known not to. `reclassify` queues that
+// evidence, and the next run, before anything else, takes every evicted row
+// out of the Local archive by key, then forgets on the Hub only the rows that
+// reached it (`forgetRowsOnHub`, ADR-0149 §3), and nothing at all when none
+// did. A pair the evidence listed for the first time holds no other excluded
+// row, so once its rows are handled it is done in both lists, and the boot
+// one-shot never forgets it whole. A pair already done stays done: it is
+// struck durably only while its row forget is in flight, so a process that
+// dies then repairs it whole at the next boot, as before. A pair already
+// listed and not done is left to the ordinary forget, which covers its rows.
+// Live evidence is dropped when the marker was rekeyed or reset (the whole
+// repair of the new classification covers it), and a row is dropped when the
+// live store no longer excludes its key.
 
 const markerSchema = z.object({
   version: z.literal(4),
@@ -155,6 +183,14 @@ function parseMarker(
 }
 
 const DEFAULT_RETRY_MS = 300_000;
+
+// A row forget with nothing left to forget (#777).
+const OK_NOTHING: FleetForgetResult = {
+  ok: true,
+  sessionsRequested: 0,
+  sessionsMatched: 0,
+  rowsRemoved: 0,
+};
 
 const trackedKey = (set: ReadonlySet<string>): string[] => [...set].sort();
 
@@ -234,6 +270,16 @@ export type OrganizationRepairDeps = {
   // include a key the live store excludes (`localArchive.excludedPairs()`).
   // Such a pair is struck from the done lists before either half runs.
   archivedExcludedPairs: () => ForgetSessionRef[];
+  // #777 (ADR-0149): live evidence's halves. Whether the live store excludes
+  // a dedup key now; the Local archive's key-scoped forget of the named rows
+  // (each pair's `rows`), which drops a row only while the live store
+  // excludes its key; and the Hub's row-scoped forget of them.
+  isExcludedKey: (key: string) => boolean;
+  forgetExcludedRowsFromLocalArchive: (rows: readonly ForgetRequestSession[]) => Promise<void>;
+  forgetRowsOnHub: (
+    rows: readonly ForgetRequestSession[],
+    target: string,
+  ) => Promise<FleetForgetResult>;
   // Injectable publication boundary for marker concurrency tests.
   renameMarker?: (from: string, to: string) => Promise<void>;
   retryMs?: number;
@@ -248,8 +294,13 @@ export type OrganizationRepair = {
   // tracked-set change, during the in-flight run) is actually served before
   // the returned promise resolves, not silently dropped.
   run: () => Promise<void>;
-  // Live evidence may classify another row in a previously repaired session.
-  invalidate: (sessions: readonly ForgetSessionRef[]) => Promise<void>;
+  // Live evidence (ADR-0141 §3, ADR-0149): the pairs a store listed for the
+  // first time and the own rows its exclusions evicted. Queued, then served
+  // by a run (`run()`'s coalescing), row by row.
+  reclassify: (evidence: {
+    listed: readonly ForgetSessionRef[];
+    evicted: readonly ExcludedRow[];
+  }) => Promise<void>;
   // Discard the durable progress WITHOUT repairing anything (#276). The
   // settings driver calls this whenever it skips a change's repair: the repair
   // is what rekeys the marker, so skipping it would leave a set that returns to
@@ -264,6 +315,28 @@ function pairKey(s: ForgetSessionRef): string {
   return `${s.projectSlug}\u0000${s.sessionId}`;
 }
 
+// Live evidence waiting for a run (#777), by `pairKey`: whether a store listed
+// the pair for the first time, and its evicted rows by dedup key, each with
+// whether a Hub may hold it.
+type LivePair = {
+  pair: ForgetSessionRef;
+  // A store listed the pair for the first time: it held no excluded row
+  // before this evidence, on any Hub.
+  listed: boolean;
+  // The Hub (`hubKey`) on which the pair was done when its evidence came, or
+  // null. On that Hub, as on any for a listed pair, every excluded row it may
+  // hold is among `rows`: the pair is complete (`isComplete`). Another Hub,
+  // or the same URL restored to another epoch, may hold older ones.
+  doneOn: string | null;
+  rows: Map<string, ForgetRowRef & { reachedHub: boolean }>;
+};
+
+// A Hub as the marker knows it: its URL and events epoch (#515).
+const hubKey = (target: string | null, epoch: string | null): string =>
+  JSON.stringify([target, epoch]);
+
+const isComplete = (entry: LivePair, hub: string): boolean => entry.listed || entry.doneOn === hub;
+
 export function createOrganizationRepair(deps: OrganizationRepairDeps): OrganizationRepair {
   const retryMs = deps.retryMs ?? DEFAULT_RETRY_MS;
   const setIntervalImpl = deps.setIntervalImpl ?? ((cb, ms) => setInterval(cb, ms));
@@ -273,7 +346,40 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
   let retry: unknown = null;
   let stopped = false;
   let rerun = false;
-  const invalidated = new Set<string>();
+  // #777: live evidence no run has taken yet.
+  let live = new Map<string, LivePair>();
+  function livePair(pair: ForgetSessionRef, into: Map<string, LivePair> = live): LivePair {
+    const key = pairKey(pair);
+    let entry = into.get(key);
+    if (entry === undefined) {
+      entry = {
+        pair: { projectSlug: pair.projectSlug, sessionId: pair.sessionId },
+        listed: false,
+        doneOn: null,
+        rows: new Map(),
+      };
+      into.set(key, entry);
+    }
+    return entry;
+  }
+  // A row reached a Hub if any report of it says so.
+  function addRow(entry: LivePair, key: string, row: ForgetRowRef & { reachedHub: boolean }): void {
+    const held = entry.rows.get(key);
+    entry.rows.set(key, {
+      ...forgetRowRef(row),
+      reachedHub: row.reachedHub || held?.reachedHub === true,
+    });
+  }
+  // Merges live pairs into `into` (the queue, by default): a later listing,
+  // done Hub or row only adds.
+  function merge(pairs: Iterable<LivePair>, into: Map<string, LivePair> = live): void {
+    for (const back of pairs) {
+      const entry = livePair(back.pair, into);
+      entry.listed ||= back.listed;
+      entry.doneOn ??= back.doneOn;
+      for (const [key, row] of back.rows) addRow(entry, key, row);
+    }
+  }
   // Bumped by every `reset()`, synchronously at the call. A run that read the
   // marker under an earlier generation must not write its done lists back over
   // the wipe — see `persist`.
@@ -316,7 +422,7 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
     dormant: string,
     hubTarget: string | null,
     hubEpoch: string | null,
-  ): Promise<{ marker: Marker; persistNow: boolean }> {
+  ): Promise<{ marker: Marker; persistNow: boolean; rekeyed: boolean }> {
     try {
       const parsed = parseMarker(
         JSON.parse(await readFile(deps.markerPath, "utf8")),
@@ -347,11 +453,13 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
               dormantHubDone: sameHub && sameDormant ? data.dormantHubDone : [],
             },
             persistNow: migrated || !sameDormant,
+            rekeyed: false,
           };
         }
         return {
           marker: freshMarker(tracked, trackedAccounts, dormant, hubTarget, hubEpoch),
           persistNow: true,
+          rekeyed: true,
         };
       }
     } catch {
@@ -360,6 +468,7 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
     return {
       marker: freshMarker(tracked, trackedAccounts, dormant, hubTarget, hubEpoch),
       persistNow: false,
+      rekeyed: false,
     };
   }
 
@@ -405,7 +514,10 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
     const hubEpoch = hubTarget === null ? null : deps.hubEpoch(hubTarget);
     // The Hub halves run only against a Hub known by URL and epoch (#515).
     const hubKnown = hubTarget !== null && hubEpoch !== null;
-    const { marker, persistNow } =
+    // #777: the live evidence this pass serves, taken before any await.
+    const taken = live;
+    live = new Map();
+    const { marker, persistNow, rekeyed } =
       generation === diskGeneration
         ? await loadMarker(trackedKeyArr, accountsKeyArr, dormant, hubTarget, hubEpoch)
         : // A reset has been called whose wipe has not landed yet (or failed):
@@ -416,6 +528,7 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
           {
             marker: freshMarker(trackedKeyArr, accountsKeyArr, dormant, hubTarget, hubEpoch),
             persistNow: false,
+            rekeyed: true,
           };
     if (persistNow) {
       // A real marker exists for a different tracked set or dormant set: its
@@ -430,10 +543,42 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
     }
     if (tracked === null && accountsKeyArr === null) {
       // Nothing is excluded on either level, so nothing is dormant either: no
-      // forget, no rebuild — just the rekey above, if any.
+      // forget, no rebuild — just the rekey above, if any. Live evidence is
+      // moot too.
       disarmRetry();
       return;
     }
+    // #777: live evidence a rekey or a reset outdates is the whole repair's.
+    // What this pass does not serve goes back on the queue (`finally`).
+    const owed = rekeyed ? new Map<string, LivePair>() : taken;
+    try {
+      await runHalves(owed, {
+        generation,
+        trackedKeyArr,
+        accountsKeyArr,
+        dormant,
+        hubTarget,
+        hubKnown,
+        marker,
+      });
+    } finally {
+      merge(owed.values());
+    }
+  }
+
+  async function runHalves(
+    owed: Map<string, LivePair>,
+    ctx: {
+      generation: number;
+      trackedKeyArr: string[];
+      accountsKeyArr: string[] | null;
+      dormant: string;
+      hubTarget: string | null;
+      hubKnown: boolean;
+      marker: Marker;
+    },
+  ): Promise<void> {
+    const { generation, trackedKeyArr, accountsKeyArr, dormant, hubTarget, hubKnown, marker } = ctx;
     const archiveDone = new Set(marker.archiveDone);
     const hubDone = new Set(marker.hubDone);
     const dormantHubDone = new Set(marker.dormantHubDone);
@@ -452,11 +597,65 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
     let hubPending = false;
     // The pairs THIS run's evidence forget attempted, whatever its answer.
     const evidenceAttempted = new Set<string>();
+    // #777: the pairs whose live rows this run forgets on the Hub, or defers.
+    // The whole-pair forget below leaves them alone, as it does a pair whose
+    // live evidence arrived during this run (`live`): the next run serves it.
+    const liveHubPairs = new Set<string>();
+    const servedByLivePath = (key: string): boolean => liveHubPairs.has(key) || live.has(key);
 
     // 1. The evidence half (#276). An empty list no longer returns: the
     //    dormant half below must run whether or not anything is foreign.
     const sessions = deps.foreignSessions();
+    if (sessions.length === 0) owed.clear();
     if (sessions.length > 0) {
+      // 1a. Live evidence's Local archive half (#777, ADR-0149 §2): every
+      //     evicted row leaves the archive by key, whether or not it reached
+      //     a Hub, before the strike below reads the archive. A row whose key
+      //     the live store no longer excludes is dropped: no forget is owed.
+      //     A failed forget leaves the rows archived, so the strike lists
+      //     their pairs and the whole forget repairs them, as before #777.
+      //     Evidence that arrives during these awaits joins this pass, and
+      //     its rows leave the archive too, before the strike reads it: an
+      //     archived row its own queued evidence will drop is no repair owed.
+      const hub = hubKey(hubTarget, marker.hubEpoch);
+      let absorbed = true;
+      while (absorbed) {
+        for (const entry of owed.values())
+          for (const key of [...entry.rows.keys()])
+            if (!deps.isExcludedKey(key)) entry.rows.delete(key);
+        // A done pair with rows that reached a Hub is struck durably BEFORE
+        // the archive forget below, whether or not the Hub is reachable now:
+        // once those rows leave the archive, the strike is the only durable
+        // record that the Hub still owes their forget, so a process that dies
+        // or quits before it lands repairs the pair whole at the next boot. In
+        // memory it stays complete on this Hub, and is forgotten row by row
+        // (1c).
+        let struckForRows = false;
+        if (hubTarget !== null)
+          for (const [key, entry] of owed)
+            if (hubDone.has(key) && [...entry.rows.values()].some((row) => row.reachedHub)) {
+              entry.doneOn = hub;
+              hubDone.delete(key);
+              struckForRows = true;
+            }
+        if (struckForRows) await persist(snapshot(), generation);
+        const archiveRows: ForgetRequestSession[] = [];
+        for (const entry of owed.values())
+          if (entry.rows.size > 0)
+            archiveRows.push({ ...entry.pair, rows: [...entry.rows.values()].map(forgetRowRef) });
+        if (archiveRows.length > 0) {
+          try {
+            await deps.forgetExcludedRowsFromLocalArchive(archiveRows);
+          } catch (err: unknown) {
+            console.warn("[sidecar] organization repair: local archive row forget failed:", err);
+          }
+        }
+        absorbed = live.size > 0;
+        if (absorbed) {
+          merge(live.values(), owed);
+          live = new Map();
+        }
+      }
       // A done pair whose Local archive rows still include a key the store
       // excludes is not done (#368 review). A done list records that a forget
       // RAN, under the attribution rule of the build that ran it; the archive
@@ -464,41 +663,110 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
       // halves: the Hub forget deletes its own rows there and the resync
       // re-pushes the admitted ones tagged, or, with no Hub, the archive
       // forget drops them. When it removes anything it is persisted at once,
-      // before either forget, as an invalidation is: the archive stops being
-      // durable evidence the moment the Local archive forget below erases
-      // those very rows. A Hub forget that fails transiently, then
-      // a rebuild that throws or a process that dies mid-walk, would otherwise
-      // leave the pair done in both lists on disk, and the next boot, finding
-      // no excluded row, would never send the Hub its forget.
+      // before either forget: the archive stops being durable evidence the
+      // moment the Local archive forget below erases those very rows. A Hub
+      // forget that fails transiently, then a rebuild that throws or a process
+      // that dies mid-walk, would otherwise leave the pair done in both lists
+      // on disk, and the next boot, finding no excluded row, would never send
+      // the Hub its forget.
       // Applied to EVERY marker, not only a migrated one, because it is a
       // no-op in steady state: a completed forget removed every archived row
-      // of the pair whose key the store excludes (#375), and the archive only
-      // ever receives the store's admitted rows, which never carry an
-      // excluded key. An excluded key can reappear in a done pair's archive
-      // only when a row's classification changed later: an attribution-rule
-      // change (v0.7.1's Owner-record-only split, ADR-0109), a restart that
-      // lost the in-process `invalidate`, or a new copy that now holds the
-      // key (#374). Each is a repair owed. Nothing is excluded when nothing is
-      // foreign, so the check is skipped then. Dormant rows are never
-      // excluded keys, so `dormantHubDone` is untouched: the evidence half's
-      // Hub forget covers the pair for that half too.
+      // of the pair whose key the store excludes (#375), live evidence's rows
+      // left the archive above (#777), and the archive only ever receives the
+      // store's admitted rows, which never carry an excluded key. An excluded
+      // key can reappear in a done pair's archive only when a row's
+      // classification changed later: an attribution-rule change (v0.7.1's
+      // Owner-record-only split, ADR-0109), a restart that lost queued live
+      // evidence, a failed live archive forget, or a new copy that now holds
+      // the key (#374). Each is a repair owed. Nothing is excluded when
+      // nothing is foreign, so the check is skipped then. Dormant rows are
+      // never excluded keys, so `dormantHubDone` is untouched: the evidence
+      // half's Hub forget covers the pair for that half too.
       let struck = false;
+      const struckPairs = new Set<string>();
       for (const s of deps.archivedExcludedPairs()) {
         const fromArchive = archiveDone.delete(pairKey(s));
         const fromHub = hubDone.delete(pairKey(s));
         if (fromArchive || fromHub) struck = true;
+        struckPairs.add(pairKey(s));
       }
-      const pendingInvalidations = [...invalidated];
-      for (const key of pendingInvalidations) {
-        archiveDone.delete(key);
-        hubDone.delete(key);
+      if (struck) await persist(snapshot(), generation);
+
+      // 1b. Live evidence's verdicts (#777, ADR-0149 §1). A pair the archive
+      //     strike just listed is the whole forget's, as is a pair listed
+      //     before and not done: the ordinary forget covers its rows. A
+      //     complete pair (listed by this evidence, or done when it came)
+      //     with no row that reached a Hub, or with no Hub, is done in both
+      //     lists now: no Hub holds an excluded row of it. One with rows that
+      //     reached a Hub is done for the archive, and its rows are forgotten
+      //     on the Hub below.
+      const liveHub: ForgetRequestSession[] = [];
+      for (const [key, entry] of owed) {
+        const done = hubTarget === null ? archiveDone.has(key) : hubDone.has(key);
+        if (struckPairs.has(key) || !(isComplete(entry, hub) || done)) {
+          owed.delete(key);
+          continue;
+        }
+        if (done) entry.doneOn = hub;
+        const reached = [...entry.rows.values()].filter((row) => row.reachedHub);
+        if (!archiveDone.has(key)) {
+          archiveDone.add(key);
+          changed = true;
+        }
+        if (hubTarget === null || reached.length === 0) {
+          if (hubTarget !== null && !hubDone.has(key)) {
+            hubDone.add(key);
+            changed = true;
+          }
+          owed.delete(key);
+          continue;
+        }
+        liveHub.push({ ...entry.pair, rows: reached.map(forgetRowRef) });
+        liveHubPairs.add(key);
       }
-      if (struck || pendingInvalidations.length > 0) {
-        await persist(snapshot(), generation);
-        for (const key of pendingInvalidations) invalidated.delete(key);
+
+      // 1c. Live evidence's Hub half (ADR-0149 §3): only the rows that reached
+      //     a Hub, by key, never their pairs' admitted rows. A failed or
+      //     deferred forget is retried row by row; the pair is done again once
+      //     it lands.
+      if (hubTarget !== null && liveHub.length > 0) {
+        if (!hubKnown) {
+          hubPending = true;
+          console.warn(
+            "[sidecar] organization repair: hub row forget deferred (the hub's events epoch is not known)",
+          );
+        } else {
+          // The marker and archive awaits may have let a fuller admitted copy
+          // take a key back; its row is no longer owed a forget.
+          const owedRows = liveHub
+            .map((ref) => ({
+              ...ref,
+              rows: (ref.rows ?? []).filter((row) =>
+                deps.isExcludedKey(fleetDedupKey(row.messageId, row.requestId)),
+              ),
+            }))
+            .filter((ref) => ref.rows.length > 0);
+          const result =
+            owedRows.length === 0 ? OK_NOTHING : await deps.forgetRowsOnHub(owedRows, hubTarget);
+          if (result.ok) {
+            for (const key of liveHubPairs) {
+              hubDone.add(key);
+              owed.delete(key);
+            }
+            changed = true;
+          } else {
+            if (transient(result)) hubPending = true;
+            console.warn(
+              `[sidecar] organization repair: hub row forget deferred (${result.reason}: ${result.detail})`,
+            );
+          }
+        }
       }
+
       if (hubTarget !== null) {
-        const pendingHub = sessions.filter((s) => !hubDone.has(pairKey(s)));
+        const pendingHub = sessions.filter(
+          (s) => !hubDone.has(pairKey(s)) && !servedByLivePath(pairKey(s)),
+        );
         if (pendingHub.length > 0 && !hubKnown) {
           // #515: the Hub's epoch is not known yet, so its completion cannot be
           // recorded; retried as an unreachable Hub is, and on the next connect.
@@ -530,7 +798,9 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
           }
         }
       }
-      const pendingArchive = sessions.filter((s) => !archiveDone.has(pairKey(s)));
+      const pendingArchive = sessions.filter(
+        (s) => !archiveDone.has(pairKey(s)) && !live.has(pairKey(s)),
+      );
       if (pendingArchive.length > 0) {
         await deps.forgetExcludedFromLocalArchive(pendingArchive);
         for (const s of pendingArchive) archiveDone.add(pairKey(s));
@@ -648,8 +918,10 @@ export function createOrganizationRepair(deps: OrganizationRepairDeps): Organiza
 
   return {
     run,
-    invalidate: (sessions) => {
-      for (const session of sessions) invalidated.add(pairKey(session));
+    reclassify: ({ listed, evicted }) => {
+      for (const pair of listed) livePair(pair).listed = true;
+      for (const row of evicted)
+        addRow(livePair(row), fleetDedupKey(row.messageId, row.requestId), row);
       return run();
     },
     reset,

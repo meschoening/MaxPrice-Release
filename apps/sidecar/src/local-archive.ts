@@ -1,5 +1,6 @@
 import {
   EVENT_PUSH_BATCH_MAX,
+  type ForgetRequestSession,
   type ForgetSessionRef,
   fleetCopySupersedes,
   fleetDedupTokenTotal,
@@ -90,6 +91,13 @@ export type LocalArchive = {
   // key the live store excludes; their admitted rows stay and no pair is barred.
   // Rejects until the delete is durable, as `forgetSessions` does.
   forgetExcludedKeys: (sessions: readonly ForgetSessionRef[]) => Promise<void>;
+  // #777 (ADR-0149 §2): the repair's forget of live evidence's rows. Drops each
+  // named row (each pair's `rows`, by dedup key) only while the live store
+  // excludes its key, behind every append queued before it, so a row an
+  // append is about to write is either refused there or dropped here. Holding
+  // none of them, it writes nothing. With no archive open it is
+  // `forgetExcludedKeys` of their pairs. Rejects until the delete is durable.
+  forgetExcludedRows: (rows: readonly ForgetRequestSession[]) => Promise<void>;
   // #368 review: every pair whose archived rows include a key the live store
   // excludes (`isExcludedDedupKey`), rows of a forgotten pair skipped — the
   // repair's "this done pair is still owed" test. Answered from the records
@@ -571,6 +579,44 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     }
   }
 
+  async function forgetExcludedRows(rows: readonly ForgetRequestSession[]): Promise<void> {
+    const keys = new Set(
+      rows.flatMap((ref) => (ref.rows ?? []).map((r) => fleetEventKey(r.messageId, r.requestId))),
+    );
+    if (keys.size === 0) return;
+    if (archive === null) {
+      // Not open: the pairs' excluded-key forget, which queues them for the
+      // open's replay, covers these rows.
+      await forgetExcludedKeys(
+        rows.map(({ projectSlug, sessionId }) => ({ projectSlug, sessionId })),
+      );
+      return;
+    }
+    const a = archive;
+    const link = chain.then(() => {
+      // Asked as the delete runs, as `excludedOfPairs` asks. Most live rows
+      // were never archived: the append that would have written them found
+      // their contribution gone. Then nothing is written.
+      const owed = [...keys].filter((key) => a.getByKey(key) !== undefined);
+      if (owed.length === 0) return;
+      const wanted = new Set(owed);
+      a.remove((_record, key) => wanted.has(key) && deps.getStore().isExcludedDedupKey(key));
+    });
+    chain = link.then(
+      () => {},
+      () => {},
+    );
+    try {
+      await link;
+    } catch (err) {
+      // The file still holds the rows; the repair's strike reads them back
+      // (`excludedPairs`) and repairs their pairs whole.
+      console.warn("[sidecar] local archive excluded-row forget failed:", err);
+      setDegraded(true);
+      throw err;
+    }
+  }
+
   return {
     loadAtBoot,
     attachStore,
@@ -579,6 +625,7 @@ export function createLocalArchive(deps: LocalArchiveDeps): LocalArchive {
     startSweeps,
     forgetSessions,
     forgetExcludedKeys,
+    forgetExcludedRows,
     excludedPairs,
     store: () => archive,
     degraded: () => isDegraded,
